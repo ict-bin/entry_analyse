@@ -654,13 +654,19 @@ class Orchestrator:
             base_dir=out_dir.name,
         )
 
-        # 4) 清理
+        # 4) flag 文件：成功写 1，失败写 0
+        flag_name = self._make_result_filename(cfg, "flag")
+        flag_value = "1" if result.status == TaskStatus.PASSED else "0"
+        (result_dir / flag_name).write_text(flag_value, encoding="utf-8")
+
+        # 5) 清理
         shutil.rmtree(out_dir, ignore_errors=True)
 
         self._emit("task_end", task_id,
                     status=result.status.value,
                     archive=str(zip_path),
-                    result_file=str(result_dir / result_filename))
+                    result_file=str(result_dir / result_filename),
+                    flag_file=str(result_dir / flag_name))
         self._cancel_event = None
         return result
 

@@ -77,6 +77,8 @@ def render_event(event: SwarmEvent, quiet: bool = False):
             print(f"   📦 Archive: {d.get('archive')}")
         if d.get("result_file"):
             print(f"   📄 Result:  {d.get('result_file')}")
+        if d.get("flag_file"):
+            print(f"   🚩 Flag:    {d.get('flag_file')}")
     elif t == "error":
         print(f"\n❗ Error: {d.get('error')}", file=sys.stderr)
 
