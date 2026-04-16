@@ -79,7 +79,26 @@ from .models import (
     make_id,
 )
 from .module_loader import ModuleInfo, load_module, prepare_workspace
-from .runner import run_agent
+from .runner import run_agent, AgentResult, PiFatalError
+
+
+# ─── 致命错误保护 ─────────────────────────────────────────────────────────────
+
+def _check_agent_result(ar: AgentResult, context: str = "") -> None:
+    """检查 run_agent 返回结果，致命错误立即抛异常终止流水线。"""
+    if getattr(ar, "fatal", False):
+        msg = "pi 致命错误"
+        if context:
+            msg += f" [{context}]"
+        msg += f": {ar.error or 'unknown'}"
+        raise PiFatalError(msg)
+
+
+async def _run_agent_checked(context: str = "", **kwargs) -> AgentResult:
+    """run_agent 的包装：执行后自动检查致命错误。"""
+    ar = await run_agent(**kwargs)
+    _check_agent_result(ar, context)
+    return ar
 
 
 # ─── 解析工具 ─────────────────────────────────────────────────────────────────
@@ -425,7 +444,8 @@ class Orchestrator:
                 if rnd_num == 1:
                     overview_prompt = self._build_worker_overview(
                         cfg.task, cfg.module_name, self.module_files)
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
+                        context="worker overview",
                         prompt=overview_prompt, **worker_base)
                     total_worker_tokens += ar.token_usage
                 elif feedback_for_workers:
@@ -436,7 +456,8 @@ class Orchestrator:
                         f"{feedback_for_workers}\n\n"
                         f"请根据反馈重新分析所有文件，修正遗漏。"
                         f"我将再次逐文件发送给你分析。")
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
+                        context="worker feedback",
                         prompt=fb_prompt, **worker_base)
                     total_worker_tokens += ar.token_usage
 
@@ -453,7 +474,8 @@ class Orchestrator:
 
                     file_prompt = self._build_file_prompt(
                         file_path, file_idx, len(self.module_files))
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
+                        context=f"worker file {file_path}",
                         prompt=file_prompt, **worker_base)
                     total_worker_tokens += ar.token_usage
                     last_output = _extract_result(ar.output)
@@ -461,7 +483,8 @@ class Orchestrator:
                 # 最后一步：汇总写入 entry-list.md
                 summary_prompt = self._build_summary_file_prompt(
                     cfg.module_name, self.module_files)
-                ar = await run_agent(
+                ar = await _run_agent_checked(
+                    context="worker summary",
                     prompt=summary_prompt, **worker_base)
                 total_worker_tokens += ar.token_usage
                 last_output = _extract_result(ar.output)
@@ -586,6 +609,12 @@ class Orchestrator:
                 if rnd_num == cfg.max_rounds:
                     result.status = TaskStatus.FAILED
                     result.final_output = _get_best_output(worker_result)
+
+        except PiFatalError as e:
+            result.status = TaskStatus.FAILED
+            result.error = str(e)
+            self._emit("error", task_id, error=str(e),
+                       fatal=True)
 
         except Exception as e:
             result.status = TaskStatus.ERROR
@@ -726,7 +755,8 @@ class Orchestrator:
                 entry_path=f"{w.worker_id}-entry-list.md",
             )
 
-            ar = await run_agent(
+            ar = await _run_agent_checked(
+                context=f"{jid} eval {w.worker_id}",
                 prompt=eval_prompt, **base_kwargs, session_file=None)
             j_result.token_usage += ar.token_usage
 
@@ -756,7 +786,8 @@ class Orchestrator:
             summary_prompt = self._build_summary_prompt(
                 round_workers, j_result.evaluations, eval_files)
 
-            ar = await run_agent(
+            ar = await _run_agent_checked(
+                context=f"{jid} summary",
                 prompt=summary_prompt, **base_kwargs, session_file=None)
             j_result.token_usage += ar.token_usage
 
