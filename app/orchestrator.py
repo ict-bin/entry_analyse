@@ -380,6 +380,8 @@ class Orchestrator:
                 "cancel_event": self._cancel_event,
                 "max_retries": cfg.agent_max_retries,
                 "retry_delay": cfg.agent_retry_delay,
+                "pi_max_retries": cfg.pi_max_retries,
+                "pi_retry_delay": cfg.pi_retry_delay,
             }
 
             agents_desc = (
@@ -676,6 +678,8 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "pi_max_retries": cfg.pi_max_retries,
+            "pi_retry_delay": cfg.pi_retry_delay,
         }
 
         # ═══ 步骤0：准备文件到 Judge 工作目录 ═══

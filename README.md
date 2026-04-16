@@ -392,8 +392,10 @@ python3 cli.py --quiet "分析ipsec模块的外部入口"
 | `max_rounds` | 3 | 最大 Worker+Judge 迭代轮数 |
 | `min_rounds` | 2 | 最少轮数（强制至少反思一次） |
 | `pass_threshold` | `ceil(judges/2)` | 通过所需的 Judge 投票数 |
-| `agent_max_retries` | 100 | API 错误最大重试次数 |
-| `agent_retry_delay` | 30 | 首次重试等待秒数（指数退避） |
+| `agent_max_retries` | 100 | API 错误最大重试次数（指数退避） |
+| `agent_retry_delay` | 30 | API 重试首次等待秒数 |
+| `pi_max_retries` | -1 | pi 进程启动/崩溃重试次数（-1 = 无限重试） |
+| `pi_retry_delay` | 5 | pi 进程重试等待秒数 |
 | `workers.agents` | — | Worker Agent 列表（模型 + 工具 + thinking） |
 | `judges.agents` | — | Judge Agent 列表 |
 | `output_dir` | /data/output | 输出目录 |

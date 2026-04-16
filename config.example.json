@@ -4,6 +4,8 @@
     "pass_threshold": 1,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
+    "pi_max_retries": -1,
+    "pi_retry_delay": 5,
 
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
