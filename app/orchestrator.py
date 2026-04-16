@@ -338,6 +338,12 @@ class Orchestrator:
             task=cfg.task, module_name=cfg.module_name,
             config_snapshot=cfg.model_dump())
 
+        # flag 文件：提前写 0，保证任何异常退出时都有 flag
+        result_dir = Path(os.path.abspath(cfg.result_dir))
+        result_dir.mkdir(parents=True, exist_ok=True)
+        flag_path = result_dir / "flag"
+        flag_path.write_text("0", encoding="utf-8")
+
         try:
             # ═══════════════════════════════════════════════════════
             # 0. 准备阶段：加载模块 → 拷贝代码文件
@@ -634,7 +640,6 @@ class Orchestrator:
             result.model_dump_json(indent=2), encoding="utf-8")
 
         # 2) 格式化输出 → result_dir
-        result_dir = Path(os.path.abspath(cfg.result_dir))
         result_dir.mkdir(parents=True, exist_ok=True)
         cleaned_output = self._format_final_output(result)
         result_filename = self._make_result_filename(cfg, "md")
@@ -654,9 +659,9 @@ class Orchestrator:
             base_dir=out_dir.name,
         )
 
-        # 4) flag 文件：成功写 1，失败写 0
-        flag_value = "1" if result.status == TaskStatus.PASSED else "0"
-        (result_dir / "flag").write_text(flag_value, encoding="utf-8")
+        # 4) flag 文件：成功覆写为 1
+        if result.status == TaskStatus.PASSED:
+            flag_path.write_text("1", encoding="utf-8")
 
         # 5) 清理
         shutil.rmtree(out_dir, ignore_errors=True)
