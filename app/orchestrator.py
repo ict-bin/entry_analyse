@@ -655,9 +655,8 @@ class Orchestrator:
         )
 
         # 4) flag 文件：成功写 1，失败写 0
-        flag_name = self._make_result_filename(cfg, "flag")
         flag_value = "1" if result.status == TaskStatus.PASSED else "0"
-        (result_dir / flag_name).write_text(flag_value, encoding="utf-8")
+        (result_dir / "flag").write_text(flag_value, encoding="utf-8")
 
         # 5) 清理
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -666,7 +665,7 @@ class Orchestrator:
                     status=result.status.value,
                     archive=str(zip_path),
                     result_file=str(result_dir / result_filename),
-                    flag_file=str(result_dir / flag_name))
+                    flag_file=str(result_dir / "flag"))
         self._cancel_event = None
         return result
 
