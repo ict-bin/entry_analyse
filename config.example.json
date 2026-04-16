@@ -4,11 +4,10 @@
     "pass_threshold": 1,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
-    "max_trace_depth": 5,
 
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
-        "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
+        "system_prompt_dir": "/opt/entry_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
             { "model": "vllm/zai-org/GLM-5" }
@@ -17,7 +16,7 @@
 
     "judges": {
         "default_tools": ["read", "bash", "grep", "find"],
-        "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
+        "system_prompt_dir": "/opt/entry_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
             { "model": "vllm/zai-org/GLM-5" }

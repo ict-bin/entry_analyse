@@ -1,5 +1,5 @@
 """
-data_flow_analyse — 数据模型
+entry_analyse — 数据模型
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ class ServiceConfig(BaseModel):
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
-    max_trace_depth: int = Field(default=3, ge=1, le=10, description="函数调用递归追踪最大深度")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -54,9 +53,8 @@ class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
     # 用户输入部分
     task: str = Field(..., description="用户的一句话 prompt")
-    source_file: str = Field(default="", description="从 prompt 解析出的文件名")
-    function_name: str = Field(default="", description="从 prompt 解析出的函数名")
-    cwd: str = Field(default="/data/target", description="待分析文件所在目录")
+    module_name: str = Field(default="", description="从 prompt 解析出的模块名")
+    cwd: str = Field(default="/data/target", description="挂载的软件包目录")
 
     # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=3)
@@ -64,14 +62,11 @@ class TaskConfig(BaseModel):
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
-    max_trace_depth: int = Field(default=3)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
-    # context 用于内部递归时注入脏数据上下文，不需用户配置
-    context: str = Field(default="", exclude=True)
 
     @property
     def worker_count(self) -> int:
@@ -114,27 +109,9 @@ class WorkerResult(BaseModel):
     worker_id: str
     model: str = ""
     output: str = ""
-    dataflow_file: str = ""  # Worker 写入的 dataflow-*.md 路径
+    entry_file: str = ""  # Worker 写入的 entry-list.md 路径
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
-
-
-class CalleeRef(BaseModel):
-    """子函数引用（从 Worker 输出中解析）"""
-    function_name: str
-    file: str = ""
-    line: str = ""
-    tainted_params: str = ""
-    description: str = ""
-
-
-class TraceNode(BaseModel):
-    """调用树节点（用于确定性合并）"""
-    function_name: str
-    depth: int = 0
-    dataflow_content: str = ""  # 该函数的 dataflow 文档内容
-    status: str = ""  # passed/failed/skipped/depth_limit
-    children: list["TraceNode"] = Field(default_factory=list)
 
 
 class WorkerEvaluation(BaseModel):
@@ -174,6 +151,8 @@ class TaskResult(BaseModel):
     task_id: str
     status: TaskStatus = TaskStatus.RUNNING
     task: str
+    module_name: str = ""
+    module_files: list[str] = Field(default_factory=list)
     config_snapshot: Optional[dict] = None
     rounds: list[RoundResult] = Field(default_factory=list)
     final_output: str = ""

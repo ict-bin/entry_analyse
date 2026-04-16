@@ -1,5 +1,5 @@
 """
-data_flow_analyse — Agent 子进程执行器
+entry_analyse — Agent 子进程执行器
 
 两种执行模式：
   1. Worker（保持上下文）：使用 --session <file> 保持会话历史
@@ -292,19 +292,3 @@ def _process_line(
 
             if msg.get("stopReason") == "error":
                 result.error = msg.get("errorMessage", "Unknown error")
-
-
-async def run_agents_parallel(
-    tasks: list[dict],
-    concurrency: int = 4,
-) -> list[AgentResult]:
-    """并行运行多个 Agent，限制并发。"""
-    semaphore = asyncio.Semaphore(concurrency)
-    results: list[AgentResult | None] = [None] * len(tasks)
-
-    async def _run(index: int, kwargs: dict):
-        async with semaphore:
-            results[index] = await run_agent(**kwargs)
-
-    await asyncio.gather(*[_run(i, t) for i, t in enumerate(tasks)])
-    return results  # type: ignore[return-value]

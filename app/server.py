@@ -1,11 +1,12 @@
 """
-data_flow_analyse — REST API 服务器
+entry_analyse — REST API 服务器
 
-  POST /analyse           提交分析（body: {"prompt": "对 xxx.c 的 yyy 函数完成数据流分析"}）
+  POST /analyse           提交分析（body: {"prompt": "分析libipsec模块的外部入口"}）
   GET  /task/{id}         查询结果
   GET  /task/{id}/stream  SSE 实时事件流
   POST /task/{id}/abort   中止
   GET  /tasks             列出任务
+  GET  /modules           列出可用模块
   GET  /health            健康检查
 """
 
@@ -25,6 +26,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .config import build_task_config, load_service_config
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
+from .module_loader import list_modules
 from .orchestrator import Orchestrator
 
 load_dotenv()
@@ -48,17 +50,18 @@ class TaskEntry:
 
 _tasks: dict[str, TaskEntry] = {}
 
-app = FastAPI(title="data_flow_analyse", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="entry_analyse", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 启动时加载一次服务配置
 _svc_config = None
 
 
 def _get_svc_config():
     global _svc_config
     if _svc_config is None:
-        for p in [SERVICE_CONFIG_PATH, "/opt/data_flow_analyse/config.example.json"]:
+        for p in [SERVICE_CONFIG_PATH, "/opt/entry_analyse/config.example.json"]:
             if os.path.isfile(p):
                 _svc_config = load_service_config(p)
                 break
@@ -70,9 +73,12 @@ def _get_svc_config():
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
-    prompt: str = Field(..., description="一句话任务描述，如：对 firmware.c 的 parse_packet 函数完成数据流分析")
-    cwd: str = Field(default="", description="待分析文件目录，默认 /data/target")
-    callback_url: str = Field(default="", description="任务完成后 POST 通知的 URL")
+    prompt: str = Field(
+        ..., description="一句话任务描述，如：分析libipsec模块的外部入口")
+    cwd: str = Field(
+        default="", description="软件包目录，默认 /data/target")
+    callback_url: str = Field(
+        default="", description="任务完成后 POST 通知的 URL")
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
@@ -84,6 +90,14 @@ async def health():
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
     }
+
+
+@app.get("/modules")
+async def get_modules(cwd: str = ""):
+    """列出可用模块。"""
+    target = cwd or TARGET_DIR
+    modules = list_modules(target)
+    return {"target_dir": target, "modules": modules}
 
 
 @app.post("/analyse", status_code=202)
@@ -113,7 +127,7 @@ async def submit_analyse(body: AnalyseRequest):
 
     async def _run():
         try:
-            entry.result = await orch.execute_recursive(task_id)
+            entry.result = await orch.execute(task_id)
         except Exception as e:
             entry.result = TaskResult(
                 task_id=task_id, status=TaskStatus.ERROR,
@@ -121,7 +135,8 @@ async def submit_analyse(body: AnalyseRequest):
         finally:
             done_data = {
                 "type": "done", "task_id": task_id,
-                "status": entry.result.status.value if entry.result else "error",
+                "status": (entry.result.status.value
+                           if entry.result else "error"),
             }
             for q in entry.queues:
                 try:
@@ -137,8 +152,7 @@ async def submit_analyse(body: AnalyseRequest):
     asyncio.create_task(_run())
     return {
         "task_id": task_id,
-        "source_file": cfg.source_file,
-        "function_name": cfg.function_name,
+        "module_name": cfg.module_name,
         "status": "accepted",
         "stream": f"/task/{task_id}/stream",
         "result": f"/task/{task_id}",
@@ -167,7 +181,10 @@ async def get_task(task_id: str):
         raise HTTPException(404, "Task not found")
     if entry.result:
         return entry.result.model_dump()
-    return {"task_id": task_id, "status": "running", "events_count": len(entry.events)}
+    return {
+        "task_id": task_id, "status": "running",
+        "events_count": len(entry.events),
+    }
 
 
 @app.get("/task/{task_id}/stream")
@@ -206,7 +223,10 @@ async def abort_task(task_id: str):
     if not entry:
         raise HTTPException(404)
     if entry.result:
-        return {"message": "Already completed", "status": entry.result.status.value}
+        return {
+            "message": "Already completed",
+            "status": entry.result.status.value,
+        }
     entry.orch.abort()
     return {"message": "Abort sent", "task_id": task_id}
 
@@ -214,7 +234,10 @@ async def abort_task(task_id: str):
 @app.get("/tasks")
 async def list_tasks():
     return {"tasks": [
-        {"task_id": tid, "prompt": e.prompt[:100],
-         "status": e.result.status.value if e.result else "running"}
+        {
+            "task_id": tid,
+            "prompt": e.prompt[:100],
+            "status": (e.result.status.value if e.result else "running"),
+        }
         for tid, e in _tasks.items()
     ]}

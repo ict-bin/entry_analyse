@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-data_flow_analyse 服务器启动入口
+entry_analyse 服务器启动入口
 
   python main.py               启动 REST API
   python main.py --port 8000   指定端口
@@ -23,10 +23,10 @@ if __name__ == "__main__":
 
     print(f"""
 ╔═══════════════════════════════════════════════════════╗
-║            data_flow_analyse API Server                 ║
+║              entry_analyse API Server                  ║
 ╠═══════════════════════════════════════════════════════╣
 ║  URL:    http://localhost:{port:<38}║
-║  POST /task  — 提交任务（body = config.json 格式）     ║
+║  POST /analyse  — 提交分析任务                        ║
 ║  GET  /task/{{id}}/stream  — SSE 实时事件流            ║
 ╚═══════════════════════════════════════════════════════╝
 """)

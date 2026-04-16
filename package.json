@@ -1,9 +1,8 @@
 {
-  "name": "data_flow_analyse",
+  "name": "entry_analyse",
   "version": "1.0.0",
-  "description": "Multi-agent data flow analysis orchestrator built on pi-coding-agent",
   "scripts": {
-    "docker:build": "docker build -t data_flow_analyse .",
-    "docker:run": "docker run --rm -p 3000:3000 --env-file .env data_flow_analyse"
+    "docker:build": "docker build -t entry_analyse .",
+    "docker:run": "docker run --rm -p 3000:3000 --env-file .env entry_analyse"
   }
 }
