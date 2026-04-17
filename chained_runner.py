@@ -13,7 +13,7 @@ from pathlib import Path
 APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
 STAGE = "03-entry"
-PREV_STAGE = "02-system"
+PREV_STAGE = "02-re"
 NEXT_STAGE = "04-dataflow"
 
 
@@ -66,7 +66,7 @@ def has_any_file(root: Path) -> bool:
 
 
 def downstream_source_root() -> Path:
-    recovered = RUN_ROOT / "01-re" / "output" / "recovered"
+    recovered = RUN_ROOT / "02-re" / "output" / "recovered"
     if has_any_file(recovered):
         return recovered
     unpacked = RUN_ROOT / "00-unpack" / "output" / "unpacked"
@@ -102,7 +102,7 @@ def prepare_input() -> Path:
     input_dir = RUN_ROOT / STAGE / "input"
     src_root = downstream_source_root()
     sync_tree(src_root, input_dir, exclude_run=(src_root == APP_ROOT))
-    modules_src = RUN_ROOT / "02-system" / "output" / "modules"
+    modules_src = RUN_ROOT / "01-system" / "output" / "modules"
     if modules_src.is_dir():
         dst = input_dir / "modules"
         if dst.exists():
@@ -195,7 +195,7 @@ def run_real() -> None:
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
 
-    modules_dir = RUN_ROOT / "02-system" / "output" / "modules"
+    modules_dir = RUN_ROOT / "01-system" / "output" / "modules"
     modules = sorted(p.name for p in modules_dir.iterdir() if p.is_dir()) if modules_dir.is_dir() else []
     all_entries: list[dict] = []
     for module in modules:
