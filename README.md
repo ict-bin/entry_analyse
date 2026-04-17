@@ -32,6 +32,7 @@
   │  输出                 │
   │  • ipsec.md          │  结构化入口列表
   │  • ipsec_log.zip     │  完整工作过程归档
+  │  • flag              │  成功“1” / 失败“0”
   └──────────────────────┘
 ```
 
@@ -259,7 +260,8 @@ docker compose up -d
 ```
 output/
 ├── ipsec.md              # 结构化入口列表
-└── ipsec_log.zip         # 完整工作过程归档
+├── ipsec_log.zip         # 工作过程归档
+└── flag                  # “1”=成功 / “0”=失败
 ```
 
 ### 输出格式
@@ -336,6 +338,27 @@ ipsec_log.zip → task-xxx/
 ├── module-info.json
 ├── report.md
 └── result.json
+```
+
+### flag 文件
+
+用于脚本对接的状态标志文件，严格命名为 `flag`，位于输出目录根下。
+
+| 项 | 说明 |
+|---|------|
+| 文件名 | `flag`（无前缀、无后缀、无扩展名） |
+| 内容 | 成功（passed）写 `1`，失败（failed/error）写 `0` |
+| 编码 | UTF-8，无 BOM |
+| 保证 | 任务启动时立即写入 `0`，仅当分析完全通过后覆写为 `1` |
+
+```bash
+# 脚本对接示例
+FLAG=$(cat /data/output/flag)
+if [ "$FLAG" = "1" ]; then
+    echo "分析成功"
+else
+    echo "分析失败"
+fi
 ```
 
 ## REST API
