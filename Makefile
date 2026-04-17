@@ -18,7 +18,7 @@ build:
 push:
 	test -z "$$(git cherry -v)" || opencode run 'push it'
 
-push_image:
+push_image: build
 	docker push $(LOCAL_IMAGE)
 push_image_remote:
 	docker push $(REMOTE_IMAGE)
