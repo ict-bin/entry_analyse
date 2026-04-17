@@ -1,17 +1,17 @@
 {
     "providers": {
-        "glm": {
-            "baseUrl": "http://172.31.29.10:8000/v1",
+        "gaiasec": {
+            "baseUrl": "http://gaiasec.ai.icsl.huawei.com/v1/",
             "api": "openai-completions",
-            "apiKey": "GLM_API_KEY",
+            "apiKey": "GAIASEC_TOKEN",
             "compat": {
                 "supportsDeveloperRole": false,
                 "supportsReasoningEffort": false
             },
             "models": [
                 {
-                    "id": "zai-org/GLM-5",
-                    "name": "GLM-5",
+                    "id": "auto",
+                    "name": "auto",
                     "reasoning": false,
                     "input": ["text"],
                     "contextWindow": 128000,

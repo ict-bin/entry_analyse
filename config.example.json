@@ -12,7 +12,7 @@
         "system_prompt_dir": "/opt/entry_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "vllm/zai-org/GLM-5" }
+            { "model": "gaiasec/auto" }
         ]
     },
 
@@ -21,7 +21,7 @@
         "system_prompt_dir": "/opt/entry_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "vllm/zai-org/GLM-5" }
+            { "model": "gaiasec/auto" }
         ]
     },
 
