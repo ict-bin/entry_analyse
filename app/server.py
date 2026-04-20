@@ -31,8 +31,10 @@ from .orchestrator import Orchestrator
 
 load_dotenv()
 
-SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/data/config/config.json")
-TARGET_DIR = os.environ.get("TARGET_DIR", "/data/target")
+# 使用统一的路径配置（优先读取环境变量）
+from .config import CONFIG_DIR, TARGET_DIR
+
+SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 
 

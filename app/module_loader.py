@@ -132,12 +132,15 @@ def resolve_file_path(file_path: str, target_dir: str) -> str | None:
     target = Path(target_dir)
     fp = file_path.strip()
 
+    # 从环境变量读取默认 target_dir（用于路径前缀替换）
+    default_target = os.environ.get("TARGET_DIR", "/data/target")
+
     # 1) 绝对路径
     if os.path.isabs(fp):
         if os.path.isfile(fp):
             return fp
-        # /data/target/... → 映射到实际 target_dir
-        for prefix in ("/data/target/", "/data/target"):
+        # 从配置读取的 target_dir 或默认 /data/target/... → 映射到实际 target_dir
+        for prefix in (f"{default_target}/", default_target, "/data/target/", "/data/target"):
             if fp.startswith(prefix):
                 relative = fp[len(prefix):]
                 candidate = target / relative
