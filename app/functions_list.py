@@ -5,10 +5,11 @@ entry_analyse — functions.list 生成器
 生成确定性的 functions.list 文件。
 
 输出格式（每行一个入口）：
-    文件名:函数名:外部入参1,外部入参2
+    文件名:函数名:污点变量1,污点变量2
 
 示例：
     libipsec.c:IPSEC_SOCKI_PipeMsg:pipe_id,pipe_type,msg_type
+    libipsec.c:IPSEC_RecvLoop:buf
     libipsec.c:IPSEC_MsgProc:message
 
 规则：
@@ -56,15 +57,17 @@ def write_functions_list(entry_md: str, output_path: str) -> int:
 
 # ─── 内部解析 ─────────────────────────────────────────────────────────────────
 
-# 表格行: | 序号 | 文件 | 函数名 | 行号 | 入口类型 | 外部数据参数 | 说明 |
-#         col0   col1   col2     col3   col4       col5           col6
+# 表格行（兼容 7 列和 8 列两种格式）:
+#   7列: | 序号 | 文件 | 函数名 | 行号 | 入口类型 | 外部数据参数 | 说明 |
+#   8列: | 序号 | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 数据来源 | 说明 |
+# 污点变量/外部数据参数 都在 col5（group 6）
 _TABLE_ROW_RE = re.compile(
     r'^\|\s*(\d+)\s*\|'   # col0: 序号（数字开头才是数据行）
     r'\s*(.*?)\s*\|'       # col1: 文件
     r'\s*(.*?)\s*\|'       # col2: 函数名
     r'\s*(.*?)\s*\|'       # col3: 行号
     r'\s*(.*?)\s*\|'       # col4: 入口类型
-    r'\s*(.*?)\s*\|'       # col5: 外部数据参数
+    r'\s*(.*?)\s*\|'       # col5: 污点变量
 )
 
 
