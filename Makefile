@@ -15,6 +15,8 @@ commit:
 build:
 	docker build -t $(LOCAL_IMAGE) -f Dockerfile.chain .
 	docker tag $(LOCAL_IMAGE) $(REMOTE_IMAGE)
+run:
+	docker run -v "/app:/app" $(LOCAL_IMAGE)
 push:
 	test -z "$$(git cherry -v)" || opencode run 'push it'
 

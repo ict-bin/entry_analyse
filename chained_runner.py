@@ -15,6 +15,7 @@ RUN_ROOT = APP_ROOT / ".run"
 STAGE = "03-entry"
 PREV_STAGE = "02-re"
 NEXT_STAGE = "04-dataflow"
+ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_ANALYSE_TIMEOUT_SEC", "45"))
 
 
 def now_iso() -> str:
@@ -137,6 +138,18 @@ def require_file(path: Path) -> None:
         raise FileNotFoundError(f"required file not found: {path}")
 
 
+def copy_if_missing(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or not src.is_file():
+        return
+    shutil.copy2(src, dst)
+
+
+def ensure_default_config(config_dir: Path) -> None:
+    copy_if_missing(Path("/opt/entry_analyse/config.example.json"), config_dir / "config.json")
+    copy_if_missing(Path("/root/.pi/agent/models.json"), config_dir / "models.json")
+
+
 def parse_entry_table(path: Path) -> list[dict]:
     entries: list[dict] = []
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -192,23 +205,33 @@ def run_real() -> None:
     output_dir = RUN_ROOT / STAGE / "output"
     config_dir = RUN_ROOT / "config" / STAGE
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_default_config(config_dir)
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
 
     modules_dir = RUN_ROOT / "01-system" / "output" / "modules"
     modules = sorted(p.name for p in modules_dir.iterdir() if p.is_dir()) if modules_dir.is_dir() else []
     all_entries: list[dict] = []
+    skipped_modules: list[dict] = []
     for module in modules:
         module_out = output_dir / "modules" / module
         module_out.mkdir(parents=True, exist_ok=True)
         setup_data_links(input_dir, config_dir, module_out)
-        subprocess.run([
-            "python3", "cli.py",
-            f"分析 {module} 模块的外部入口",
-            "--config", "/data/config/config.json",
-            "--cwd", "/data/target",
-            "--quiet",
-        ], check=True)
+        try:
+            subprocess.run([
+                "python3", "cli.py",
+                f"分析 {module} 模块的外部入口",
+                "--config", "/data/config/config.json",
+                "--cwd", "/data/target",
+                "--quiet",
+            ], check=True, timeout=ENTRY_TIMEOUT_SEC)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            skipped_modules.append({
+                "module": module,
+                "reason": type(exc).__name__,
+                "message": str(exc),
+            })
+            continue
         result_file = module_out / f"{re.sub(r'[^\w.-]', '_', module)}.md"
         if result_file.exists():
             for entry in parse_entry_table(result_file):
@@ -223,6 +246,7 @@ def run_real() -> None:
         "module_count": len(modules),
         "entry_count": len(all_entries),
         "entries": all_entries,
+        "skipped_modules": skipped_modules,
         "updated_at": now_iso(),
     })
     create_request_for_next({"from_stage": STAGE, "entries": all_entries, "mode": "real"})

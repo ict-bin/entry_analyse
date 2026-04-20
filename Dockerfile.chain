@@ -48,13 +48,16 @@ COPY config.example.json .env.example ./
 RUN chmod +x scripts/*.sh 2>/dev/null || true
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
+# pi 的全局配置目录，镜像内置固定 models.json / settings.json
 ENV PI_CODING_AGENT_DIR=/root/.pi/agent
 RUN mkdir -p /root/.pi/agent
+COPY config/models.json.example /root/.pi/agent/models.json
+COPY config/settings.json /root/.pi/agent/settings.json
 
 # ═══ 挂载点 ═══════════════════════════════════════════════════════════════════
 #
 # /data/target  — 软件包目录（二进制+反汇编代码+模块分析文件，只读）
-# /data/config  — config.json + models.json（只读）
+# /data/config  — config.json（只读）
 # /data/output  — 输出目录
 #
 RUN mkdir -p /data/target /data/config /data/output /data/sessions
