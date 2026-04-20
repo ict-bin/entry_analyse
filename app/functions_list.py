@@ -10,10 +10,15 @@ entry_analyse — functions.list 生成器
     被动回调型 → 函数定义行（参数在此处即为污点）
     主动拉取型 → recv/read 等系统调用所在行（污点在此处产生）
 
+污点变量格式：
+    被动回调型 → 直接变量名：          a2,msg_ptr
+    主动拉取型 → 系统调用名@变量名：  recv@buf,recvfrom@addr
+
 示例：
     libipsec.c:IPSEC_SOCKI_PipeMsg:L26837:pipe_id,pipe_type,msg_type
-    libipsec.c:IPSEC_RecvLoop:L505:buf
-    libipsec.c:IPSEC_LoadCfg:L812:data
+    libipsec.c:IPSEC_RecvLoop:L505:recv@buf
+    libipsec.c:IPSEC_LoadCfg:L812:fread@data
+    libipsec.c:IPSEC_RecvFrom:L900:recvfrom@buf,recvfrom@addr
 
 规则：
     - 严格按表格行顺序输出
@@ -96,13 +101,16 @@ def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
 
 def _clean_params(raw: str) -> str:
     """
-    清洗污点变量字符串，只保留变量名。
+    清洗污点变量字符串，保留 syscall@var 格式。
 
     输入 → 输出：
-        "pipe_id, pipe_type, msg_type" → "pipe_id,pipe_type,msg_type"
-        "a2(消息指针)" → "a2"
-        "buf(接收缓冲区)" → "buf"
-        "" → ""
+        "a2, msg_ptr"                 → "a2,msg_ptr"
+        "a2(消息体指针)"               → "a2"
+        "recv@buf(接收缓冲区)"         → "recv@buf"
+        "recvfrom@buf, recvfrom@addr" → "recvfrom@buf,recvfrom@addr"
+        "SOCK_RecvMbuf@mbuf"          → "SOCK_RecvMbuf@mbuf"
+        "mmap@ptr"                    → "mmap@ptr"
+        "无污点"                       → ""
     """
     if not raw or raw == "-" or raw.startswith("无"):
         return ""
@@ -112,10 +120,10 @@ def _clean_params(raw: str) -> str:
         seg = seg.strip()
         if not seg:
             continue
-        # 去掉括号及其中内容: "a2(消息指针)" → "a2"
+        # 去掉括号及其中内容: "recv@buf(缓冲区)" → "recv@buf"
         name = re.sub(r'[(\uff08].*?[)\uff09]', '', seg).strip()
-        # 去掉非标识符字符（保留字母数字下划线）
-        name = re.sub(r'[^\w]', '', name)
+        # 保留 字母数字下划线 和 @ 符号
+        name = re.sub(r'[^\w@]', '', name)
         if name:
             parts.append(name)
     return ",".join(parts)

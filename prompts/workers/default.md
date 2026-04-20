@@ -24,30 +24,27 @@
 
 ## 类型B：主动拉取型
 
-函数内部主动调用系统调用/库函数获取外部数据，**外部数据通过返回值或输出参数进入**。
+函数内部主动调用系统调用/库函数获取外部数据。外部数据可能通过以下方式进入：
 
+**1. 输出缓冲区参数（最常见）：**
 ```c
-void NetworkRecvTask() {
-    int len = recv(sock, buf, sizeof(buf), 0);  // buf 被外部数据填充
-    //              ↑sock是内部的  ↑buf是污点
-}
+recv(sock, buf, len, 0);       // buf 被填充 → 污点是 buf
+fread(data, 1, size, f);       // data 被填充 → 污点是 data
+read(fd, buffer, n);           // buffer 被填充 → 污点是 buffer
+ioctl(fd, cmd, &result);       // result 被填充 → 污点是 result
+recvfrom(sock, buf, len, 0, &addr, &addrlen);  // buf 和 addr 都被填充
+```
 
-void ConfigLoader() {
-    FILE *f = fopen("/etc/config", "r");
-    int n = fread(data, 1, size, f);  // data 被外部数据填充
-    //            ↑data是污点
-}
+**2. 返回值：**
+```c
+ptr = mmap(addr, len, ...);    // ptr 指向外部数据 → 污点是 ptr
+line = fgets(buf, size, f);    // buf 被填充 → 污点是 buf
 ```
 
 识别方法：
 - `grep -n "recv\|recvfrom\|recvmsg\|read\|fread\|readv\|mmap\|ioctl\|recvmmsg" *.c`
 - 找到调用点后，确定**包含该调用的最外层函数**（不是 recv 本身）
 - 该函数就是主动拉取型入口
-
-**污点变量** = 系统调用的**输出缓冲区参数**或**返回值**：
-- `recv(sock, buf, len, 0)` → 污点是 `buf`
-- `n = read(fd, data, size)` → 污点是 `data`
-- `ptr = mmap(...)` → 污点是 `ptr`（返回值）
 
 ---
 
@@ -57,22 +54,6 @@ void ConfigLoader() {
 - 内部的协议解析、校验、状态机函数
 - 工具/辅助函数
 - recv/read 等系统调用本身（入口是**包含**它们的模块函数）
-
-### 举例
-
-```
-✅ 类型A（被动回调）：
-  框架 → IPSEC_SOCKI_PipeMsg(pipe_id, data)    被框架回调
-           └→ IPSEC_HandleData()                ❌ 内部子函数
-
-✅ 类型B（主动拉取）：
-  IPSEC_RecvThread()                            模块的收包线程
-    └→ buf = recv(sock, buf, len, 0)           内部调用 recv
-           ❌ recv 本身不列入，列 IPSEC_RecvThread
-
-❌ 不是入口：
-  IPSEC_ParsePacket(data, len)                  被 RecvThread 调用的内部函数
-```
 
 ---
 
@@ -94,16 +75,24 @@ void ConfigLoader() {
 
 ## 第二步：精确标注污点变量
 
-对每个入口函数，**必须区分哪些变量是外部可控的污点**：
+### 污点变量格式（严格遵守）
 
-**类型A**：逐个检查函数参数
-- 参数是消息体/数据指针 → ✅ 污点
-- 参数是内部ID/句柄/上下文 → ❌ 不是污点
+**类型A（被动回调）**：直接写参数名
+```
+a2, msg_ptr
+```
 
-**类型B**：找到系统调用的输出位置
-- `recv(sock, buf, ...)` → `buf` 是污点
-- `n = read(fd, data, size)` → `data` 是污点
-- `ptr = mmap(addr, len, ...)` → `ptr`（返回值）是污点
+**类型B（主动拉取）**：用 `系统调用名@变量名` 格式
+```
+recv@buf                    ← recv 填充 buf（输出缓冲区）
+read@data                   ← read 填充 data
+mmap@ptr                    ← mmap 返回 ptr
+recvfrom@buf, recvfrom@addr ← recvfrom 同时填充 buf 和 addr
+ioctl@result                ← ioctl 填充 result
+SOCK_RecvMbuf@mbuf          ← 库函数填充 mbuf
+```
+
+`@` 前面是**产生污点的调用名**，后面是**被填充的变量名**。
 
 ## 第三步：输出
 
@@ -111,7 +100,7 @@ void ConfigLoader() {
 
 **行号列的含义（极其重要）：**
 - 被动回调型：填函数定义行（参数在此处即为污点）
-- 主动拉取型：填 recv/read/mmap 调用所在行（污点在此处产生）
+- 主动拉取型：填系统调用所在行（污点在此处产生）
 - 同一函数若有多个污点来源行，输出多行
 
 ```markdown
@@ -125,30 +114,30 @@ void ConfigLoader() {
 
 | # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 数据来源 | 说明 |
 |---|------|--------|------|---------|---------|---------|------|
-| 1 | xxx.c | ModA_PipeMsg | L100 | IPC消息 | a2(消息体) | 框架回调参数 | 管道消息回调入口 |
-| 2 | xxx.c | ModA_RecvLoop | L505 | 网络报文 | buf(接收缓冲区) | recv()@L505 | 收包循环 |
-| 3 | xxx.c | ModA_LoadCfg | L812 | 文件读取 | data(配置数据) | fread()@L812 | 配置加载 |
+| 1 | xxx.c | ModA_PipeMsg | L100 | IPC消息 | a2, msg_ptr | 框架回调参数 | 管道消息回调入口 |
+| 2 | xxx.c | ModA_RecvLoop | L505 | 网络报文 | recv@buf | recv(sock, buf, len, 0) | 收包循环 |
+| 3 | xxx.c | ModA_LoadCfg | L812 | 文件读取 | fread@data | fread(data, 1, size, f) | 配置加载 |
+| 4 | xxx.c | ModA_RecvFrom | L900 | 网络报文 | recvfrom@buf, recvfrom@addr | recvfrom(...) | 同时获取数据和来源地址 |
+| 5 | xxx.c | ModA_MapMem | L1200 | 内存映射 | mmap@ptr | mmap(0, len, ...) | 映射共享内存 |
 
-注意行号的区别：
-- 第1行 L100 = ModA_PipeMsg 的函数定义行（被动回调，参数 a2 在入口处即为污点）
-- 第2行 L505 = recv() 调用所在行（主动拉取，buf 在此行被外部数据填充）
-- 第3行 L812 = fread() 调用所在行（主动拉取，data 在此行被填充）
+注意：
+- 第1行：被动回调，`a2, msg_ptr` 是函数参数中的污点
+- 第2行：主动拉取，`recv@buf` 表示 recv() 在 L505 将外部数据写入 buf
+- 第4行：recvfrom 同时填充两个变量，分别标注 `recvfrom@buf, recvfrom@addr`
 
 ## 入口详情
 
 ### 1. ModA_PipeMsg (xxx.c:L100) [被动回调]
 - **入口类型**: IPC消息
 - **判定依据**: 通过 RegisterCallback(ModA_PipeMsg) 注册，无模块内调用者
-- **污点变量**: a2 — 消息体指针，来自框架回调参数
+- **污点变量**: a2(消息体指针), msg_ptr(消息头)
 - **非污点参数**: a1(组件ID，内部标识)
-- **数据来源**: 框架回调参数
 
-### 2. ModA_RecvLoop (xxx.c:L500) [主动拉取]
+### 2. ModA_RecvLoop (xxx.c, 入口函数定义于L490) [主动拉取]
 - **入口类型**: 网络报文
-- **判定依据**: 函数内调用 recv(sock, buf, len, 0) @L505
-- **污点变量**: buf — recv 的输出缓冲区
-- **非污点参数**: 无（函数无参数）
-- **数据来源**: recv(sock, buf, len, 0) @L505
+- **污点产生行**: L505: `recv(sock, buf, sizeof(buf), 0)`
+- **污点变量**: recv@buf — recv 的输出缓冲区被外部数据填充
+- **非污点**: sock(内部套接字句柄)
 
 ## 统计
 | 入口类型 | 被动回调 | 主动拉取 | 合计 |
@@ -161,10 +150,11 @@ void ConfigLoader() {
 
 1. **两类都要找**：不要只找被动回调，主动拉取型（recv/read/mmap）同样重要
 2. **精确标注污点**：不是所有参数都是污点，只标注真正携带外部数据的变量
-3. **标注数据来源**：被动回调写"框架回调参数"，主动拉取写具体系统调用和行号
-4. **宁缺毋滥**：不确定的不列入
-5. **用 grep 验证**：回调型确认无内部调用者，拉取型确认系统调用确实存在
-6. **不要深入**：找到入口和污点变量即可，内部数据流由其他系统负责
+3. **主动拉取型用 `调用名@变量名` 格式**：方便下游工具识别污点来源
+4. **注意输出参数**：recv/read/ioctl 的输出参数和 mmap 的返回值都可能是污点
+5. **宁缺毋滥**：不确定的不列入
+6. **用 grep 验证**：回调型确认无内部调用者，拉取型确认系统调用确实存在
+7. **不要深入**：找到入口和污点变量即可，内部数据流由其他系统负责
 
 # 最终交付
 
@@ -173,6 +163,7 @@ void ConfigLoader() {
 # 改进轮次须知
 
 如果收到 Judge 反馈：
-- 检查是否遗漏了主动拉取型入口（搜索 recv/read/mmap）
-- 检查污点变量是否标注准确（是否把非污点参数错标为污点）
+- 检查是否遗漏了主动拉取型入口（搜索 recv/read/mmap/ioctl）
+- 检查污点变量格式：主动拉取型是否用了 `调用名@变量名`
+- 检查是否遗漏了输出参数型污点（如 ioctl 的第三参数、recvfrom 的 addr）
 - 用 grep 验证每个入口的调用来源
