@@ -78,6 +78,7 @@ from .models import (
     WorkerResult,
     make_id,
 )
+from .functions_list import write_functions_list
 from .module_loader import ModuleInfo, load_module, prepare_workspace
 from .runner import run_agent, AgentResult, PiFatalError
 
@@ -647,7 +648,11 @@ class Orchestrator:
             cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) 压缩
+        # 3) functions.list——确定性解析，从表格提取入口函数
+        func_list_path = str(result_dir / "functions.list")
+        write_functions_list(cleaned_output, func_list_path)
+
+        # 4) 压缩
         archive_dir = Path(os.path.abspath(cfg.archive_dir))
         archive_dir.mkdir(parents=True, exist_ok=True)
         zip_name = self._make_result_filename(cfg, "zip", suffix="_log")
@@ -670,6 +675,7 @@ class Orchestrator:
                     status=result.status.value,
                     archive=str(zip_path),
                     result_file=str(result_dir / result_filename),
+                    functions_list=func_list_path,
                     flag_file=str(result_dir / "flag"))
         self._cancel_event = None
         return result
