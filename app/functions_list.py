@@ -1,21 +1,25 @@
 """
 entry_analyse — functions.list 生成器
 
-从 entry-list.md（Worker 输出）或最终 report.md 中解析总入口表格，
-生成确定性的 functions.list 文件。
+从 entry-list.md 中解析总入口表格，生成确定性的 functions.list 文件。
 
-输出格式（每行一个入口）：
-    文件名:函数名:污点变量1,污点变量2
+输出格式（每行一个污点入口）：
+    文件名:函数名:行号:污点变量1,污点变量2
+
+行号 = 污点产生的位置：
+    被动回调型 → 函数定义行（参数在此处即为污点）
+    主动拉取型 → recv/read 等系统调用所在行（污点在此处产生）
 
 示例：
-    libipsec.c:IPSEC_SOCKI_PipeMsg:pipe_id,pipe_type,msg_type
-    libipsec.c:IPSEC_RecvLoop:buf
-    libipsec.c:IPSEC_MsgProc:message
+    libipsec.c:IPSEC_SOCKI_PipeMsg:L26837:pipe_id,pipe_type,msg_type
+    libipsec.c:IPSEC_RecvLoop:L505:buf
+    libipsec.c:IPSEC_LoadCfg:L812:data
 
 规则：
     - 严格按表格行顺序输出
-    - 参数中的括号注释（如 "a2(消息指针)"）只保留变量名部分
-    - 无参数时冒号后为空: "file.c:func_name:"
+    - 一个函数若有多个污点来源行，输出多行
+    - 括号注释（如 "a2(消息指针)"）只保留变量名
+    - 无污点变量时该行不输出
     - 文件末尾无空行
 """
 
@@ -29,17 +33,16 @@ def generate_functions_list(entry_md: str) -> str:
     """
     从 entry-list markdown 内容解析总入口表格，生成 functions.list 内容。
 
-    Args:
-        entry_md: entry-list.md 或最终报告的完整文本
-
     Returns:
         functions.list 的文本内容（无尾部换行）
     """
     rows = _parse_entry_table(entry_md)
     lines: list[str] = []
-    for file_name, func_name, params_raw in rows:
-        params = _clean_params(params_raw)
-        lines.append(f"{file_name}:{func_name}:{params}")
+    for file_name, func_name, line_no, taint_vars_raw in rows:
+        taint = _clean_params(taint_vars_raw)
+        if not taint:
+            continue
+        lines.append(f"{file_name}:{func_name}:{line_no}:{taint}")
     return "\n".join(lines)
 
 
@@ -57,57 +60,49 @@ def write_functions_list(entry_md: str, output_path: str) -> int:
 
 # ─── 内部解析 ─────────────────────────────────────────────────────────────────
 
-# 表格行（兼容 7 列和 8 列两种格式）:
-#   7列: | 序号 | 文件 | 函数名 | 行号 | 入口类型 | 外部数据参数 | 说明 |
-#   8列: | 序号 | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 数据来源 | 说明 |
-# 污点变量/外部数据参数 都在 col5（group 6）
+# 表格行（兼容 7 列和 8 列）:
+#   7列: | # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 说明 |
+#   8列: | # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 数据来源 | 说明 |
 _TABLE_ROW_RE = re.compile(
-    r'^\|\s*(\d+)\s*\|'   # col0: 序号（数字开头才是数据行）
-    r'\s*(.*?)\s*\|'       # col1: 文件
-    r'\s*(.*?)\s*\|'       # col2: 函数名
-    r'\s*(.*?)\s*\|'       # col3: 行号
-    r'\s*(.*?)\s*\|'       # col4: 入口类型
-    r'\s*(.*?)\s*\|'       # col5: 污点变量
+    r'^\|\s*(\d+)\s*\|'   # group1: 序号
+    r'\s*(.*?)\s*\|'       # group2: 文件
+    r'\s*(.*?)\s*\|'       # group3: 函数名
+    r'\s*(.*?)\s*\|'       # group4: 行号
+    r'\s*(.*?)\s*\|'       # group5: 入口类型
+    r'\s*(.*?)\s*\|'       # group6: 污点变量
 )
 
 
-def _parse_entry_table(md: str) -> list[tuple[str, str, str]]:
+def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
     """
     解析 markdown 中的总入口列表表格。
 
     Returns:
-        [(文件名, 函数名, 原始参数字符串), ...]
+        [(文件名, 函数名, 行号, 污点变量原始字符串), ...]
     """
-    results: list[tuple[str, str, str]] = []
+    results: list[tuple[str, str, str, str]] = []
     for line in md.splitlines():
         m = _TABLE_ROW_RE.match(line.strip())
         if not m:
             continue
         file_name = m.group(2).strip()
         func_name = m.group(3).strip()
-        params_raw = m.group(6).strip()
+        line_no = m.group(4).strip()
+        taint_raw = m.group(6).strip()
         if file_name and func_name:
-            results.append((file_name, func_name, params_raw))
+            results.append((file_name, func_name, line_no, taint_raw))
     return results
 
 
 def _clean_params(raw: str) -> str:
     """
-    清洗参数字符串，只保留变量名。
+    清洗污点变量字符串，只保留变量名。
 
-    输入示例:
-        "pipe_id, pipe_type, msg_type"
-        "a1, a2(消息指针)"
-        "message(消息体指针)"
-        "send_cid, request_msg"
-        ""
-
-    输出:
-        "pipe_id,pipe_type,msg_type"
-        "a1,a2"
-        "message"
-        "send_cid,request_msg"
-        ""
+    输入 → 输出：
+        "pipe_id, pipe_type, msg_type" → "pipe_id,pipe_type,msg_type"
+        "a2(消息指针)" → "a2"
+        "buf(接收缓冲区)" → "buf"
+        "" → ""
     """
     if not raw or raw == "-":
         return ""
