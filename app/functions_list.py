@@ -104,7 +104,7 @@ def _clean_params(raw: str) -> str:
         "buf(接收缓冲区)" → "buf"
         "" → ""
     """
-    if not raw or raw == "-":
+    if not raw or raw == "-" or raw.startswith("无"):
         return ""
 
     parts: list[str] = []

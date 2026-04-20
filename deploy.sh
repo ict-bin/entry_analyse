@@ -11,8 +11,8 @@ echo "=== 同步代码 ==="
 scp $SSH_OPTS "$LOCAL/cli.py" "$LOCAL/main.py" "$LOCAL/config.example.json" "$LOCAL/Dockerfile" "$REMOTE:$DIR/"
 cd "$LOCAL" && tar cf - app prompts scripts | ssh $SSH_OPTS $REMOTE "cd $DIR && rm -rf app prompts scripts && tar xf -"
 
-echo "=== 构建镜像 ==="
-ssh $SSH_OPTS $REMOTE "cd $DIR && docker build -t entry_analyse ."
+echo "=== 修复行尾 + 构建镜像 ==="
+ssh $SSH_OPTS $REMOTE "cd $DIR && sed -i 's/\r$//' scripts/*.sh && docker build -t entry_analyse ."
 
 echo "=== 清理残留镜像 ==="
 ssh $SSH_OPTS $REMOTE "docker image prune -f"
