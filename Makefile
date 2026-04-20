@@ -11,14 +11,14 @@ pull:
 	git checkout main
 	git pull
 commit:
-	test -z "$$(git status --short)" || opencode run 'commit it'
+	test -z "$$(git status --short)" || opencode run 'git commit it'
 build:
 	docker build -t $(LOCAL_IMAGE) -f Dockerfile.chain .
 	docker tag $(LOCAL_IMAGE) $(REMOTE_IMAGE)
 run:
 	docker run -v "/app:/app" $(LOCAL_IMAGE)
 push:
-	test -z "$$(git cherry -v)" || opencode run 'push it'
+	test -z "$$(git cherry -v)" || opencode run 'git push it'
 
 push_image: build
 	docker push $(LOCAL_IMAGE)
