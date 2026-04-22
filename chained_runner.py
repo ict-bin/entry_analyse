@@ -22,6 +22,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def log(message: str) -> None:
+    print(f"[{now_iso()}] [{STAGE}] {message}", flush=True)
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -169,6 +173,10 @@ def ensure_default_config(config_dir: Path) -> None:
     copy_if_missing(Path("/root/.pi/agent/models.json"), config_dir / "models.json")
 
 
+def cli_quiet_enabled() -> bool:
+    return os.environ.get("GAIASEC_CLI_QUIET", "").lower() in {"1", "true", "yes"}
+
+
 def parse_entry_table(path: Path) -> list[dict]:
     entries: list[dict] = []
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -227,24 +235,34 @@ def run_real() -> None:
     ensure_default_config(config_dir)
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
+    log(
+        f"real mode start: input_dir={input_dir} config={config_dir / 'config.json'} "
+        f"models={config_dir / 'models.json'}"
+    )
 
     modules_dir = RUN_ROOT / "01-system" / "output" / "modules"
     modules = sorted(p.name for p in modules_dir.iterdir() if p.is_dir()) if modules_dir.is_dir() else []
+    quiet = cli_quiet_enabled()
+    log(f"discovered modules: module_count={len(modules)} quiet={quiet} timeout_sec={ENTRY_TIMEOUT_SEC}")
     all_entries: list[dict] = []
     skipped_modules: list[dict] = []
     for module in modules:
         module_out = output_dir / "modules" / module
         module_out.mkdir(parents=True, exist_ok=True)
         setup_data_links(input_dir, config_dir, module_out)
+        cmd = [
+            "python3", "cli.py",
+            f"分析 {module} 模块的外部入口",
+            "--config", "/data/config/config.json",
+            "--cwd", "/data/target",
+        ]
+        if quiet:
+            cmd.append("--quiet")
+        log(f"launching cli for module={module}: output_dir={module_out}")
         try:
-            subprocess.run([
-                "python3", "cli.py",
-                f"分析 {module} 模块的外部入口",
-                "--config", "/data/config/config.json",
-                "--cwd", "/data/target",
-                "--quiet",
-            ], check=True, timeout=ENTRY_TIMEOUT_SEC)
+            subprocess.run(cmd, check=True, timeout=ENTRY_TIMEOUT_SEC)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            log(f"module failed: module={module} reason={type(exc).__name__} message={exc}")
             skipped_modules.append({
                 "module": module,
                 "reason": type(exc).__name__,
@@ -252,11 +270,16 @@ def run_real() -> None:
             })
             continue
         result_file = module_out / f"{re.sub(r'[^\w.-]', '_', module)}.md"
+        log(f"module finished: module={module} result_file={result_file}")
         if result_file.exists():
             for entry in parse_entry_table(result_file):
                 entry["module"] = module
                 all_entries.append(entry)
 
+    log(
+        f"real mode complete: module_count={len(modules)} entry_count={len(all_entries)} "
+        f"skipped_modules={len(skipped_modules)}"
+    )
     save_json(output_dir / "entrypoints.json", {"entries": all_entries})
     save_json(output_dir / "summary.json", {
         "stage": STAGE,
@@ -274,9 +297,11 @@ def run_real() -> None:
 def main() -> int:
     mode = os.environ.get("CHAINED_MODE") or load_json(RUN_ROOT / STAGE / "request.json").get("mode") or "real"
     if stage_already_completed(mode):
+        log(f"stage already completed historically; skipping rerun for mode={mode}")
         resume_from_history(mode)
         return 0
     require_previous_passed()
+    log(f"stage start: mode={mode} app_root={APP_ROOT}")
     update_pipeline(STAGE, "running", mode=mode)
     update_status("running")
     try:
@@ -285,11 +310,13 @@ def main() -> int:
         else:
             run_real()
     except Exception as exc:
+        log(f"stage failed: {exc}")
         update_status("failed", str(exc))
         update_pipeline(STAGE, "failed", str(exc), mode=mode)
         raise
     update_status("passed")
     update_pipeline(NEXT_STAGE, "running", mode=mode)
+    log(f"stage passed; next_stage={NEXT_STAGE}")
     return 0
 
 
