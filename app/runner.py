@@ -130,21 +130,9 @@ def _build_args(
         args.extend(["--tools", ",".join(tools)])
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])
+    # 注意：prompt 不拼入命令行参数，而是通过 stdin 发送，
+    # 以避免超出 Linux ARG_MAX 命令行长度限制。
     return args
-
-
-def _write_temp_markdown(
-    tmp_dir: str | None,
-    prefix: str,
-    filename: str,
-    content: str,
-) -> tuple[str, str]:
-    """将 prompt 写入临时 markdown 文件，返回 (tmp_dir, file_path)。"""
-    if tmp_dir is None:
-        tmp_dir = tempfile.mkdtemp(prefix=prefix)
-    file_path = os.path.join(tmp_dir, filename)
-    Path(file_path).write_text(content, encoding="utf-8")
-    return tmp_dir, file_path
 
 
 # ─── 错误分类 ─────────────────────────────────────────────────────────────────
@@ -269,35 +257,31 @@ async def run_agent(
 
     args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
 
-    # System/User Prompt → 临时文件，避免超长 argv 导致 Argument list too long
+    # System Prompt → 临时文件
     tmp_dir: str | None = None
-    sys_tmp_file: str | None = None
-    prompt_tmp_file: str | None = None
+    tmp_file: str | None = None
     if system_prompt.strip():
-        tmp_dir, sys_tmp_file = _write_temp_markdown(
-            tmp_dir, "ea-", "system.md", system_prompt)
-        args.extend(["--append-system-prompt", sys_tmp_file])
+        tmp_dir = tempfile.mkdtemp(prefix="ea-")
+        tmp_file = os.path.join(tmp_dir, "system.md")
+        Path(tmp_file).write_text(system_prompt, encoding="utf-8")
+        args.extend(["--append-system-prompt", tmp_file])
 
-    tmp_dir, prompt_tmp_file = _write_temp_markdown(
-        tmp_dir, "ea-", "prompt.md", prompt)
-    args.append(f"@{prompt_tmp_file}")
+    # prompt 通过 stdin 传递，而非命令行参数，避免超出 Linux ARG_MAX 限制。
+    # pi 在 print/json 模式下会读取 piped stdin 并将其合并到初始 prompt。
+    stdin_data: bytes = prompt.encode("utf-8") if prompt else b""
 
     try:
         return await _run_with_pi_retry(
             args=args, cwd=os.path.abspath(cwd),
+            stdin_data=stdin_data,
             cancel_event=cancel_event, on_stream=on_stream,
             max_retries=max_retries, retry_delay=retry_delay,
             pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
         )
     finally:
-        if sys_tmp_file and os.path.exists(sys_tmp_file):
+        if tmp_file and os.path.exists(tmp_file):
             try:
-                os.unlink(sys_tmp_file)
-            except OSError:
-                pass
-        if prompt_tmp_file and os.path.exists(prompt_tmp_file):
-            try:
-                os.unlink(prompt_tmp_file)
+                os.unlink(tmp_file)
             except OSError:
                 pass
         if tmp_dir and os.path.exists(tmp_dir):
@@ -311,6 +295,7 @@ async def run_agent(
 
 async def _run_with_pi_retry(
     *, args: list[str], cwd: str,
+    stdin_data: bytes,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
@@ -328,6 +313,7 @@ async def _run_with_pi_retry(
         try:
             result = await _run_with_api_retry(
                 args=args, cwd=cwd,
+                stdin_data=stdin_data,
                 cancel_event=cancel_event, on_stream=on_stream,
                 max_retries=max_retries, retry_delay=retry_delay,
             )
@@ -392,6 +378,7 @@ async def _run_with_pi_retry(
 
 async def _run_with_api_retry(
     *, args: list[str], cwd: str,
+    stdin_data: bytes,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
@@ -403,12 +390,24 @@ async def _run_with_api_retry(
         result = AgentResult()
 
         # ── 拉起子进程（OSError 由外层 catch）──
+        # 使用 stdin=PIPE，进程启动后再写入 prompt，
+        # 避免将大 prompt 拼入命令行参数超出 Linux ARG_MAX 限制。
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
         )
+
+        # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
+        if stdin_data and proc.stdin:
+            try:
+                proc.stdin.write(stdin_data)
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionResetError):
+                # 进程已退出，忽略管道写入错误
+                pass
 
         cancel_task = None
         if cancel_event:
