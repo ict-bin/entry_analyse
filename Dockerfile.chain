@@ -72,10 +72,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
-# ═══ 入口脚本 ═════════════════════════════════════════════════════════════════
-COPY scripts/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
-
-# 默认链式执行，覆盖: python3 main.py
-CMD ["python3", "chained_runner.py"]
+ENTRYPOINT ["python3", "/opt/entry_analyse/chained_runner.py"]
