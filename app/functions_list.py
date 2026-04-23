@@ -78,6 +78,35 @@ _TABLE_ROW_RE = re.compile(
 )
 
 
+def _normalize_lineno(raw: str) -> str:
+    """行号归一化：确保输出以 'L' 开头。
+
+    输入 → 输出:
+        'L26837' → 'L26837'  (已正确，不变)
+        '26837'  → 'L26837'  (缺少前缀，补上)
+        'l26837' → 'L26837'  (小写 l，统一大写)
+        'Line 26837' → 'L26837'  (其他格式，提取数字)
+        ''       → ''         (空候保留)
+    """
+    s = raw.strip()
+    if not s:
+        return s
+    # 已是标准格式
+    if re.match(r'^L\d+$', s):
+        return s
+    # 小写 l
+    if re.match(r'^l\d+$', s):
+        return 'L' + s[1:]
+    # 纯数字
+    if re.match(r'^\d+$', s):
+        return 'L' + s
+    # 其他情况提取第一个数字序列
+    m = re.search(r'(\d+)', s)
+    if m:
+        return 'L' + m.group(1)
+    return s
+
+
 def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
     """
     解析 markdown 中的总入口列表表格。
@@ -92,7 +121,7 @@ def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
             continue
         file_name = m.group(2).strip()
         func_name = m.group(3).strip()
-        line_no = m.group(4).strip()
+        line_no   = _normalize_lineno(m.group(4).strip())
         taint_raw = m.group(6).strip()
         if file_name and func_name:
             results.append((file_name, func_name, line_no, taint_raw))
