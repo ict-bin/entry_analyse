@@ -1,13 +1,24 @@
 """
 entry_analyse — REST API 服务器
 
-  POST /analyse           提交分析（body: {"prompt": "分析libipsec模块的外部入口"}）
-  GET  /task/{id}         查询结果
-  GET  /task/{id}/stream  SSE 实时事件流
-  POST /task/{id}/abort   中止
-  GET  /tasks             列出任务
-  GET  /modules           列出可用模块
-  GET  /health            健康检查
+  Management layer (persistent, project-scoped):
+    POST /api/app/entry-analyse/tasks          创建任务
+    GET  /api/app/entry-analyse/tasks          任务列表（project_id 过滤）
+    GET  /api/app/entry-analyse/tasks/{id}     任务详情
+    POST /api/app/entry-analyse/tasks/{id}/cancel   取消任务
+    POST /api/app/entry-analyse/tasks/{id}/restart  重新运行任务
+    POST /api/app/entry-analyse/generate-prompt    根据路径生成 prompt
+    CRUD /api/app/entry-analyse/prompts/*      Prompt 模板
+    GET/PUT /api/app/entry-analyse/config      项目配置
+    GET  /api/app/entry-analyse/health         健康检查
+
+  Legacy engine routes (in-memory, backward compat):
+    POST /analyse           直接提交分析（CLI 兼容）
+    GET  /task/{id}         查询结果
+    GET  /task/{id}/stream  SSE 实时事件流
+    POST /task/{id}/abort   中止
+    GET  /tasks             列出内存任务
+    GET  /modules           列出可用模块
 """
 
 from __future__ import annotations
@@ -15,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -25,17 +37,67 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from .config import build_task_config, load_service_config
+from .logging_utils import configure_container_logging
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .module_loader import list_modules
 from .orchestrator import Orchestrator
 
 load_dotenv()
+configure_container_logging("entry_analyse")
 
 # 使用统一的路径配置（优先读取环境变量）
 from .config import CONFIG_DIR, TARGET_DIR
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    _db_ready = False
+    try:
+        from .service.svc_config import get_service_yaml
+        svc_yaml = get_service_yaml()
+        db_url = svc_yaml.database.url
+        try:
+            from .db import init_db
+            init_db(
+                db_url,
+                pool_size=svc_yaml.database.pool_size,
+                max_overflow=svc_yaml.database.max_overflow,
+            )
+            _db_ready = True
+        except Exception as exc:
+            import logging
+            logging.getLogger("ea.server").warning("DB init failed (management APIs unavailable): %s", exc)
+
+        try:
+            from .service.registry_service import get_registry_service
+            registry = get_registry_service(svc_yaml.registry)
+            await registry.register()
+            registry.start()
+        except Exception as exc:
+            import logging
+            logging.getLogger("ea.server").warning("Registry startup failed: %s", exc)
+    except Exception as exc:
+        import logging
+        logging.getLogger("ea.server").warning("Startup error: %s", exc)
+
+    if _db_ready:
+        from .api import router as mgmt_router
+        app.include_router(mgmt_router)
+
+    yield
+
+    # --- shutdown ---
+    try:
+        from .service.registry_service import get_registry_service
+        get_registry_service().stop()
+    except Exception:
+        pass
 
 
 class TaskEntry:
@@ -52,7 +114,7 @@ class TaskEntry:
 
 _tasks: dict[str, TaskEntry] = {}
 
-app = FastAPI(title="entry_analyse", version="1.0.0")
+app = FastAPI(title="entry_analyse", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -86,6 +148,7 @@ class AnalyseRequest(BaseModel):
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
+@app.get("/api/app/entry-analyse/health")
 async def health():
     return {
         "status": "ok",
