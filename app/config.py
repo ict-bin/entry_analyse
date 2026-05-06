@@ -28,7 +28,7 @@ def load_service_config(config_path: str) -> ServiceConfig:
     return ServiceConfig(**raw)
 
 
-def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskConfig:
+def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_task_id: str = "") -> TaskConfig:
     """从服务配置 + 用户一句话 prompt 构造运行时 TaskConfig。
 
     prompt 示例：
@@ -56,6 +56,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
         output_dir=svc.output_dir,
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,
+        resume_task_id=resume_task_id,
     )
 
     _backfill_role(cfg.workers)

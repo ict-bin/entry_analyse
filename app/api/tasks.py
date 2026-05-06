@@ -74,6 +74,12 @@ async def restart_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().restart_task(db, task_id)
 
 
+@router.post("/tasks/{task_id}/resume", status_code=201)
+async def resume_task(task_id: str, db: Session = Depends(get_db)):
+    """Resume an interrupted task from the last completed round (断点续跑)."""
+    return get_task_service().resume_task(db, task_id)
+
+
 @router.post("/generate-prompt")
 async def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a prompt from an input path."""

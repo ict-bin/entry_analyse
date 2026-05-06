@@ -127,6 +127,44 @@ class TaskService:
         logger.info("task created task_id=%r project_id=%r", task_id, project_id)
         return self._row_to_dict(row)
 
+    def resume_task(self, db: Session, task_id: str) -> dict:
+        """断点续跑：从上次中断的轮次继续，创建新任务记录并继承原任务目录。"""
+        row = self._get_or_404(db, task_id)
+        if row.status in ("pending", "running"):
+            from fastapi import HTTPException
+            raise HTTPException(400, "任务仍在运行中，请先取消后再恢复")
+        if row.status == "passed":
+            from fastapi import HTTPException
+            raise HTTPException(400, "任务已完成，无需恢复")
+
+        new_task_id = f"eat_{uuid.uuid4().hex[:16]}"
+        effective_output = row.output_path or os.environ.get("OUTPUT_DIR", "/data/output")
+
+        new_row = AppEaTask(
+            task_id=new_task_id,
+            project_id=row.project_id,
+            task_name=f"{row.task_name} [续跑]",
+            task_description=row.task_description,
+            input_path=row.input_path,
+            output_path=effective_output,
+            prompt_template_id=row.prompt_template_id,
+            prompt_content=row.prompt_content,
+            status="pending",
+            created_by=row.created_by,
+        )
+        db.add(new_row)
+        db.commit()
+        db.refresh(new_row)
+
+        asyncio_task = asyncio.create_task(
+            self._execute_task(new_task_id, resume_task_id=task_id),
+            name=f"ea_task_{new_task_id}",
+        )
+        _running_tasks[new_task_id] = asyncio_task
+
+        logger.info("task resumed original=%r new=%r", task_id, new_task_id)
+        return self._row_to_dict(new_row)
+
     def restart_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         if row.status in ("pending", "running"):
@@ -174,7 +212,7 @@ class TaskService:
         db.refresh(row)
         return self._row_to_dict(row)
 
-    async def _execute_task(self, task_id: str) -> None:
+    async def _execute_task(self, task_id: str, resume_task_id: str = "") -> None:
         from app.db import get_db
         db_gen = get_db()
         db: Session = next(db_gen)
@@ -188,7 +226,8 @@ class TaskService:
             db.commit()
 
             svc = _load_svc_config()
-            cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
+            cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path,
+                                    resume_task_id=resume_task_id)
 
             orch = Orchestrator(config=cfg)
             result = await orch.execute(task_id)

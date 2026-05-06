@@ -72,6 +72,9 @@ class TaskConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
+    # 断点续跑：填入已有任务 ID，自动检测上次完成的轮次并从下一轮继续
+    resume_task_id: str = Field(default="", description="断点续跑：已有任务 ID，从中断处继续")
+
     @property
     def worker_count(self) -> int:
         return len(self.workers.agents)

@@ -334,6 +334,31 @@ class Orchestrator:
         threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
+        # ── 断点续跑：覆盖 task_id 为已有任务，自动检测上次完成的轮次 ──────────
+        _resuming = False
+        _start_round = 1
+        _resume_feedback = ""
+        if cfg.resume_task_id:
+            task_id = cfg.resume_task_id  # 继承原任务目录结构
+            _probe_dir = Path(os.path.abspath(cfg.output_dir)) / task_id / "run"
+            if _probe_dir.is_dir():
+                _done = sorted(
+                    [
+                        int(d.name.split("-")[1])
+                        for d in _probe_dir.iterdir()
+                        if d.is_dir()
+                        and d.name.startswith("round-")
+                        and (d / "feedback.md").exists()
+                    ],
+                    key=int,
+                )
+                if _done:
+                    _start_round = _done[-1] + 1
+                    _resume_feedback = (
+                        _probe_dir / f"round-{_done[-1]}" / "feedback.md"
+                    ).read_text("utf-8")
+                    _resuming = True
+
         # 每个任务平行独立目录结构：
         #   {output_dir}/{task_id}/run/    — 中间过程文件（不删除、不压缩）
         #   {output_dir}/{task_id}/output/ — 最终输出文件
@@ -356,40 +381,54 @@ class Orchestrator:
 
         try:
             # ═══════════════════════════════════════════════════════
-            # 0. 准备阶段：加载模块 → 拷贝代码文件
+            # 0. 准备阶段：加载模块 → 拷贝代码文件（断点续跑时复用已有工作目录）
             # ═══════════════════════════════════════════════════════
 
-            self._emit("module_load", task_id, module=cfg.module_name)
-
-            module_info = load_module(cfg.module_name, target_dir)
-            self._emit("module_found", task_id,
-                        module=cfg.module_name,
-                        files=module_info.files)
-
-            # 为 Worker 创建工作目录并拷贝模块文件到 run_dir 下（任务间隔离）
             worker_cwd_path = run_dir / "workspace-worker"
-            worker_cwd_path.mkdir(exist_ok=True)
-            copied = prepare_workspace(module_info, target_dir, str(worker_cwd_path))
-            worker_cwd = str(worker_cwd_path)
 
-            self.module_files = copied
-            result.module_files = copied
+            if _resuming and worker_cwd_path.is_dir():
+                # ── 断点续跑：复用已有工作目录，跳过文件拷贝 ──
+                worker_cwd = str(worker_cwd_path)
+                mi_path = run_dir / "module-info.json"
+                if mi_path.exists():
+                    mi_data = json.loads(mi_path.read_text("utf-8"))
+                    self.module_files = mi_data.get("copied_to_workspace", [])
+                    result.module_files = self.module_files
+                self._emit("task_resume", task_id,
+                           start_round=_start_round,
+                           worker_cwd=worker_cwd,
+                           files=self.module_files)
+            else:
+                # ── 正常首次运行 ──
+                self._emit("module_load", task_id, module=cfg.module_name)
 
-            if not copied:
-                raise FileNotFoundError(
-                    f"模块 '{cfg.module_name}' 的所有文件均未找到: {module_info.files}")
+                module_info = load_module(cfg.module_name, target_dir)
+                self._emit("module_found", task_id,
+                            module=cfg.module_name,
+                            files=module_info.files)
 
-            self._emit("module_ready", task_id,
-                        copied=copied, count=len(copied))
+                worker_cwd_path.mkdir(exist_ok=True)
+                copied = prepare_workspace(module_info, target_dir, str(worker_cwd_path))
+                worker_cwd = str(worker_cwd_path)
 
-            # 保存模块信息（中间文件）
-            (run_dir / "module-info.json").write_text(
-                json.dumps({
-                    "module_name": module_info.module_name,
-                    "files": module_info.files,
-                    "copied_to_workspace": copied,
-                }, ensure_ascii=False, indent=2),
-                encoding="utf-8")
+                self.module_files = copied
+                result.module_files = copied
+
+                if not copied:
+                    raise FileNotFoundError(
+                        f"模块 '{cfg.module_name}' 的所有文件均未找到: {module_info.files}")
+
+                self._emit("module_ready", task_id,
+                            copied=copied, count=len(copied))
+
+                # 保存模块信息（中间文件）
+                (run_dir / "module-info.json").write_text(
+                    json.dumps({
+                        "module_name": module_info.module_name,
+                        "files": module_info.files,
+                        "copied_to_workspace": copied,
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
 
             # ═══════════════════════════════════════════════════════
             # Worker / Judge 配置（单 Worker，串行逐文件）
@@ -425,16 +464,16 @@ class Orchestrator:
                    for i, a in enumerate(cfg.judges.agents)]
             )
             self._emit("task_start", task_id, task=cfg.task,
-                        module=cfg.module_name, files=copied,
+                        module=cfg.module_name, files=self.module_files,
                         agents=agents_desc)
 
             # ═══════════════════════════════════════════════════════
             # 主循环：Worker 串行逐文件 + Judge 评审
             # ═══════════════════════════════════════════════════════
 
-            feedback_for_workers = ""
+            feedback_for_workers = _resume_feedback
 
-            for rnd_num in range(1, cfg.max_rounds + 1):
+            for rnd_num in range(_start_round, cfg.max_rounds + 1):
                 if self._cancel_event.is_set():
                     break
 
