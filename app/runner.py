@@ -34,6 +34,55 @@ logger = logging.getLogger("ea.runner")
 _MAX_BACKOFF = 300  # 退避上限 5 分钟
 
 
+# ─── 进程隔离 ─────────────────────────────────────────────────────────────────
+# WORKER_ISOLATION_MODE: none | unshare | bwrap
+_ISOLATION_MODE = os.environ.get("WORKER_ISOLATION_MODE", "none").lower()
+
+
+def _build_isolated_args(args: list[str], cwd: str) -> list[str]:
+    """
+    可选：为 pi 子进程包裹文件系统隔离层。
+
+    WORKER_ISOLATION_MODE:
+      none    (默认) — 仅依赖每任务独立工作目录实现隔离
+      unshare        — Linux user+mount namespace（需内核开启 user_namespaces）
+      bwrap          — bubblewrap 沙箱（需 bwrap 在 PATH 中）
+    """
+    if _ISOLATION_MODE == "none":
+        return args
+
+    if _ISOLATION_MODE == "bwrap":
+        bwrap = shutil.which("bwrap")
+        if bwrap:
+            return _bwrap_wrap_args(bwrap, cwd) + args
+        logger.warning("bwrap not found, falling back to unshare isolation")
+
+    # unshare（或 bwrap 回退到 unshare）
+    if _ISOLATION_MODE in ("unshare", "bwrap"):
+        unshare = shutil.which("unshare")
+        if unshare:
+            # 私有 user+mount namespace（rootless，Linux ≥ 3.8 需 user_namespaces 支持）
+            return [unshare, "--mount", "--user", "--map-root-user", "--"] + args
+        logger.warning(
+            "unshare not found, no process isolation applied (mode=%r)",
+            _ISOLATION_MODE,
+        )
+
+    return args
+
+
+def _bwrap_wrap_args(bwrap: str, cwd: str) -> list[str]:
+    """构建 bubblewrap 沙箱参数：cwd 可读写，系统路径只读。"""
+    wa = [bwrap]
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32",
+                  "/etc", "/opt", "/nix", "/run"):
+        if os.path.isdir(path):
+            wa += ["--ro-bind", path, path]
+    wa += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    wa += ["--bind", cwd, cwd, "--chdir", cwd, "--"]
+    return wa
+
+
 # ─── 结果类 ───────────────────────────────────────────────────────────────────
 
 class AgentResult:
@@ -392,8 +441,10 @@ async def _run_with_api_retry(
         # ── 拉起子进程（OSError 由外层 catch）──
         # 使用 stdin=PIPE，进程启动后再写入 prompt，
         # 避免将大 prompt 拼入命令行参数超出 Linux ARG_MAX 限制。
+        # 根据 WORKER_ISOLATION_MODE 可选包裹文件系统隔离层。
+        _spawn_args = _build_isolated_args(args, cwd)
         proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd,
+            *_spawn_args, cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,

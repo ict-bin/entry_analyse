@@ -22,33 +22,38 @@ entry_analyse — 编排引擎
      - 通过且 >= min_rounds → 取最佳 Worker 输出
      - 通过但 < min_rounds → 强制反思
 
-  4. 归档：
-     - 输出 entry-list 结果到 result_dir
-     - 压缩全部工作过程到 archive_dir
+  4. 输出：
+     - 最终结果写入 output/{task_id}/output/（不压缩、不删除）
+     - 中间过程保留于 output/{task_id}/run/（不压缩、不删除）
+     - 多任务并行：每个 task_id 拥有独立目录，互不干扰
 ═══════════════════════════════════════════════════════════════════
 
-归档目录结构：
+目录结构：
   output/{task_id}/
-  ├── round-1/
-  │   ├── workers/
-  │   │   ├── worker-0-output.md
-  │   │   └── worker-0-entry-list.md
-  │   ├── judges/
-  │   │   └── judge-0/
-  │   │       ├── eval-worker-0.md
-  │   │       └── summary.md
-  │   └── feedback.md
-  ├── round-2/
-  │   └── ...
-  ├── sessions/
-  │   └── worker-0.jsonl
-  ├── workspace-worker-0/
-  │   ├── file1.c (拷贝的模块代码)
-  │   ├── file2.c
-  │   └── entry-list.md (Worker 生成)
-  ├── module-info.json
-  ├── report.md
-  └── result.json
+  ├── run/                        ← 中间过程（可用于调试）
+  │   ├── round-1/
+  │   │   ├── workers/
+  │   │   │   ├── worker-0-output.md
+  │   │   │   └── worker-0-entry-list.md
+  │   │   ├── judges/
+  │   │   │   └── judge-0/
+  │   │   │       ├── eval-worker-0.md
+  │   │   │       └── summary.md
+  │   │   └── feedback.md
+  │   ├── round-2/
+  │   │   └── ...
+  │   ├── sessions/
+  │   │   └── worker.jsonl
+  │   ├── workspace-worker/       ← Worker 的隔离工作目录
+  │   │   ├── file1.c
+  │   │   └── entry-list.md
+  │   ├── module-info.json
+  │   ├── report.md
+  │   └── result.json
+  └── output/                     ← 最终输出
+      ├── {module}.md             ← entry-list 格式化输出
+      ├── functions.list          ← 解析出的入口函数列表
+      └── flag                    ← 0=失败 / 1=成功
 """
 
 from __future__ import annotations
@@ -329,9 +334,15 @@ class Orchestrator:
         threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
-        out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
+        # 每个任务平行独立目录结构：
+        #   {output_dir}/{task_id}/run/    — 中间过程文件（不删除、不压缩）
+        #   {output_dir}/{task_id}/output/ — 最终输出文件
+        base_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
+        run_dir = base_dir / "run"
+        out_dir = base_dir / "output"
+        run_dir.mkdir(parents=True, exist_ok=True)
         out_dir.mkdir(parents=True, exist_ok=True)
-        sess_dir = out_dir / "sessions"
+        sess_dir = run_dir / "sessions"
         sess_dir.mkdir(exist_ok=True)
 
         result = TaskResult(
@@ -340,9 +351,7 @@ class Orchestrator:
             config_snapshot=cfg.model_dump())
 
         # flag 文件：提前写 0，保证任何异常退出时都有 flag
-        result_dir = Path(os.path.abspath(cfg.result_dir))
-        result_dir.mkdir(parents=True, exist_ok=True)
-        flag_path = result_dir / "flag"
+        flag_path = out_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")
 
         try:
@@ -357,8 +366,8 @@ class Orchestrator:
                         module=cfg.module_name,
                         files=module_info.files)
 
-            # 为 Worker 创建工作目录并拷贝模块文件
-            worker_cwd_path = out_dir / "workspace-worker"
+            # 为 Worker 创建工作目录并拷贝模块文件到 run_dir 下（任务间隔离）
+            worker_cwd_path = run_dir / "workspace-worker"
             worker_cwd_path.mkdir(exist_ok=True)
             copied = prepare_workspace(module_info, target_dir, str(worker_cwd_path))
             worker_cwd = str(worker_cwd_path)
@@ -373,8 +382,8 @@ class Orchestrator:
             self._emit("module_ready", task_id,
                         copied=copied, count=len(copied))
 
-            # 保存模块信息
-            (out_dir / "module-info.json").write_text(
+            # 保存模块信息（中间文件）
+            (run_dir / "module-info.json").write_text(
                 json.dumps({
                     "module_name": module_info.module_name,
                     "files": module_info.files,
@@ -430,7 +439,7 @@ class Orchestrator:
                     break
 
                 self._emit("round_start", task_id, round=rnd_num)
-                rnd_dir = out_dir / f"round-{rnd_num}"
+                rnd_dir = run_dir / f"round-{rnd_num}"
                 rnd_workers_dir = rnd_dir / "workers"
                 rnd_judges_dir = rnd_dir / "judges"
                 rnd_workers_dir.mkdir(parents=True, exist_ok=True)
@@ -631,52 +640,37 @@ class Orchestrator:
         result.total_duration_ms = (time.time() - start) * 1000
 
         # ═══════════════════════════════════════════════════════════════
-        # 归档
+        # 输出归档（不压缩、不删除）
         # ═══════════════════════════════════════════════════════════════
 
-        # 1) 报告
-        (out_dir / "report.md").write_text(
+        # 1) 运行报告 + 中间结果 → run_dir
+        (run_dir / "report.md").write_text(
             self._report(result), encoding="utf-8")
-        (out_dir / "result.json").write_text(
+        (run_dir / "result.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8")
 
-        # 2) 格式化输出 → result_dir
-        result_dir.mkdir(parents=True, exist_ok=True)
+        # 2) 格式化最终输出 → out_dir
         cleaned_output = self._format_final_output(result)
         result_filename = self._make_result_filename(cfg, "md")
-        (result_dir / result_filename).write_text(
+        (out_dir / result_filename).write_text(
             cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) functions.list——确定性解析，从表格提取入口函数
-        func_list_path = str(result_dir / "functions.list")
+        # 3) functions.list——确定性解析，从表格提取入口函数 → out_dir
+        func_list_path = str(out_dir / "functions.list")
         write_functions_list(cleaned_output, func_list_path)
-
-        # 4) 压缩
-        archive_dir = Path(os.path.abspath(cfg.archive_dir))
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        zip_name = self._make_result_filename(cfg, "zip", suffix="_log")
-        zip_path = archive_dir / zip_name
-        shutil.make_archive(
-            str(zip_path).removesuffix(".zip"),
-            "zip",
-            root_dir=str(out_dir.parent),
-            base_dir=out_dir.name,
-        )
 
         # 4) flag 文件：成功覆写为 1
         if result.status == TaskStatus.PASSED:
             flag_path.write_text("1", encoding="utf-8")
 
-        # 5) 清理
-        shutil.rmtree(out_dir, ignore_errors=True)
-
         self._emit("task_end", task_id,
                     status=result.status.value,
-                    archive=str(zip_path),
-                    result_file=str(result_dir / result_filename),
+                    run_dir=str(run_dir),
+                    output_dir=str(out_dir),
+                    result_file=str(out_dir / result_filename),
                     functions_list=func_list_path,
-                    flag_file=str(result_dir / "flag"))
+                    flag_file=str(out_dir / "flag"))
         self._cancel_event = None
         return result
 
