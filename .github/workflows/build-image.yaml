@@ -1,0 +1,112 @@
+name: build-secflow-app-entry-analyse-image
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date_tag: ${{ steps.date.outputs.date_tag }}
+      owner_lc: ${{ steps.owner.outputs.owner_lc }}
+    steps:
+      - name: Generate date tag
+        id: date
+        run: echo "date_tag=$(date +'%Y%m%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize owner
+        id: owner
+        run: echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build amd64 image
+        run: |
+          docker build \
+            --file Dockerfile \
+            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-latest \
+            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            .
+
+      - name: Push amd64 image
+        run: |
+          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-latest
+          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build arm64 image
+        run: |
+          docker build \
+            --file Dockerfile \
+            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:arm64-latest \
+            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
+            .
+
+      - name: Push arm64 image
+        run: |
+          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:arm64-latest
+          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+
+  merge-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (latest)
+        run: |
+          docker manifest create ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:latest \
+            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-latest \
+            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:arm64-latest
+          docker manifest push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:latest
+
+      - name: Create and push multi-arch manifest (date tag)
+        run: |
+          docker manifest create ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }}
