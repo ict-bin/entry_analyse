@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -211,6 +212,19 @@ class TaskService:
         db.commit()
         db.refresh(row)
         return self._row_to_dict(row)
+
+    def delete_task(self, db: Session, task_id: str) -> None:
+        row = self._get_or_404(db, task_id)
+        at = _running_tasks.get(task_id)
+        if at and not at.done():
+            at.cancel()
+        row.status = "cancelled"
+        row.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        row.is_deleted = True
+        output_path = row.output_path
+        db.commit()
+        if output_path and os.path.exists(output_path):
+            shutil.rmtree(output_path, ignore_errors=True)
 
     async def _execute_task(self, task_id: str, resume_task_id: str = "") -> None:
         from app.db import get_db

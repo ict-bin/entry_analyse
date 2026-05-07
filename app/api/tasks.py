@@ -68,6 +68,11 @@ async def cancel_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().cancel_task(db, task_id)
 
 
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: str, db: Session = Depends(get_db)):
+    get_task_service().delete_task(db, task_id)
+
+
 @router.post("/tasks/{task_id}/restart", status_code=201)
 async def restart_task(task_id: str, db: Session = Depends(get_db)):
     """Clone an existing task and start it immediately with the current service config."""
