@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y \
     curl wget gnupg ca-certificates git zip \
     python3 python3-pip python3-venv \
+    bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # ═══ Node.js 22 ═══════════════════════════════════════════════════════════════
@@ -19,13 +20,14 @@ RUN npm install -g @mariozechner/pi-coding-agent
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
 WORKDIR /opt/entry_analyse
+# 先拷贝依赖文件，使 pip install 层可被缓存（app/ 变更时不重装依赖）
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 COPY app/               ./app/
 COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
 COPY config.example.json .env.example ./
-COPY requirements.txt ./
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════

@@ -28,7 +28,8 @@ def load_service_config(config_path: str) -> ServiceConfig:
     return ServiceConfig(**raw)
 
 
-def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_task_id: str = "") -> TaskConfig:
+def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_task_id: str = "",
+                       module_name: str = "", source_path: str = "") -> TaskConfig:
     """从服务配置 + 用户一句话 prompt 构造运行时 TaskConfig。
 
     prompt 示例：
@@ -38,12 +39,14 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
     """
     if cwd is None:
         cwd = TARGET_DIR
-    module_name = parse_module_prompt(prompt)
+    # 优先使用显式传入的 module_name，否则从 prompt 解析
+    effective_module = module_name.strip() if module_name and module_name.strip() else parse_module_prompt(prompt)
 
     cfg = TaskConfig(
         task=prompt,
-        module_name=module_name,
+        module_name=effective_module,
         cwd=cwd,
+        source_path=source_path or None,
         max_rounds=svc.max_rounds,
         min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,

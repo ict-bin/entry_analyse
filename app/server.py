@@ -74,6 +74,30 @@ async def lifespan(app: FastAPI):
             import logging
             logging.getLogger("ea.server").warning("DB init failed (management APIs unavailable): %s", exc)
 
+        # --- Recover orphaned tasks from a previous pod instance ---
+        if _db_ready:
+            try:
+                from datetime import datetime, timezone
+                from .db import get_db
+                from .db.models import AppEaTask
+                _db = next(get_db())
+                orphaned = _db.query(AppEaTask).filter(
+                    AppEaTask.status.in_(["running", "pending"]),
+                    AppEaTask.is_deleted.is_(False),
+                ).all()
+                if orphaned:
+                    for t in orphaned:
+                        t.status = "error"
+                        t.error = "服务重启，任务被中断"
+                        t.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    _db.commit()
+                    import logging as _l
+                    _l.getLogger("ea.server").warning(
+                        "Recovered %d orphaned task(s) from previous pod instance", len(orphaned))
+            except Exception as exc:
+                import logging
+                logging.getLogger("ea.server").warning("Orphan task recovery failed: %s", exc)
+
         try:
             from .service.registry_service import get_registry_service
             registry = get_registry_service(svc_yaml.registry)

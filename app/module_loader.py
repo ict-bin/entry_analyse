@@ -106,6 +106,48 @@ def load_module(module_name: str, target_dir: str) -> ModuleInfo:
             if files:
                 return ModuleInfo(module_name=module_name, files=files)
 
+    # ─── 格式6：<module_name>/files.list 直接在 target_dir 下 ─────────
+    files_list_direct = target / module_name / "files.list"
+    if files_list_direct.is_file():
+        lines = [
+            ln.strip() for ln in
+            files_list_direct.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        return ModuleInfo(module_name=module_name, files=lines)
+
+    # ─── 格式7：target_dir 本身就是模块目录（含 files.list）──────────
+    if module_name == target.name:
+        files_list_self = target / "files.list"
+        if files_list_self.is_file():
+            lines = [
+                ln.strip() for ln in
+                files_list_self.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            return ModuleInfo(module_name=module_name, files=lines)
+
+    # ─── 格式8（兜底）：深度扫描，找任意 <module_name>/files.list ─────
+    # 在 target_dir 3层以内找所有目录名 == module_name 且含 files.list 的
+    try:
+        target_str = str(target)
+        for root, _dirs, files in os.walk(target_str):
+            rel = os.path.relpath(root, target_str)
+            depth = 0 if rel == "." else len(Path(rel).parts)
+            if depth > 3:
+                continue
+            node = Path(root)
+            if "files.list" in files and (depth == 0 and module_name == target.name
+                                           or depth > 0 and node.name == module_name):
+                lines = [
+                    ln.strip() for ln in
+                    (node / "files.list").read_text(encoding="utf-8").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+                return ModuleInfo(module_name=module_name, files=lines)
+    except OSError:
+        pass
+
     # ─── 全部未命中 ──────────────────────────────────────────────────
     available = list_modules(target_dir)
     avail_msg = f"\n可用模块: {', '.join(available)}" if available else ""
@@ -201,18 +243,18 @@ def prepare_workspace(
 
 
 def list_modules(target_dir: str) -> list[str]:
-    """列出 target_dir 中所有可用的模块名。"""
+    """列出 target_dir 中所有可用的模块名。
+
+    检测策略：
+      1. module_map.json / modules.json                （JSON 映射）
+      2. modules/<name>.json / .txt / .md              （单文件格式）
+      3. 深度扫描：target_dir 3层以内所有含 files.list 的目录，
+         以该目录名作为模块名（target_dir 本身用其 basename）
+    """
     target = Path(target_dir)
     modules: set[str] = set()
 
-    mod_dir = target / "modules"
-    if mod_dir.is_dir():
-        for d in mod_dir.iterdir():
-            if d.is_dir() and (d / "files.list").is_file():
-                modules.add(d.name)
-            elif d.is_file() and d.suffix in (".json", ".txt", ".md"):
-                modules.add(d.stem)
-
+    # ─── JSON 映射格式 ───────────────────────────────────────────────
     for name in ("module_map.json", "modules.json"):
         p = target / name
         if p.is_file():
@@ -222,6 +264,28 @@ def list_modules(target_dir: str) -> list[str]:
                     modules.update(data.keys())
             except (json.JSONDecodeError, OSError):
                 pass
+
+    # ─── modules/<name>.json/.txt/.md 单文件格式 ─────────────────────
+    mod_dir = target / "modules"
+    if mod_dir.is_dir():
+        for f in mod_dir.iterdir():
+            if f.is_file() and f.suffix in (".json", ".txt", ".md"):
+                modules.add(f.stem)
+
+    # ─── 深度扫描：3层以内找所有 files.list ──────────────────────────
+    # 任何含 files.list 的目录都是一个模块；target_dir 本身用 basename 命名
+    try:
+        target_str = str(target)
+        for root, dirs, files in os.walk(target_str):
+            rel = os.path.relpath(root, target_str)
+            depth = 0 if rel == "." else len(Path(rel).parts)
+            if depth > 3:
+                dirs.clear()   # 不再深入
+                continue
+            if "files.list" in files:
+                modules.add(target.name if depth == 0 else Path(root).name)
+    except OSError:
+        pass
 
     return sorted(modules)
 

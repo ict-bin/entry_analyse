@@ -25,6 +25,8 @@ class AppEaTask(Base):
     task_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     input_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    module_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     output_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
 
     prompt_template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -34,6 +36,8 @@ class AppEaTask(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), index=True)

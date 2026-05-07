@@ -49,6 +49,12 @@ class AppConfig:
     debug: bool = False
 
 
+@dataclass
+class ConfigCenterConfig:
+    base_url: str = "http://secflow-platform-configcenter/api/configcenter"
+    timeout: int = 30
+
+
 # Lazy import to avoid circular
 class ServiceYaml:
     def __init__(
@@ -57,11 +63,13 @@ class ServiceYaml:
         auth_service: AuthConfig,
         registry,
         app: AppConfig,
+        configcenter: "ConfigCenterConfig | None" = None,
     ):
         self.database = database
         self.auth_service = auth_service
         self.registry = registry
         self.app = app
+        self.configcenter = configcenter or ConfigCenterConfig()
 
 
 def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> "ServiceYaml":
@@ -110,7 +118,13 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> "ServiceYaml":
         debug=bool(app_raw.get("debug", False)),
     )
 
-    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg)
+    cc_raw = raw.get("configcenter_service", raw.get("configcenter", {}))
+    configcenter = ConfigCenterConfig(
+        base_url=cc_raw.get("base_url", "http://secflow-platform-configcenter/api/configcenter"),
+        timeout=int(cc_raw.get("timeout", 30)),
+    )
+
+    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg, configcenter=configcenter)
 
 
 _service_yaml: Optional[ServiceYaml] = None

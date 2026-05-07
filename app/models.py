@@ -56,7 +56,8 @@ class TaskConfig(BaseModel):
     # 用户输入部分
     task: str = Field(..., description="用户的一句话 prompt")
     module_name: str = Field(default="", description="从 prompt 解析出的模块名")
-    cwd: str = Field(default="/data/target", description="挂载的软件包目录")
+    cwd: str = Field(default="/data/target", description="模块目录（含 files.list 或子模块目录）")
+    source_path: Optional[str] = Field(default=None, description="源码根目录（用于解析files.list中的文件路径；为None时使用cwd）")
 
     # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=3)

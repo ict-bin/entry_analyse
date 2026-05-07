@@ -4,8 +4,8 @@ sse-starlette
 pydantic>=2.0
 pyyaml
 httpx
+aiohttp
 python-dotenv
 sqlalchemy
 pymysql
-cryptography
 cryptography

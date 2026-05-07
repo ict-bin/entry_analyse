@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.service.task_service import generate_prompt_from_path, get_task_service
+from app.service.task_service import get_task_service
 
 from . import router
 
@@ -17,11 +17,13 @@ from . import router
 class TaskCreateRequest(BaseModel):
     project_id: str
     task_name: str
-    input_path: str
+    input_path: str                          # 模块目录（含 modules/ 子目录或直接含 files.list）
+    module_name: str                         # 具体模块名（从 list_modules 中选择）
+    source_path: Optional[str] = None       # 源码根目录（用于解析 files.list 中的路径）
     output_path: Optional[str] = None
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
-    prompt_content: Optional[str] = None  # If omitted, auto-generated from input_path
+    # prompt_content is intentionally removed — always auto-generated from module_name
 
 
 class GeneratePromptRequest(BaseModel):
@@ -30,20 +32,17 @@ class GeneratePromptRequest(BaseModel):
 
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
-    prompt = body.prompt_content
-    if not prompt or not prompt.strip():
-        prompt = generate_prompt_from_path(body.input_path)
-
     svc = get_task_service()
     return svc.create_task(
         db,
         project_id=body.project_id,
         task_name=body.task_name,
         input_path=body.input_path,
+        module_name=body.module_name,
+        source_path=body.source_path,
         output_path=body.output_path,
         task_description=body.task_description,
         prompt_template_id=body.prompt_template_id,
-        prompt_content=prompt,
     )
 
 
@@ -75,17 +74,78 @@ async def delete_task(task_id: str, db: Session = Depends(get_db)):
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
 async def restart_task(task_id: str, db: Session = Depends(get_db)):
-    """Clone an existing task and start it immediately with the current service config."""
+    """Reset and restart an existing task in-place, reusing the same task ID."""
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
 async def resume_task(task_id: str, db: Session = Depends(get_db)):
-    """Resume an interrupted task from the last completed round (断点续跑)."""
+    """Resume an interrupted task from the last completed stage (断点续跑)."""
     return get_task_service().resume_task(db, task_id)
+
+
+@router.delete("/tasks/{task_id}", status_code=204, response_class=Response)
+async def delete_task(
+    task_id: str,
+    delete_files: bool = Query(default=True),
+    db: Session = Depends(get_db),
+) -> Response:
+    """删除任务记录（软删除），并可选同步删除输出目录下的任务文件。"""
+    get_task_service().delete_task(db, task_id, delete_files=delete_files)
+    return Response(status_code=204)
+
+
+@router.get("/tasks/{task_id}/logs")
+async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+    """Return stages_json for the task (stage events used as structured log stream)."""
+    from app.db.models import AppEaTask
+    row = db.query(AppEaTask).filter(
+        AppEaTask.task_id == task_id,
+        AppEaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    return {
+        "task_id": task_id,
+        "status": row.status,
+        "stages_json": row.stages_json or {"events": []},
+    }
 
 
 @router.post("/generate-prompt")
 async def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a prompt from an input path."""
+    from app.service.task_service import generate_prompt_from_path
     return {"prompt": generate_prompt_from_path(body.input_path)}
+
+
+@router.get("/modules")
+async def list_modules(base_path: str = Query(..., description="模块目录（含 files.list 或子模块）")):
+    """列出指定目录下可用的模块名列表。"""
+    from app.module_loader import list_modules as _list_modules
+    import os
+    if not os.path.isdir(base_path):
+        # 目录不存在时返回调试信息：父目录内容
+        parent = os.path.dirname(base_path)
+        parent_ls: list[str] = []
+        try:
+            parent_ls = sorted(os.listdir(parent)) if os.path.isdir(parent) else []
+        except OSError:
+            pass
+        return {
+            "modules": [],
+            "base_path": base_path,
+            "error": "directory_not_found",
+            "parent_contents": parent_ls,
+        }
+    # 返回模块列表以及目录顶层内容（便于调试）
+    try:
+        top_ls = sorted(os.listdir(base_path))
+    except OSError:
+        top_ls = []
+    return {
+        "modules": _list_modules(base_path),
+        "base_path": base_path,
+        "top_contents": top_ls,
+    }

@@ -72,13 +72,25 @@ def _build_isolated_args(args: list[str], cwd: str) -> list[str]:
 
 
 def _bwrap_wrap_args(bwrap: str, cwd: str) -> list[str]:
-    """构建 bubblewrap 沙箱参数：cwd 可读写，系统路径只读。"""
+    """构建 bubblewrap 沙箱参数：cwd 可读写，系统路径只读。
+
+    只将任务的工作目录 (cwd) 挂载为可写，其余路径均为只读或不可见。
+    这样同一容器内运行的多个任务之间相互隔离：每个任务的 pi 进程无法
+    读写其他任务的工作目录或 /data/files 下的原始数据目录。
+    """
     wa = [bwrap]
+    # 系统/运行时路径：只读
     for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32",
                   "/etc", "/opt", "/nix", "/run"):
         if os.path.isdir(path):
             wa += ["--ro-bind", path, path]
+    # pi agent 配置目录（只读）
+    for path in ("/root/.pi", "/root/.npm", "/root/.config", "/root/.cache"):
+        if os.path.isdir(path):
+            wa += ["--ro-bind", path, path]
+    # 虚拟文件系统
     wa += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    # 任务工作目录：可读写（唯一可写挂载点）
     wa += ["--bind", cwd, cwd, "--chdir", cwd, "--"]
     return wa
 

@@ -69,6 +69,8 @@ from pathlib import Path
 from typing import Callable
 
 from .config import load_system_prompts, resolve_system_prompt
+from .service.llm_provider_sync import sync_providers_to_pi
+from .service.svc_config import get_service_yaml
 from .models import (
     AgentInstanceConfig,
     JudgeRoundResult,
@@ -331,8 +333,25 @@ class Orchestrator:
         task_id = task_id or make_id()
         start = time.time()
         target_dir = os.path.abspath(cfg.cwd)
+        # source_path: 源码根目录（用于解析files.list中的文件路径）
+        # 若未指定，回退到 cwd（兼容旧任务）
+        source_dir = os.path.abspath(cfg.source_path) if cfg.source_path else target_dir
         threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
+
+        # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
+        try:
+            svc = get_service_yaml()
+            await sync_providers_to_pi(
+                base_url=svc.configcenter.base_url,
+                token=svc.auth_service.service_machine_token,
+                timeout=svc.configcenter.timeout,
+            )
+        except Exception as _sync_err:
+            import logging as _log
+            _log.getLogger("ea.orchestrator").warning(
+                "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err
+            )
 
         # ── 断点续跑：覆盖 task_id 为已有任务，自动检测上次完成的轮次 ──────────
         _resuming = False
@@ -408,7 +427,7 @@ class Orchestrator:
                             files=module_info.files)
 
                 worker_cwd_path.mkdir(exist_ok=True)
-                copied = prepare_workspace(module_info, target_dir, str(worker_cwd_path))
+                copied = prepare_workspace(module_info, source_dir, str(worker_cwd_path))
                 worker_cwd = str(worker_cwd_path)
 
                 self.module_files = copied
