@@ -613,36 +613,35 @@ class Orchestrator:
                             ef_content, encoding="utf-8")
 
                 else:
-                    # ── 并行模式：每文件一个 Worker（独立上下文），之后 Merger 合并 ──
+                    # ── 并行模式：文件按 worker 数量轮询均分，每个 Worker 串行处理其分片，之后 Merger 合并 ──
                     _w_dir_prompts = load_system_prompts(
                         cfg.workers.system_prompt_dir, cfg.worker_count)
-                    # 信号量限制最大并发数为 worker_count
-                    _sem = asyncio.Semaphore(cfg.worker_count)
+                    # 将文件列表轮询分配给各 Worker（进程池模式）
+                    _file_shards = _split_files(self.module_files, cfg.worker_count)
 
-                    async def _launch_file_worker(
-                        file_idx: int, file_path: str,
+                    async def _launch_shard_worker(
+                        w_idx: int, file_shard: list[str],
                     ) -> WorkerResult:
-                        w_idx = file_idx % cfg.worker_count
                         w_acfg = cfg.workers.agents[w_idx]
                         w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
-                        # 每文件独立 session，按文件索引命名，跨 round 持续
-                        w_sess = str(sess_dir / f"worker-file-{file_idx}.jsonl")
-                        async with _sem:
-                            return await self._run_one_worker(
-                                worker_idx=file_idx, acfg=w_acfg,
-                                worker_sys_prompt=w_sys,
-                                file_shard=[file_path],
-                                all_files=self.module_files,
-                                worker_cwd=worker_cwd,
-                                session_file=w_sess,
-                                task_id=task_id,
-                                rnd_num=rnd_num,
-                                feedback=feedback_for_workers,
-                            )
+                        # session 按 worker 槽位命名，跨 round 持续
+                        w_sess = str(sess_dir / f"worker-{w_idx}.jsonl")
+                        return await self._run_one_worker(
+                            worker_idx=w_idx, acfg=w_acfg,
+                            worker_sys_prompt=w_sys,
+                            file_shard=file_shard,
+                            all_files=self.module_files,
+                            worker_cwd=worker_cwd,
+                            session_file=w_sess,
+                            task_id=task_id,
+                            rnd_num=rnd_num,
+                            feedback=feedback_for_workers,
+                        )
 
                     round_file_workers = list(await asyncio.gather(*[
-                        _launch_file_worker(i, fp)
-                        for i, fp in enumerate(self.module_files)
+                        _launch_shard_worker(w_idx, shard)
+                        for w_idx, shard in enumerate(_file_shards)
+                        if shard  # 文件数少于 worker 数时跳过空分片
                     ]))
                     _parallel_file_workers = round_file_workers
 
