@@ -25,6 +25,29 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 _running_tasks: dict[str, asyncio.Task] = {}
 
 
+def _origin_payload(row: AppEaTask) -> dict:
+    task_origin_type = str(row.task_origin_type or "").strip() or "manual"
+    parent_task_type = str(row.parent_task_type or "").strip() or None
+    origin_label = (
+        "二进制安全-源码扫描"
+        if task_origin_type == "binary_security" and parent_task_type == "source"
+        else "二进制安全-二进制类扫描"
+        if task_origin_type == "binary_security"
+        else "手动任务"
+    )
+    return {
+        "task_origin_type": task_origin_type,
+        "parent_project_id": row.parent_project_id,
+        "parent_task_id": row.parent_task_id,
+        "parent_task_type": parent_task_type,
+        "parent_stage_name": row.parent_stage_name,
+        "parent_stage_item_id": row.parent_stage_item_id,
+        "parent_stage_item_key": row.parent_stage_item_key,
+        "origin_label": origin_label,
+        "parent_task_display": row.parent_task_id,
+    }
+
+
 def _load_svc_config():
     for p in [SERVICE_CONFIG_PATH, "/opt/entry_analyse/config.example.json"]:
         if os.path.isfile(p):
@@ -138,6 +161,13 @@ class TaskService:
         prompt_content: str = "",
         created_by: Optional[str] = None,
         task_config_json: Optional[dict] = None,
+        task_origin_type: Optional[str] = None,
+        parent_project_id: Optional[str] = None,
+        parent_task_id: Optional[str] = None,
+        parent_task_type: Optional[str] = None,
+        parent_stage_name: Optional[str] = None,
+        parent_stage_item_id: Optional[str] = None,
+        parent_stage_item_key: Optional[str] = None,
     ) -> dict:
         # Auto-generate prompt from module_name (never use user-supplied prompt)
         effective_prompt = generate_prompt_from_module(module_name) if module_name else generate_prompt_from_path(input_path)
@@ -151,6 +181,13 @@ class TaskService:
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=effective_prompt, status="pending", created_by=created_by,
             task_config_json=task_config_json,
+            task_origin_type=str(task_origin_type or "").strip() or "manual",
+            parent_project_id=parent_project_id,
+            parent_task_id=parent_task_id,
+            parent_task_type=parent_task_type,
+            parent_stage_name=parent_stage_name,
+            parent_stage_item_id=parent_stage_item_id,
+            parent_stage_item_key=parent_stage_item_key,
         )
         db.add(row); db.commit(); db.refresh(row)
         asyncio_task = asyncio.create_task(self._execute_task(task_id),
@@ -350,6 +387,7 @@ class TaskService:
             return dt.isoformat() + "Z" if dt else None
         return {
             "task_id": row.task_id, "project_id": row.project_id,
+            **_origin_payload(row),
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "source_path": row.source_path,
             "module_name": row.module_name, "output_path": row.output_path,

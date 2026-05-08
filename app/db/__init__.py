@@ -24,6 +24,13 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN source_path VARCHAR(1024) NULL",
     # Add module_name for explicit module selection (added 2026-05)
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN module_name VARCHAR(255) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN task_origin_type VARCHAR(32) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN parent_project_id VARCHAR(100) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN parent_task_id VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN parent_task_type VARCHAR(32) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
 ]
 
 

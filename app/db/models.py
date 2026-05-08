@@ -21,6 +21,13 @@ class AppEaTask(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    task_origin_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    parent_project_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    parent_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    parent_task_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    parent_stage_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parent_stage_item_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parent_stage_item_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     task_name: Mapped[str] = mapped_column(String(255), nullable=False)
     task_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

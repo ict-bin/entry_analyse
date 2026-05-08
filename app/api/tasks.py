@@ -24,6 +24,13 @@ class TaskCreateRequest(BaseModel):
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
     # prompt_content is intentionally removed — always auto-generated from module_name
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
 
 
 class GeneratePromptRequest(BaseModel):
@@ -43,6 +50,13 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         output_path=body.output_path,
         task_description=body.task_description,
         prompt_template_id=body.prompt_template_id,
+        task_origin_type=body.task_origin_type,
+        parent_project_id=body.parent_project_id,
+        parent_task_id=body.parent_task_id,
+        parent_task_type=body.parent_task_type,
+        parent_stage_name=body.parent_stage_name,
+        parent_stage_item_id=body.parent_stage_item_id,
+        parent_stage_item_key=body.parent_stage_item_key,
     )
 
 
