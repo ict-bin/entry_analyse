@@ -1,34 +1,37 @@
 """
 entry_analyse — functions.list 生成器
 
-从 entry-list-merged.json 中解析入口数组，生成 functions.list JSON 文件。
+从 entry-list-merged.md（或 .json）解析入口数组，生成 functions.list 文件。
 
-输入格式（JSON 数组）：
+════════════════════════════════════════
+functions.list 固定输出格式（JSON 数组，不可变更）
+════════════════════════════════════════
+
     [
       {
-        "function": "HandleRequest()",
-        "type": "passive",
-        "file": "announce_begin_server.cpp",
-        "line": 45,
-        "taints": ["aHeader", "aMessage", "aMessageInfo"],
-        "risk": "high"
+        "tag":      "P",                         // 必须: "P"=被动回调 | "A"=主动拉取
+        "file":     "announce_begin_server.cpp", // 必须: 源文件名，非空字符串
+        "line":     45,                          // 必须: 整数行号（未知时为 0）
+        "function": "HandleRequest()",           // 必须: 完整函数签名，非空字符串
+        "taints":   ["aMessage", "aMessageInfo"] // 必须: 外部可控参数，非空数组
       },
       ...
     ]
 
-输出格式（functions.list 也是 JSON 数组）：
-    [
-      {
-        "tag": "P",
-        "file": "announce_begin_server.cpp",
-        "line": 45,
-        "function": "HandleRequest()",
-        "taints": ["aHeader", "aMessage", "aMessageInfo"]
-      },
-      ...
-    ]
+字段规范：
+  - tag      : "P" = Passive 被动回调型（被外部框架回调，参数携带外部数据）
+               "A" = Active  主动拉取型（函数内调用 recv/read/mmap/ioctl 等）
+  - file     : 源文件名（不含路径前缀）
+  - line     : 函数定义行号，整数
+  - function : 函数名（含参数类型），完整签名
+  - taints   : 外部可控污点参数列表，至少 1 个元素
 
-tag: "P" = Passive 被动回调型, "A" = Active 主动拉取型（taints 含 @ 符号）
+判 FAIL 条件（任一满足）：
+  1. 含 `_error` 字段  → 脚本解析失败
+  2. 数组为 `[]` 且 entry-list 有入口条目  → Worker 漏掉所有入口
+  3. 任一项缺少必须字段或 taints 为空数组
+  4. tag 值不是 "P" 或 "A"
+  5. 条目数与 entry-list 入口数差超过 1 项
 """
 
 from __future__ import annotations

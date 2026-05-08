@@ -923,10 +923,15 @@ class Orchestrator:
                 )
             _fl_count = len(_fl_parsed)
         except (json.JSONDecodeError, ValueError, OSError) as _fl_err:
-            _fl_count = 0
+            _fl_count = -1
             self._emit("functions_list_error", task_id, error=str(_fl_err))
-            # 写入空数组，保证下游微服务始终得到合法 JSON
-            Path(func_list_path).write_text("[]", encoding="utf-8")
+            # 写入错误标记（合法 JSON，但含 _error 字段，Judge 见到即判 FAIL）
+            # 不能写 []，空数组会让下游误认为「无入口函数」
+            _err_marker = _json.dumps(
+                [{"_error": str(_fl_err),
+                  "_source_preview": _fl_raw[:300] if "_fl_raw" in dir() else ""}],
+                ensure_ascii=False, indent=2)
+            Path(func_list_path).write_text(_err_marker, encoding="utf-8")
 
         # 4) flag 文件：成功覆写为 1
         if result.status == TaskStatus.PASSED:
@@ -1428,11 +1433,25 @@ class Orchestrator:
             "3. **主动拉取型入口**：函数内调用 recv/read/mmap/ioctl 等的入口是否找全\n"
             "4. **污点变量精确性**：是否正确区分外部可控参数 vs 内部标识符\n"
             "5. **数据来源标注**：被动型标注了注册点，主动型标注了系统调用和行号\n"
-            "6. **functions.list 格式正确性**：\n"
-            "   - 必须是合法 JSON 数组（`[{...}, ...]`），不得含 `_error` 字段\n"
-            "   - 每项须包含 `tag`（\"P\"/\"A\"）、`file`、`line`、`function`、`taints` 字段\n"
-            "   - `taints` 为非空数组，`tag=A` 表示主动拉取型，`tag=P` 表示被动回调型\n"
-            "   - entry-list 中的每个入口函数都应对应 functions.list 中的一项"
+            "6. **functions.list 强制校验（以下任一条件不满足即判 FAIL）**：\n"
+            "   固定格式（每项必须严格符合）：\n"
+            "   ```json\n"
+            "   [\n"
+            "     {\n"
+            "       \"tag\": \"P\",          // \"P\"=被动回调(passive), \"A\"=主动拉取(active)\n"
+            "       \"file\": \"foo.cpp\",   // 源文件名，非空字符串\n"
+            "       \"line\": 42,           // 行号，整数（未知时为 0）\n"
+            "       \"function\": \"Fn()\",  // 完整函数签名，非空字符串\n"
+            "       \"taints\": [\"arg\"]    // 外部可控参数，非空数组\n"
+            "     }\n"
+            "   ]\n"
+            "   ```\n"
+            "   校验规则（违反任一 → 直接判 FAIL，不可通过）：\n"
+            "   - 含 `_error` 字段 → 脚本解析失败，Worker 输出格式错误\n"
+            "   - 数组为空 `[]` 且 entry-list 有入口函数条目 → Worker 漏掉所有入口\n"
+            "   - 任一项缺少 `tag`/`file`/`function`/`taints` 字段，或 `taints` 为空数组\n"
+            "   - `tag` 值不是 \"P\" 或 \"A\"\n"
+            "   - functions.list 条目数与 entry-list 入口函数数量不一致（误差超过 1 项）"
         )
 
         file_list = ", ".join(f"`{f}`" for f in module_files)
@@ -1453,9 +1472,12 @@ class Orchestrator:
             f"外部入口列表: `{entry_path}`"
             f"{fl_line}\n\n"
             f"**请使用 read 工具读取以上文件和模块源代码，然后进行评测。**\n\n"
-            f"**特别检查 functions.list**：读取后确认：① 是合法 JSON 数组；"
-            f"② 不含 `_error` 字段；③ 每项 `tag`/`file`/`function`/`taints` 均非空；"
-            f"④ 条目数量与 entry-list 中入口函数数量一致。"
+            f"**functions.list 必须校验（违反即判 FAIL）**：\n"
+            f"① 读取文件，确认是合法 JSON 数组；\n"
+            f"② 不含 `_error` 字段（有则表示脚本解析失败）；\n"
+            f"③ 若 entry-list 有入口函数，数组不得为空 `[]`；\n"
+            f"④ 每项必须有非空的 `tag`（\"P\"/\"A\"）、`file`、`function`、`taints`；\n"
+            f"⑤ 条目数与 entry-list 入口数量一致（误差超过 1 项则 FAIL）。"
             if functions_list_path else
             f"## {worker.worker_id} 的输出文件\n\n"
             f"摘要输出文件: `{output_path}`\n"
