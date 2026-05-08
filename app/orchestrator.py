@@ -912,6 +912,21 @@ class Orchestrator:
             # 最终兜底：用最终输出文本（可能失败，但至少记录 raw_preview）
             write_functions_list(cleaned_output, func_list_path)
 
+        # 强制校验：functions.list 必须是合法 JSON 数组，保证调用方能正常 json.loads
+        import json as _json_fl
+        _fl_count = 0
+        try:
+            _fl_raw = Path(func_list_path).read_text(encoding="utf-8")
+            _fl_data = _json_fl.loads(_fl_raw)
+            if not isinstance(_fl_data, list):
+                raise ValueError(f"expected JSON array, got {type(_fl_data).__name__}")
+            _fl_count = len(_fl_data)
+        except (json.JSONDecodeError, ValueError, OSError) as _fl_err:
+            # 写入空数组，确保文件始终可被 json.loads 加载
+            Path(func_list_path).write_text("[]", encoding="utf-8")
+            _fl_count = 0
+            self._emit("functions_list_invalid", task_id, error=str(_fl_err))
+
         # 4) flag 文件：成功覆写为 1
         if result.status == TaskStatus.PASSED:
             flag_path.write_text("1", encoding="utf-8")
@@ -922,6 +937,7 @@ class Orchestrator:
                     output_dir=str(out_dir),
                     result_file=str(out_dir / result_filename),
                     functions_list=func_list_path,
+                    functions_list_count=_fl_count,
                     flag_file=str(out_dir / "flag"))
         self._cancel_event = None
         return result
