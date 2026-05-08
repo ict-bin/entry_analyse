@@ -1132,6 +1132,13 @@ class Orchestrator:
                     )
             except _json.JSONDecodeError as e:
                 json_error = f"entry-list-merged.json JSON 解析失败：{e}"
+        elif ef and ef.endswith(".md"):
+            # 新格式要求输出 JSON，产出 .md 视为格式错误，强制下一轮重试
+            json_error = (
+                "master_worker 输出了 .md 格式（entry-list-merged.md），"
+                "但要求输出 entry-list-merged.json（JSON 数组）。"
+                "请严格按照格式要求输出纯 JSON 数组。"
+            )
         elif not ef:
             json_error = "master_worker 未生成 entry-list-merged.json 文件"
 
