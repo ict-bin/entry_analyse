@@ -752,21 +752,6 @@ class Orchestrator:
                         except OSError:
                             pass
 
-                    # 程序级 JSON 校验短路：格式不合法时跳过 Judge，直接进下一轮
-                    if master_result.error:
-                        _json_fail_feedback = (
-                            f"## Round {rnd_num} — JSON 格式校验失败（程序自动检测）\n\n"
-                            f"**错误**：{master_result.error}\n\n"
-                            f"**要求**：`entry-list-merged.json` 必须是合法的 JSON 数组，"
-                            f"每个元素包含 `function`、`type`、`file`、`line`、`taints`、`risk` 字段。\n\n"
-                            f"请修正文件格式后重试。"
-                        )
-                        self._emit("json_validation_failed", task_id,
-                                   round=rnd_num, error=master_result.error)
-                        feedback_for_workers = _json_fail_feedback
-                        # 跳到下一轮，不调用 Judge
-                        continue
-
                     # Judge 只评审 Master Worker 的合并结果（1 次而不是 N 次）
                     round_workers = [master_result]
                     worker_result = master_result
@@ -1104,13 +1089,13 @@ class Orchestrator:
         total_tokens += ar.token_usage
         last_output = _extract_result(ar.output)
 
-        # 查找 Master Worker 写入的合并 entry-list JSON 文件（优先 .json，回退 .md）
-        ef_json = Path(worker_cwd) / "entry-list-merged.json"
+        # 查找 Master Worker 写入的合并 entry-list 文件（优先 .md，回退 .json）
         ef_md   = Path(worker_cwd) / "entry-list-merged.md"
-        if ef_json.exists():
-            ef = str(ef_json)
-        elif ef_md.exists():
+        ef_json = Path(worker_cwd) / "entry-list-merged.json"
+        if ef_md.exists():
             ef = str(ef_md)
+        elif ef_json.exists():
+            ef = str(ef_json)
         else:
             ef = (
                 _find_entry_file(worker_cwd, f"{cfg.module_name}-merged")
@@ -1118,37 +1103,13 @@ class Orchestrator:
                 or ""
             )
 
-        # 程序级 JSON 格式校验：读取文件并尝试 json.loads()
-        json_error: str = ""
-        if ef and ef.endswith(".json"):
-            import json as _json
-            try:
-                raw_json = Path(ef).read_text(encoding="utf-8")
-                parsed = _json.loads(raw_json)
-                if not isinstance(parsed, list):
-                    json_error = (
-                        f"entry-list-merged.json 格式错误：期望 JSON 数组，"
-                        f"实际类型为 {type(parsed).__name__}"
-                    )
-            except _json.JSONDecodeError as e:
-                json_error = f"entry-list-merged.json JSON 解析失败：{e}"
-        elif ef and ef.endswith(".md"):
-            # 新格式要求输出 JSON，产出 .md 视为格式错误，强制下一轮重试
-            json_error = (
-                "master_worker 输出了 .md 格式（entry-list-merged.md），"
-                "但要求输出 entry-list-merged.json（JSON 数组）。"
-                "请严格按照格式要求输出纯 JSON 数组。"
-            )
-        elif not ef:
-            json_error = "master_worker 未生成 entry-list-merged.json 文件"
-
         return WorkerResult(
             worker_id="master_worker",
             model=acfg.model,
             output=last_output,
             entry_file=ef,
             token_usage=total_tokens,
-            error=json_error or None,
+            error=None,
         )
 
     # ═══════════════════════════════════════════════════════════════════════
