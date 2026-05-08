@@ -65,6 +65,7 @@ import os
 import re
 import shutil
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 
@@ -148,6 +149,16 @@ def _get_best_output(worker: WorkerResult) -> str:
         except OSError:
             pass
     return worker.output
+
+
+def _split_files(files: list[str], n: int) -> list[list[str]]:
+    """将文件列表均匀轮询分割为 n 个分片。"""
+    if n <= 1:
+        return [list(files)]
+    shards: list[list[str]] = [[] for _ in range(n)]
+    for i, f in enumerate(files):
+        shards[i % n].append(f)
+    return shards
 
 
 def _extract_json_object(text: str, required_key: str) -> dict | None:
@@ -336,7 +347,8 @@ class Orchestrator:
         # source_path: 源码根目录（用于解析files.list中的文件路径）
         # 若未指定，回退到 cwd（兼容旧任务）
         source_dir = os.path.abspath(cfg.source_path) if cfg.source_path else target_dir
-        threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
+        # pass_threshold: -1=全部裁判通过, 0=大于半数通过 (ceil(n/2))
+        threshold = cfg.judge_count if cfg.pass_threshold == -1 else math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
         # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
@@ -453,35 +465,47 @@ class Orchestrator:
             # Worker / Judge 配置（单 Worker，串行逐文件）
             # ═══════════════════════════════════════════════════════
 
-            worker_dir_prompts = load_system_prompts(
-                cfg.workers.system_prompt_dir, 1)
             judge_dir_prompts = load_system_prompts(
                 cfg.judges.system_prompt_dir, cfg.judge_count)
-            worker_session = str(sess_dir / "worker.jsonl")
-            acfg = cfg.workers.agents[0]
-            worker_sys_prompt = resolve_system_prompt(
-                0, acfg, worker_dir_prompts)
 
-            worker_base = {
-                "model": acfg.model,
-                "tools": acfg.tools or cfg.workers.default_tools,
-                "system_prompt": worker_sys_prompt,
-                "cwd": worker_cwd,
-                "thinking_level": (
-                    acfg.thinking_level or cfg.workers.default_thinking_level),
-                "session_file": worker_session,
-                "cancel_event": self._cancel_event,
-                "max_retries": cfg.agent_max_retries,
-                "retry_delay": cfg.agent_retry_delay,
-                "pi_max_retries": cfg.pi_max_retries,
-                "pi_retry_delay": cfg.pi_retry_delay,
-            }
+            # 串行模式准备 worker base；并行模式在 _run_one_worker 内部构建
+            _parallel = cfg.worker_parallel and cfg.worker_count > 1
+            if not _parallel:
+                worker_dir_prompts = load_system_prompts(
+                    cfg.workers.system_prompt_dir, 1)
+                worker_session = str(sess_dir / "worker.jsonl")
+                acfg = cfg.workers.agents[0]
+                worker_sys_prompt = resolve_system_prompt(
+                    0, acfg, worker_dir_prompts)
+                worker_base = {
+                    "model": acfg.model,
+                    "tools": acfg.tools or cfg.workers.default_tools,
+                    "system_prompt": worker_sys_prompt,
+                    "cwd": worker_cwd,
+                    "thinking_level": (
+                        acfg.thinking_level or cfg.workers.default_thinking_level),
+                    "session_file": worker_session,
+                    "cancel_event": self._cancel_event,
+                    "max_retries": cfg.agent_max_retries,
+                    "retry_delay": cfg.agent_retry_delay,
+                    "pi_max_retries": cfg.pi_max_retries,
+                    "pi_retry_delay": cfg.pi_retry_delay,
+                }
+                agents_desc = (
+                    [f"worker={cfg.workers.agents[0].model}"]
+                    + [f"judge-{i}={a.model}"
+                       for i, a in enumerate(cfg.judges.agents)]
+                )
+            else:
+                acfg = cfg.workers.agents[0]
+                worker_base = {}  # 并行模式不在此处使用
+                agents_desc = (
+                    [f"worker-{i}={a.model}"
+                     for i, a in enumerate(cfg.workers.agents)]
+                    + [f"judge-{i}={a.model}"
+                       for i, a in enumerate(cfg.judges.agents)]
+                )
 
-            agents_desc = (
-                [f"worker={acfg.model}"]
-                + [f"judge-{i}={a.model}"
-                   for i, a in enumerate(cfg.judges.agents)]
-            )
             self._emit("task_start", task_id, task=cfg.task,
                         module=cfg.module_name, files=self.module_files,
                         agents=agents_desc)
@@ -492,7 +516,8 @@ class Orchestrator:
 
             feedback_for_workers = _resume_feedback
 
-            for rnd_num in range(_start_round, cfg.max_rounds + 1):
+            _rnd_iter = range(_start_round, cfg.max_rounds + 1) if cfg.max_rounds != -1 else __import__('itertools').count(_start_round)
+            for rnd_num in _rnd_iter:
                 if self._cancel_event.is_set():
                     break
 
@@ -504,90 +529,130 @@ class Orchestrator:
                 rnd_judges_dir.mkdir(parents=True, exist_ok=True)
 
                 # ───────────────────────────────────────────────
-                # 1. Worker 串行逐文件分析（同一 session）
+                # 1. Worker 分析（串行 or 并行）
                 # ───────────────────────────────────────────────
 
-                wid = "worker-0"
-                total_worker_tokens = TokenUsage()
-                last_output = ""
+                wid = "worker-0"          # serial default
+                worker_result: WorkerResult  # set in both branches
 
-                self._emit("worker_start", task_id, worker_id=wid,
-                           model=acfg.model, round=rnd_num)
+                if not _parallel:
+                    # ── 串行单 Worker 逐文件分析（原有逻辑）──────────
+                    total_worker_tokens = TokenUsage()
+                    last_output = ""
 
-                # 第 1 轮第 1 个文件前，先发一条概览指令
-                if rnd_num == 1:
-                    overview_prompt = self._build_worker_overview(
-                        cfg.task, cfg.module_name, self.module_files)
+                    self._emit("worker_start", task_id, worker_id=wid,
+                               model=acfg.model, round=rnd_num)
+
+                    if rnd_num == 1:
+                        overview_prompt = self._build_worker_overview(
+                            cfg.task, cfg.module_name, self.module_files)
+                        ar = await _run_agent_checked(
+                            context="worker overview",
+                            prompt=overview_prompt, **worker_base)
+                        total_worker_tokens += ar.token_usage
+                    elif feedback_for_workers:
+                        fb_prompt = (
+                            f"# Round {rnd_num} — 改进\n\n"
+                            f"上一轮评审未通过，以下是评审反馈：\n\n"
+                            f"{feedback_for_workers}\n\n"
+                            f"请根据反馈重新分析所有文件，修正遗漏。"
+                            f"我将再次逐文件发送给你分析。")
+                        ar = await _run_agent_checked(
+                            context="worker feedback",
+                            prompt=fb_prompt, **worker_base)
+                        total_worker_tokens += ar.token_usage
+
+                    for file_idx, file_path in enumerate(self.module_files):
+                        if self._cancel_event.is_set():
+                            break
+                        self._emit("worker_file", task_id,
+                                   file=file_path,
+                                   index=file_idx + 1,
+                                   total=len(self.module_files),
+                                   round=rnd_num)
+                        file_prompt = self._build_file_prompt(
+                            file_path, file_idx, len(self.module_files))
+                        ar = await _run_agent_checked(
+                            context=f"worker file {file_path}",
+                            prompt=file_prompt, **worker_base)
+                        total_worker_tokens += ar.token_usage
+                        last_output = _extract_result(ar.output)
+
+                    summary_prompt = self._build_summary_file_prompt(
+                        cfg.module_name, self.module_files)
                     ar = await _run_agent_checked(
-                        context="worker overview",
-                        prompt=overview_prompt, **worker_base)
-                    total_worker_tokens += ar.token_usage
-                elif feedback_for_workers:
-                    # 后续轮次：注入 feedback
-                    fb_prompt = (
-                        f"# Round {rnd_num} — 改进\n\n"
-                        f"上一轮评审未通过，以下是评审反馈：\n\n"
-                        f"{feedback_for_workers}\n\n"
-                        f"请根据反馈重新分析所有文件，修正遗漏。"
-                        f"我将再次逐文件发送给你分析。")
-                    ar = await _run_agent_checked(
-                        context="worker feedback",
-                        prompt=fb_prompt, **worker_base)
-                    total_worker_tokens += ar.token_usage
-
-                # 逐文件串行发送
-                for file_idx, file_path in enumerate(self.module_files):
-                    if self._cancel_event.is_set():
-                        break
-
-                    self._emit("worker_file", task_id,
-                               file=file_path,
-                               index=file_idx + 1,
-                               total=len(self.module_files),
-                               round=rnd_num)
-
-                    file_prompt = self._build_file_prompt(
-                        file_path, file_idx, len(self.module_files))
-                    ar = await _run_agent_checked(
-                        context=f"worker file {file_path}",
-                        prompt=file_prompt, **worker_base)
+                        context="worker summary",
+                        prompt=summary_prompt, **worker_base)
                     total_worker_tokens += ar.token_usage
                     last_output = _extract_result(ar.output)
 
-                # 最后一步：汇总写入 entry-list.md
-                summary_prompt = self._build_summary_file_prompt(
-                    cfg.module_name, self.module_files)
-                ar = await _run_agent_checked(
-                    context="worker summary",
-                    prompt=summary_prompt, **worker_base)
-                total_worker_tokens += ar.token_usage
-                last_output = _extract_result(ar.output)
+                    ef = _find_entry_file(worker_cwd, cfg.module_name)
+                    ef_content = ""
+                    if ef:
+                        try:
+                            ef_content = Path(ef).read_text(encoding="utf-8")
+                        except OSError:
+                            pass
 
-                # 搜索 entry-list*.md
-                ef = _find_entry_file(worker_cwd, cfg.module_name)
-                ef_content = ""
-                if ef:
-                    try:
-                        ef_content = Path(ef).read_text(encoding="utf-8")
-                    except OSError:
-                        pass
+                    self._emit("worker_done", task_id, worker_id=wid,
+                               output=last_output[:500],
+                               entry_file_found=bool(ef))
 
-                self._emit("worker_done", task_id, worker_id=wid,
-                           output=last_output[:500],
-                           entry_file_found=bool(ef))
+                    worker_result = WorkerResult(
+                        worker_id=wid, model=acfg.model,
+                        output=last_output, entry_file=ef or "",
+                        token_usage=total_worker_tokens)
+                    round_workers: list[WorkerResult] = [worker_result]
 
-                worker_result = WorkerResult(
-                    worker_id=wid, model=acfg.model,
-                    output=last_output, entry_file=ef or "",
-                    token_usage=total_worker_tokens)
-                round_workers: list[WorkerResult] = [worker_result]
+                    (rnd_workers_dir / f"{wid}-output.md").write_text(
+                        last_output, encoding="utf-8")
+                    if ef_content:
+                        (rnd_workers_dir / f"{wid}-entry-list.md").write_text(
+                            ef_content, encoding="utf-8")
 
-                # 归档
-                (rnd_workers_dir / f"{wid}-output.md").write_text(
-                    last_output, encoding="utf-8")
-                if ef_content:
-                    (rnd_workers_dir / f"{wid}-entry-list.md").write_text(
-                        ef_content, encoding="utf-8")
+                else:
+                    # ── 并行多 Worker 文件分片分析 ────────────────────
+                    file_shards = _split_files(self.module_files, cfg.worker_count)
+                    _w_dir_prompts = load_system_prompts(
+                        cfg.workers.system_prompt_dir, cfg.worker_count)
+
+                    async def _launch_worker(
+                        w_idx: int, w_acfg: AgentInstanceConfig,
+                        shard: list[str],
+                    ) -> WorkerResult:
+                        w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
+                        w_sess = str(sess_dir / f"worker-{w_idx}.jsonl")
+                        return await self._run_one_worker(
+                            worker_idx=w_idx, acfg=w_acfg,
+                            worker_sys_prompt=w_sys,
+                            file_shard=shard,
+                            all_files=self.module_files,
+                            worker_cwd=worker_cwd,
+                            session_file=w_sess,
+                            task_id=task_id,
+                            rnd_num=rnd_num,
+                            feedback=feedback_for_workers,
+                        )
+
+                    round_workers = list(await asyncio.gather(*[
+                        _launch_worker(i, a, shard)
+                        for i, (a, shard) in enumerate(
+                            zip(cfg.workers.agents, file_shards))
+                    ]))
+
+                    # 归档各 Worker 输出
+                    for wr in round_workers:
+                        (rnd_workers_dir / f"{wr.worker_id}-output.md").write_text(
+                            wr.output, encoding="utf-8")
+                        if wr.entry_file:
+                            try:
+                                ef_txt = Path(wr.entry_file).read_text(encoding="utf-8")
+                                (rnd_workers_dir / f"{wr.worker_id}-entry-list.md").write_text(
+                                    ef_txt, encoding="utf-8")
+                            except OSError:
+                                pass
+
+                    worker_result = round_workers[0]  # 兼容性引用
 
                 # ───────────────────────────────────────────────
                 # 2. Judge 评审
@@ -635,7 +700,12 @@ class Orchestrator:
                                    overall_passed=j_result.summary.overall_passed,
                                    reasoning=j_result.summary.reasoning[:200])
 
-                result.total_tokens += total_worker_tokens
+                # worker token 累加（串行用 total_worker_tokens，并行从 round_workers 汇总）
+                if not _parallel:
+                    result.total_tokens += total_worker_tokens
+                else:
+                    for _wr in round_workers:
+                        result.total_tokens += _wr.token_usage
 
                 # ───────────────────────────────────────────────
                 # 3. 投票
@@ -643,11 +713,26 @@ class Orchestrator:
 
                 pass_count = sum(
                     1 for j in round_judges
-                    if j.evaluations and j.evaluations[0].passed)
+                    if j.summary and j.summary.overall_passed)
                 is_passed = pass_count >= threshold
 
+                # 确定最优 Worker
+                if _parallel and len(round_workers) > 1:
+                    _best_votes = Counter(
+                        j.summary.best_worker_id
+                        for j in round_judges
+                        if j.summary and j.summary.best_worker_id)
+                    best_wid = (_best_votes.most_common(1)[0][0]
+                                if _best_votes else round_workers[0].worker_id)
+                    best_wr = next(
+                        (w for w in round_workers if w.worker_id == best_wid),
+                        round_workers[0])
+                else:
+                    best_wid = wid
+                    best_wr = worker_result
+
                 feedback_md = self._build_feedback_md(
-                    round_workers, round_judges, wid, rnd_num)
+                    round_workers, round_judges, best_wid, rnd_num)
                 (rnd_dir / "feedback.md").write_text(
                     feedback_md, encoding="utf-8")
 
@@ -658,7 +743,7 @@ class Orchestrator:
                     pass_count=pass_count,
                     total_judges=cfg.judge_count,
                     passed=is_passed,
-                    best_worker_id=wid,
+                    best_worker_id=best_wid,
                     feedback_to_workers=feedback_md,
                 )
                 result.rounds.append(rnd)
@@ -666,11 +751,11 @@ class Orchestrator:
                 self._emit("round_end", task_id, round=rnd_num,
                            passed=is_passed, pass_count=pass_count,
                            total_judges=cfg.judge_count,
-                           best_worker=wid)
+                           best_worker=best_wid)
 
                 if is_passed and rnd_num >= cfg.min_rounds:
                     result.status = TaskStatus.PASSED
-                    result.final_output = _get_best_output(worker_result)
+                    result.final_output = _get_best_output(best_wr)
                     break
 
                 if is_passed and rnd_num < cfg.min_rounds:
@@ -680,9 +765,14 @@ class Orchestrator:
                                         f"forcing reflection"))
 
                 feedback_for_workers = feedback_md
-                if rnd_num == cfg.max_rounds:
+                if cfg.max_rounds != -1 and rnd_num >= cfg.max_rounds:
                     result.status = TaskStatus.FAILED
-                    result.final_output = _get_best_output(worker_result)
+                    result.error = (
+                        f"已执行 {cfg.max_rounds} 轮，评审仍未通过"
+                        f"（最后一轮通过票 {pass_count}/{cfg.judge_count}，需 {threshold}）"
+                    )
+                    result.final_output = _get_best_output(best_wr)
+                    break
 
         except PiFatalError as e:
             result.status = TaskStatus.FAILED
@@ -735,6 +825,109 @@ class Orchestrator:
     def abort(self):
         if self._cancel_event:
             self._cancel_event.set()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 并行 Worker 执行（文件分片模式）
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _run_one_worker(
+        self,
+        worker_idx: int,
+        acfg: AgentInstanceConfig,
+        worker_sys_prompt: str,
+        file_shard: list[str],
+        all_files: list[str],
+        worker_cwd: str,
+        session_file: str,
+        task_id: str,
+        rnd_num: int,
+        feedback: str,
+    ) -> WorkerResult:
+        """并行模式：单个 Worker 串行分析其负责的文件分片。"""
+        cfg = self.cfg
+        wid = f"worker-{worker_idx}"
+
+        self._emit("worker_start", task_id, worker_id=wid,
+                   model=acfg.model, round=rnd_num)
+
+        worker_kwargs: dict = {
+            "model": acfg.model,
+            "tools": acfg.tools or cfg.workers.default_tools,
+            "system_prompt": worker_sys_prompt,
+            "cwd": worker_cwd,
+            "thinking_level": (
+                acfg.thinking_level or cfg.workers.default_thinking_level),
+            "session_file": session_file,
+            "cancel_event": self._cancel_event,
+            "max_retries": cfg.agent_max_retries,
+            "retry_delay": cfg.agent_retry_delay,
+            "pi_max_retries": cfg.pi_max_retries,
+            "pi_retry_delay": cfg.pi_retry_delay,
+        }
+
+        total_tokens = TokenUsage()
+        last_output = ""
+        n_total = len(all_files)
+        n_shard = len(file_shard)
+
+        if rnd_num == 1:
+            overview = self._build_worker_overview(
+                cfg.task, cfg.module_name, file_shard)
+            if n_total > n_shard:
+                overview += (
+                    f"\n\n**注意**：本模块共 {n_total} 个文件，由多个 Worker 并行分析，"
+                    f"你负责以下 {n_shard} 个：\n"
+                    + "\n".join(f"- `{f}`" for f in file_shard))
+            ar = await _run_agent_checked(
+                context=f"{wid} overview", prompt=overview, **worker_kwargs)
+            total_tokens += ar.token_usage
+        elif feedback:
+            fb_prompt = (
+                f"# Round {rnd_num} — 改进\n\n"
+                f"上一轮评审未通过，以下是评审反馈：\n\n"
+                f"{feedback}\n\n"
+                f"请根据反馈重新分析你负责的 {n_shard} 个文件，修正遗漏。"
+                f"我将再次逐文件发送给你分析。")
+            ar = await _run_agent_checked(
+                context=f"{wid} feedback", prompt=fb_prompt, **worker_kwargs)
+            total_tokens += ar.token_usage
+
+        for file_idx, file_path in enumerate(file_shard):
+            if self._cancel_event.is_set():
+                break
+            self._emit("worker_file", task_id,
+                       file=file_path,
+                       index=file_idx + 1,
+                       total=n_shard,
+                       round=rnd_num,
+                       worker_id=wid)
+            file_prompt = self._build_file_prompt(file_path, file_idx, n_shard)
+            ar = await _run_agent_checked(
+                context=f"{wid} file {file_path}",
+                prompt=file_prompt, **worker_kwargs)
+            total_tokens += ar.token_usage
+            last_output = _extract_result(ar.output)
+
+        entry_filename = f"entry-list-{wid}.md"
+        summary_prompt = self._build_summary_file_prompt_parallel(
+            cfg.module_name, file_shard, entry_filename)
+        ar = await _run_agent_checked(
+            context=f"{wid} summary", prompt=summary_prompt, **worker_kwargs)
+        total_tokens += ar.token_usage
+        last_output = _extract_result(ar.output)
+
+        ef_path = Path(worker_cwd) / entry_filename
+        ef = str(ef_path) if ef_path.exists() else (
+            _find_entry_file(worker_cwd, f"{cfg.module_name}-{wid}") or "")
+
+        self._emit("worker_done", task_id, worker_id=wid,
+                   output=last_output[:500],
+                   entry_file_found=bool(ef))
+
+        return WorkerResult(
+            worker_id=wid, model=acfg.model,
+            output=last_output, entry_file=ef,
+            token_usage=total_tokens)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Judge 评审
@@ -922,6 +1115,20 @@ class Orchestrator:
             f"你已经分析完模块 **{module_name}** 的所有 {len(module_files)} 个文件：\n"
             f"{file_list}\n\n"
             f"现在请汇总所有分析结果，使用 `write` 工具写入 `entry-list.md`，"
+            f"严格按照 system prompt 中的格式要求输出。\n\n"
+            f"写入完成后，用 `<result>...</result>` 包裹摘要信息"
+            f"（外部入口数量 + 关键发现）。")
+
+    def _build_summary_file_prompt_parallel(
+        self, module_name: str, file_shard: list[str], entry_filename: str,
+    ) -> str:
+        """并行模式：分片 Worker 汇总其负责文件的分析结果。"""
+        file_list = "\n".join(f"- `{f}`" for f in file_shard)
+        return (
+            f"# 汇总（并行分析）\n\n"
+            f"你已经分析完模块 **{module_name}** 中你负责的 {len(file_shard)} 个文件：\n"
+            f"{file_list}\n\n"
+            f"现在请汇总所有分析结果，使用 `write` 工具写入 `{entry_filename}`，"
             f"严格按照 system prompt 中的格式要求输出。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要信息"
             f"（外部入口数量 + 关键发现）。")

@@ -13,9 +13,9 @@ from app.db.models import AppEaModelsConfig, AppEaProjectConfig
 logger = logging.getLogger("ea.config_service")
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
-    "max_rounds": 3,
+    "max_rounds": -1,
     "min_rounds": 2,
-    "pass_threshold": 1,
+    "pass_threshold": 0,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "pi_max_retries": -1,

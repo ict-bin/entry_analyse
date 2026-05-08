@@ -33,13 +33,14 @@ class RoleConfig(BaseModel):
 
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
-    max_rounds: int = Field(default=3, ge=1, le=10)
+    max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃重试次数，-1 为无限重试")
     pi_retry_delay: float = Field(default=5.0, description="pi 进程重试等待秒数")
+    worker_parallel: bool = Field(default=False, description="并行 Worker 模式：多个 agents 实例同时各自分析文件分片，文件列表按 agents 数量均分")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -60,13 +61,14 @@ class TaskConfig(BaseModel):
     source_path: Optional[str] = Field(default=None, description="源码根目录（用于解析files.list中的文件路径；为None时使用cwd）")
 
     # 服务配置部分（从 ServiceConfig 合并）
-    max_rounds: int = Field(default=3)
+    max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
     min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
     pi_max_retries: int = Field(default=-1)
     pi_retry_delay: float = Field(default=5.0)
+    worker_parallel: bool = Field(default=False)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")

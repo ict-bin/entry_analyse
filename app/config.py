@@ -50,6 +50,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         max_rounds=svc.max_rounds,
         min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,
+        worker_parallel=svc.worker_parallel,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
         pi_max_retries=svc.pi_max_retries,
