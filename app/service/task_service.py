@@ -7,7 +7,7 @@ import logging
 import os
 import time as _time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from app.db.models import AppEaTask
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
+from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("ea.task_service")
 
@@ -264,7 +265,7 @@ class TaskService:
         if at and not at.done():
             at.cancel()
         row.status = "cancelled"
-        row.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        row.finished_at = now_local()
         db.commit(); db.refresh(row)
         return self._row_to_dict(row)
 
@@ -305,7 +306,7 @@ class TaskService:
                 return
             row.status = "running"
             if row.started_at is None:
-                row.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                row.started_at = now_local()
             db.commit()
 
             svc = _load_svc_config_from_db(db, row.project_id)
@@ -328,7 +329,7 @@ class TaskService:
             if row.status == "cancelled":
                 return
             row.status = result.status.value if result else "error"
-            row.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            row.finished_at = now_local()
             _prev = row.stages_json
             _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
             row.stages_json = {"events": _prev_events + event_buffer, "final": True}
@@ -348,7 +349,7 @@ class TaskService:
                 if r and r.status == "running":
                     r.status = "error"
                     r.error = str(exc)
-                    r.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    r.finished_at = now_local()
                     _prev2 = r.stages_json
                     _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
                     r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
@@ -375,7 +376,7 @@ class TaskService:
     @staticmethod
     def _row_to_dict(row: AppEaTask) -> dict:
         def fmt(dt: datetime | None) -> str | None:
-            return dt.isoformat() + "Z" if dt else None
+            return isoformat_local(dt)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),

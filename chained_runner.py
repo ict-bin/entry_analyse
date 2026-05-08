@@ -7,8 +7,9 @@ import os
 import re
 import shutil
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
+
+from app.time_utils import isoformat_local, now_local
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
@@ -19,7 +20,7 @@ ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_ANALYSE_TIMEOUT_SEC", "45"))
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return isoformat_local(now_local()) or ""
 
 
 def log(message: str) -> None:
