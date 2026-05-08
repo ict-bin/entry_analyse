@@ -502,6 +502,7 @@ class Orchestrator:
                 agents_desc = (
                     [f"worker-{i}={a.model}"
                      for i, a in enumerate(cfg.workers.agents)]
+                    + [f"merger={cfg.workers.agents[0].model}"]
                     + [f"judge-{i}={a.model}"
                        for i, a in enumerate(cfg.judges.agents)]
                 )
@@ -534,6 +535,7 @@ class Orchestrator:
 
                 wid = "worker-0"          # serial default
                 worker_result: WorkerResult  # set in both branches
+                _parallel_file_workers: list[WorkerResult] = []  # set in parallel branch
 
                 if not _parallel:
                     # ── 串行单 Worker 逐文件分析（原有逻辑）──────────
@@ -611,37 +613,41 @@ class Orchestrator:
                             ef_content, encoding="utf-8")
 
                 else:
-                    # ── 并行多 Worker 文件分片分析 ────────────────────
-                    file_shards = _split_files(self.module_files, cfg.worker_count)
+                    # ── 并行模式：每文件一个 Worker（独立上下文），之后 Merger 合并 ──
                     _w_dir_prompts = load_system_prompts(
                         cfg.workers.system_prompt_dir, cfg.worker_count)
+                    # 信号量限制最大并发数为 worker_count
+                    _sem = asyncio.Semaphore(cfg.worker_count)
 
-                    async def _launch_worker(
-                        w_idx: int, w_acfg: AgentInstanceConfig,
-                        shard: list[str],
+                    async def _launch_file_worker(
+                        file_idx: int, file_path: str,
                     ) -> WorkerResult:
+                        w_idx = file_idx % cfg.worker_count
+                        w_acfg = cfg.workers.agents[w_idx]
                         w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
-                        w_sess = str(sess_dir / f"worker-{w_idx}.jsonl")
-                        return await self._run_one_worker(
-                            worker_idx=w_idx, acfg=w_acfg,
-                            worker_sys_prompt=w_sys,
-                            file_shard=shard,
-                            all_files=self.module_files,
-                            worker_cwd=worker_cwd,
-                            session_file=w_sess,
-                            task_id=task_id,
-                            rnd_num=rnd_num,
-                            feedback=feedback_for_workers,
-                        )
+                        # 每文件独立 session，按文件索引命名，跨 round 持续
+                        w_sess = str(sess_dir / f"worker-file-{file_idx}.jsonl")
+                        async with _sem:
+                            return await self._run_one_worker(
+                                worker_idx=file_idx, acfg=w_acfg,
+                                worker_sys_prompt=w_sys,
+                                file_shard=[file_path],
+                                all_files=self.module_files,
+                                worker_cwd=worker_cwd,
+                                session_file=w_sess,
+                                task_id=task_id,
+                                rnd_num=rnd_num,
+                                feedback=feedback_for_workers,
+                            )
 
-                    round_workers = list(await asyncio.gather(*[
-                        _launch_worker(i, a, shard)
-                        for i, (a, shard) in enumerate(
-                            zip(cfg.workers.agents, file_shards))
+                    round_file_workers = list(await asyncio.gather(*[
+                        _launch_file_worker(i, fp)
+                        for i, fp in enumerate(self.module_files)
                     ]))
+                    _parallel_file_workers = round_file_workers
 
-                    # 归档各 Worker 输出
-                    for wr in round_workers:
+                    # 归档各文件 Worker 输出
+                    for wr in round_file_workers:
                         (rnd_workers_dir / f"{wr.worker_id}-output.md").write_text(
                             wr.output, encoding="utf-8")
                         if wr.entry_file:
@@ -652,7 +658,40 @@ class Orchestrator:
                             except OSError:
                                 pass
 
-                    worker_result = round_workers[0]  # 兼容性引用
+                    # ── Merger：合并所有文件 Worker 的分析结果 ──────────────
+                    merger_acfg = cfg.workers.agents[0]
+                    merger_sys = resolve_system_prompt(0, merger_acfg, _w_dir_prompts)
+                    merger_sess = str(sess_dir / "merger.jsonl")
+                    self._emit("merger_start", task_id, round=rnd_num,
+                               workers=len(round_file_workers))
+                    merger_result = await self._run_merger(
+                        acfg=merger_acfg,
+                        merger_sys_prompt=merger_sys,
+                        round_file_workers=round_file_workers,
+                        worker_cwd=worker_cwd,
+                        session_file=merger_sess,
+                        task_id=task_id,
+                        rnd_num=rnd_num,
+                        feedback=feedback_for_workers,
+                    )
+                    self._emit("merger_done", task_id, round=rnd_num,
+                               entry_file_found=bool(merger_result.entry_file),
+                               output=merger_result.output[:500])
+
+                    # 归档 merger 输出
+                    (rnd_workers_dir / "merger-output.md").write_text(
+                        merger_result.output, encoding="utf-8")
+                    if merger_result.entry_file:
+                        try:
+                            ef_txt = Path(merger_result.entry_file).read_text(encoding="utf-8")
+                            (rnd_workers_dir / "merger-entry-list.md").write_text(
+                                ef_txt, encoding="utf-8")
+                        except OSError:
+                            pass
+
+                    # Judge 只评审 merger 的合并结果（1 次而不是 N 次）
+                    round_workers = [merger_result]
+                    worker_result = merger_result
 
                 # ───────────────────────────────────────────────
                 # 2. Judge 评审
@@ -700,11 +739,11 @@ class Orchestrator:
                                    overall_passed=j_result.summary.overall_passed,
                                    reasoning=j_result.summary.reasoning[:200])
 
-                # worker token 累加（串行用 total_worker_tokens，并行从 round_workers 汇总）
+                # worker token 累加（串行用 total_worker_tokens，并行从 file workers + merger 汇总）
                 if not _parallel:
                     result.total_tokens += total_worker_tokens
                 else:
-                    for _wr in round_workers:
+                    for _wr in _parallel_file_workers + round_workers:
                         result.total_tokens += _wr.token_usage
 
                 # ───────────────────────────────────────────────
@@ -716,20 +755,9 @@ class Orchestrator:
                     if j.summary and j.summary.overall_passed)
                 is_passed = pass_count >= threshold
 
-                # 确定最优 Worker
-                if _parallel and len(round_workers) > 1:
-                    _best_votes = Counter(
-                        j.summary.best_worker_id
-                        for j in round_judges
-                        if j.summary and j.summary.best_worker_id)
-                    best_wid = (_best_votes.most_common(1)[0][0]
-                                if _best_votes else round_workers[0].worker_id)
-                    best_wr = next(
-                        (w for w in round_workers if w.worker_id == best_wid),
-                        round_workers[0])
-                else:
-                    best_wid = wid
-                    best_wr = worker_result
+                # 最终输出：并行模式取 merger 结果，串行取 worker_result
+                best_wid = worker_result.worker_id
+                best_wr = worker_result
 
                 feedback_md = self._build_feedback_md(
                     round_workers, round_judges, best_wid, rnd_num)
@@ -738,7 +766,9 @@ class Orchestrator:
 
                 rnd = RoundResult(
                     round=rnd_num,
-                    worker_results=round_workers,
+                    worker_results=(
+                        _parallel_file_workers + round_workers
+                        if _parallel else round_workers),
                     judge_results=round_judges,
                     pass_count=pass_count,
                     total_judges=cfg.judge_count,
@@ -928,6 +958,73 @@ class Orchestrator:
             worker_id=wid, model=acfg.model,
             output=last_output, entry_file=ef,
             token_usage=total_tokens)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Merger（并行模式：合并所有文件 Worker 的分析结果）
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _run_merger(
+        self,
+        acfg: AgentInstanceConfig,
+        merger_sys_prompt: str,
+        round_file_workers: list[WorkerResult],
+        worker_cwd: str,
+        session_file: str,
+        task_id: str,
+        rnd_num: int,
+        feedback: str,
+    ) -> WorkerResult:
+        """
+        合并所有文件 Worker 的分析结果，生成统一的 entry-list-merged.md。
+
+        - Round 1：读取各 Worker 的 entry-list，合并去重写入 entry-list-merged.md
+        - Round 2+：根据 Judge 反馈修正合并结果（session 持续，可积累改进经验）
+        """
+        cfg = self.cfg
+        merger_kwargs: dict = {
+            "model": acfg.model,
+            "tools": acfg.tools or cfg.workers.default_tools,
+            "system_prompt": merger_sys_prompt,
+            "cwd": worker_cwd,
+            "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
+            "session_file": session_file,
+            "cancel_event": self._cancel_event,
+            "max_retries": cfg.agent_max_retries,
+            "retry_delay": cfg.agent_retry_delay,
+            "pi_max_retries": cfg.pi_max_retries,
+            "pi_retry_delay": cfg.pi_retry_delay,
+        }
+
+        total_tokens = TokenUsage()
+
+        if rnd_num == 1:
+            merge_prompt = self._build_merger_prompt(
+                cfg.task, cfg.module_name, round_file_workers)
+        else:
+            merge_prompt = self._build_merger_retry_prompt(
+                cfg.task, cfg.module_name, round_file_workers, feedback, rnd_num)
+
+        ar = await _run_agent_checked(
+            context="merger", prompt=merge_prompt, **merger_kwargs)
+        total_tokens += ar.token_usage
+        last_output = _extract_result(ar.output)
+
+        # 查找 merger 写入的合并 entry-list 文件
+        ef_path = Path(worker_cwd) / "entry-list-merged.md"
+        ef = (
+            str(ef_path) if ef_path.exists()
+            else _find_entry_file(worker_cwd, f"{cfg.module_name}-merged")
+            or _find_entry_file(worker_cwd, cfg.module_name)
+            or ""
+        )
+
+        return WorkerResult(
+            worker_id="merger",
+            model=acfg.model,
+            output=last_output,
+            entry_file=ef,
+            token_usage=total_tokens,
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Judge 评审
@@ -1133,6 +1230,54 @@ class Orchestrator:
             f"写入完成后，用 `<result>...</result>` 包裹摘要信息"
             f"（外部入口数量 + 关键发现）。")
 
+    def _build_merger_prompt(
+        self, task: str, module_name: str, file_workers: list[WorkerResult],
+    ) -> str:
+        """Merger 第一轮：读取各文件 Worker 的 entry-list，合并去重，写入 entry-list-merged.md。"""
+        items = []
+        for w in file_workers:
+            ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
+            items.append(f"- `{ef_name}` （来自 {w.worker_id}）")
+        file_list_str = "\n".join(items)
+        return (
+            f"# 合并任务\n\n"
+            f"## 任务描述\n\n{task}\n\n"
+            f"## 模块: {module_name}\n\n"
+            f"已有 {len(file_workers)} 个 Worker 分别对各自负责的文件进行了外部入口分析，"
+            f"各自的分析结果保存在对应的 entry-list 文件中：\n\n"
+            f"{file_list_str}\n\n"
+            f"**请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
+            f"然后合并去重，使用 `write` 工具写入 `entry-list-merged.md`。**\n\n"
+            f"合并规则：\n"
+            f"1. 汇总所有文件的全部外部入口，一个不漏\n"
+            f"2. 去除内容完全重复的条目\n"
+            f"3. 同一函数被多个 Worker 标注时，保留信息最完整的版本\n"
+            f"4. 严格按 system prompt 的格式要求输出\n\n"
+            f"写入完成后，用 `<result>...</result>` 包裹摘要（总入口数量 + 关键发现）。"
+        )
+
+    def _build_merger_retry_prompt(
+        self, task: str, module_name: str, file_workers: list[WorkerResult],
+        feedback: str, rnd_num: int,
+    ) -> str:
+        """Merger 后续轮：根据 Judge 反馈修正合并结果。"""
+        items = []
+        for w in file_workers:
+            ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
+            items.append(f"- `{ef_name}` （来自 {w.worker_id}）")
+        file_list_str = "\n".join(items)
+        return (
+            f"# Round {rnd_num} — 重新合并\n\n"
+            f"上一轮合并结果未通过评审，Judge 的反馈如下：\n\n"
+            f"{feedback}\n\n"
+            f"---\n\n"
+            f"请根据以上反馈，重新读取各 Worker 的最新 entry-list 文件并修正合并结果：\n\n"
+            f"{file_list_str}\n\n"
+            f"**请使用 `read` 工具读取相关文件，修正遗漏或错误，"
+            f"重新写入 `entry-list-merged.md`。**\n\n"
+            f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 总入口数量）。"
+        )
+
     def _build_eval_prompt(self, task, module_name, module_files,
                            worker: WorkerResult, rnd,
                            output_path: str = "",
@@ -1154,9 +1299,9 @@ class Orchestrator:
             f"## 模块文件\n\n模块 **{module_name}** 包含以下文件: {file_list}\n\n"
             f"这些源代码文件也在你的当前目录下，请自行阅读验证。",
             f"## Evaluation Criteria\n\n{CRITERIA}",
-            f"## {worker.worker_id}'s Output Files\n\n"
-            f"Worker 的摘要输出文件: `{output_path}`\n"
-            f"Worker 的外部入口列表: `{entry_path}`\n\n"
+            f"## {worker.worker_id} 的输出文件\n\n"
+            f"摘要输出文件: `{output_path}`\n"
+            f"外部入口列表: `{entry_path}`\n\n"
             f"**请使用 read 工具读取以上文件和模块源代码，然后进行评测。**",
             "评测完成后，请严格按以下 markdown 格式输出结果：\n\n"
             "```\n"
