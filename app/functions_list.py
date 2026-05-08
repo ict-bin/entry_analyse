@@ -65,10 +65,9 @@ def write_functions_list(entry_md: str, output_path: str) -> int:
 
 # ─── 内部解析 ─────────────────────────────────────────────────────────────────
 
-# 表格行（兼容 7 列和 8 列）:
-#   7列: | # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 说明 |
-#   8列: | # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | 数据来源 | 说明 |
-_TABLE_ROW_RE = re.compile(
+# 旧格式（7/8列）：| # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | ...
+# 首列必须是纯数字（序号）
+_TABLE_ROW_OLD_RE = re.compile(
     r'^\|\s*(\d+)\s*\|'   # group1: 序号
     r'\s*(.*?)\s*\|'       # group2: 文件
     r'\s*(.*?)\s*\|'       # group3: 函数名
@@ -76,6 +75,20 @@ _TABLE_ROW_RE = re.compile(
     r'\s*(.*?)\s*\|'       # group5: 入口类型
     r'\s*(.*?)\s*\|'       # group6: 污点变量
 )
+
+# 新格式（5列，merger 实际输出）：
+# | 入口函数 | 入口类型 | 污点变量 | 文件位置 | 风险等级 |
+# 文件位置格式：filename.cpp:45 或 filename.cpp
+_TABLE_ROW_NEW_RE = re.compile(
+    r'^\|\s*(.*?)\s*\|'    # group1: 入口函数（可含反引号）
+    r'\s*(.*?)\s*\|'       # group2: 入口类型（忽略）
+    r'\s*(.*?)\s*\|'       # group3: 污点变量
+    r'\s*(.*?)\s*\|'       # group4: 文件位置（filename.cpp:45）
+    r'\s*(.*?)\s*\|'       # group5: 风险等级（忽略）
+)
+
+# 新格式表头关键词（用于识别并跳过表头行）
+_NEW_FORMAT_HEADERS = {'入口函数', 'entry', 'function', '函数', '函数名'}
 
 
 def _normalize_lineno(raw: str) -> str:
@@ -107,24 +120,77 @@ def _normalize_lineno(raw: str) -> str:
     return s
 
 
+def _strip_backticks(s: str) -> str:
+    """去除 markdown 反引号包裹。"""
+    return s.strip('`').strip()
+
+
+def _parse_file_lineno(raw: str) -> tuple[str, str]:
+    """
+    从 '文件位置' 列解析文件名和行号。
+
+    输入示例：
+        'announce_begin_server.cpp:45'  → ('announce_begin_server.cpp', 'L45')
+        'key_manager.cpp'               → ('key_manager.cpp', '')
+        'announce_begin_server.cpp:45 ' → ('announce_begin_server.cpp', 'L45')
+    """
+    raw = _strip_backticks(raw).strip()
+    # 尝试按最后一个 ':' 分割（避免 Windows 路径 C: 的干扰，取最后一段）
+    if ':' in raw:
+        last_colon = raw.rfind(':')
+        maybe_line = raw[last_colon + 1:].strip()
+        if re.match(r'^\d+$', maybe_line):
+            return raw[:last_colon].strip(), 'L' + maybe_line
+    return raw, ''
+
+
 def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
     """
     解析 markdown 中的总入口列表表格。
+    同时支持旧格式（带序号列）和新格式（入口函数|入口类型|污点变量|文件位置|风险等级）。
 
     Returns:
         [(文件名, 函数名, 行号, 污点变量原始字符串), ...]
     """
     results: list[tuple[str, str, str, str]] = []
     for line in md.splitlines():
-        m = _TABLE_ROW_RE.match(line.strip())
-        if not m:
+        stripped = line.strip()
+        if not stripped.startswith('|'):
             continue
-        file_name = m.group(2).strip()
-        func_name = m.group(3).strip()
-        line_no   = _normalize_lineno(m.group(4).strip())
-        taint_raw = m.group(6).strip()
-        if file_name and func_name:
-            results.append((file_name, func_name, line_no, taint_raw))
+        # 跳过分隔行
+        if re.match(r'^\|[-|\s:]+\|$', stripped):
+            continue
+
+        # ── 先尝试旧格式（首列为数字序号）──
+        m = _TABLE_ROW_OLD_RE.match(stripped)
+        if m:
+            file_name = m.group(2).strip()
+            func_name = m.group(3).strip()
+            line_no   = _normalize_lineno(m.group(4).strip())
+            taint_raw = m.group(6).strip()
+            if file_name and func_name:
+                results.append((file_name, func_name, line_no, taint_raw))
+            continue
+
+        # ── 再尝试新格式（5列，无序号）──
+        m2 = _TABLE_ROW_NEW_RE.match(stripped)
+        if not m2:
+            continue
+        func_raw   = _strip_backticks(m2.group(1))
+        taint_raw  = _strip_backticks(m2.group(3))
+        file_pos   = m2.group(4).strip()
+
+        # 跳过表头行
+        if func_raw.lower() in _NEW_FORMAT_HEADERS:
+            continue
+        # 跳过无意义内容
+        if not func_raw or func_raw.startswith('-'):
+            continue
+
+        file_name, line_no = _parse_file_lineno(file_pos)
+        if func_raw and file_name:
+            results.append((file_name, func_raw, line_no, taint_raw))
+
     return results
 
 
@@ -141,7 +207,7 @@ def _clean_params(raw: str) -> str:
         "mmap@ptr"                    → "mmap@ptr"
         "无污点"                       → ""
     """
-    if not raw or raw == "-" or raw.startswith("无"):
+    if not raw or raw == "-" or raw.startswith("无") or raw in ("间接污点", "N/A", "n/a"):
         return ""
 
     parts: list[str] = []
