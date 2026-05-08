@@ -27,8 +27,10 @@ COPY app/               ./app/
 COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
+COPY .pi/               ./.pi/
 COPY config.example.json .env.example ./
-RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
+RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true \
+    && chmod +x .pi/skills/write-entry-list-json/scripts/validate_entry_list.py 2>/dev/null || true
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
 ENV PI_CODING_AGENT_DIR=/root/.pi/agent

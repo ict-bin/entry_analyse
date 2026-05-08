@@ -1082,6 +1082,8 @@ class Orchestrator:
         - Round 2+：根据 Judge 反馈修正合并结果（session 持续，可积累改进经验）
         """
         cfg = self.cfg
+        # 项目级 skill：提供 entry-list-merged.json 格式规范 + 验证脚本
+        _skill_path = "/opt/entry_analyse/.pi/skills/write-entry-list-json"
         master_kwargs: dict = {
             "model": acfg.model,
             "tools": acfg.tools or cfg.workers.default_tools,
@@ -1089,6 +1091,7 @@ class Orchestrator:
             "cwd": worker_cwd,
             "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
             "session_file": session_file,
+            "skill_paths": [_skill_path],
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,

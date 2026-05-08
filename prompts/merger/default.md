@@ -52,42 +52,45 @@
 3. 如是配置型：判断是否有外部可控污点参数
 4. 不符合标准的**直接丢弃**，不要放入合并结果
 
-## 第三步：写入 entry-list-merged.md
+## 第三步：写入 entry-list-merged.json
 
-只写入通过过滤的入口，**严格使用以下固定格式**，不得偏离：
-
-```markdown
-# 外部入口合并分析：<模块名>
-
-## 模块概述
-- **模块名**: <module_name>
-- **分析来源**: <N> 个 Worker 的独立分析结果
-- **合并规则**: 去重、过滤非真实入口、保留信息最完整版本
-
-## 外部入口汇总
-
-| 入口函数 | 入口类型 | 污点变量 | 源文件 | 行号 | 风险等级 |
-|----------|----------|----------|--------|------|----------|
-| `Mle::HandleUdpReceive(void*, otMessage*, otMessageInfo*)` | 被动回调型 | `aMessage`, `aMessageInfo` | mle.cpp | 1983 | 高 |
-| `Mle::SetDeviceMode(uint8_t)` | 主动拉取型 | `aMode` | mle.cpp | 432 | 中 |
-```
+只写入通过过滤的入口，**严格使用 `write-entry-list-json` skill 中的 JSON 格式**。
 
 > ⚠️ **格式强制规定（违反即导致下游解析失败）：**
-> 1. 所有入口函数 **必须且只能** 写入上表，**严禁**使用 `- 函数名` 列表格式
-> 2. 表头列名**固定为** `入口函数 | 入口类型 | 污点变量 | 源文件 | 行号 | 风险等级`，不得修改列名、增减列、拆成多表
-> 3. `入口类型` 列只能填 `被动回调型` 或 `主动拉取型`
-> 4. `污点变量` 列：反引号包裹，多个用 `, ` 分隔；主动拉取型用 `syscall@var` 格式
-> 5. `源文件` 列：只填文件名（如 `mle.cpp`），不含路径
-> 6. `行号` 列：整数行号（被动型=函数定义行，主动型=系统调用行），未知时填 0
-> 7. 所有条目写入 **同一张表**，不分节、不分类别
+> 1. 文件名固定为 **`entry-list-merged.json`**，不得写为 `.md` 或其他名称
+> 2. 文件内容为 **JSON 数组**，每项 5 个字段（`tag` / `file` / `line` / `function` / `taints`），**全部必填**
+> 3. `tag` 只能是 `"P"`（被动回调型）或 `"A"`（主动拉取型）
+> 4. `file` 填源文件名（如 `mle.cpp`），**不能为空字符串**
+> 5. `line` 为整数行号（未知时填 `0`），**不能是字符串**
+> 6. `function` 填完整函数签名，**不能为空字符串**
+> 7. `taints` 填外部可控参数名数组（如 `["aMessage", "aMessageInfo"]`），**不能为空数组**
 
-**格式要求：**
-- 入口函数：反引号包裹完整函数签名（含参数类型）
-- 入口类型：只能是"被动回调型"或"主动拉取型"
-- 污点变量：反引号包裹，多个用 `, ` 分隔，主动拉取型用 `syscall@var` 格式
-- 源文件：文件名（不含路径），如 `mle.cpp`
-- 行号：整数，函数定义行号，未知时填 0
-- 风险等级：根据污点变量是否外部可控及危害程度判断
+示例：
+```json
+[
+  {
+    "tag": "P",
+    "file": "mle.cpp",
+    "line": 1983,
+    "function": "Mle::HandleUdpReceive(void*, otMessage*, otMessageInfo*)",
+    "taints": ["aMessage", "aMessageInfo"]
+  },
+  {
+    "tag": "A",
+    "file": "key_manager.cpp",
+    "line": 412,
+    "function": "KeyManager::SetMasterKey(const uint8_t*, uint8_t)",
+    "taints": ["aKey"]
+  }
+]
+```
+
+写入后，**必须**运行以下命令验证：
+```bash
+python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_entry_list.py entry-list-merged.json
+```
+
+验证通过（输出 `✅ ...`）才能继续；若验证失败，根据错误提示修正后重新写入。
 
 ## 第四步：输出摘要
 

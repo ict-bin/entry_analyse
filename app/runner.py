@@ -178,6 +178,7 @@ def _find_pi_command() -> list[str]:
 def _build_args(
     pi_cmd: list[str], model: str, tools: list[str],
     thinking_level: str, session_file: str | None,
+    skill_paths: list[str] | None = None,
 ) -> list[str]:
     """构造 pi 命令行参数（不含 system prompt 和 prompt）。"""
     args = [*pi_cmd, "--mode", "json", "-p"]
@@ -191,6 +192,9 @@ def _build_args(
         args.extend(["--tools", ",".join(tools)])
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])
+    if skill_paths:
+        for sp in skill_paths:
+            args.extend(["--skill", sp])
     # 注意：prompt 不拼入命令行参数，而是通过 stdin 发送，
     # 以避免超出 Linux ARG_MAX 命令行长度限制。
     return args
@@ -292,6 +296,7 @@ async def run_agent(
     cwd: str = ".",
     thinking_level: str = "off",
     session_file: str | None = None,
+    skill_paths: list[str] | None = None,
     on_stream: Callable[[str], None] | None = None,
     cancel_event: asyncio.Event | None = None,
     max_retries: int = 3,
@@ -316,7 +321,7 @@ async def run_agent(
         r.fatal = True
         return r
 
-    args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+    args = _build_args(pi_cmd, model, tools, thinking_level, session_file, skill_paths)
 
     # System Prompt → 临时文件
     tmp_dir: str | None = None
