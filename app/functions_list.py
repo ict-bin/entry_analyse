@@ -66,7 +66,7 @@ def write_functions_list(entry_md: str, output_path: str) -> int:
 # ─── 内部解析 ─────────────────────────────────────────────────────────────────
 
 # 旧格式（7/8列）：| # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | ...
-# 首列必须是纯数字（序号）
+# 首列必须是纯数字（序号），需要至少6列
 _TABLE_ROW_OLD_RE = re.compile(
     r'^\|\s*(\d+)\s*\|'   # group1: 序号
     r'\s*(.*?)\s*\|'       # group2: 文件
@@ -76,7 +76,18 @@ _TABLE_ROW_OLD_RE = re.compile(
     r'\s*(.*?)\s*\|'       # group6: 污点变量
 )
 
-# 新格式（5列，merger 实际输出）：
+# 汇总格式（5列，最终输出 thread_core.md 实际使用）：
+# | # | 函数名 | 文件 | 污点变量 | 风险等级 |
+# 首列为纯数字序号，文件列可能包含多文件（以 / 分隔）
+_TABLE_ROW_SUMMARY_RE = re.compile(
+    r'^\|\s*(\d+)\s*\|'   # group1: 序号
+    r'\s*(.*?)\s*\|'       # group2: 函数名（可含反引号和括号消歧注释）
+    r'\s*(.*?)\s*\|'       # group3: 文件（可含多文件 file1/file2）
+    r'\s*(.*?)\s*\|'       # group4: 污点变量
+    r'\s*(.*?)\s*\|'       # group5: 风险等级（忽略）
+)
+
+# 详情格式（5列，merger-entry-list.md 使用）：
 # | 入口函数 | 入口类型 | 污点变量 | 文件位置 | 风险等级 |
 # 文件位置格式：filename.cpp:45 或 filename.cpp
 _TABLE_ROW_NEW_RE = re.compile(
@@ -87,8 +98,8 @@ _TABLE_ROW_NEW_RE = re.compile(
     r'\s*(.*?)\s*\|'       # group5: 风险等级（忽略）
 )
 
-# 新格式表头关键词（用于识别并跳过表头行）
-_NEW_FORMAT_HEADERS = {'入口函数', 'entry', 'function', '函数', '函数名'}
+# 表头关键词（用于识别并跳过表头行，适用于 _TABLE_ROW_NEW_RE）
+_NEW_FORMAT_HEADERS = {'入口函数', 'entry', 'function', '函数', '函数名', '#'}
 
 
 def _normalize_lineno(raw: str) -> str:
@@ -144,10 +155,20 @@ def _parse_file_lineno(raw: str) -> tuple[str, str]:
     return raw, ''
 
 
+def _strip_module_context(func: str) -> str:
+    """去除函数名末尾的消歧注释，如 'HandleTimer() (AnnounceBeginServer)' → 'HandleTimer()'。
+    只去除末尾形如 ' (纯字母/下划线/空格)' 的括号，避免误删真实参数类型。
+    """
+    return re.sub(r'\s+\([A-Za-z_][A-Za-z0-9_\s]*\)\s*$', '', func).strip()
+
+
 def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
     """
     解析 markdown 中的总入口列表表格。
-    同时支持旧格式（带序号列）和新格式（入口函数|入口类型|污点变量|文件位置|风险等级）。
+    支持三种格式：
+      - 旧格式（7/8列，带序号）：| # | 文件 | 函数名 | 行号 | 类型 | 污点 | ...
+      - 汇总格式（5列，带序号）：| # | 函数名 | 文件 | 污点变量 | 风险等级 |
+      - 详情格式（5列，无序号）：| 入口函数 | 入口类型 | 污点变量 | 文件位置 | 风险等级 |
 
     Returns:
         [(文件名, 函数名, 行号, 污点变量原始字符串), ...]
@@ -161,7 +182,7 @@ def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
         if re.match(r'^\|[-|\s:]+\|$', stripped):
             continue
 
-        # ── 先尝试旧格式（首列为数字序号）──
+        # ── 先尝试旧格式（6列+，首列为纯数字序号）──
         m = _TABLE_ROW_OLD_RE.match(stripped)
         if m:
             file_name = m.group(2).strip()
@@ -172,15 +193,29 @@ def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
                 results.append((file_name, func_name, line_no, taint_raw))
             continue
 
-        # ── 再尝试新格式（5列，无序号）──
+        # ── 再尝试汇总格式（5列，首列为纯数字序号）──
+        m_sum = _TABLE_ROW_SUMMARY_RE.match(stripped)
+        if m_sum:
+            func_raw  = _strip_backticks(m_sum.group(2))
+            func_raw  = _strip_module_context(func_raw)
+            file_raw  = m_sum.group(3).strip()
+            taint_raw = m_sum.group(4).strip()
+            # 文件列可能有多文件（mle.cpp/mle_router.cpp），取第一个
+            primary_file = file_raw.split('/')[0].strip()
+            file_name, line_no = _parse_file_lineno(primary_file)
+            if func_raw and file_name:
+                results.append((file_name, func_raw, line_no, taint_raw))
+            continue
+
+        # ── 最后尝试详情格式（5列，无序号）──
         m2 = _TABLE_ROW_NEW_RE.match(stripped)
         if not m2:
             continue
         func_raw   = _strip_backticks(m2.group(1))
-        taint_raw  = _strip_backticks(m2.group(3))
+        taint_raw  = m2.group(3).strip()
         file_pos   = m2.group(4).strip()
 
-        # 跳过表头行
+        # 跳过表头行（含 '入口函数'、'#' 等表头关键词）
         if func_raw.lower() in _NEW_FORMAT_HEADERS:
             continue
         # 跳过无意义内容
@@ -211,13 +246,23 @@ def _clean_params(raw: str) -> str:
         return ""
 
     parts: list[str] = []
+
+    # 优先从反引号包裹的变量中提取（新格式：`var`🔴 `var2`🟡 空格分隔）
+    backtick_vars = re.findall(r'`([^`]+)`', raw)
+    if backtick_vars:
+        for bv in backtick_vars:
+            name = re.sub(r'[(\uff08].*?[)\uff09]', '', bv).strip()
+            name = re.sub(r'[^\w@]', '', name)
+            if name:
+                parts.append(name)
+        return ",".join(parts)
+
+    # 回退：逗号分隔（旧格式）
     for seg in raw.split(","):
         seg = seg.strip()
         if not seg:
             continue
-        # 去掉括号及其中内容: "recv@buf(缓冲区)" → "recv@buf"
         name = re.sub(r'[(\uff08].*?[)\uff09]', '', seg).strip()
-        # 保留 字母数字下划线 和 @ 符号
         name = re.sub(r'[^\w@]', '', name)
         if name:
             parts.append(name)

@@ -663,7 +663,14 @@ class Orchestrator:
 
                     # ── Merger：合并所有文件 Worker 的分析结果 ──────────────
                     merger_acfg = cfg.workers.agents[0]
-                    merger_sys = resolve_system_prompt(0, merger_acfg, _w_dir_prompts)
+                    # 优先从专属 merger prompt 目录加载，回退到 workers prompt
+                    _merger_prompt_dir = str(
+                        Path(cfg.workers.system_prompt_dir).parent / "merger")
+                    _merger_dir_prompts = load_system_prompts(_merger_prompt_dir, 1)
+                    if _merger_dir_prompts and _merger_dir_prompts[0]:
+                        merger_sys = _merger_dir_prompts[0]
+                    else:
+                        merger_sys = resolve_system_prompt(0, merger_acfg, _w_dir_prompts)
                     merger_sess = str(sess_dir / "merger.jsonl")
                     self._emit("merger_start", task_id, round=rnd_num,
                                workers=len(round_file_workers))
@@ -1242,27 +1249,30 @@ class Orchestrator:
     def _build_merger_prompt(
         self, task: str, module_name: str, file_workers: list[WorkerResult],
     ) -> str:
-        """Merger 第一轮：读取各文件 Worker 的 entry-list，合并去重，写入 entry-list-merged.md。"""
+        """Merger 第一轮：读取各文件 Worker 的 entry-list，精筛合并，写入 entry-list-merged.md。"""
         items = []
         for w in file_workers:
             ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
             items.append(f"- `{ef_name}` （来自 {w.worker_id}）")
         file_list_str = "\n".join(items)
         return (
-            f"# 合并任务\n\n"
+            f"# 合并精筛任务\n\n"
             f"## 任务描述\n\n{task}\n\n"
             f"## 模块: {module_name}\n\n"
             f"已有 {len(file_workers)} 个 Worker 分别对各自负责的文件进行了外部入口分析，"
             f"各自的分析结果保存在对应的 entry-list 文件中：\n\n"
             f"{file_list_str}\n\n"
             f"**请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
-            f"然后合并去重，使用 `write` 工具写入 `entry-list-merged.md`。**\n\n"
-            f"合并规则：\n"
-            f"1. 汇总所有文件的全部外部入口，一个不漏\n"
-            f"2. 去除内容完全重复的条目\n"
-            f"3. 同一函数被多个 Worker 标注时，保留信息最完整的版本\n"
-            f"4. 严格按 system prompt 的格式要求输出\n\n"
-            f"写入完成后，用 `<result>...</result>` 包裹摘要（总入口数量 + 关键发现）。"
+            f"然后按 system prompt 中的标准精筛合并，使用 `write` 工具写入 `entry-list-merged.md`。**\n\n"
+            f"精筛合并规则（严格执行）：\n"
+            f"1. **过滤**：只保留真正从外部引入数据的入口（被动回调型 或 主动拉取型），"
+            f"定时器回调、构造函数、无污点参数的纯配置函数、内部子函数**一律过滤**\n"
+            f"2. **去重**：去除内容完全重复的条目\n"
+            f"3. **去伪**：对有疑问的被动回调入口，用 `bash` 执行 `grep` 确认其无模块内调用者；"
+            f"有内部调用者的**直接过滤**\n"
+            f"4. **保优**：同一函数被多个 Worker 标注时，保留信息最完整的版本\n"
+            f"5. **格式**：严格按 system prompt 的格式要求输出\n\n"
+            f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
     def _build_merger_retry_prompt(
@@ -1276,15 +1286,16 @@ class Orchestrator:
             items.append(f"- `{ef_name}` （来自 {w.worker_id}）")
         file_list_str = "\n".join(items)
         return (
-            f"# Round {rnd_num} — 重新合并\n\n"
+            f"# Round {rnd_num} — 重新精筛合并\n\n"
             f"上一轮合并结果未通过评审，Judge 的反馈如下：\n\n"
             f"{feedback}\n\n"
             f"---\n\n"
             f"请根据以上反馈，重新读取各 Worker 的最新 entry-list 文件并修正合并结果：\n\n"
             f"{file_list_str}\n\n"
-            f"**请使用 `read` 工具读取相关文件，修正遗漏或错误，"
+            f"**请使用 `read` 工具读取相关文件，按 system prompt 中的过滤标准修正遗漏或误报，"
             f"重新写入 `entry-list-merged.md`。**\n\n"
-            f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 总入口数量）。"
+            f"注意：修正时同样需要对新增条目进行有效性判断，不能只增加不过滤。\n\n"
+            f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 最终保留入口数量）。"
         )
 
     def _build_eval_prompt(self, task, module_name, module_files,
@@ -1293,10 +1304,15 @@ class Orchestrator:
                            entry_path: str = ""):
         CRITERIA = (
             "重点评判维度：\n"
-            "1. **被动回调型入口**：回调注册/函数指针表/消息分发表注册的入口是否找全\n"
-            "2. **主动拉取型入口**：函数内调用 recv/read/mmap/ioctl 等的入口是否找全\n"
-            "3. **污点变量精确性**：是否正确区分外部可控参数 vs 内部标识符\n"
-            "4. **无误报**：没有把内部子函数误标为入口\n"
+            "1. **无误报（最重要）**：入口列表中是否混入了非外部数据入口\n"
+            "   - 定时器回调（HandleTimer, HandleXxxTimer, HandlePollTimeout 等）→ 误报\n"
+            "   - 构造函数 / Init 函数（参数是内部对象引用）→ 误报\n"
+            "   - 无外部污点参数的配置函数（Enable/Disable/Start/Stop/BecomeDetached 等）→ 误报\n"
+            "   - 被模块内其他函数调用的内部子函数 → 误报\n"
+            "   - 内部存储操作（Store/Restore）→ 误报\n"
+            "2. **被动回调型入口**：真正被外部框架回调、参数携带外部数据的函数是否找全\n"
+            "3. **主动拉取型入口**：函数内调用 recv/read/mmap/ioctl 等的入口是否找全\n"
+            "4. **污点变量精确性**：是否正确区分外部可控参数 vs 内部标识符\n"
             "5. **数据来源标注**：被动型标注了注册点，主动型标注了系统调用和行号"
         )
 
