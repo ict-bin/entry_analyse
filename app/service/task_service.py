@@ -240,14 +240,8 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务已完成，无需续跑")
         from sqlalchemy.orm.attributes import flag_modified
-        svc = _load_svc_config_from_db(db, row.project_id)
-        effective_output = row.output_path or (
-            f"{os.environ.get('FILESERVER_ROOT', '/data/files')}/{row.project_id}/app/secflow-app-entry-analyse"
-        )
-        resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
         tcfg = dict(row.task_config_json or {})
-        tcfg["start_stage"] = 3
-        tcfg["resume_workspace"] = resume_workspace
+        tcfg["resume_task_id"] = task_id
         row.task_config_json = tcfg
         row.status = "pending"
         row.finished_at = None
@@ -259,7 +253,7 @@ class TaskService:
                                             name=f"ea_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
-                  task_id=task_id, project_id=row.project_id, resume_workspace=resume_workspace)
+                  task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
@@ -316,10 +310,6 @@ class TaskService:
 
             svc = _load_svc_config_from_db(db, row.project_id)
             tcfg = row.task_config_json or {}
-            if tcfg.get("start_stage"):
-                svc.start_stage = tcfg["start_stage"]
-            if tcfg.get("resume_workspace"):
-                svc.resume_workspace = tcfg["resume_workspace"]
             if row.output_path:
                 svc.output_dir = row.output_path
                 svc.archive_dir = row.output_path
@@ -328,6 +318,7 @@ class TaskService:
                 svc, row.prompt_content, cwd=row.input_path,
                 module_name=row.module_name or "",
                 source_path=row.source_path or "",
+                resume_task_id=tcfg.get("resume_task_id", ""),
             )
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute(task_id)

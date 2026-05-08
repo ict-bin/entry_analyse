@@ -624,15 +624,35 @@ class Orchestrator:
                         cfg.workers.system_prompt_dir, cfg.worker_count)
 
                     if _cached_file_workers is None:
-                        # ── 第一次运行文件 Workers ────────────────────────────
+                        # ── 断点续跑：从磁盘恢复已完成的文件 Worker 结果 ──────
+                        _recovered_workers: dict[int, WorkerResult] = {}
+                        if _resuming:
+                            for _fi in range(len(self.module_files)):
+                                _w_out_path = rnd_workers_dir / f"worker-{_fi}-output.md"
+                                if _w_out_path.exists():
+                                    _recovered_workers[_fi] = WorkerResult(
+                                        worker_id=f"worker-{_fi}",
+                                        model=cfg.workers.agents[_fi % cfg.worker_count].model,
+                                        output=_w_out_path.read_text("utf-8"),
+                                        entry_file="",
+                                        token_usage=TokenUsage(),
+                                    )
+                            if _recovered_workers:
+                                self._emit("task_resume_workers", task_id,
+                                           recovered=len(_recovered_workers),
+                                           total=len(self.module_files))
+
                         # 信号量限制最大并发数为 worker_count
                         _sem = asyncio.Semaphore(cfg.worker_count)
                         # 共享完成计数器 [done, total]，asyncio 单线程安全
-                        _progress = [0, len(self.module_files)]
+                        _progress = [len(_recovered_workers), len(self.module_files)]
 
                         async def _launch_file_worker(
                             file_idx: int, file_path: str,
                         ) -> WorkerResult:
+                            # 断点续跑：直接返回已从磁盘恢复的 Worker 结果
+                            if file_idx in _recovered_workers:
+                                return _recovered_workers[file_idx]
                             w_idx = file_idx % cfg.worker_count
                             w_acfg = cfg.workers.agents[w_idx]
                             w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
