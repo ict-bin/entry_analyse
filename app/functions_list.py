@@ -4,21 +4,21 @@ entry_analyse — functions.list 生成器
 从 entry-list.md 中解析总入口表格，生成确定性的 functions.list 文件。
 
 输出格式（每行一个污点入口）：
-    文件名:函数名:行号:污点变量1,污点变量2
+    [P]  文件名:行号  函数名  污点变量1,污点变量2   ← 被动回调型
+    [A]  文件名:行号  函数名  syscall@var1,syscall@var2  ← 主动拉取型
+
+[P] = Passive  被动回调型：外部框架直接回调，污点变量是携带外部数据的函数参数
+[A] = Active   主动拉取型：函数内调用 recv/read/mmap 等，污点变量用 syscall@var 格式
 
 行号 = 污点产生的位置：
-    被动回调型 → 函数定义行（参数在此处即为污点）
-    主动拉取型 → recv/read 等系统调用所在行（污点在此处产生）
-
-污点变量格式：
-    被动回调型 → 直接变量名：          a2,msg_ptr
-    主动拉取型 → 系统调用名@变量名：  recv@buf,recvfrom@addr
+    [P] 被动回调型 → 函数定义行（参数在此处即为污点）
+    [A] 主动拉取型 → recv/read 等系统调用所在行（污点在此处产生）
 
 示例：
-    libipsec.c:IPSEC_SOCKI_PipeMsg:L26837:pipe_id,pipe_type,msg_type
-    libipsec.c:IPSEC_RecvLoop:L505:recv@buf
-    libipsec.c:IPSEC_LoadCfg:L812:fread@data
-    libipsec.c:IPSEC_RecvFrom:L900:recvfrom@buf,recvfrom@addr
+    [P]  announce_begin_server.cpp:L45  HandleRequest()  aHeader,aMessage,aMessageInfo
+    [P]  key_manager.cpp              SetMasterKey()   Key
+    [A]  coap.cpp:L505               CoAP_RecvLoop()  recv@buf
+    [A]  libipsec.c:L900             IPSEC_RecvFrom() recvfrom@buf,recvfrom@addr
 
 规则：
     - 严格按表格行顺序输出
@@ -47,7 +47,10 @@ def generate_functions_list(entry_md: str) -> str:
         taint = _clean_params(taint_vars_raw)
         if not taint:
             continue
-        lines.append(f"{file_name}:{func_name}:{line_no}:{taint}")
+        # [A] 主动拉取型：污点含 syscall@var 格式；[P] 被动回调型：直接参数名
+        tag = "[A]" if "@" in taint else "[P]"
+        loc = f"{file_name}:{line_no}" if line_no else file_name
+        lines.append(f"{tag}  {loc}  {func_name}  {taint}")
     return "\n".join(lines)
 
 
