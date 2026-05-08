@@ -1178,7 +1178,8 @@ class Orchestrator:
 
             ar = await _run_agent_checked(
                 context=f"{jid} eval {w.worker_id}",
-                prompt=eval_prompt, **base_kwargs, session_file=None)
+                prompt=eval_prompt, **base_kwargs,
+                session_file=str(sess_dir / f"{jid}-r{rnd_num}.jsonl"))
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_eval_md(ar.output)
@@ -1209,7 +1210,8 @@ class Orchestrator:
 
             ar = await _run_agent_checked(
                 context=f"{jid} summary",
-                prompt=summary_prompt, **base_kwargs, session_file=None)
+                prompt=summary_prompt, **base_kwargs,
+                session_file=str(sess_dir / f"{jid}-r{rnd_num}.jsonl"))
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_summary_md(ar.output)
