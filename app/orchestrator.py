@@ -86,7 +86,7 @@ from .models import (
     WorkerResult,
     make_id,
 )
-from .functions_list import write_functions_list
+from .functions_list import generate_functions_list, write_functions_list
 from .module_loader import ModuleInfo, load_module, prepare_workspace
 from .runner import run_agent, AgentResult, PiFatalError
 
@@ -912,20 +912,21 @@ class Orchestrator:
             # 最终兜底：用最终输出文本（可能失败，但至少记录 raw_preview）
             write_functions_list(cleaned_output, func_list_path)
 
-        # 强制校验：functions.list 必须是合法 JSON 数组，保证调用方能正常 json.loads
-        import json as _json_fl
-        _fl_count = 0
+        # 程序级强制保证：functions.list 必须是合法 JSON 数组
+        import json as _json
         try:
             _fl_raw = Path(func_list_path).read_text(encoding="utf-8")
-            _fl_data = _json_fl.loads(_fl_raw)
-            if not isinstance(_fl_data, list):
-                raise ValueError(f"expected JSON array, got {type(_fl_data).__name__}")
-            _fl_count = len(_fl_data)
+            _fl_parsed = _json.loads(_fl_raw)
+            if not isinstance(_fl_parsed, list):
+                raise ValueError(
+                    f"functions.list 不是 JSON 数组，实际类型: {type(_fl_parsed).__name__}"
+                )
+            _fl_count = len(_fl_parsed)
         except (json.JSONDecodeError, ValueError, OSError) as _fl_err:
-            # 写入空数组，确保文件始终可被 json.loads 加载
-            Path(func_list_path).write_text("[]", encoding="utf-8")
             _fl_count = 0
-            self._emit("functions_list_invalid", task_id, error=str(_fl_err))
+            self._emit("functions_list_error", task_id, error=str(_fl_err))
+            # 写入空数组，保证下游微服务始终得到合法 JSON
+            Path(func_list_path).write_text("[]", encoding="utf-8")
 
         # 4) flag 文件：成功覆写为 1
         if result.status == TaskStatus.PASSED:
@@ -937,7 +938,6 @@ class Orchestrator:
                     output_dir=str(out_dir),
                     result_file=str(out_dir / result_filename),
                     functions_list=func_list_path,
-                    functions_list_count=_fl_count,
                     flag_file=str(out_dir / "flag"))
         self._cancel_event = None
         return result
@@ -1180,6 +1180,7 @@ class Orchestrator:
             # Worker entry-list：优先使用 .json，回退 .md
             ef_ext = ".json" if (w.entry_file and w.entry_file.endswith(".json")) else ".md"
             ef_dst = j_dir / f"{w.worker_id}-entry-list{ef_ext}"
+            ef_content = ""
             if w.entry_file:
                 try:
                     ef_content = Path(w.entry_file).read_text(encoding="utf-8")
@@ -1191,6 +1192,25 @@ class Orchestrator:
             else:
                 ef_dst.write_text(
                     "# ⚠️ Worker did not produce an entry-list file",
+                    encoding="utf-8")
+
+            # 生成 functions.list 供 Judge 校验（脚本保证合法 JSON 数组）
+            fl_dst = j_dir / f"{w.worker_id}-functions.list"
+            fl_src = ef_content or w.output
+            try:
+                fl_json = generate_functions_list(fl_src)
+                # 二次验证：必须能加载为 list
+                import json as _json
+                parsed = _json.loads(fl_json)
+                if not isinstance(parsed, list):
+                    raise ValueError(f"生成结果不是 JSON 数组: {type(parsed).__name__}")
+                fl_dst.write_text(fl_json, encoding="utf-8")
+            except Exception as _fl_e:
+                # 兜底：写空数组 + 错误说明，保证下游始终得到合法 JSON
+                fl_dst.write_text(
+                    _json.dumps(
+                        [{"_error": str(_fl_e), "_source_preview": fl_src[:300]}],
+                        ensure_ascii=False, indent=2),
                     encoding="utf-8")
 
         # 拷贝模块源代码文件到 Judge 目录（供验证）
@@ -1210,11 +1230,14 @@ class Orchestrator:
 
         for w in round_workers:
             ef_ext = ".json" if (w.entry_file and w.entry_file.endswith(".json")) else ".md"
+            fl_path = f"{w.worker_id}-functions.list"
+            fl_exists = (j_dir / fl_path).exists()
             eval_prompt = self._build_eval_prompt(
                 cfg.task, cfg.module_name, self.module_files,
                 w, rnd_num,
                 output_path=f"{w.worker_id}-output.md",
                 entry_path=f"{w.worker_id}-entry-list{ef_ext}",
+                functions_list_path=fl_path if fl_exists else "",
             )
 
             ar = await _run_agent_checked(
@@ -1391,7 +1414,8 @@ class Orchestrator:
     def _build_eval_prompt(self, task, module_name, module_files,
                            worker: WorkerResult, rnd,
                            output_path: str = "",
-                           entry_path: str = ""):
+                           entry_path: str = "",
+                           functions_list_path: str = ""):
         CRITERIA = (
             "重点评判维度：\n"
             "1. **无误报（最重要）**：入口列表中是否混入了非外部数据入口\n"
@@ -1403,10 +1427,20 @@ class Orchestrator:
             "2. **被动回调型入口**：真正被外部框架回调、参数携带外部数据的函数是否找全\n"
             "3. **主动拉取型入口**：函数内调用 recv/read/mmap/ioctl 等的入口是否找全\n"
             "4. **污点变量精确性**：是否正确区分外部可控参数 vs 内部标识符\n"
-            "5. **数据来源标注**：被动型标注了注册点，主动型标注了系统调用和行号"
+            "5. **数据来源标注**：被动型标注了注册点，主动型标注了系统调用和行号\n"
+            "6. **functions.list 格式正确性**：\n"
+            "   - 必须是合法 JSON 数组（`[{...}, ...]`），不得含 `_error` 字段\n"
+            "   - 每项须包含 `tag`（\"P\"/\"A\"）、`file`、`line`、`function`、`taints` 字段\n"
+            "   - `taints` 为非空数组，`tag=A` 表示主动拉取型，`tag=P` 表示被动回调型\n"
+            "   - entry-list 中的每个入口函数都应对应 functions.list 中的一项"
         )
 
         file_list = ", ".join(f"`{f}`" for f in module_files)
+
+        fl_line = (
+            f"\nfunctions.list（脚本从 entry-list 自动生成）: `{functions_list_path}`"
+            if functions_list_path else ""
+        )
 
         parts = [
             f"# Evaluate {worker.worker_id} (Round {rnd})",
@@ -1414,6 +1448,15 @@ class Orchestrator:
             f"## 模块文件\n\n模块 **{module_name}** 包含以下文件: {file_list}\n\n"
             f"这些源代码文件也在你的当前目录下，请自行阅读验证。",
             f"## Evaluation Criteria\n\n{CRITERIA}",
+            f"## {worker.worker_id} 的输出文件\n\n"
+            f"摘要输出文件: `{output_path}`\n"
+            f"外部入口列表: `{entry_path}`"
+            f"{fl_line}\n\n"
+            f"**请使用 read 工具读取以上文件和模块源代码，然后进行评测。**\n\n"
+            f"**特别检查 functions.list**：读取后确认：① 是合法 JSON 数组；"
+            f"② 不含 `_error` 字段；③ 每项 `tag`/`file`/`function`/`taints` 均非空；"
+            f"④ 条目数量与 entry-list 中入口函数数量一致。"
+            if functions_list_path else
             f"## {worker.worker_id} 的输出文件\n\n"
             f"摘要输出文件: `{output_path}`\n"
             f"外部入口列表: `{entry_path}`\n\n"
