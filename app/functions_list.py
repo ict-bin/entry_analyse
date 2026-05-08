@@ -43,62 +43,118 @@ from pathlib import Path
 
 def _parse_markdown_fallback(content: str) -> list[dict]:
     """
-    兼容解析旧版 entry-list-merged.md 的 markdown table 格式。
+    列名感知的 entry-list-merged.md Markdown 表格解析器。
 
-    表头格式：| # | 入口函数 | 类型 | 污点变量（外部可控） | 风险 | 说明 |
-    段落头格式：### N. ClassName — (`file.cpp/.hpp`)
+    通过读取表头行动态确定每列含义，支持中英文列名及任意列顺序。
+
+    识别的列名（不区分大小写）：
+      function : 入口函数, function, entry function, func, 函数
+      type     : 入口类型, type, tag, 类型
+      taints   : 污点变量, taints, taint variables, 污点参数, 污点
+      file     : 源文件, file, source file, 文件, 文件名
+      file_line: 文件位置  (combined "file.cpp:line" format)
+      line     : 行号, line, line no, 行
     """
+    FUNC_NAMES      = {"入口函数", "function", "entry function", "func", "函数"}
+    TYPE_NAMES      = {"入口类型", "type", "tag", "类型"}
+    TAINT_NAMES     = {"污点变量", "taints", "taint variables", "污点参数", "污点"}
+    FILE_NAMES      = {"源文件", "file", "source file", "文件", "文件名"}
+    FILE_LINE_NAMES = {"文件位置"}
+    LINE_NAMES      = {"行号", "line", "line no", "行"}
+
+    def _classify(name: str) -> str | None:
+        n = name.lower().strip()
+        if n in FUNC_NAMES:      return "function"
+        if n in TYPE_NAMES:      return "type"
+        if n in TAINT_NAMES:     return "taints"
+        if n in FILE_NAMES:      return "file"
+        if n in FILE_LINE_NAMES: return "file_line"
+        if n in LINE_NAMES:      return "line"
+        return None
+
     result: list[dict] = []
-    current_file = ""
+    col_map: dict[int, str] = {}  # column index → field name
 
     for line in content.split("\n"):
         stripped = line.strip()
 
-        # 从 ### 段落头提取文件名，如 `file.cpp`
-        if stripped.startswith("#"):
-            m = re.search(r"`([^`]+\.(?:cpp|hpp|c|h|cc|cxx|hxx))`", stripped)
-            if m:
-                current_file = m.group(1)
-            continue
-
         if not stripped.startswith("|"):
+            col_map = {}  # reset table context on non-table line
             continue
 
         cells = [c.strip() for c in stripped.split("|")[1:-1]]
-        if len(cells) < 4:
+        if not cells:
             continue
 
-        # 跳过分隔行（---|---）和表头行
+        # Skip separator rows (---|---)
         if all(re.match(r"^[-:]+$", c.replace(" ", "")) for c in cells if c):
             continue
-        if "入口函数" in cells[1] or cells[0].strip() in ("#", "入口函数"):
+
+        # Detect header row: any cell matches a recognized column name
+        clean = [re.sub(r"[`*_【】]", "", c).lower().strip() for c in cells]
+        if any(_classify(h) for h in clean):
+            col_map = {}
+            for i, h in enumerate(clean):
+                field = _classify(h)
+                if field:
+                    col_map[i] = field
             continue
 
-        func = cells[1].strip("`").strip()
-        if not func or func == "#":
+        if not col_map:
             continue
 
-        type_str = cells[2].strip()
-        taints_str = cells[3].strip()
-        # 去掉 backtick 和 **bold**
-        taints_str = re.sub(r"[`*]", "", taints_str)
+        def _get(field: str) -> str:
+            for idx, f in col_map.items():
+                if f == field and idx < len(cells):
+                    return cells[idx]
+            return ""
 
-        taints = [
-            t.strip()
-            for t in re.split(r"[,，、/]", taints_str)
-            if t.strip()
-        ]
-        if not taints:
-            taints = [taints_str] if taints_str else []
+        # Extract function name
+        func_raw = re.sub(r"[`*]", "", _get("function")).strip()
+        if not func_raw:
+            continue
 
-        # 主动拉取 → A, 被动回调 → P
-        tag = "A" if "主动" in type_str else "P"
+        # Extract file (separate column or combined "file.cpp:line")
+        file_val = ""
+        file_line_raw = re.sub(r"[`*]", "", _get("file_line")).strip()
+        if file_line_raw:
+            m = re.match(r"^(.+?)(?::(\d+))?$", file_line_raw)
+            if m:
+                file_val = m.group(1).strip()
+        else:
+            file_val = re.sub(r"[`*]", "", _get("file")).strip()
+
+        # Extract line number
+        line_val = 0
+        if "line" in col_map.values():
+            line_raw = re.sub(r"[`*\s]", "", _get("line"))
+            try:
+                line_val = int(line_raw)
+            except ValueError:
+                line_val = 0
+        elif file_line_raw:
+            m2 = re.search(r":(\d+)", file_line_raw)
+            if m2:
+                try:
+                    line_val = int(m2.group(1))
+                except ValueError:
+                    pass
+
+        # Extract taints
+        taints_raw = re.sub(r"[`*]", "", _get("taints")).strip()
+        taints = [t.strip() for t in re.split(r"[,，、\s]+", taints_raw) if t.strip()]
+        if not taints and taints_raw:
+            taints = [taints_raw]
+
+        # Determine tag from type column
+        type_raw = re.sub(r"[`*]", "", _get("type")).lower().strip()
+        tag = "A" if ("主动" in type_raw or "active" in type_raw) else "P"
 
         result.append({
             "tag": tag,
-            "file": current_file,
-            "line": 0,
-            "function": func,
+            "file": file_val,
+            "line": line_val,
+            "function": func_raw,
             "taints": taints,
         })
 
