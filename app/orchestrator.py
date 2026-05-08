@@ -913,18 +913,18 @@ class Orchestrator:
             cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) functions.list——从 entry-list JSON 提取入口函数 → out_dir
+        # 3) functions.list——从 entry-list 文件提取入口函数 → out_dir
         func_list_path = str(out_dir / "functions.list")
-        _entry_json_src = ""
-        if best_wr.entry_file and best_wr.entry_file.endswith(".json"):
+        _entry_src = ""
+        if best_wr.entry_file:
             try:
-                _entry_json_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
+                _entry_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
             except OSError:
                 pass
-        if _entry_json_src:
-            write_functions_list(_entry_json_src, func_list_path)
+        if _entry_src:
+            write_functions_list(_entry_src, func_list_path)
         else:
-            # 回退：用最终 md 输出（旧逻辑兼容）
+            # 最终兜底：用最终输出文本（可能失败，但至少记录 raw_preview）
             write_functions_list(cleaned_output, func_list_path)
 
         # 4) flag 文件：成功覆写为 1
