@@ -10,7 +10,7 @@
 
 你的工作目录中有：
 - `{worker_id}-output.md` — Worker 的摘要输出
-- `{worker_id}-entry-list.md` — Worker 的入口列表
+- `{worker_id}-entry-list.json` — Worker 的入口列表（JSON 数组格式，已通过程序校验）
 - 模块源代码文件
 
 **必须使用 `read` 工具读取文件，禁止凭记忆评审。**

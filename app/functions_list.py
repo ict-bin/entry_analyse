@@ -1,275 +1,103 @@
 """
 entry_analyse — functions.list 生成器
 
-从 entry-list.md 中解析总入口表格，生成确定性的 functions.list 文件。
+从 entry-list-merged.json 中解析入口数组，生成 functions.list JSON 文件。
 
-输出格式（每行一个污点入口）：
-    [P]  文件名:行号  函数名  污点变量1,污点变量2   ← 被动回调型
-    [A]  文件名:行号  函数名  syscall@var1,syscall@var2  ← 主动拉取型
+输入格式（JSON 数组）：
+    [
+      {
+        "function": "HandleRequest()",
+        "type": "passive",
+        "file": "announce_begin_server.cpp",
+        "line": 45,
+        "taints": ["aHeader", "aMessage", "aMessageInfo"],
+        "risk": "high"
+      },
+      ...
+    ]
 
-[P] = Passive  被动回调型：外部框架直接回调，污点变量是携带外部数据的函数参数
-[A] = Active   主动拉取型：函数内调用 recv/read/mmap 等，污点变量用 syscall@var 格式
+输出格式（functions.list 也是 JSON 数组）：
+    [
+      {
+        "tag": "P",
+        "file": "announce_begin_server.cpp",
+        "line": 45,
+        "function": "HandleRequest()",
+        "taints": ["aHeader", "aMessage", "aMessageInfo"]
+      },
+      ...
+    ]
 
-行号 = 污点产生的位置：
-    [P] 被动回调型 → 函数定义行（参数在此处即为污点）
-    [A] 主动拉取型 → recv/read 等系统调用所在行（污点在此处产生）
-
-示例：
-    [P]  announce_begin_server.cpp:L45  HandleRequest()  aHeader,aMessage,aMessageInfo
-    [P]  key_manager.cpp              SetMasterKey()   Key
-    [A]  coap.cpp:L505               CoAP_RecvLoop()  recv@buf
-    [A]  libipsec.c:L900             IPSEC_RecvFrom() recvfrom@buf,recvfrom@addr
-
-规则：
-    - 严格按表格行顺序输出
-    - 一个函数若有多个污点来源行，输出多行
-    - 括号注释（如 "a2(消息指针)"）只保留变量名
-    - 无污点变量时该行不输出
-    - 文件末尾无空行
+tag: "P" = Passive 被动回调型, "A" = Active 主动拉取型（taints 含 @ 符号）
 """
 
 from __future__ import annotations
 
-import re
+import json
 from pathlib import Path
 
 
-def generate_functions_list(entry_md: str) -> str:
+def generate_functions_list(entry_json: str) -> str:
     """
-    从 entry-list markdown 内容解析总入口表格，生成 functions.list 内容。
+    从 entry-list JSON 内容解析入口数组，生成 functions.list 的 JSON 内容。
+
+    Args:
+        entry_json: entry-list-merged.json 的文本内容
 
     Returns:
-        functions.list 的文本内容（无尾部换行）
+        functions.list 的 JSON 文本（缩进格式）
+
+    Raises:
+        json.JSONDecodeError: 输入不是合法 JSON
+        ValueError: JSON 结构不符合预期（非数组）
     """
-    rows = _parse_entry_table(entry_md)
-    lines: list[str] = []
-    for file_name, func_name, line_no, taint_vars_raw in rows:
-        taint = _clean_params(taint_vars_raw)
-        if not taint:
+    data = json.loads(entry_json)
+    if not isinstance(data, list):
+        raise ValueError(f"entry-list JSON 必须是数组，实际类型: {type(data).__name__}")
+
+    result: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
             continue
-        # [A] 主动拉取型：污点含 syscall@var 格式；[P] 被动回调型：直接参数名
-        tag = "[A]" if "@" in taint else "[P]"
-        loc = f"{file_name}:{line_no}" if line_no else file_name
-        lines.append(f"{tag}  {loc}  {func_name}  {taint}")
-    return "\n".join(lines)
+        taints: list[str] = item.get("taints") or []
+        if not taints:
+            continue
+        # [A] 主动拉取型：任意 taint 含 @ 符号；[P] 被动回调型
+        tag = "A" if any("@" in t for t in taints) else "P"
+        line = item.get("line", 0)
+        result.append({
+            "tag": tag,
+            "file": item.get("file", ""),
+            "line": line if isinstance(line, int) else 0,
+            "function": item.get("function", ""),
+            "taints": taints,
+        })
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def write_functions_list(entry_md: str, output_path: str) -> int:
+def write_functions_list(entry_json: str, output_path: str) -> int:
     """
-    解析并写入 functions.list 文件。
+    解析 entry-list JSON 并写入 functions.list 文件。
 
     Returns:
-        写入的入口数量
+        写入的入口数量；若 JSON 解析失败则写入错误信息并返回 -1
     """
-    content = generate_functions_list(entry_md)
+    try:
+        content = generate_functions_list(entry_json)
+    except (json.JSONDecodeError, ValueError) as e:
+        error_content = json.dumps(
+            {"error": f"JSON parse failed: {e}", "raw_preview": entry_json[:500]},
+            ensure_ascii=False, indent=2)
+        Path(output_path).write_text(error_content, encoding="utf-8")
+        return -1
+
     Path(output_path).write_text(content, encoding="utf-8")
-    return content.count("\n") + 1 if content else 0
-
-
-# ─── 内部解析 ─────────────────────────────────────────────────────────────────
-
-# 旧格式（7/8列）：| # | 文件 | 函数名 | 行号 | 入口类型 | 污点变量 | ...
-# 首列必须是纯数字（序号），需要至少6列
-_TABLE_ROW_OLD_RE = re.compile(
-    r'^\|\s*(\d+)\s*\|'   # group1: 序号
-    r'\s*(.*?)\s*\|'       # group2: 文件
-    r'\s*(.*?)\s*\|'       # group3: 函数名
-    r'\s*(.*?)\s*\|'       # group4: 行号
-    r'\s*(.*?)\s*\|'       # group5: 入口类型
-    r'\s*(.*?)\s*\|'       # group6: 污点变量
-)
-
-# 汇总格式（5列，最终输出 thread_core.md 实际使用）：
-# | # | 函数名 | 文件 | 污点变量 | 风险等级 |
-# 首列为纯数字序号，文件列可能包含多文件（以 / 分隔）
-_TABLE_ROW_SUMMARY_RE = re.compile(
-    r'^\|\s*(\d+)\s*\|'   # group1: 序号
-    r'\s*(.*?)\s*\|'       # group2: 函数名（可含反引号和括号消歧注释）
-    r'\s*(.*?)\s*\|'       # group3: 文件（可含多文件 file1/file2）
-    r'\s*(.*?)\s*\|'       # group4: 污点变量
-    r'\s*(.*?)\s*\|'       # group5: 风险等级（忽略）
-)
-
-# 详情格式（5列，merger-entry-list.md 使用）：
-# | 入口函数 | 入口类型 | 污点变量 | 文件位置 | 风险等级 |
-# 文件位置格式：filename.cpp:45 或 filename.cpp
-_TABLE_ROW_NEW_RE = re.compile(
-    r'^\|\s*(.*?)\s*\|'    # group1: 入口函数（可含反引号）
-    r'\s*(.*?)\s*\|'       # group2: 入口类型（忽略）
-    r'\s*(.*?)\s*\|'       # group3: 污点变量
-    r'\s*(.*?)\s*\|'       # group4: 文件位置（filename.cpp:45）
-    r'\s*(.*?)\s*\|'       # group5: 风险等级（忽略）
-)
-
-# 表头关键词（用于识别并跳过表头行，适用于 _TABLE_ROW_NEW_RE）
-_NEW_FORMAT_HEADERS = {'入口函数', 'entry', 'function', '函数', '函数名', '#'}
-
-
-def _normalize_lineno(raw: str) -> str:
-    """行号归一化：确保输出以 'L' 开头。
-
-    输入 → 输出:
-        'L26837' → 'L26837'  (已正确，不变)
-        '26837'  → 'L26837'  (缺少前缀，补上)
-        'l26837' → 'L26837'  (小写 l，统一大写)
-        'Line 26837' → 'L26837'  (其他格式，提取数字)
-        ''       → ''         (空候保留)
-    """
-    s = raw.strip()
-    if not s:
-        return s
-    # 已是标准格式
-    if re.match(r'^L\d+$', s):
-        return s
-    # 小写 l
-    if re.match(r'^l\d+$', s):
-        return 'L' + s[1:]
-    # 纯数字
-    if re.match(r'^\d+$', s):
-        return 'L' + s
-    # 其他情况提取第一个数字序列
-    m = re.search(r'(\d+)', s)
-    if m:
-        return 'L' + m.group(1)
-    return s
-
-
-def _strip_backticks(s: str) -> str:
-    """去除 markdown 反引号包裹。"""
-    return s.strip('`').strip()
-
-
-def _parse_file_lineno(raw: str) -> tuple[str, str]:
-    """
-    从 '文件位置' 列解析文件名和行号。
-
-    输入示例：
-        'announce_begin_server.cpp:45'  → ('announce_begin_server.cpp', 'L45')
-        'key_manager.cpp'               → ('key_manager.cpp', '')
-        'announce_begin_server.cpp:45 ' → ('announce_begin_server.cpp', 'L45')
-    """
-    raw = _strip_backticks(raw).strip()
-    # 尝试按最后一个 ':' 分割（避免 Windows 路径 C: 的干扰，取最后一段）
-    if ':' in raw:
-        last_colon = raw.rfind(':')
-        maybe_line = raw[last_colon + 1:].strip()
-        if re.match(r'^\d+$', maybe_line):
-            return raw[:last_colon].strip(), 'L' + maybe_line
-    return raw, ''
-
-
-def _strip_module_context(func: str) -> str:
-    """去除函数名末尾的消歧注释，如 'HandleTimer() (AnnounceBeginServer)' → 'HandleTimer()'。
-    只去除末尾形如 ' (纯字母/下划线/空格)' 的括号，避免误删真实参数类型。
-    """
-    return re.sub(r'\s+\([A-Za-z_][A-Za-z0-9_\s]*\)\s*$', '', func).strip()
-
-
-def _parse_entry_table(md: str) -> list[tuple[str, str, str, str]]:
-    """
-    解析 markdown 中的总入口列表表格。
-    支持三种格式：
-      - 旧格式（7/8列，带序号）：| # | 文件 | 函数名 | 行号 | 类型 | 污点 | ...
-      - 汇总格式（5列，带序号）：| # | 函数名 | 文件 | 污点变量 | 风险等级 |
-      - 详情格式（5列，无序号）：| 入口函数 | 入口类型 | 污点变量 | 文件位置 | 风险等级 |
-
-    Returns:
-        [(文件名, 函数名, 行号, 污点变量原始字符串), ...]
-    """
-    results: list[tuple[str, str, str, str]] = []
-    for line in md.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith('|'):
-            continue
-        # 跳过分隔行
-        if re.match(r'^\|[-|\s:]+\|$', stripped):
-            continue
-
-        # ── 先尝试旧格式（6列+，首列为纯数字序号）──
-        m = _TABLE_ROW_OLD_RE.match(stripped)
-        if m:
-            file_name = m.group(2).strip()
-            func_name = m.group(3).strip()
-            line_no   = _normalize_lineno(m.group(4).strip())
-            taint_raw = m.group(6).strip()
-            if file_name and func_name:
-                results.append((file_name, func_name, line_no, taint_raw))
-            continue
-
-        # ── 再尝试汇总格式（5列，首列为纯数字序号）──
-        m_sum = _TABLE_ROW_SUMMARY_RE.match(stripped)
-        if m_sum:
-            func_raw  = _strip_backticks(m_sum.group(2))
-            func_raw  = _strip_module_context(func_raw)
-            file_raw  = m_sum.group(3).strip()
-            taint_raw = m_sum.group(4).strip()
-            # 文件列可能有多文件（mle.cpp/mle_router.cpp），取第一个
-            primary_file = file_raw.split('/')[0].strip()
-            file_name, line_no = _parse_file_lineno(primary_file)
-            if func_raw and file_name:
-                results.append((file_name, func_raw, line_no, taint_raw))
-            continue
-
-        # ── 最后尝试详情格式（5列，无序号）──
-        m2 = _TABLE_ROW_NEW_RE.match(stripped)
-        if not m2:
-            continue
-        func_raw   = _strip_backticks(m2.group(1))
-        taint_raw  = m2.group(3).strip()
-        file_pos   = m2.group(4).strip()
-
-        # 跳过表头行（含 '入口函数'、'#' 等表头关键词）
-        if func_raw.lower() in _NEW_FORMAT_HEADERS:
-            continue
-        # 跳过无意义内容
-        if not func_raw or func_raw.startswith('-'):
-            continue
-
-        file_name, line_no = _parse_file_lineno(file_pos)
-        if func_raw and file_name:
-            results.append((file_name, func_raw, line_no, taint_raw))
-
-    return results
-
-
-def _clean_params(raw: str) -> str:
-    """
-    清洗污点变量字符串，保留 syscall@var 格式。
-
-    输入 → 输出：
-        "a2, msg_ptr"                 → "a2,msg_ptr"
-        "a2(消息体指针)"               → "a2"
-        "recv@buf(接收缓冲区)"         → "recv@buf"
-        "recvfrom@buf, recvfrom@addr" → "recvfrom@buf,recvfrom@addr"
-        "SOCK_RecvMbuf@mbuf"          → "SOCK_RecvMbuf@mbuf"
-        "mmap@ptr"                    → "mmap@ptr"
-        "无污点"                       → ""
-    """
-    if not raw or raw == "-" or raw.startswith("无") or raw in ("间接污点", "N/A", "n/a"):
-        return ""
-
-    parts: list[str] = []
-
-    # 优先从反引号包裹的变量中提取（新格式：`var`🔴 `var2`🟡 空格分隔）
-    backtick_vars = re.findall(r'`([^`]+)`', raw)
-    if backtick_vars:
-        for bv in backtick_vars:
-            name = re.sub(r'[(\uff08].*?[)\uff09]', '', bv).strip()
-            name = re.sub(r'[^\w@]', '', name)
-            if name:
-                parts.append(name)
-        return ",".join(parts)
-
-    # 回退：逗号分隔（旧格式）
-    for seg in raw.split(","):
-        seg = seg.strip()
-        if not seg:
-            continue
-        name = re.sub(r'[(\uff08].*?[)\uff09]', '', seg).strip()
-        name = re.sub(r'[^\w@]', '', name)
-        if name:
-            parts.append(name)
-    return ",".join(parts)
+    try:
+        count = len(json.loads(content))
+    except json.JSONDecodeError:
+        count = 0
+    return count
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -277,19 +105,19 @@ def _clean_params(raw: str) -> str:
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("用法: python -m app.functions_list <entry-list.md> [output.list]",
+        print("用法: python -m app.functions_list <entry-list-merged.json> [output.list]",
               file=sys.stderr)
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else None
 
-    md = Path(input_path).read_text(encoding="utf-8")
-    content = generate_functions_list(md)
+    raw = Path(input_path).read_text(encoding="utf-8")
+    content = generate_functions_list(raw)
 
     if output_path:
         Path(output_path).write_text(content, encoding="utf-8")
-        count = content.count("\n") + 1 if content else 0
+        count = len(json.loads(content))
         print(f"写入 {count} 个入口到 {output_path}", file=sys.stderr)
     else:
         print(content)

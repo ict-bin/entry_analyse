@@ -519,6 +519,8 @@ class Orchestrator:
             # 并行模式：缓存 Round 1 的文件 Worker 结果，后续轮直接复用，
             # 跳过重新分析，只让 Master Worker 根据反馈修正合并结果。
             _cached_file_workers: list[WorkerResult] | None = None
+            # 初始化 best_wr（供 JSON 验证全部失败时的 fallback）
+            best_wr: WorkerResult = WorkerResult(worker_id="worker-0")
 
             _rnd_iter = range(_start_round, cfg.max_rounds + 1) if cfg.max_rounds != -1 else __import__('itertools').count(_start_round)
             for rnd_num in _rnd_iter:
@@ -740,10 +742,30 @@ class Orchestrator:
                     if master_result.entry_file:
                         try:
                             ef_txt = Path(master_result.entry_file).read_text(encoding="utf-8")
-                            (rnd_workers_dir / "master-worker-entry-list.md").write_text(
+                            ef_archive_name = (
+                                "master-worker-entry-list.json"
+                                if master_result.entry_file.endswith(".json")
+                                else "master-worker-entry-list.md"
+                            )
+                            (rnd_workers_dir / ef_archive_name).write_text(
                                 ef_txt, encoding="utf-8")
                         except OSError:
                             pass
+
+                    # 程序级 JSON 校验短路：格式不合法时跳过 Judge，直接进下一轮
+                    if master_result.error:
+                        _json_fail_feedback = (
+                            f"## Round {rnd_num} — JSON 格式校验失败（程序自动检测）\n\n"
+                            f"**错误**：{master_result.error}\n\n"
+                            f"**要求**：`entry-list-merged.json` 必须是合法的 JSON 数组，"
+                            f"每个元素包含 `function`、`type`、`file`、`line`、`taints`、`risk` 字段。\n\n"
+                            f"请修正文件格式后重试。"
+                        )
+                        self._emit("json_validation_failed", task_id,
+                                   round=rnd_num, error=master_result.error)
+                        feedback_for_workers = _json_fail_feedback
+                        # 跳到下一轮，不调用 Judge
+                        continue
 
                     # Judge 只评审 Master Worker 的合并结果（1 次而不是 N 次）
                     round_workers = [master_result]
@@ -891,9 +913,19 @@ class Orchestrator:
             cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) functions.list——确定性解析，从表格提取入口函数 → out_dir
+        # 3) functions.list——从 entry-list JSON 提取入口函数 → out_dir
         func_list_path = str(out_dir / "functions.list")
-        write_functions_list(cleaned_output, func_list_path)
+        _entry_json_src = ""
+        if best_wr.entry_file and best_wr.entry_file.endswith(".json"):
+            try:
+                _entry_json_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        if _entry_json_src:
+            write_functions_list(_entry_json_src, func_list_path)
+        else:
+            # 回退：用最终 md 输出（旧逻辑兼容）
+            write_functions_list(cleaned_output, func_list_path)
 
         # 4) flag 文件：成功覆写为 1
         if result.status == TaskStatus.PASSED:
@@ -1072,14 +1104,36 @@ class Orchestrator:
         total_tokens += ar.token_usage
         last_output = _extract_result(ar.output)
 
-        # 查找 Master Worker 写入的合并 entry-list 文件
-        ef_path = Path(worker_cwd) / "entry-list-merged.md"
-        ef = (
-            str(ef_path) if ef_path.exists()
-            else _find_entry_file(worker_cwd, f"{cfg.module_name}-merged")
-            or _find_entry_file(worker_cwd, cfg.module_name)
-            or ""
-        )
+        # 查找 Master Worker 写入的合并 entry-list JSON 文件（优先 .json，回退 .md）
+        ef_json = Path(worker_cwd) / "entry-list-merged.json"
+        ef_md   = Path(worker_cwd) / "entry-list-merged.md"
+        if ef_json.exists():
+            ef = str(ef_json)
+        elif ef_md.exists():
+            ef = str(ef_md)
+        else:
+            ef = (
+                _find_entry_file(worker_cwd, f"{cfg.module_name}-merged")
+                or _find_entry_file(worker_cwd, cfg.module_name)
+                or ""
+            )
+
+        # 程序级 JSON 格式校验：读取文件并尝试 json.loads()
+        json_error: str = ""
+        if ef and ef.endswith(".json"):
+            import json as _json
+            try:
+                raw_json = Path(ef).read_text(encoding="utf-8")
+                parsed = _json.loads(raw_json)
+                if not isinstance(parsed, list):
+                    json_error = (
+                        f"entry-list-merged.json 格式错误：期望 JSON 数组，"
+                        f"实际类型为 {type(parsed).__name__}"
+                    )
+            except _json.JSONDecodeError as e:
+                json_error = f"entry-list-merged.json JSON 解析失败：{e}"
+        elif not ef:
+            json_error = "master_worker 未生成 entry-list-merged.json 文件"
 
         return WorkerResult(
             worker_id="master_worker",
@@ -1087,6 +1141,7 @@ class Orchestrator:
             output=last_output,
             entry_file=ef,
             token_usage=total_tokens,
+            error=json_error or None,
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1138,8 +1193,9 @@ class Orchestrator:
             # Worker 摘要输出
             (j_dir / f"{w.worker_id}-output.md").write_text(
                 w.output, encoding="utf-8")
-            # Worker entry-list
-            ef_dst = j_dir / f"{w.worker_id}-entry-list.md"
+            # Worker entry-list：优先使用 .json，回退 .md
+            ef_ext = ".json" if (w.entry_file and w.entry_file.endswith(".json")) else ".md"
+            ef_dst = j_dir / f"{w.worker_id}-entry-list{ef_ext}"
             if w.entry_file:
                 try:
                     ef_content = Path(w.entry_file).read_text(encoding="utf-8")
@@ -1169,11 +1225,12 @@ class Orchestrator:
         # ═══ 步骤1：逐个评判 ═══
 
         for w in round_workers:
+            ef_ext = ".json" if (w.entry_file and w.entry_file.endswith(".json")) else ".md"
             eval_prompt = self._build_eval_prompt(
                 cfg.task, cfg.module_name, self.module_files,
                 w, rnd_num,
                 output_path=f"{w.worker_id}-output.md",
-                entry_path=f"{w.worker_id}-entry-list.md",
+                entry_path=f"{w.worker_id}-entry-list{ef_ext}",
             )
 
             ar = await _run_agent_checked(
