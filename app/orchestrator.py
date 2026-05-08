@@ -516,6 +516,9 @@ class Orchestrator:
             # ═══════════════════════════════════════════════════════
 
             feedback_for_workers = _resume_feedback
+            # 并行模式：缓存 Round 1 的文件 Worker 结果，后续轮直接复用，
+            # 跳过重新分析，只让 Merger (Master Worker) 根据反馈修正合并结果。
+            _cached_file_workers: list[WorkerResult] | None = None
 
             _rnd_iter = range(_start_round, cfg.max_rounds + 1) if cfg.max_rounds != -1 else __import__('itertools').count(_start_round)
             for rnd_num in _rnd_iter:
@@ -613,53 +616,76 @@ class Orchestrator:
                             ef_content, encoding="utf-8")
 
                 else:
-                    # ── 并行模式：每文件一个 Worker（独立上下文），之后 Merger 合并 ──
+                    # ── 并行模式 ────────────────────────────────────────────────
+                    # Round 1：每文件一个 Worker 并行分析，结果缓存到 _cached_file_workers
+                    # Round 2+：文件内容未变，跳过重新分析，直接复用缓存，
+                    #            由 Merger (Master Worker) 根据 Judge 反馈修正合并结果。
                     _w_dir_prompts = load_system_prompts(
                         cfg.workers.system_prompt_dir, cfg.worker_count)
-                    # 信号量限制最大并发数为 worker_count
-                    _sem = asyncio.Semaphore(cfg.worker_count)
-                    # 共享完成计数器 [done, total]，asyncio 单线程安全
-                    _progress = [0, len(self.module_files)]
 
-                    async def _launch_file_worker(
-                        file_idx: int, file_path: str,
-                    ) -> WorkerResult:
-                        w_idx = file_idx % cfg.worker_count
-                        w_acfg = cfg.workers.agents[w_idx]
-                        w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
-                        # 每文件独立 session，按文件索引命名，跨 round 持续
-                        w_sess = str(sess_dir / f"worker-file-{file_idx}.jsonl")
-                        async with _sem:
-                            return await self._run_one_worker(
-                                worker_idx=file_idx, acfg=w_acfg,
-                                worker_sys_prompt=w_sys,
-                                file_shard=[file_path],
-                                all_files=self.module_files,
-                                worker_cwd=worker_cwd,
-                                session_file=w_sess,
-                                task_id=task_id,
-                                rnd_num=rnd_num,
-                                feedback=feedback_for_workers,
-                                _progress=_progress,
-                            )
+                    if _cached_file_workers is None:
+                        # ── 第一次运行文件 Workers ────────────────────────────
+                        # 信号量限制最大并发数为 worker_count
+                        _sem = asyncio.Semaphore(cfg.worker_count)
+                        # 共享完成计数器 [done, total]，asyncio 单线程安全
+                        _progress = [0, len(self.module_files)]
 
-                    round_file_workers = list(await asyncio.gather(*[
-                        _launch_file_worker(i, fp)
-                        for i, fp in enumerate(self.module_files)
-                    ]))
-                    _parallel_file_workers = round_file_workers
+                        async def _launch_file_worker(
+                            file_idx: int, file_path: str,
+                        ) -> WorkerResult:
+                            w_idx = file_idx % cfg.worker_count
+                            w_acfg = cfg.workers.agents[w_idx]
+                            w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
+                            # 每文件独立 session，按文件索引命名，跨 round 持续
+                            w_sess = str(sess_dir / f"worker-file-{file_idx}.jsonl")
+                            async with _sem:
+                                return await self._run_one_worker(
+                                    worker_idx=file_idx, acfg=w_acfg,
+                                    worker_sys_prompt=w_sys,
+                                    file_shard=[file_path],
+                                    all_files=self.module_files,
+                                    worker_cwd=worker_cwd,
+                                    session_file=w_sess,
+                                    task_id=task_id,
+                                    rnd_num=rnd_num,
+                                    feedback=feedback_for_workers,
+                                    _progress=_progress,
+                                )
 
-                    # 归档各文件 Worker 输出
-                    for wr in round_file_workers:
-                        (rnd_workers_dir / f"{wr.worker_id}-output.md").write_text(
-                            wr.output, encoding="utf-8")
-                        if wr.entry_file:
-                            try:
-                                ef_txt = Path(wr.entry_file).read_text(encoding="utf-8")
-                                (rnd_workers_dir / f"{wr.worker_id}-entry-list.md").write_text(
-                                    ef_txt, encoding="utf-8")
-                            except OSError:
-                                pass
+                        round_file_workers = list(await asyncio.gather(*[
+                            _launch_file_worker(i, fp)
+                            for i, fp in enumerate(self.module_files)
+                        ]))
+                        _cached_file_workers = round_file_workers
+
+                        # 归档各文件 Worker 输出
+                        for wr in round_file_workers:
+                            (rnd_workers_dir / f"{wr.worker_id}-output.md").write_text(
+                                wr.output, encoding="utf-8")
+                            if wr.entry_file:
+                                try:
+                                    ef_txt = Path(wr.entry_file).read_text(encoding="utf-8")
+                                    (rnd_workers_dir / f"{wr.worker_id}-entry-list.md").write_text(
+                                        ef_txt, encoding="utf-8")
+                                except OSError:
+                                    pass
+                    else:
+                        # ── Round 2+：复用缓存，Merger 直接根据反馈修正 ──────
+                        round_file_workers = _cached_file_workers
+                        self._emit("workers_skipped", task_id, round=rnd_num,
+                                   workers=len(round_file_workers),
+                                   reason="files unchanged, master-worker will revise based on feedback")
+                        # 将上一轮的文件 Worker entry-list 软链/复制到本轮目录，
+                        # 方便 Merger 和 Judge 读取（路径不变，Merger 直接用 cwd 中的文件）
+                        for wr in round_file_workers:
+                            if wr.entry_file:
+                                try:
+                                    ef_txt = Path(wr.entry_file).read_text(encoding="utf-8")
+                                    ef_name = Path(wr.entry_file).name
+                                    (rnd_workers_dir / ef_name).write_text(
+                                        ef_txt, encoding="utf-8")
+                                except OSError:
+                                    pass
 
                     # ── Merger：合并所有文件 Worker 的分析结果 ──────────────
                     merger_acfg = cfg.workers.agents[0]
@@ -753,7 +779,8 @@ class Orchestrator:
                 if not _parallel:
                     result.total_tokens += total_worker_tokens
                 else:
-                    for _wr in _parallel_file_workers + round_workers:
+                    # _cached_file_workers 在首轮后已设置；round_workers 为 [merger_result]
+                    for _wr in (_cached_file_workers or []) + round_workers:
                         result.total_tokens += _wr.token_usage
 
                 # ───────────────────────────────────────────────
