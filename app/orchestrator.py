@@ -502,7 +502,7 @@ class Orchestrator:
                 agents_desc = (
                     [f"worker-{i}={a.model}"
                      for i, a in enumerate(cfg.workers.agents)]
-                    + [f"merger={cfg.workers.agents[0].model}"]
+                    + [f"master_worker={cfg.workers.agents[0].model}"]
                     + [f"judge-{i}={a.model}"
                        for i, a in enumerate(cfg.judges.agents)]
                 )
@@ -517,7 +517,7 @@ class Orchestrator:
 
             feedback_for_workers = _resume_feedback
             # 并行模式：缓存 Round 1 的文件 Worker 结果，后续轮直接复用，
-            # 跳过重新分析，只让 Merger (Master Worker) 根据反馈修正合并结果。
+            # 跳过重新分析，只让 Master Worker 根据反馈修正合并结果。
             _cached_file_workers: list[WorkerResult] | None = None
 
             _rnd_iter = range(_start_round, cfg.max_rounds + 1) if cfg.max_rounds != -1 else __import__('itertools').count(_start_round)
@@ -619,7 +619,7 @@ class Orchestrator:
                     # ── 并行模式 ────────────────────────────────────────────────
                     # Round 1：每文件一个 Worker 并行分析，结果缓存到 _cached_file_workers
                     # Round 2+：文件内容未变，跳过重新分析，直接复用缓存，
-                    #            由 Merger (Master Worker) 根据 Judge 反馈修正合并结果。
+                    #            由 Master Worker 根据 Judge 反馈修正合并结果。
                     _w_dir_prompts = load_system_prompts(
                         cfg.workers.system_prompt_dir, cfg.worker_count)
 
@@ -670,13 +670,13 @@ class Orchestrator:
                                 except OSError:
                                     pass
                     else:
-                        # ── Round 2+：复用缓存，Merger 直接根据反馈修正 ──────
+                        # ── Round 2+：复用缓存，Master Worker 直接根据反馈修正 ──────
                         round_file_workers = _cached_file_workers
                         self._emit("workers_skipped", task_id, round=rnd_num,
                                    workers=len(round_file_workers),
                                    reason="files unchanged, master-worker will revise based on feedback")
                         # 将上一轮的文件 Worker entry-list 软链/复制到本轮目录，
-                        # 方便 Merger 和 Judge 读取（路径不变，Merger 直接用 cwd 中的文件）
+                        # 方便 Master Worker 和 Judge 读取（路径不变，Master Worker 直接用 cwd 中的文件）
                         for wr in round_file_workers:
                             if wr.entry_file:
                                 try:
@@ -687,47 +687,47 @@ class Orchestrator:
                                 except OSError:
                                     pass
 
-                    # ── Merger：合并所有文件 Worker 的分析结果 ──────────────
-                    merger_acfg = cfg.workers.agents[0]
-                    # 优先从专属 merger prompt 目录加载，回退到 workers prompt
-                    _merger_prompt_dir = str(
-                        Path(cfg.workers.system_prompt_dir).parent / "merger")
-                    _merger_dir_prompts = load_system_prompts(_merger_prompt_dir, 1)
-                    if _merger_dir_prompts and _merger_dir_prompts[0]:
-                        merger_sys = _merger_dir_prompts[0]
+                    # ── Master Worker：合并所有文件 Worker 的分析结果 ──────────────
+                    master_acfg = cfg.workers.agents[0]
+                    # 优先从专属 master_worker prompt 目录加载，回退到 workers prompt
+                    _master_prompt_dir = str(
+                        Path(cfg.workers.system_prompt_dir).parent / "master_worker")
+                    _master_dir_prompts = load_system_prompts(_master_prompt_dir, 1)
+                    if _master_dir_prompts and _master_dir_prompts[0]:
+                        master_sys = _master_dir_prompts[0]
                     else:
-                        merger_sys = resolve_system_prompt(0, merger_acfg, _w_dir_prompts)
-                    merger_sess = str(sess_dir / "merger.jsonl")
-                    self._emit("merger_start", task_id, round=rnd_num,
+                        master_sys = resolve_system_prompt(0, master_acfg, _w_dir_prompts)
+                    master_sess = str(sess_dir / "master-worker.jsonl")
+                    self._emit("master_worker_start", task_id, round=rnd_num,
                                workers=len(round_file_workers))
-                    merger_result = await self._run_merger(
-                        acfg=merger_acfg,
-                        merger_sys_prompt=merger_sys,
+                    master_result = await self._run_master_worker(
+                        acfg=master_acfg,
+                        master_sys_prompt=master_sys,
                         round_file_workers=round_file_workers,
                         worker_cwd=worker_cwd,
-                        session_file=merger_sess,
+                        session_file=master_sess,
                         task_id=task_id,
                         rnd_num=rnd_num,
                         feedback=feedback_for_workers,
                     )
-                    self._emit("merger_done", task_id, round=rnd_num,
-                               entry_file_found=bool(merger_result.entry_file),
-                               output=merger_result.output[:500])
+                    self._emit("master_worker_done", task_id, round=rnd_num,
+                               entry_file_found=bool(master_result.entry_file),
+                               output=master_result.output[:500])
 
-                    # 归档 merger 输出
-                    (rnd_workers_dir / "merger-output.md").write_text(
-                        merger_result.output, encoding="utf-8")
-                    if merger_result.entry_file:
+                    # 归档 Master Worker 输出
+                    (rnd_workers_dir / "master-worker-output.md").write_text(
+                        master_result.output, encoding="utf-8")
+                    if master_result.entry_file:
                         try:
-                            ef_txt = Path(merger_result.entry_file).read_text(encoding="utf-8")
-                            (rnd_workers_dir / "merger-entry-list.md").write_text(
+                            ef_txt = Path(master_result.entry_file).read_text(encoding="utf-8")
+                            (rnd_workers_dir / "master-worker-entry-list.md").write_text(
                                 ef_txt, encoding="utf-8")
                         except OSError:
                             pass
 
-                    # Judge 只评审 merger 的合并结果（1 次而不是 N 次）
-                    round_workers = [merger_result]
-                    worker_result = merger_result
+                    # Judge 只评审 Master Worker 的合并结果（1 次而不是 N 次）
+                    round_workers = [master_result]
+                    worker_result = master_result
 
                 # ───────────────────────────────────────────────
                 # 2. Judge 评审
@@ -775,11 +775,11 @@ class Orchestrator:
                                    overall_passed=j_result.summary.overall_passed,
                                    reasoning=j_result.summary.reasoning[:200])
 
-                # worker token 累加（串行用 total_worker_tokens，并行从 file workers + merger 汇总）
+                # worker token 累加（串行用 total_worker_tokens，并行从 file workers + master worker 汇总）
                 if not _parallel:
                     result.total_tokens += total_worker_tokens
                 else:
-                    # _cached_file_workers 在首轮后已设置；round_workers 为 [merger_result]
+                    # _cached_file_workers 在首轮后已设置；round_workers 为 [master_result]
                     for _wr in (_cached_file_workers or []) + round_workers:
                         result.total_tokens += _wr.token_usage
 
@@ -792,7 +792,7 @@ class Orchestrator:
                     if j.summary and j.summary.overall_passed)
                 is_passed = pass_count >= threshold
 
-                # 最终输出：并行模式取 merger 结果，串行取 worker_result
+                # 最终输出：并行模式取 master worker 结果，串行取 worker_result
                 best_wid = worker_result.worker_id
                 best_wr = worker_result
 
@@ -1003,13 +1003,13 @@ class Orchestrator:
             token_usage=total_tokens)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Merger（并行模式：合并所有文件 Worker 的分析结果）
+    # Master Worker（并行模式：合并所有文件 Worker 的分析结果）
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _run_merger(
+    async def _run_master_worker(
         self,
         acfg: AgentInstanceConfig,
-        merger_sys_prompt: str,
+        master_sys_prompt: str,
         round_file_workers: list[WorkerResult],
         worker_cwd: str,
         session_file: str,
@@ -1024,10 +1024,10 @@ class Orchestrator:
         - Round 2+：根据 Judge 反馈修正合并结果（session 持续，可积累改进经验）
         """
         cfg = self.cfg
-        merger_kwargs: dict = {
+        master_kwargs: dict = {
             "model": acfg.model,
             "tools": acfg.tools or cfg.workers.default_tools,
-            "system_prompt": merger_sys_prompt,
+            "system_prompt": master_sys_prompt,
             "cwd": worker_cwd,
             "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
             "session_file": session_file,
@@ -1041,18 +1041,18 @@ class Orchestrator:
         total_tokens = TokenUsage()
 
         if rnd_num == 1:
-            merge_prompt = self._build_merger_prompt(
+            merge_prompt = self._build_master_worker_prompt(
                 cfg.task, cfg.module_name, round_file_workers)
         else:
-            merge_prompt = self._build_merger_retry_prompt(
+            merge_prompt = self._build_master_worker_retry_prompt(
                 cfg.task, cfg.module_name, round_file_workers, feedback, rnd_num)
 
         ar = await _run_agent_checked(
-            context="merger", prompt=merge_prompt, **merger_kwargs)
+            context="master_worker", prompt=merge_prompt, **master_kwargs)
         total_tokens += ar.token_usage
         last_output = _extract_result(ar.output)
 
-        # 查找 merger 写入的合并 entry-list 文件
+        # 查找 Master Worker 写入的合并 entry-list 文件
         ef_path = Path(worker_cwd) / "entry-list-merged.md"
         ef = (
             str(ef_path) if ef_path.exists()
@@ -1062,7 +1062,7 @@ class Orchestrator:
         )
 
         return WorkerResult(
-            worker_id="merger",
+            worker_id="master_worker",
             model=acfg.model,
             output=last_output,
             entry_file=ef,
@@ -1273,10 +1273,10 @@ class Orchestrator:
             f"写入完成后，用 `<result>...</result>` 包裹摘要信息"
             f"（外部入口数量 + 关键发现）。")
 
-    def _build_merger_prompt(
+    def _build_master_worker_prompt(
         self, task: str, module_name: str, file_workers: list[WorkerResult],
     ) -> str:
-        """Merger 第一轮：读取各文件 Worker 的 entry-list，精筛合并，写入 entry-list-merged.md。"""
+        """Master Worker 第一轮：读取各文件 Worker 的 entry-list，精筛合并，写入 entry-list-merged.md。"""
         items = []
         for w in file_workers:
             ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
@@ -1302,11 +1302,11 @@ class Orchestrator:
             f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
-    def _build_merger_retry_prompt(
+    def _build_master_worker_retry_prompt(
         self, task: str, module_name: str, file_workers: list[WorkerResult],
         feedback: str, rnd_num: int,
     ) -> str:
-        """Merger 后续轮：根据 Judge 反馈修正合并结果。"""
+        """Master Worker 后续轮：根据 Judge 反馈修正合并结果。"""
         items = []
         for w in file_workers:
             ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
