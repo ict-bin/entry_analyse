@@ -58,6 +58,61 @@ def _task_run_root(row: AppEaTask) -> Path | None:
     return root / "run" if root else None
 
 
+def _task_result_path(row: AppEaTask) -> Path | None:
+    run_root = _task_run_root(row)
+    return run_root / "result.json" if run_root else None
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_task_result_json(row: AppEaTask) -> dict | None:
+    path = _task_result_path(row)
+    if path and path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception as exc:
+            logger.warning("failed to load task result file %s: %s", path, exc)
+    return row.result_json if isinstance(row.result_json, dict) else None
+
+
+def _write_task_result_json(row: AppEaTask, payload: dict) -> str | None:
+    path = _task_result_path(row)
+    if not path:
+        return None
+    _write_json_atomic(path, payload)
+    return str(path)
+
+
+def _lightweight_result_json(row: AppEaTask, payload: dict | None, result_file: str | None = None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("result_externalized"):
+        return {
+            **payload,
+            "result_file": payload.get("result_file") or result_file or (str(_task_result_path(row)) if _task_result_path(row) else None),
+            "result_externalized": True,
+        }
+    total_tokens = payload.get("total_tokens") if isinstance(payload.get("total_tokens"), dict) else None
+    rounds = payload.get("rounds") if isinstance(payload.get("rounds"), list) else []
+    return {
+        "result_file": result_file or (str(_task_result_path(row)) if _task_result_path(row) else None),
+        "result_externalized": True,
+        "status": payload.get("status") or row.status,
+        "error": payload.get("error"),
+        "module_name": payload.get("module_name") or row.module_name,
+        "round_count": len(rounds),
+        "total_duration_ms": payload.get("total_duration_ms"),
+        "total_tokens": total_tokens,
+    }
+
+
 def _task_sessions_root(row: AppEaTask) -> Path | None:
     run_root = _task_run_root(row)
     return run_root / "sessions" if run_root else None
@@ -389,16 +444,9 @@ class TaskService:
             if err:
                 warnings.append(err)
 
-        run_result_json = None
-        if run_result_path and run_result_path.is_file():
-            try:
-                loaded = json.loads(run_result_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    run_result_json = loaded
-            except Exception as exc:
-                warnings.append(f"result.json 读取失败: {exc}")
-        if run_result_json is None and isinstance(row.result_json, dict):
-            run_result_json = row.result_json
+        run_result_json = _load_task_result_json(row)
+        if run_result_path and run_result_path.is_file() and run_result_json is None:
+            warnings.append("result.json 读取失败")
 
         total_tokens = ((run_result_json or {}).get("total_tokens") or {}) if isinstance(run_result_json, dict) else {}
         rounds = (run_result_json or {}).get("rounds") if isinstance(run_result_json, dict) else []
@@ -499,15 +547,10 @@ class TaskService:
         row = self._get_or_404(db, task_id)
         run_root = _task_run_root(row)
         warnings: list[str] = []
-        result_json = row.result_json if isinstance(row.result_json, dict) else None
         run_result_path = run_root / "result.json" if run_root else None
-        if run_result_path and run_result_path.is_file():
-            try:
-                loaded = json.loads(run_result_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    result_json = loaded
-            except Exception as exc:
-                warnings.append(f"result.json 读取失败: {exc}")
+        result_json = _load_task_result_json(row)
+        if run_result_path and run_result_path.is_file() and result_json is None:
+            warnings.append("result.json 读取失败")
         if not result_json:
             return {
                 "task_id": row.task_id,
@@ -800,7 +843,9 @@ class TaskService:
             _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
             row.stages_json = {"events": _prev_events + event_buffer, "final": True}
             if result:
-                row.result_json = result.model_dump(mode="json")
+                result_payload = result.model_dump(mode="json")
+                result_file = _write_task_result_json(row, result_payload)
+                row.result_json = _lightweight_result_json(row, result_payload, result_file)
                 if result.error:
                     row.error = result.error
             db.commit()
@@ -851,7 +896,7 @@ class TaskService:
             "module_name": row.module_name, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content, "status": row.status,
-            "error": row.error, "result_json": row.result_json,
+            "error": row.error, "result_json": _lightweight_result_json(row, row.result_json),
             "stages_json": row.stages_json,
             "task_config_json": row.task_config_json,
             "created_by": row.created_by,
