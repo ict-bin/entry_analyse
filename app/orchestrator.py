@@ -218,40 +218,50 @@ def _parse_eval_md(output: str) -> dict:
     feedback = ""
     refinement = ""
 
+    # 先剥离 <think>...</think> 块，只对实际响应文本做解析
+    # 模型的推理过程不应影响结构化字段的提取
+    clean = re.sub(r'<think>.*?</think>', '', output, flags=re.DOTALL).strip()
+    # 若剥离后为空（模型只输出了 think 块），回退到完整 output
+    parse_target = clean if clean else output
+
     # ═══ markdown 解析 ═══
-    m = re.search(r'##\s*评分[::=：]\s*(\d+)', output)
+    # 兼容 "## 评分: 72"、"## 评分: **72**"、"## 评分: **72** / 100" 等变体
+    m = re.search(r'##\s*评分[::=：]\s*\*{0,2}(\d+)\*{0,2}', parse_target)
     if not m:
-        m = re.search(r'##\s*[Ss]core[::=：]\s*(\d+)', output)
+        m = re.search(r'##\s*[Ss]core[::=：]\s*\*{0,2}(\d+)\*{0,2}', parse_target)
     if m:
         score = min(int(m.group(1)), 100)
 
-    m = re.search(r'##\s*通过[::=：]\s*(是|否|true|false|yes|no|pass|fail)', output, re.IGNORECASE)
+    # 兼容 "## 通过: 否"、"## 通过: **否**" 等变体
+    m = re.search(r'##\s*通过[::=：]\s*\*{0,2}(是|否|true|false|yes|no|pass|fail)\*{0,2}', parse_target, re.IGNORECASE)
     if not m:
-        m = re.search(r'##\s*[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
+        m = re.search(r'##\s*[Pp]ass[::=：]\s*\*{0,2}(是|否|true|false|yes|no)\*{0,2}', parse_target, re.IGNORECASE)
     if m:
         passed = m.group(1).lower() in ('是', 'true', 'yes', 'pass')
     elif score >= 70:
         passed = True
 
-    m = re.search(r'##\s*评审意见\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    m = re.search(r'##\s*评审意见\s*\n(.*?)(?=\n##|$)', parse_target, re.DOTALL)
     if not m:
-        m = re.search(r'##\s*[Ff]eedback\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+        m = re.search(r'##\s*[Ff]eedback\s*\n(.*?)(?=\n##|$)', parse_target, re.DOTALL)
     if m:
         feedback = m.group(1).strip()
 
-    m = re.search(r'##\s*改进指令\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    m = re.search(r'##\s*改进指令\s*\n(.*?)(?=\n##|$)', parse_target, re.DOTALL)
     if not m:
-        m = re.search(r'##\s*[Rr]efinement\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+        m = re.search(r'##\s*[Rr]efinement\s*\n(.*?)(?=\n##|$)', parse_target, re.DOTALL)
     if m:
         refinement = m.group(1).strip()
 
     if score > 0:
         if not feedback:
-            feedback = output[:500]
+            feedback = parse_target[:500]
         return {"pass": passed, "score": score, "feedback": feedback, "refinement": refinement}
 
     # ═══ 回退 JSON ═══
-    obj = _extract_json_object(output, "pass")
+    obj = _extract_json_object(parse_target, "pass")
+    if not obj:
+        obj = _extract_json_object(output, "pass")
     if obj:
         return {
             "pass": bool(obj.get("pass", False)),
@@ -261,13 +271,13 @@ def _parse_eval_md(output: str) -> dict:
         }
 
     # ═══ 最后尝试 ═══
-    sm = re.search(r'(\d{1,3})\s*/\s*100|\b(\d{2,3})分', output)
+    sm = re.search(r'(\d{1,3})\s*/\s*100|\b(\d{2,3})分', parse_target)
     if sm:
         score = int(sm.group(1) or sm.group(2))
         passed = score >= 70
-        return {"pass": passed, "score": score, "feedback": output[:500], "refinement": ""}
+        return {"pass": passed, "score": score, "feedback": parse_target[:500], "refinement": ""}
 
-    return {"pass": False, "score": 0, "feedback": output[:500], "refinement": ""}
+    return {"pass": False, "score": 0, "feedback": parse_target[:500], "refinement": ""}
 
 
 def _parse_summary_md(output: str) -> dict:
