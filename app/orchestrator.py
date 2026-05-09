@@ -1155,13 +1155,13 @@ class Orchestrator:
         total_tokens += ar.token_usage
         last_output = _extract_result(ar.output)
 
-        # 查找 Master Worker 写入的合并 entry-list 文件（优先 .md，回退 .json）
-        ef_md   = Path(worker_cwd) / "entry-list-merged.md"
+        # 查找 Master Worker 写入的合并 entry-list 文件（优先 .json，回退 .md）
         ef_json = Path(worker_cwd) / "entry-list-merged.json"
-        if ef_md.exists():
-            ef = str(ef_md)
-        elif ef_json.exists():
+        ef_md   = Path(worker_cwd) / "entry-list-merged.md"
+        if ef_json.exists():
             ef = str(ef_json)
+        elif ef_md.exists():
+            ef = str(ef_md)
         else:
             ef = (
                 _find_entry_file(worker_cwd, f"{cfg.module_name}-merged")
@@ -1412,7 +1412,7 @@ class Orchestrator:
     def _build_master_worker_prompt(
         self, task: str, module_name: str, file_workers: list[WorkerResult],
     ) -> str:
-        """Master Worker 第一轮：读取各文件 Worker 的 entry-list，精筛合并，写入 entry-list-merged.md。"""
+        """Master Worker 第一轮：读取各文件 Worker 的 entry-list，精筛合并，写入 entry-list-merged.json。"""
         items = []
         for w in file_workers:
             ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
@@ -1425,18 +1425,9 @@ class Orchestrator:
             f"已有 {len(file_workers)} 个 Worker 分别对各自负责的文件进行了外部入口分析，"
             f"各自的分析结果保存在对应的 entry-list 文件中：\n\n"
             f"{file_list_str}\n\n"
-            f"**请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
-            f"然后按 system prompt 中的标准精筛合并，使用 `write` 工具写入 `entry-list-merged.md`。**\n\n"
-            f"精筛合并规则（严格执行）：\n"
-            f"1. **过滤**：只保留真正从外部引入数据的入口（被动回调型 或 主动拉取型），"
-            f"定时器回调、构造函数、无污点参数的纯配置函数、内部子函数**一律过滤**\n"
-            f"2. **去重**：去除内容完全重复的条目\n"
-            f"3. **去伪**：对有疑问的被动回调入口，用 `bash` 执行 `grep` 确认其无模块内调用者；"
-            f"有内部调用者的**直接过滤**\n"
-            f"4. **保优**：同一函数被多个 Worker 标注时，保留信息最完整的版本\n"
-            f"5. **格式**：严格按 system prompt 的格式要求输出\n\n"
-            f"**完成 entry-list-merged.md 写入后，还需使用 `write-functions-list` skill "
-            f"将 entry-list-merged.json 转换为 `functions.list` 并通过验证脚本校验。**\n\n"
+            f"请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
+            f"严格按照 system prompt 中的工作流程和过滤标准完成精筛合并，"
+            f"写入 `entry-list-merged.json`，并使用 `write-functions-list` skill 生成 `functions.list`。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
@@ -1455,13 +1446,10 @@ class Orchestrator:
             f"上一轮合并结果未通过评审，Judge 的反馈如下：\n\n"
             f"{feedback}\n\n"
             f"---\n\n"
-            f"请根据以上反馈，重新读取各 Worker 的最新 entry-list 文件并修正合并结果：\n\n"
+            f"请根据以上反馈，严格按照 system prompt 中的工作流程和过滤标准，"
+            f"重新读取相关 entry-list 文件并修正合并结果：\n\n"
             f"{file_list_str}\n\n"
-            f"**请使用 `read` 工具读取相关文件，按 system prompt 中的过滤标准修正遗漏或误报，"
-            f"重新写入 `entry-list-merged.md`。**\n\n"
-            f"注意：修正时同样需要对新增条目进行有效性判断，不能只增加不过滤。\n\n"
-            f"**重新写入 entry-list-merged.md 后，还需使用 `write-functions-list` skill "
-            f"重新生成 `functions.list` 并通过验证脚本校验。**\n\n"
+            f"重新写入 `entry-list-merged.json`，并使用 `write-functions-list` skill 重新生成 `functions.list`。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 最终保留入口数量）。"
         )
 
