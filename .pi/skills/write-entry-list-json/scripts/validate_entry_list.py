@@ -10,6 +10,7 @@ validate_entry_list.py — 验证 entry-list-merged.json 格式
     1  — 格式错误（详见 stderr）
 """
 import json
+import re
 import sys
 
 
@@ -69,6 +70,18 @@ def validate(path: str) -> list[str]:
             errors.append(f"{prefix} taints={taints!r} 为空或非数组")
         elif any(not isinstance(t, str) or not t.strip() for t in taints):
             errors.append(f"{prefix} taints 含空字符串元素: {taints!r}")
+        else:
+            # 合法格式：标识符、param->member、param.member、Ns::name、source@field、@return
+            # 不允许括号、空格、中文及其他特殊字符
+            _TAINT = re.compile(
+                r'^[a-zA-Z_@][a-zA-Z0-9_]*(?:(?:->|::|[.@])[a-zA-Z_][a-zA-Z0-9_]*)*$'
+            )
+            bad = [t for t in taints if not _TAINT.match(t)]
+            if bad:
+                errors.append(
+                    f"{prefix} taints 含非法元素（只允许参数名/成员访问如"
+                    f" param->field 或 @return，不能含括号/空格/中文）: {bad!r}"
+                )
 
     return errors
 
