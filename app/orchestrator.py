@@ -898,19 +898,39 @@ class Orchestrator:
             cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) functions.list——从 entry-list 文件提取入口函数 → out_dir
+        # 3) functions.list——优先使用 agent（master worker）通过 skill 写入的版本；
+        #    若 agent 未写，则从 entry-list 文件程序化生成（兜底路径）
         func_list_path = str(out_dir / "functions.list")
-        _entry_src = ""
+
+        # 检查 agent 是否已写入 functions.list（与 out_dir 同级的 worker_cwd 中）
+        _agent_fl = Path(out_dir.parent.parent) / "functions.list" if out_dir.parent.parent.exists() else None
+        # agent 写在 worker_cwd（session 的 run 目录）
+        _worker_cwd_fl = None
         if best_wr.entry_file:
-            try:
-                _entry_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
-            except OSError:
-                pass
-        if _entry_src:
-            write_functions_list(_entry_src, func_list_path)
-        else:
-            # 最终兜底：用最终输出文本（可能失败，但至少记录 raw_preview）
-            write_functions_list(cleaned_output, func_list_path)
+            _worker_cwd_fl = Path(best_wr.entry_file).parent / "functions.list"
+
+        _agent_wrote_fl = False
+        for _candidate in [_worker_cwd_fl]:
+            if _candidate and _candidate.exists() and _candidate.stat().st_size > 2:
+                import shutil as _shutil
+                _shutil.copy2(str(_candidate), func_list_path)
+                self._emit("functions_list_from_skill", task_id,
+                           source=str(_candidate))
+                _agent_wrote_fl = True
+                break
+
+        if not _agent_wrote_fl:
+            # 兜底：用 Python 程序化解析 entry-list 生成 functions.list
+            _entry_src = ""
+            if best_wr.entry_file:
+                try:
+                    _entry_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
+                except OSError:
+                    pass
+            if _entry_src:
+                write_functions_list(_entry_src, func_list_path)
+            else:
+                write_functions_list(cleaned_output, func_list_path)
 
         # 程序级强制保证：functions.list 必须通过深度字段验证
         import json as _json
@@ -1104,6 +1124,8 @@ class Orchestrator:
         cfg = self.cfg
         # 项目级 skill：提供 entry-list-merged.json 格式规范 + 验证脚本
         _skill_path = "/opt/entry_analyse/.pi/skills/write-entry-list-json"
+        # functions.list skill：指导 agent 从 entry-list-merged.json 生成 functions.list
+        _fl_skill_path = "/opt/entry_analyse/.pi/skills/write-functions-list"
         master_kwargs: dict = {
             "model": acfg.model,
             "tools": acfg.tools or cfg.workers.default_tools,
@@ -1111,7 +1133,7 @@ class Orchestrator:
             "cwd": worker_cwd,
             "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
             "session_file": session_file,
-            "skill_paths": [_skill_path],
+            "skill_paths": [_skill_path, _fl_skill_path],
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
@@ -1413,6 +1435,8 @@ class Orchestrator:
             f"有内部调用者的**直接过滤**\n"
             f"4. **保优**：同一函数被多个 Worker 标注时，保留信息最完整的版本\n"
             f"5. **格式**：严格按 system prompt 的格式要求输出\n\n"
+            f"**完成 entry-list-merged.md 写入后，还需使用 `write-functions-list` skill "
+            f"将 entry-list-merged.json 转换为 `functions.list` 并通过验证脚本校验。**\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
@@ -1436,6 +1460,8 @@ class Orchestrator:
             f"**请使用 `read` 工具读取相关文件，按 system prompt 中的过滤标准修正遗漏或误报，"
             f"重新写入 `entry-list-merged.md`。**\n\n"
             f"注意：修正时同样需要对新增条目进行有效性判断，不能只增加不过滤。\n\n"
+            f"**重新写入 entry-list-merged.md 后，还需使用 `write-functions-list` skill "
+            f"重新生成 `functions.list` 并通过验证脚本校验。**\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 最终保留入口数量）。"
         )
 
