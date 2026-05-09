@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Depends, Query, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -35,6 +35,66 @@ class TaskCreateRequest(BaseModel):
 
 class GeneratePromptRequest(BaseModel):
     input_path: str
+
+
+class TaskResultSummaryResponse(BaseModel):
+    module_name: Optional[str] = None
+    function_count: int = 0
+    round_count: int = 0
+    passed_round_count: int = 0
+    total_duration_ms: Optional[float] = None
+    total_tokens: int = 0
+    total_cost: Optional[float] = None
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    available: bool
+    status: str
+    output_root: Optional[str] = None
+    result_file_path: Optional[str] = None
+    functions_list_path: Optional[str] = None
+    run_report_path: Optional[str] = None
+    run_result_path: Optional[str] = None
+    result_markdown: Optional[str] = None
+    functions_list_markdown: Optional[str] = None
+    functions: list[str] = Field(default_factory=list)
+    run_report_markdown: Optional[str] = None
+    result_json: Optional[dict[str, Any]] = None
+    summary: TaskResultSummaryResponse
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TaskSessionMetaResponse(BaseModel):
+    session_id: str
+    session_name: str
+    relative_path: str
+    stage_group: str
+    role_name: str
+    size: int
+    mtime: float
+    event_count: int = 0
+    line_count: int = 0
+    is_active: bool = False
+    display_name: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TaskSessionFileResponse(BaseModel):
+    path: str
+    session_meta: dict = Field(default_factory=dict)
+    events: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    line_count: int = 0
+
+
+class TaskEvaluationResponse(BaseModel):
+    task_id: str
+    status: str
+    available: bool
+    summary: Optional[dict[str, Any]] = None
+    rounds: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 @router.post("/tasks", status_code=201)
@@ -74,6 +134,26 @@ async def list_tasks(
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
+
+
+@router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
+async def get_task_result(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_result(db, task_id)
+
+
+@router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
+async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().list_task_sessions(db, task_id)
+
+
+@router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)
+async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
+    return get_task_service().get_task_session_file(db, task_id, path)
+
+
+@router.get("/tasks/{task_id}/evaluation", response_model=TaskEvaluationResponse)
+async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_evaluation(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")

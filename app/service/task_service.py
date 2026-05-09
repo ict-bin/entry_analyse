@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import time as _time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -24,6 +27,192 @@ logger = logging.getLogger("ea.task_service")
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 
 _running_tasks: dict[str, asyncio.Task] = {}
+
+_SESSION_THINKING_LEVEL_MAP: dict[str, str] = {
+    "off": "off",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "x-high": "xhigh",
+}
+
+
+def _task_root(row: AppEaTask) -> Path | None:
+    if not row.output_path:
+        return None
+    return Path(row.output_path) / row.task_id
+
+
+def _task_run_root(row: AppEaTask) -> Path | None:
+    root = _task_root(row)
+    return root / "run" if root else None
+
+
+def _task_sessions_root(row: AppEaTask) -> Path | None:
+    run_root = _task_run_root(row)
+    return run_root / "sessions" if run_root else None
+
+
+def _task_output_root(row: AppEaTask) -> Path | None:
+    root = _task_root(row)
+    return root / "output" if root else None
+
+
+def _read_text_if_exists(path: Path) -> tuple[str | None, str | None]:
+    if not path.exists():
+        return None, f"文件不存在: {path}"
+    if not path.is_file():
+        return None, f"不是文件: {path}"
+    try:
+        return path.read_text(encoding="utf-8", errors="replace"), None
+    except Exception as exc:
+        return None, f"读取失败 {path}: {exc}"
+
+
+def _safe_module_filename(module_name: str | None, ext: str = "md") -> str:
+    mod = str(module_name or "unknown")
+    mod = re.sub(r"[^\w.-]", "_", mod)
+    return f"{mod}.{ext}"
+
+
+def _normalize_relative_session_path(path: str) -> str:
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part and part != "."]
+    if not parts:
+        raise ValueError("会话路径不能为空")
+    if any(part == ".." for part in parts):
+        raise ValueError("会话路径非法")
+    return "/".join(parts)
+
+
+def _resolve_session_path(sessions_root: Path, relative_path: str) -> Path:
+    normalized = _normalize_relative_session_path(relative_path)
+    candidate = (sessions_root / normalized).resolve()
+    root_resolved = sessions_root.resolve()
+    if not str(candidate).startswith(str(root_resolved)):
+        raise ValueError("会话路径超出允许范围")
+    if candidate.suffix.lower() != ".jsonl":
+        raise ValueError("仅支持 .jsonl 会话文件")
+    return candidate
+
+
+def _parse_message_parts(content: object) -> list[dict]:
+    parts: list[dict] = []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return parts
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        content_type = item.get("type", "")
+        if content_type == "text":
+            parts.append({"type": "text", "text": item.get("text", "")})
+        elif content_type == "thinking":
+            parts.append({"type": "thinking", "text": item.get("thinking", "")})
+        elif content_type == "toolCall":
+            parts.append({
+                "type": "toolCall",
+                "name": item.get("name", ""),
+                "id": item.get("id", ""),
+                "arguments": item.get("arguments", {}),
+            })
+        elif content_type == "toolResult":
+            parts.append({"type": "toolResult", "text": item.get("text", "")})
+        else:
+            parts.append({"type": "unknown", "detail": str(item)[:200]})
+    return parts
+
+
+def _parse_session_jsonl_lines(lines: list[str], *, start_line: int = 1) -> tuple[dict, list[dict], list[str], int]:
+    events: list[dict] = []
+    warnings: list[str] = []
+    session_meta: dict = {}
+    line_count = 0
+    for index, raw_line in enumerate(lines):
+        line_no = start_line + index
+        line = raw_line.strip()
+        if not line:
+            continue
+        line_count += 1
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            warnings.append(f"第 {line_no} 行 JSON 解析失败")
+            events.append({"type": "raw", "line": line_no, "raw_line": line[:200], "summary": line[:200]})
+            continue
+        if not isinstance(obj, dict):
+            events.append({"type": "raw", "line": line_no, "raw_line": line[:200], "summary": line[:200]})
+            continue
+        event_type = obj.get("type", "")
+        if event_type == "session":
+            session_meta = {
+                "id": obj.get("id", ""),
+                "version": obj.get("version", ""),
+                "timestamp": obj.get("timestamp", ""),
+                "cwd": obj.get("cwd", ""),
+            }
+            continue
+        if event_type == "model_change":
+            events.append({
+                "type": "model_change",
+                "line": line_no,
+                "event_index": line_no,
+                "timestamp": obj.get("timestamp", ""),
+                "display_timestamp": obj.get("timestamp", ""),
+                "provider": obj.get("provider", ""),
+                "modelId": obj.get("modelId", ""),
+                "raw_line": line,
+            })
+            continue
+        if event_type == "thinking_level_change":
+            level = obj.get("thinkingLevel", "")
+            events.append({
+                "type": "thinking_level_change",
+                "line": line_no,
+                "event_index": line_no,
+                "timestamp": obj.get("timestamp", ""),
+                "display_timestamp": obj.get("timestamp", ""),
+                "thinkingLevel": level,
+                "thinkingLevelClass": f"thinking-{_SESSION_THINKING_LEVEL_MAP.get(str(level).lower(), 'off')}",
+                "raw_line": line,
+            })
+            continue
+        if event_type == "message":
+            msg = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
+            role = msg.get("role", "")
+            event_data = {
+                "type": "message",
+                "line": line_no,
+                "event_index": line_no,
+                "timestamp": obj.get("timestamp", ""),
+                "display_timestamp": obj.get("timestamp", ""),
+                "role": role,
+                "render_role": role,
+                "parts": _parse_message_parts(msg.get("content", [])),
+                "raw_line": line,
+            }
+            if role == "toolResult":
+                event_data["toolCallId"] = msg.get("toolCallId", msg.get("tool_call_id", ""))
+                event_data["toolName"] = msg.get("toolName", msg.get("tool_name", ""))
+                event_data["isError"] = msg.get("isError", msg.get("is_error", False))
+            events.append(event_data)
+            continue
+        events.append({
+            "type": event_type or "unknown_event",
+            "line": line_no,
+            "event_index": line_no,
+            "display_timestamp": obj.get("timestamp", ""),
+            "summary": str(obj)[:200],
+            "raw_line": line[:200],
+        })
+    return session_meta, events, warnings, line_count
+
+
+def _parse_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], int]:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        lines = handle.readlines()
+    return _parse_session_jsonl_lines(lines)
 
 
 def _origin_payload(row: AppEaTask) -> dict:
@@ -146,6 +335,270 @@ class TaskService:
 
     def get_task(self, db: Session, task_id: str) -> dict:
         return self._row_to_dict(self._get_or_404(db, task_id))
+
+    def get_task_result(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        output_root = _task_output_root(row)
+        run_root = _task_run_root(row)
+        warnings: list[str] = []
+
+        result_file_path: Path | None = None
+        if output_root and output_root.is_dir():
+            candidate = output_root / _safe_module_filename(row.module_name, "md")
+            if candidate.is_file():
+                result_file_path = candidate
+            else:
+                result_file_path = next(iter(sorted(output_root.glob("*.md"))), None)
+
+        functions_list_path = output_root / "functions.list" if output_root else None
+        run_report_path = run_root / "report.md" if run_root else None
+        run_result_path = run_root / "result.json" if run_root else None
+
+        result_markdown: str | None = None
+        if result_file_path:
+            result_markdown, err = _read_text_if_exists(result_file_path)
+            if err:
+                warnings.append(err)
+
+        functions_list: list[str] = []
+        functions_list_markdown: str | None = None
+        if functions_list_path:
+            text, err = _read_text_if_exists(functions_list_path)
+            if err:
+                warnings.append(err)
+            else:
+                functions_list_markdown = text
+                functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+        run_report_markdown: str | None = None
+        if run_report_path:
+            run_report_markdown, err = _read_text_if_exists(run_report_path)
+            if err:
+                warnings.append(err)
+
+        run_result_json = None
+        if run_result_path and run_result_path.is_file():
+            try:
+                loaded = json.loads(run_result_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    run_result_json = loaded
+            except Exception as exc:
+                warnings.append(f"result.json 读取失败: {exc}")
+        if run_result_json is None and isinstance(row.result_json, dict):
+            run_result_json = row.result_json
+
+        total_tokens = ((run_result_json or {}).get("total_tokens") or {}) if isinstance(run_result_json, dict) else {}
+        rounds = (run_result_json or {}).get("rounds") if isinstance(run_result_json, dict) else []
+        rounds = rounds if isinstance(rounds, list) else []
+        passed_rounds = sum(1 for item in rounds if isinstance(item, dict) and item.get("passed"))
+        available = bool(result_markdown or functions_list or run_report_markdown or run_result_json)
+        if row.status in ("pending", "running") and not available:
+            available = False
+
+        return {
+            "task_id": row.task_id,
+            "available": available,
+            "status": row.status,
+            "output_root": str(output_root) if output_root else None,
+            "result_file_path": str(result_file_path) if result_file_path else None,
+            "functions_list_path": str(functions_list_path) if functions_list_path else None,
+            "run_report_path": str(run_report_path) if run_report_path else None,
+            "run_result_path": str(run_result_path) if run_result_path else None,
+            "result_markdown": result_markdown,
+            "functions_list_markdown": functions_list_markdown,
+            "functions": functions_list,
+            "run_report_markdown": run_report_markdown,
+            "result_json": run_result_json,
+            "summary": {
+                "module_name": row.module_name,
+                "function_count": len(functions_list),
+                "round_count": len(rounds),
+                "passed_round_count": passed_rounds,
+                "total_duration_ms": (run_result_json or {}).get("total_duration_ms") if isinstance(run_result_json, dict) else None,
+                "total_tokens": sum(
+                    int(total_tokens.get(key) or 0)
+                    for key in ("input", "output", "cache_read", "cache_write")
+                ) if isinstance(total_tokens, dict) else 0,
+                "total_cost": total_tokens.get("cost") if isinstance(total_tokens, dict) else None,
+            },
+            "warnings": warnings,
+        }
+
+    def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
+        row = self._get_or_404(db, task_id)
+        sessions_root = _task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            return []
+        now_ts = _time.time()
+        items: list[dict] = []
+        for session_file in sorted(sessions_root.rglob("*.jsonl")):
+            try:
+                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
+                relative_parts = relative_path.split("/")
+                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
+                session_name = session_file.stem
+                _, events, warnings, line_count = _parse_session_jsonl_file(session_file)
+                stat = session_file.stat()
+                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
+                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
+                items.append({
+                    "session_id": session_name,
+                    "session_name": session_name,
+                    "relative_path": relative_path,
+                    "stage_group": stage_group,
+                    "role_name": session_name,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "event_count": len(events),
+                    "line_count": line_count,
+                    "is_active": is_active,
+                    "display_name": display_name,
+                    "warnings": warnings,
+                })
+            except Exception as exc:
+                logger.warning("list_task_sessions failed to inspect %s: %s", session_file, exc)
+        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+
+    def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        sessions_root = _task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            from fastapi import HTTPException
+            raise HTTPException(404, "会话目录不存在")
+        try:
+            target = _resolve_session_path(sessions_root, relative_path)
+        except ValueError as exc:
+            from fastapi import HTTPException
+            raise HTTPException(400, str(exc))
+        if not target.is_file():
+            from fastapi import HTTPException
+            raise HTTPException(404, f"会话文件不存在: {relative_path}")
+        session_meta, events, warnings, line_count = _parse_session_jsonl_file(target)
+        return {
+            "path": str(target.relative_to(sessions_root)).replace("\\", "/"),
+            "session_meta": session_meta,
+            "events": events,
+            "warnings": warnings,
+            "line_count": line_count,
+        }
+
+    def get_task_evaluation(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        run_root = _task_run_root(row)
+        warnings: list[str] = []
+        result_json = row.result_json if isinstance(row.result_json, dict) else None
+        run_result_path = run_root / "result.json" if run_root else None
+        if run_result_path and run_result_path.is_file():
+            try:
+                loaded = json.loads(run_result_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    result_json = loaded
+            except Exception as exc:
+                warnings.append(f"result.json 读取失败: {exc}")
+        if not result_json:
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "available": False,
+                "summary": None,
+                "rounds": [],
+                "warnings": warnings,
+            }
+
+        rounds_payload = result_json.get("rounds")
+        rounds_payload = rounds_payload if isinstance(rounds_payload, list) else []
+        rounds: list[dict] = []
+        total_judges = 0
+        passed_rounds = 0
+        token_total = 0
+        total_cost = 0.0
+        for item in rounds_payload:
+            if not isinstance(item, dict):
+                continue
+            worker_results = item.get("worker_results") if isinstance(item.get("worker_results"), list) else []
+            judge_results = item.get("judge_results") if isinstance(item.get("judge_results"), list) else []
+            round_token_total = 0
+            round_cost = 0.0
+            for actor in list(worker_results) + list(judge_results):
+                if not isinstance(actor, dict):
+                    continue
+                usage = actor.get("token_usage") if isinstance(actor.get("token_usage"), dict) else {}
+                round_token_total += sum(int(usage.get(key) or 0) for key in ("input", "output", "cache_read", "cache_write"))
+                round_cost += float(usage.get("cost") or 0)
+            pass_count = int(item.get("pass_count") or 0)
+            judge_count = int(item.get("total_judges") or len(judge_results) or 0)
+            total_judges += judge_count
+            if item.get("passed"):
+                passed_rounds += 1
+            token_total += round_token_total
+            total_cost += round_cost
+            scores: list[float] = []
+            for judge in judge_results:
+                if not isinstance(judge, dict):
+                    continue
+                evaluations = judge.get("evaluations") if isinstance(judge.get("evaluations"), list) else []
+                for evaluation in evaluations:
+                    if isinstance(evaluation, dict) and evaluation.get("score") is not None:
+                        try:
+                            scores.append(float(evaluation.get("score")))
+                        except (TypeError, ValueError):
+                            pass
+            rounds.append({
+                "task_id": row.task_id,
+                "module_name": result_json.get("module_name") or row.module_name,
+                "stage": "entry_analysis",
+                "round": item.get("round"),
+                "status": "passed" if item.get("passed") else "failed",
+                "worker": {"count": len(worker_results), "items": worker_results},
+                "judges": judge_results,
+                "metrics": {
+                    "pass_count": pass_count,
+                    "total_judges": judge_count,
+                    "review_pass_rate": (pass_count / judge_count) if judge_count else None,
+                    "avg_judge_score": (sum(scores) / len(scores)) if scores else None,
+                    "token_total": round_token_total,
+                    "cost": round_cost,
+                },
+                "extra": {
+                    "best_worker_id": item.get("best_worker_id"),
+                    "feedback_to_workers": item.get("feedback_to_workers"),
+                },
+            })
+
+        total_tokens = result_json.get("total_tokens") if isinstance(result_json.get("total_tokens"), dict) else {}
+        if not token_total:
+            token_total = sum(int(total_tokens.get(key) or 0) for key in ("input", "output", "cache_read", "cache_write"))
+        if not total_cost:
+            total_cost = float(total_tokens.get("cost") or 0)
+        summary = {
+            "task_id": row.task_id,
+            "task_status": result_json.get("status") or row.status,
+            "module_name": result_json.get("module_name") or row.module_name,
+            "round_count": len(rounds),
+            "passed_round_count": passed_rounds,
+            "failed_round_count": max(0, len(rounds) - passed_rounds),
+            "total_duration_ms": result_json.get("total_duration_ms"),
+            "total_tokens": token_total,
+            "total_cost": total_cost,
+            "stage_summary": {
+                "entry_analysis": {
+                    "round_count": len(rounds),
+                    "passed_round_count": passed_rounds,
+                    "avg_review_pass_rate": (passed_rounds / len(rounds)) if rounds else None,
+                }
+            },
+            "effectiveness": {
+                "final_round_pass_rate": (passed_rounds / len(rounds)) if rounds else None,
+            },
+        }
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "available": bool(rounds),
+            "summary": summary,
+            "rounds": rounds,
+            "warnings": warnings,
+        }
 
     def create_task(
         self,
