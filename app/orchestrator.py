@@ -86,7 +86,7 @@ from .models import (
     WorkerResult,
     make_id,
 )
-from .functions_list import generate_functions_list, write_functions_list, validate_functions_list
+from .functions_list import generate_functions_list, write_functions_list, validate_functions_list, auto_fix_functions_list
 from .module_loader import ModuleInfo, load_module, prepare_workspace
 from .runner import run_agent, AgentResult, PiFatalError
 
@@ -922,6 +922,20 @@ class Orchestrator:
                 raise ValueError(
                     f"functions.list 不是 JSON 数组，实际类型: {type(_fl_parsed).__name__}"
                 )
+
+            # 自动修复格式问题（过滤非法 taints、修复 tag/line 等）
+            _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl_parsed)
+            if _fl_fix_log:
+                self._emit("functions_list_autofix", task_id,
+                           fixes=_fl_fix_log[:20],
+                           original_count=len(_fl_parsed),
+                           fixed_count=len(_fl_fixed))
+                # 如果有修复，重写修复后的版本
+                Path(func_list_path).write_text(
+                    _json.dumps(_fl_fixed, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+                _fl_parsed = _fl_fixed
+
             _fl_errors = validate_functions_list(_fl_parsed)
             if _fl_errors:
                 raise ValueError(

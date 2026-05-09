@@ -48,14 +48,14 @@ def _parse_markdown_fallback(content: str) -> list[dict]:
     通过读取表头行动态确定每列含义，支持中英文列名及任意列顺序。
 
     识别的列名（不区分大小写）：
-      function : 入口函数, function, entry function, func, 函数
+      function : 入口函数, function, entry function, func, 函数, 函数名
       type     : 入口类型, type, tag, 类型
       taints   : 污点变量, taints, taint variables, 污点参数, 污点
       file     : 源文件, file, source file, 文件, 文件名
       file_line: 文件位置  (combined "file.cpp:line" format)
       line     : 行号, line, line no, 行
     """
-    FUNC_NAMES      = {"入口函数", "function", "entry function", "func", "函数"}
+    FUNC_NAMES      = {"入口函数", "function", "entry function", "func", "函数", "函数名"}
     TYPE_NAMES      = {"入口类型", "type", "tag", "类型"}
     TAINT_NAMES     = {"污点变量", "taints", "taint variables", "污点参数", "污点"}
     FILE_NAMES      = {"源文件", "file", "source file", "文件", "文件名"}
@@ -140,11 +140,15 @@ def _parse_markdown_fallback(content: str) -> list[dict]:
                 except ValueError:
                     pass
 
-        # Extract taints
-        taints_raw = re.sub(r"[`*]", "", _get("taints")).strip()
-        taints = [t.strip() for t in re.split(r"[,，、\s]+", taints_raw) if t.strip()]
-        if not taints and taints_raw:
-            taints = [taints_raw]
+        # Extract taints: prefer backtick-enclosed tokens (more accurate than split)
+        # Invalid taints will be filtered later by auto_fix_functions_list
+        taints_cell = _get("taints")
+        bt_tokens = re.findall(r'`([^`]+)`', taints_cell)
+        if bt_tokens:
+            taints = [t.strip() for t in bt_tokens if t.strip()]
+        else:
+            taints_raw = re.sub(r"[`*]", "", taints_cell).strip()
+            taints = [t.strip() for t in re.split(r"[,，、\s]+", taints_raw) if t.strip()]
 
         # Determine tag from type column
         type_raw = re.sub(r"[`*]", "", _get("type")).lower().strip()
@@ -191,13 +195,12 @@ def generate_functions_list(entry_json: str) -> str:
         for item in data:
             if not isinstance(item, dict):
                 continue
+            # Pass taints through as-is; invalid taints are filtered by auto_fix_functions_list
             taints: list[str] = item.get("taints") or []
-            if not taints:
-                continue
             # 优先使用 entry-list 中明确的 tag 字段；仅当缺失或非法时才推断
             raw_tag = item.get("tag", "")
             tag = raw_tag if raw_tag in ("P", "A") else (
-                "A" if any("@" in t for t in taints) else "P"
+                "A" if any(isinstance(t, str) and "@" in t for t in taints) else "P"
             )
             line = item.get("line", 0)
             result.append({
@@ -307,6 +310,74 @@ def validate_functions_list(items: list) -> list[str]:
                 )
 
     return errors
+
+
+def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
+    """
+    自动修复 functions.list 数组中的常见格式问题。
+
+    修复内容：
+    - 过滤 taints 中不符合 _TAINT_RE 的非法元素（含 emoji、中文注释、带参括号等）
+    - 跳过过滤后 taints 为空的条目
+    - 修复 tag 非法值（从 taints 推断 P/A）
+    - 修复 line 非整数（置为 0）
+
+    Returns:
+        (fixed_items, fix_log): 修复后的列表和修复日志（非空表示有修复发生）
+    """
+    fixed: list[dict] = []
+    log: list[str] = []
+
+    if not isinstance(items, list):
+        return [], [f"输入类型错误: {type(items).__name__}"]
+
+    for i, item in enumerate(items):
+        prefix = f"[{i}]"
+        if not isinstance(item, dict):
+            log.append(f"{prefix} 跳过非字典元素: {type(item).__name__}")
+            continue
+        if "_error" in item:
+            log.append(f"{prefix} 跳过含 _error 字段的条目")
+            continue
+
+        item = dict(item)  # shallow copy to avoid mutating input
+
+        # Fix tag
+        tag = item.get("tag")
+        if tag not in ("P", "A"):
+            taints_for_infer = item.get("taints") or []
+            new_tag = "A" if any(isinstance(t, str) and "@" in t
+                                  for t in taints_for_infer) else "P"
+            log.append(f"{prefix} tag={tag!r} 修复为 {new_tag!r}")
+            item["tag"] = new_tag
+
+        # Fix line
+        line = item.get("line")
+        if not isinstance(line, int) or isinstance(line, bool):
+            log.append(f"{prefix} line={line!r} 修复为 0")
+            item["line"] = 0
+
+        # Filter taints: remove invalid elements, keep only _TAINT_RE-matching ones
+        taints = item.get("taints")
+        if not isinstance(taints, list):
+            log.append(f"{prefix} taints 不是数组，跳过条目")
+            continue
+        good = [t for t in taints
+                if isinstance(t, str) and t.strip() and _TAINT_RE.match(t.strip())]
+        bad = [t for t in taints if t not in good]
+        if bad:
+            preview = json.dumps(bad[:3], ensure_ascii=False)
+            suffix = " ..." if len(bad) > 3 else ""
+            log.append(f"{prefix} 过滤 {len(bad)} 个非法 taint: {preview}{suffix}")
+        if not good:
+            fn = item.get('function', '')
+            log.append(f"{prefix} 过滤后 taints 为空，跳过条目 function={fn!r}")
+            continue
+        item["taints"] = good
+
+        fixed.append(item)
+
+    return fixed, log
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
