@@ -194,7 +194,11 @@ def generate_functions_list(entry_json: str) -> str:
             taints: list[str] = item.get("taints") or []
             if not taints:
                 continue
-            tag = "A" if any("@" in t for t in taints) else "P"
+            # 优先使用 entry-list 中明确的 tag 字段；仅当缺失或非法时才推断
+            raw_tag = item.get("tag", "")
+            tag = raw_tag if raw_tag in ("P", "A") else (
+                "A" if any("@" in t for t in taints) else "P"
+            )
             line = item.get("line", 0)
             result.append({
                 "tag": tag,
@@ -237,6 +241,72 @@ def write_functions_list(entry_json: str, output_path: str) -> int:
     except json.JSONDecodeError:
         count = 0
     return count
+
+
+_TAINT_RE = re.compile(
+    r'^[a-zA-Z_@][a-zA-Z0-9_]*(?:(?:->|::|[.@])[a-zA-Z_][a-zA-Z0-9_]*)*$'
+)
+
+
+def validate_functions_list(items: list) -> list[str]:
+    """
+    深度验证已解析的 functions.list 数组。
+
+    Returns:
+        错误信息列表；为空表示全部通过。
+    """
+    errors: list[str] = []
+
+    if not isinstance(items, list):
+        return [f"根类型必须是数组，实际是 {type(items).__name__}"]
+    if len(items) == 0:
+        return ["数组为空 — 应包含至少 1 个入口"]
+
+    for i, item in enumerate(items):
+        prefix = f"[{i}]"
+        if not isinstance(item, dict):
+            errors.append(f"{prefix} 元素类型错误: {type(item).__name__}")
+            continue
+
+        if "_error" in item:
+            errors.append(f"{prefix} 含 _error 字段: {item['_error']}")
+            continue
+
+        # tag
+        tag = item.get("tag")
+        if tag not in ("P", "A"):
+            errors.append(f"{prefix} tag={tag!r} 不合法，必须是 'P' 或 'A'")
+
+        # file
+        file_ = item.get("file", "")
+        if not isinstance(file_, str) or not file_.strip():
+            errors.append(f"{prefix} file 为空或非字符串: {file_!r}")
+
+        # line
+        line = item.get("line")
+        if not isinstance(line, int) or isinstance(line, bool):
+            errors.append(f"{prefix} line={line!r} 类型错误，必须是整数")
+
+        # function
+        func = item.get("function", "")
+        if not isinstance(func, str) or not func.strip():
+            errors.append(f"{prefix} function 为空或非字符串: {func!r}")
+
+        # taints
+        taints = item.get("taints")
+        if not isinstance(taints, list) or len(taints) == 0:
+            errors.append(f"{prefix} taints={taints!r} 为空或非数组")
+        elif any(not isinstance(t, str) or not t.strip() for t in taints):
+            errors.append(f"{prefix} taints 含空字符串元素: {taints!r}")
+        else:
+            bad = [t for t in taints if not _TAINT_RE.match(t)]
+            if bad:
+                errors.append(
+                    f"{prefix} taints 含非法元素（只允许参数名/成员访问/  @return，"
+                    f"不能含括号/空格/中文）: {bad!r}"
+                )
+
+    return errors
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────

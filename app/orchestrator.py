@@ -86,7 +86,7 @@ from .models import (
     WorkerResult,
     make_id,
 )
-from .functions_list import generate_functions_list, write_functions_list
+from .functions_list import generate_functions_list, write_functions_list, validate_functions_list
 from .module_loader import ModuleInfo, load_module, prepare_workspace
 from .runner import run_agent, AgentResult, PiFatalError
 
@@ -912,14 +912,20 @@ class Orchestrator:
             # 最终兜底：用最终输出文本（可能失败，但至少记录 raw_preview）
             write_functions_list(cleaned_output, func_list_path)
 
-        # 程序级强制保证：functions.list 必须是合法 JSON 数组
+        # 程序级强制保证：functions.list 必须通过深度字段验证
         import json as _json
+        _fl_raw = ""
         try:
             _fl_raw = Path(func_list_path).read_text(encoding="utf-8")
             _fl_parsed = _json.loads(_fl_raw)
             if not isinstance(_fl_parsed, list):
                 raise ValueError(
                     f"functions.list 不是 JSON 数组，实际类型: {type(_fl_parsed).__name__}"
+                )
+            _fl_errors = validate_functions_list(_fl_parsed)
+            if _fl_errors:
+                raise ValueError(
+                    "functions.list 字段验证失败:\n" + "\n".join(f"  • {e}" for e in _fl_errors)
                 )
             _fl_count = len(_fl_parsed)
         except (json.JSONDecodeError, ValueError, OSError) as _fl_err:
@@ -929,7 +935,7 @@ class Orchestrator:
             # 不能写 []，空数组会让下游误认为「无入口函数」
             _err_marker = _json.dumps(
                 [{"_error": str(_fl_err),
-                  "_source_preview": _fl_raw[:300] if "_fl_raw" in dir() else ""}],
+                  "_source_preview": _fl_raw[:300]}],
                 ensure_ascii=False, indent=2)
             Path(func_list_path).write_text(_err_marker, encoding="utf-8")
 
