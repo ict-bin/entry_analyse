@@ -244,7 +244,7 @@ def write_functions_list(entry_json: str, output_path: str) -> int:
 
 
 _TAINT_RE = re.compile(
-    r'^[a-zA-Z_@][a-zA-Z0-9_]*(?:(?:->|::|[.@])[a-zA-Z_][a-zA-Z0-9_]*)*$'
+    r'^[a-zA-Z_@][a-zA-Z0-9_]*(?:(?:->|::|[.@])[a-zA-Z_][a-zA-Z0-9_]*)*(?:\(\))?$'
 )
 
 
@@ -295,15 +295,15 @@ def validate_functions_list(items: list) -> list[str]:
         # taints
         taints = item.get("taints")
         if not isinstance(taints, list) or len(taints) == 0:
-            errors.append(f"{prefix} taints={taints!r} 为空或非数组")
+            errors.append(f"{prefix} taints={json.dumps(taints, ensure_ascii=False)} 为空或非数组")
         elif any(not isinstance(t, str) or not t.strip() for t in taints):
-            errors.append(f"{prefix} taints 含空字符串元素: {taints!r}")
+            errors.append(f"{prefix} taints 含空字符串元素: {json.dumps(taints, ensure_ascii=False)}")
         else:
             bad = [t for t in taints if not _TAINT_RE.match(t)]
             if bad:
                 errors.append(
-                    f"{prefix} taints 含非法元素（只允许参数名/成员访问/  @return，"
-                    f"不能含括号/空格/中文）: {bad!r}"
+                    f"{prefix} taints 含非法元素（只允许参数名/成员访问/末尾()/"
+                    f"@return，不能含空格/中文/带参括号）: {json.dumps(bad, ensure_ascii=False)}"
                 )
 
     return errors
