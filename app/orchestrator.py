@@ -63,7 +63,6 @@ import json
 import math
 import os
 import re
-import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -1263,7 +1262,7 @@ class Orchestrator:
                         ensure_ascii=False, indent=2),
                     encoding="utf-8")
 
-        # 拷贝模块源代码文件到 Judge 目录（供验证）
+        # 为 Judge 创建源代码文件符号链接（避免每个 Judge 每轮拷贝整个模块源码）
         if worker_cwd:
             src_dir = Path(worker_cwd)
             for fname in self.module_files:
@@ -1272,7 +1271,7 @@ class Orchestrator:
                 if src.exists() and not dst.exists():
                     try:
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(src), str(dst))
+                        dst.symlink_to(src.resolve())
                     except OSError:
                         pass
 
