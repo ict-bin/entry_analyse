@@ -28,6 +28,15 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 
 _running_tasks: dict[str, asyncio.Task] = {}
 
+_TASK_LIST_SORT_COLUMNS = {
+    "created_at": AppEaTask.created_at,
+    "updated_at": AppEaTask.updated_at,
+    "started_at": AppEaTask.started_at,
+    "finished_at": AppEaTask.finished_at,
+    "status": AppEaTask.status,
+    "task_name": AppEaTask.task_name,
+}
+
 _SESSION_THINKING_LEVEL_MAP: dict[str, str] = {
     "off": "off",
     "minimal": "minimal",
@@ -316,6 +325,8 @@ class TaskService:
         page: int = 1,
         per_page: int = 20,
         status: Optional[str] = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
     ) -> dict:
         query = db.query(AppEaTask).filter(
             AppEaTask.project_id == project_id,
@@ -323,9 +334,11 @@ class TaskService:
         )
         if status:
             query = query.filter(AppEaTask.status == status)
+        sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppEaTask.created_at)
+        order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         total = query.count()
         rows = (
-            query.order_by(AppEaTask.created_at.desc())
+            query.order_by(order_expr, AppEaTask.id.desc())
             .offset((page - 1) * per_page)
             .limit(per_page)
             .all()

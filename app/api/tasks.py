@@ -126,9 +126,19 @@ async def list_tasks(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
 ):
-    return get_task_service().list_tasks(db, project_id=project_id, page=page, per_page=per_page, status=status)
+    return get_task_service().list_tasks(
+        db,
+        project_id=project_id,
+        page=page,
+        per_page=per_page,
+        status=status,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
 
 
 @router.get("/tasks/{task_id}")
