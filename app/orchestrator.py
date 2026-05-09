@@ -901,9 +901,7 @@ class Orchestrator:
         #    若 agent 未写，则从 entry-list 文件程序化生成（兜底路径）
         func_list_path = str(out_dir / "functions.list")
 
-        # 检查 agent 是否已写入 functions.list（与 out_dir 同级的 worker_cwd 中）
-        _agent_fl = Path(out_dir.parent.parent) / "functions.list" if out_dir.parent.parent.exists() else None
-        # agent 写在 worker_cwd（session 的 run 目录）
+        # 检查 agent 是否已写入 functions.list（agent 写在 worker_cwd 中）
         _worker_cwd_fl = None
         if best_wr.entry_file:
             _worker_cwd_fl = Path(best_wr.entry_file).parent / "functions.list"
@@ -1115,9 +1113,9 @@ class Orchestrator:
         feedback: str,
     ) -> WorkerResult:
         """
-        合并所有文件 Worker 的分析结果，生成统一的 entry-list-merged.md。
+        合并所有文件 Worker 的分析结果，生成统一的 entry-list-merged.json。
 
-        - Round 1：读取各 Worker 的 entry-list，合并去重写入 entry-list-merged.md
+        - Round 1：读取各 Worker 的 entry-list，合并去重写入 entry-list-merged.json
         - Round 2+：根据 Judge 反馈修正合并结果（session 持续，可积累改进经验）
         """
         cfg = self.cfg
