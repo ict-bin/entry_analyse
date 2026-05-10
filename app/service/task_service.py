@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.config import build_task_config, load_service_config
 from app.db.models import AppEaTask
@@ -378,7 +378,7 @@ class TaskService:
         *,
         project_id: str,
         page: int = 1,
-        per_page: int = 20,
+        per_page: int = 100,
         status: Optional[str] = None,
         sort_by: str = "created_at",
         sort_order: str = "desc",
@@ -393,12 +393,13 @@ class TaskService:
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         total = query.count()
         rows = (
-            query.order_by(order_expr, AppEaTask.id.desc())
+            query.options(*self._list_load_options())
+            .order_by(order_expr, AppEaTask.id.desc())
             .offset((page - 1) * per_page)
             .limit(per_page)
             .all()
         )
-        return {"items": [self._row_to_dict(r) for r in rows],
+        return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
@@ -885,7 +886,38 @@ class TaskService:
         return row
 
     @staticmethod
-    def _row_to_dict(row: AppEaTask) -> dict:
+    def _list_load_options():
+        return (
+            load_only(
+                AppEaTask.id,
+                AppEaTask.task_id,
+                AppEaTask.project_id,
+                AppEaTask.task_origin_type,
+                AppEaTask.parent_project_id,
+                AppEaTask.parent_task_id,
+                AppEaTask.parent_task_type,
+                AppEaTask.parent_stage_name,
+                AppEaTask.parent_stage_item_id,
+                AppEaTask.parent_stage_item_key,
+                AppEaTask.task_name,
+                AppEaTask.task_description,
+                AppEaTask.input_path,
+                AppEaTask.source_path,
+                AppEaTask.module_name,
+                AppEaTask.output_path,
+                AppEaTask.prompt_template_id,
+                AppEaTask.status,
+                AppEaTask.error,
+                AppEaTask.created_by,
+                AppEaTask.created_at,
+                AppEaTask.updated_at,
+                AppEaTask.started_at,
+                AppEaTask.finished_at,
+            ),
+        )
+
+    @staticmethod
+    def _row_to_dict(row: AppEaTask, *, include_heavy: bool = True) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         return {
@@ -895,10 +927,11 @@ class TaskService:
             "input_path": row.input_path, "source_path": row.source_path,
             "module_name": row.module_name, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
-            "prompt_content": row.prompt_content, "status": row.status,
-            "error": row.error, "result_json": _lightweight_result_json(row, row.result_json),
-            "stages_json": row.stages_json,
-            "task_config_json": row.task_config_json,
+            "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
+            "error": row.error,
+            "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
+            "stages_json": row.stages_json if include_heavy else None,
+            "task_config_json": row.task_config_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
