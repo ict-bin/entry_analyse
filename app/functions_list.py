@@ -209,6 +209,14 @@ def generate_functions_list(entry_json: str) -> str:
                 "line": line if isinstance(line, int) else 0,
                 "function": item.get("function", ""),
                 "taints": taints,
+                "definition_file": item.get("definition_file") or item.get("file", ""),
+                "definition_line": (
+                    item.get("definition_line")
+                    if isinstance(item.get("definition_line"), int)
+                    else (line if isinstance(line, int) else 0)
+                ),
+                "is_definition_found": bool(item.get("is_definition_found", True)),
+                "signature_params": item.get("signature_params") if isinstance(item.get("signature_params"), list) else [],
             })
 
         return json.dumps(result, ensure_ascii=False, indent=2)
