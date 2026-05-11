@@ -18,6 +18,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pass_threshold": 0,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
+    "agent_run_timeout_seconds": 3600,
+    "agent_timeout_retry_enabled": True,
+    "agent_timeout_max_retries": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
     "workers": {

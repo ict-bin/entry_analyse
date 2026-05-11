@@ -497,6 +497,9 @@ class Orchestrator:
                     "cancel_event": self._cancel_event,
                     "max_retries": cfg.agent_max_retries,
                     "retry_delay": cfg.agent_retry_delay,
+                    "run_timeout_seconds": cfg.agent_run_timeout_seconds,
+                    "timeout_retry_enabled": cfg.agent_timeout_retry_enabled,
+                    "timeout_max_retries": cfg.agent_timeout_max_retries,
                     "pi_max_retries": cfg.pi_max_retries,
                     "pi_retry_delay": cfg.pi_retry_delay,
                 }
@@ -1034,6 +1037,9 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "run_timeout_seconds": cfg.agent_run_timeout_seconds,
+            "timeout_retry_enabled": cfg.agent_timeout_retry_enabled,
+            "timeout_max_retries": cfg.agent_timeout_max_retries,
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
         }
@@ -1144,6 +1150,9 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "run_timeout_seconds": cfg.agent_run_timeout_seconds,
+            "timeout_retry_enabled": cfg.agent_timeout_retry_enabled,
+            "timeout_max_retries": cfg.agent_timeout_max_retries,
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
         }
@@ -1224,6 +1233,9 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "run_timeout_seconds": cfg.agent_run_timeout_seconds,
+            "timeout_retry_enabled": cfg.agent_timeout_retry_enabled,
+            "timeout_max_retries": cfg.agent_timeout_max_retries,
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
         }
