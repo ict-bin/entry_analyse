@@ -65,6 +65,7 @@ import os
 import re
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -88,6 +89,57 @@ from .models import (
 from .functions_list import generate_functions_list, write_functions_list, validate_functions_list, auto_fix_functions_list
 from .module_loader import ModuleInfo, load_module, prepare_workspace
 from .runner import run_agent, AgentResult, PiFatalError
+
+
+# ─── 目录命名与输入元数据 ─────────────────────────────────────────────────────
+
+_ROUND_DIR_RE = re.compile(r"^round[-_](\d+)$")
+
+
+def _round_dir_name(round_num: int) -> str:
+    return f"round_{round_num:03d}"
+
+
+def _round_number_from_dir(path: Path) -> int | None:
+    match = _ROUND_DIR_RE.match(path.name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _round_dir(run_dir: Path, round_num: int) -> Path:
+    return run_dir / _round_dir_name(round_num)
+
+
+def _find_existing_round_dir(run_dir: Path, round_num: int) -> Path:
+    preferred = _round_dir(run_dir, round_num)
+    if preferred.exists():
+        return preferred
+    legacy = run_dir / f"round-{round_num}"
+    if legacy.exists():
+        return legacy
+    return preferred
+
+
+def _write_input_metadata(input_dir: Path, *, task_id: str, cfg: TaskConfig, source_dir: str, target_dir: str) -> None:
+    input_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "task_id": task_id,
+        "task": cfg.task,
+        "module_name": cfg.module_name,
+        "source_path": cfg.source_path,
+        "source_dir": source_dir,
+        "target_dir": target_dir,
+        "created_at": datetime.now().isoformat(),
+        "note": "metadata only; original source files remain in the project source directory",
+    }
+    (input_dir / "task-metadata.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 # ─── 致命错误保护 ─────────────────────────────────────────────────────────────
@@ -384,10 +436,10 @@ class Orchestrator:
             if _probe_dir.is_dir():
                 _done = sorted(
                     [
-                        int(d.name.split("-")[1])
+                        round_num
                         for d in _probe_dir.iterdir()
                         if d.is_dir()
-                        and d.name.startswith("round-")
+                        and (round_num := _round_number_from_dir(d)) is not None
                         and (d / "feedback.md").exists()
                     ],
                     key=int,
@@ -395,7 +447,7 @@ class Orchestrator:
                 if _done:
                     _start_round = _done[-1] + 1
                     _resume_feedback = (
-                        _probe_dir / f"round-{_done[-1]}" / "feedback.md"
+                        _find_existing_round_dir(_probe_dir, _done[-1]) / "feedback.md"
                     ).read_text("utf-8")
                     _resuming = True
 
@@ -403,8 +455,10 @@ class Orchestrator:
         #   {output_dir}/{task_id}/run/    — 中间过程文件（不删除、不压缩）
         #   {output_dir}/{task_id}/output/ — 最终输出文件
         base_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
+        input_dir = base_dir / "input"
         run_dir = base_dir / "run"
         out_dir = base_dir / "output"
+        _write_input_metadata(input_dir, task_id=task_id, cfg=cfg, source_dir=source_dir, target_dir=target_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         out_dir.mkdir(parents=True, exist_ok=True)
         sess_dir = run_dir / "sessions"
@@ -540,7 +594,7 @@ class Orchestrator:
                     break
 
                 self._emit("round_start", task_id, round=rnd_num)
-                rnd_dir = run_dir / f"round-{rnd_num}"
+                rnd_dir = _round_dir(run_dir, rnd_num)
                 rnd_workers_dir = rnd_dir / "workers"
                 rnd_judges_dir = rnd_dir / "judges"
                 rnd_workers_dir.mkdir(parents=True, exist_ok=True)
@@ -1272,15 +1326,14 @@ class Orchestrator:
             try:
                 fl_json = generate_functions_list(fl_src)
                 # 二次验证：必须能加载为 list
-                import json as _json
-                parsed = _json.loads(fl_json)
+                parsed = json.loads(fl_json)
                 if not isinstance(parsed, list):
                     raise ValueError(f"生成结果不是 JSON 数组: {type(parsed).__name__}")
                 fl_dst.write_text(fl_json, encoding="utf-8")
             except Exception as _fl_e:
                 # 兜底：写空数组 + 错误说明，保证下游始终得到合法 JSON
                 fl_dst.write_text(
-                    _json.dumps(
+                    json.dumps(
                         [{"_error": str(_fl_e), "_source_preview": fl_src[:300]}],
                         ensure_ascii=False, indent=2),
                     encoding="utf-8")
