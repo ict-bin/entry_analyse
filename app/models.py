@@ -147,6 +147,7 @@ class JudgeSummary(BaseModel):
 class JudgeRoundResult(BaseModel):
     judge_id: str
     model: str = ""
+    session_file: str = ""
     evaluations: list[WorkerEvaluation] = Field(default_factory=list)
     summary: Optional[JudgeSummary] = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)

@@ -1221,7 +1221,10 @@ class Orchestrator:
         j_dir.mkdir(parents=True, exist_ok=True)
 
         j_result = JudgeRoundResult(
-            judge_id=jid, model=judge_cfg.model)
+            judge_id=jid,
+            model=judge_cfg.model,
+            session_file=str(sess_dir / f"{jid}-r{rnd_num}.jsonl"),
+        )
 
         base_kwargs = {
             "model": judge_cfg.model,
@@ -1312,7 +1315,7 @@ class Orchestrator:
             ar = await _run_agent_checked(
                 context=f"{jid} eval {w.worker_id}",
                 prompt=eval_prompt, **base_kwargs,
-                session_file=str(sess_dir / f"{jid}-r{rnd_num}.jsonl"))
+                session_file=j_result.session_file)
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_eval_md(ar.output)
@@ -1344,7 +1347,7 @@ class Orchestrator:
             ar = await _run_agent_checked(
                 context=f"{jid} summary",
                 prompt=summary_prompt, **base_kwargs,
-                session_file=str(sess_dir / f"{jid}-r{rnd_num}.jsonl"))
+                session_file=j_result.session_file)
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_summary_md(ar.output)
