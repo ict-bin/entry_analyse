@@ -471,6 +471,10 @@ class Orchestrator:
             task_id=task_id, status=TaskStatus.RUNNING,
             task=cfg.task, module_name=cfg.module_name,
             config_snapshot=cfg.model_dump())
+        # 保底 worker 结果必须在 try 外准备好。
+        # 否则一旦准备阶段在进入主循环前抛错，收尾归档再访问 best_wr
+        # 会覆盖掉原始异常，表现成 “best_wr 未关联值”。
+        best_wr: WorkerResult = WorkerResult(worker_id="worker-0")
 
         # flag 文件：提前写 0，保证任何异常退出时都有 flag
         flag_path = out_dir / "flag"
@@ -589,8 +593,6 @@ class Orchestrator:
             # 并行模式：缓存 Round 1 的文件 Worker 结果，后续轮直接复用，
             # 跳过重新分析，只让 Master Worker 根据反馈修正合并结果。
             _cached_file_workers: list[WorkerResult] | None = None
-            # 初始化 best_wr（供 JSON 验证全部失败时的 fallback）
-            best_wr: WorkerResult = WorkerResult(worker_id="worker-0")
 
             _rnd_iter = range(_start_round, cfg.max_rounds + 1) if cfg.max_rounds != -1 else __import__('itertools').count(_start_round)
             for rnd_num in _rnd_iter:
