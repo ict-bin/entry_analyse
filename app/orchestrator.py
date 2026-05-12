@@ -535,7 +535,7 @@ class Orchestrator:
                 cfg.judges.system_prompt_dir, cfg.judge_count)
 
             # 串行模式准备 worker base；并行模式在 _run_one_worker 内部构建
-            _parallel = cfg.worker_parallel and cfg.worker_count > 1
+            _parallel = cfg.worker_parallel and cfg.worker_count > 0 and cfg.worker_parallelism > 1
             if not _parallel:
                 worker_dir_prompts = load_system_prompts(
                     cfg.workers.system_prompt_dir, 1)
@@ -569,8 +569,9 @@ class Orchestrator:
                 acfg = cfg.workers.agents[0]
                 worker_base = {}  # 并行模式不在此处使用
                 agents_desc = (
-                    [f"worker-{i}={a.model}"
+                    [f"worker-profile-{i}={a.model}"
                      for i, a in enumerate(cfg.workers.agents)]
+                    + [f"worker_parallelism={cfg.worker_parallelism}"]
                     + [f"master_worker={cfg.workers.agents[0].model}"]
                     + [f"judge-{i}={a.model}"
                        for i, a in enumerate(cfg.judges.agents)]
@@ -713,8 +714,8 @@ class Orchestrator:
                                            recovered=len(_recovered_workers),
                                            total=len(self.module_files))
 
-                        # 信号量限制最大并发数为 worker_count
-                        _sem = asyncio.Semaphore(cfg.worker_count)
+                        # 信号量限制单任务内部最大并发数，由 worker_parallelism 控制
+                        _sem = asyncio.Semaphore(cfg.worker_parallelism)
                         # 共享完成计数器 [done, total]，asyncio 单线程安全
                         _progress = [len(_recovered_workers), len(self.module_files)]
 

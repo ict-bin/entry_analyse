@@ -17,12 +17,37 @@ MAX_ROUNDS_EXCEEDED_ACTIONS = {
     "treat_as_failed",
 }
 
+MAX_CONCURRENT_TASKS_DEFAULT = 64
+MAX_CONCURRENT_TASKS_LIMIT = 128
+WORKER_PARALLELISM_DEFAULT = 128
+WORKER_PARALLELISM_LIMIT = 256
+
 
 def normalize_max_rounds_exceeded_action(value: str | None) -> str:
     candidate = str(value or "").strip().lower()
     if candidate in MAX_ROUNDS_EXCEEDED_ACTIONS:
         return candidate
     return "treat_as_passed"
+
+
+def normalize_max_concurrent_tasks(value: int | str | None) -> int:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return MAX_CONCURRENT_TASKS_DEFAULT
+    if candidate < 1:
+        return 1
+    return min(candidate, MAX_CONCURRENT_TASKS_LIMIT)
+
+
+def normalize_worker_parallelism(value: int | str | None) -> int:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return WORKER_PARALLELISM_DEFAULT
+    if candidate < 1:
+        return 1
+    return min(candidate, WORKER_PARALLELISM_LIMIT)
 
 
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
@@ -53,6 +78,7 @@ class ServiceConfig(BaseModel):
     )
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[int] = Field(default=None)
+    max_concurrent_tasks: int = Field(default=MAX_CONCURRENT_TASKS_DEFAULT, description="任务间最大并发数")
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
     agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")
@@ -61,6 +87,7 @@ class ServiceConfig(BaseModel):
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃重试次数，-1 为无限重试")
     pi_retry_delay: float = Field(default=5.0, description="pi 进程重试等待秒数")
     worker_parallel: bool = Field(default=False, description="并行 Worker 模式：多个 agents 实例同时各自分析文件分片，文件列表按 agents 数量均分")
+    worker_parallelism: int = Field(default=WORKER_PARALLELISM_DEFAULT, description="单个任务内部 Worker 最大并发数")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -85,6 +112,7 @@ class TaskConfig(BaseModel):
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
+    max_concurrent_tasks: int = Field(default=MAX_CONCURRENT_TASKS_DEFAULT)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
     agent_run_timeout_seconds: int = Field(default=3600)
@@ -93,6 +121,7 @@ class TaskConfig(BaseModel):
     pi_max_retries: int = Field(default=-1)
     pi_retry_delay: float = Field(default=5.0)
     worker_parallel: bool = Field(default=False)
+    worker_parallelism: int = Field(default=WORKER_PARALLELISM_DEFAULT)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")

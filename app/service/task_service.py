@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, load_only
 from app.config import build_task_config, load_service_config
 from app.db.models import AppEaTask
 from app.logging_utils import log_event
-from app.models import SwarmEvent, TaskStatus
+from app.models import SwarmEvent, TaskStatus, normalize_max_concurrent_tasks
 from app.orchestrator import Orchestrator
 from app.time_utils import isoformat_local, now_local
 
@@ -27,6 +27,8 @@ logger = logging.getLogger("ea.task_service")
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 
 _running_tasks: dict[str, asyncio.Task] = {}
+_dispatch_tasks: dict[str, asyncio.Task] = {}
+_dispatch_locks: dict[str, asyncio.Lock] = {}
 
 _TASK_LIST_SORT_COLUMNS = {
     "created_at": AppEaTask.created_at,
@@ -372,6 +374,78 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 class TaskService:
+    @staticmethod
+    def _get_dispatch_lock(project_id: str) -> asyncio.Lock:
+        lock = _dispatch_locks.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _dispatch_locks[project_id] = lock
+        return lock
+
+    def _schedule_pending_dispatch(self, project_id: str) -> None:
+        existing = _dispatch_tasks.get(project_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._dispatch_pending_tasks(project_id),
+            name=f"ea_dispatch_{project_id}",
+        )
+        _dispatch_tasks[project_id] = task
+
+    async def _dispatch_pending_tasks(self, project_id: str) -> None:
+        from app.db import get_db
+
+        lock = self._get_dispatch_lock(project_id)
+        async with lock:
+            db_gen = get_db()
+            db: Session = next(db_gen)
+            try:
+                svc = _load_svc_config_from_db(db, project_id)
+                max_concurrent_tasks = normalize_max_concurrent_tasks(
+                    getattr(svc, "max_concurrent_tasks", None)
+                )
+                running_count = int(
+                    db.query(AppEaTask)
+                    .filter(
+                        AppEaTask.project_id == project_id,
+                        AppEaTask.is_deleted.is_(False),
+                        AppEaTask.status == "running",
+                    )
+                    .count()
+                )
+                if running_count >= max_concurrent_tasks:
+                    return
+                pending_rows = (
+                    db.query(AppEaTask)
+                    .filter(
+                        AppEaTask.project_id == project_id,
+                        AppEaTask.is_deleted.is_(False),
+                        AppEaTask.status == "pending",
+                    )
+                    .order_by(AppEaTask.created_at.asc(), AppEaTask.id.asc())
+                    .limit(max_concurrent_tasks - running_count)
+                    .all()
+                )
+                for row in pending_rows:
+                    if running_count >= max_concurrent_tasks:
+                        break
+                    if row.task_id in _running_tasks:
+                        continue
+                    asyncio_task = asyncio.create_task(
+                        self._execute_task(row.task_id),
+                        name=f"ea_task_{row.task_id}",
+                    )
+                    _running_tasks[row.task_id] = asyncio_task
+                    running_count += 1
+            except Exception as exc:
+                logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)
+            finally:
+                _dispatch_tasks.pop(project_id, None)
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+
     def list_tasks(
         self,
         db: Session,
@@ -701,9 +775,7 @@ class TaskService:
             parent_stage_item_key=parent_stage_item_key,
         )
         db.add(row); db.commit(); db.refresh(row)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"ea_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
+        self._schedule_pending_dispatch(project_id)
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
         return self._row_to_dict(row)
@@ -734,9 +806,7 @@ class TaskService:
                     _shutil.rmtree(task_root)
                 except Exception as _e:
                     logger.warning("Failed to clean task dir %s: %s", task_root, _e)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"ea_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
+        self._schedule_pending_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -760,9 +830,7 @@ class TaskService:
         row.error = None
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"ea_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
+        self._schedule_pending_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -802,6 +870,7 @@ class TaskService:
         db_gen = get_db()
         db: Session = next(db_gen)
         event_buffer: list[dict] = []
+        project_id: str | None = None
 
         def on_event(event: SwarmEvent) -> None:
             event_buffer.append({"ts": _time.time(), "type": event.type,
@@ -814,6 +883,7 @@ class TaskService:
             row = db.query(AppEaTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
                 return
+            project_id = row.project_id
             row.status = "running"
             if row.started_at is None:
                 row.started_at = now_local()
@@ -870,6 +940,8 @@ class TaskService:
                 pass
         finally:
             _running_tasks.pop(task_id, None)
+            if project_id:
+                self._schedule_pending_dispatch(project_id)
             try:
                 next(db_gen)
             except StopIteration:

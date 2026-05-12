@@ -9,7 +9,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.models import AppEaModelsConfig, AppEaProjectConfig
-from app.models import normalize_max_rounds_exceeded_action
+from app.models import (
+    normalize_max_concurrent_tasks,
+    normalize_max_rounds_exceeded_action,
+    normalize_worker_parallelism,
+)
 
 logger = logging.getLogger("ea.config_service")
 
@@ -18,6 +22,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds_exceeded_action": "treat_as_passed",
     "min_rounds": 2,
     "pass_threshold": 0,
+    "max_concurrent_tasks": 64,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "agent_run_timeout_seconds": 3600,
@@ -25,6 +30,8 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "agent_timeout_max_retries": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
+    "worker_parallel": False,
+    "worker_parallelism": 128,
     "workers": {
         "default_model": "",
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
@@ -82,24 +89,34 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 class ConfigService:
+    @staticmethod
+    def _normalize_runtime_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(data)
+        normalized["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            normalized.get("max_rounds_exceeded_action")
+        )
+        normalized["max_concurrent_tasks"] = normalize_max_concurrent_tasks(
+            normalized.get("max_concurrent_tasks")
+        )
+        normalized["worker_parallelism"] = normalize_worker_parallelism(
+            normalized.get("worker_parallelism")
+        )
+        return normalized
+
     def get_config(self, db: Session, project_id: str) -> dict:
         row = db.query(AppEaProjectConfig).filter_by(project_id=project_id).first()
         if row and row.config_json:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
-        data["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
-            data.get("max_rounds_exceeded_action")
-        )
+        data = self._normalize_runtime_fields(data)
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
 
     def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
         blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
-        blob["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
-            blob.get("max_rounds_exceeded_action")
-        )
+        blob = self._normalize_runtime_fields(blob)
         row = db.query(AppEaProjectConfig).filter_by(project_id=project_id).first()
         if row:
             row.config_json = blob
@@ -108,10 +125,7 @@ class ConfigService:
             db.add(row)
         db.commit()
         db.refresh(row)
-        result = _deep_merge(_DEFAULT_CONFIG, blob)
-        result["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
-            result.get("max_rounds_exceeded_action")
-        )
+        result = self._normalize_runtime_fields(_deep_merge(_DEFAULT_CONFIG, blob))
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
