@@ -12,6 +12,19 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+MAX_ROUNDS_EXCEEDED_ACTIONS = {
+    "treat_as_passed",
+    "treat_as_failed",
+}
+
+
+def normalize_max_rounds_exceeded_action(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in MAX_ROUNDS_EXCEEDED_ACTIONS:
+        return candidate
+    return "treat_as_passed"
+
+
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
 
 class AgentInstanceConfig(BaseModel):
@@ -34,6 +47,10 @@ class RoleConfig(BaseModel):
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
+    max_rounds_exceeded_action: str = Field(
+        default="treat_as_passed",
+        description="达到最大轮次且评审仍未通过时的处理策略：treat_as_passed/treat_as_failed",
+    )
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
@@ -65,6 +82,7 @@ class TaskConfig(BaseModel):
 
     # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
+    max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)

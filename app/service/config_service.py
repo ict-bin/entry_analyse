@@ -9,11 +9,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.models import AppEaModelsConfig, AppEaProjectConfig
+from app.models import normalize_max_rounds_exceeded_action
 
 logger = logging.getLogger("ea.config_service")
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds": -1,
+    "max_rounds_exceeded_action": "treat_as_passed",
     "min_rounds": 2,
     "pass_threshold": 0,
     "agent_max_retries": 100,
@@ -86,12 +88,18 @@ class ConfigService:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
+        data["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            data.get("max_rounds_exceeded_action")
+        )
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
 
     def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
         blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
+        blob["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            blob.get("max_rounds_exceeded_action")
+        )
         row = db.query(AppEaProjectConfig).filter_by(project_id=project_id).first()
         if row:
             row.config_json = blob
@@ -101,6 +109,9 @@ class ConfigService:
         db.commit()
         db.refresh(row)
         result = _deep_merge(_DEFAULT_CONFIG, blob)
+        result["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            result.get("max_rounds_exceeded_action")
+        )
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result

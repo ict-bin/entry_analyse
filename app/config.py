@@ -10,7 +10,7 @@ import os
 import re
 from pathlib import Path
 
-from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
+from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig, normalize_max_rounds_exceeded_action
 
 # 容器内固定挂载路径（可通过环境变量覆盖）
 # ENV: TARGET_DIR, CONFIG_DIR, OUTPUT_DIR
@@ -48,6 +48,9 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         cwd=cwd,
         source_path=source_path or None,
         max_rounds=svc.max_rounds,
+        max_rounds_exceeded_action=normalize_max_rounds_exceeded_action(
+            getattr(svc, "max_rounds_exceeded_action", None)
+        ),
         min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,
         worker_parallel=svc.worker_parallel,

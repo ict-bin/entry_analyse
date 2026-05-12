@@ -410,6 +410,9 @@ class Orchestrator:
         source_dir = os.path.abspath(cfg.source_path) if cfg.source_path else target_dir
         # pass_threshold: -1=全部裁判通过, 0=大于半数通过 (ceil(n/2))
         threshold = cfg.judge_count if cfg.pass_threshold == -1 else math.ceil(cfg.judge_count / 2)
+        max_rounds_action = str(
+            getattr(cfg, "max_rounds_exceeded_action", "treat_as_passed") or "treat_as_passed"
+        ).strip().lower()
         self._cancel_event = asyncio.Event()
 
         # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
@@ -926,11 +929,15 @@ class Orchestrator:
 
                 feedback_for_workers = feedback_md
                 if cfg.max_rounds != -1 and rnd_num >= cfg.max_rounds:
-                    result.status = TaskStatus.FAILED
-                    result.error = (
-                        f"已执行 {cfg.max_rounds} 轮，评审仍未通过"
-                        f"（最后一轮通过票 {pass_count}/{cfg.judge_count}，需 {threshold}）"
-                    )
+                    if max_rounds_action == "treat_as_passed":
+                        result.status = TaskStatus.PASSED
+                        result.error = None
+                    else:
+                        result.status = TaskStatus.FAILED
+                        result.error = (
+                            f"已执行 {cfg.max_rounds} 轮，评审仍未通过"
+                            f"（最后一轮通过票 {pass_count}/{cfg.judge_count}，需 {threshold}）"
+                        )
                     result.final_output = _get_best_output(best_wr)
                     break
 
