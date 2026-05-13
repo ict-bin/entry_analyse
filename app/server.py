@@ -41,6 +41,7 @@ from .logging_utils import configure_container_logging
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .module_loader import list_modules
 from .orchestrator import Orchestrator
+from .service.runtime_role import get_runtime_role, role_enabled
 
 load_dotenv()
 configure_container_logging("entry_analyse")
@@ -74,42 +75,12 @@ async def lifespan(app: FastAPI):
             import logging
             logging.getLogger("ea.server").warning("DB init failed (management APIs unavailable): %s", exc)
 
-        # --- Recover orphaned tasks from a previous pod instance ---
-        if _db_ready:
-            try:
-                from .time_utils import now_local
-                from .db import get_db
-                from .db.models import AppEaTask
-                _db_gen = get_db()
-                _db = next(_db_gen)
-                try:
-                    orphaned = _db.query(AppEaTask).filter(
-                        AppEaTask.status.in_(["running", "pending"]),
-                        AppEaTask.is_deleted.is_(False),
-                    ).all()
-                    if orphaned:
-                        for t in orphaned:
-                            t.status = "error"
-                            t.error = "服务重启，任务被中断"
-                            t.finished_at = now_local()
-                        _db.commit()
-                        import logging as _l
-                        _l.getLogger("ea.server").warning(
-                            "Recovered %d orphaned task(s) from previous pod instance", len(orphaned))
-                finally:
-                    try:
-                        next(_db_gen)
-                    except StopIteration:
-                        pass
-            except Exception as exc:
-                import logging
-                logging.getLogger("ea.server").warning("Orphan task recovery failed: %s", exc)
-
         try:
             from .service.registry_service import get_registry_service
             registry = get_registry_service(svc_yaml.registry)
-            await registry.register()
-            registry.start()
+            if role_enabled("api"):
+                await registry.register()
+                registry.start()
         except Exception as exc:
             import logging
             logging.getLogger("ea.server").warning("Registry startup failed: %s", exc)
@@ -117,9 +88,25 @@ async def lifespan(app: FastAPI):
         import logging
         logging.getLogger("ea.server").warning("Startup error: %s", exc)
 
-    if _db_ready:
+    if _db_ready and role_enabled("api"):
         from .api import router as mgmt_router
         app.include_router(mgmt_router)
+
+    if _db_ready and role_enabled("scheduler"):
+        try:
+            from .service.scheduler_service import get_scheduler_service
+            get_scheduler_service().start()
+        except Exception as exc:
+            import logging
+            logging.getLogger("ea.server").warning("Scheduler startup failed: %s", exc)
+
+    if _db_ready and role_enabled("worker"):
+        try:
+            from .service.worker_service import get_worker_service
+            get_worker_service().start()
+        except Exception as exc:
+            import logging
+            logging.getLogger("ea.server").warning("Worker startup failed: %s", exc)
 
     yield
 
@@ -127,6 +114,16 @@ async def lifespan(app: FastAPI):
     try:
         from .service.registry_service import get_registry_service
         get_registry_service().stop()
+    except Exception:
+        pass
+    try:
+        from .service.scheduler_service import get_scheduler_service
+        get_scheduler_service().stop()
+    except Exception:
+        pass
+    try:
+        from .service.worker_service import get_worker_service
+        get_worker_service().stop()
     except Exception:
         pass
 
@@ -165,6 +162,15 @@ def _get_svc_config():
     return _svc_config
 
 
+def _ensure_legacy_worker_runtime() -> None:
+    if role_enabled("worker"):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=f"当前运行角色 {get_runtime_role()} 不支持内存执行接口，请使用 worker/all 角色",
+    )
+
+
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
@@ -181,8 +187,23 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/entry-analyse/health")
 async def health():
+    scheduler_running = False
+    worker_running = False
+    try:
+        from .service.scheduler_service import get_scheduler_service
+        scheduler_running = get_scheduler_service().is_running()
+    except Exception:
+        scheduler_running = False
+    try:
+        from .service.worker_service import get_worker_service
+        worker_running = get_worker_service().is_running()
+    except Exception:
+        worker_running = False
     return {
         "status": "ok",
+        "role": get_runtime_role(),
+        "scheduler_running": scheduler_running,
+        "worker_running": worker_running,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
     }
@@ -199,6 +220,7 @@ async def get_modules(cwd: str = ""):
 @app.post("/analyse", status_code=202)
 async def submit_analyse(body: AnalyseRequest):
     """提交分析任务。只需一句话 prompt。"""
+    _ensure_legacy_worker_runtime()
     svc = _get_svc_config()
     cwd = body.cwd or TARGET_DIR
     cfg = build_task_config(svc, body.prompt, cwd=cwd)
@@ -272,6 +294,7 @@ async def _notify(entry: TaskEntry):
 
 @app.get("/task/{task_id}")
 async def get_task(task_id: str):
+    _ensure_legacy_worker_runtime()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
@@ -285,6 +308,7 @@ async def get_task(task_id: str):
 
 @app.get("/task/{task_id}/stream")
 async def stream_task(task_id: str):
+    _ensure_legacy_worker_runtime()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
@@ -315,6 +339,7 @@ async def stream_task(task_id: str):
 
 @app.post("/task/{task_id}/abort")
 async def abort_task(task_id: str):
+    _ensure_legacy_worker_runtime()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404)
@@ -329,6 +354,7 @@ async def abort_task(task_id: str):
 
 @app.get("/tasks")
 async def list_tasks():
+    _ensure_legacy_worker_runtime()
     return {"tasks": [
         {
             "task_id": tid,

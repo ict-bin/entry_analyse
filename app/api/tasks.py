@@ -12,6 +12,7 @@ from app.db import get_db
 from app.service.task_service import get_task_service
 
 from . import router
+from .deps import ensure_project_access, get_current_user
 
 
 class TaskCreateRequest(BaseModel):
@@ -98,7 +99,13 @@ class TaskEvaluationResponse(BaseModel):
 
 
 @router.post("/tasks", status_code=201)
-async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
+async def create_task(
+    body: TaskCreateRequest,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    current_user, token = user_and_token
+    await ensure_project_access(body.project_id, token)
     svc = get_task_service()
     return svc.create_task(
         db,
@@ -117,6 +124,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         parent_stage_name=body.parent_stage_name,
         parent_stage_item_id=body.parent_stage_item_id,
         parent_stage_item_key=body.parent_stage_item_key,
+        created_by=current_user.get("username") or current_user.get("name") or "system",
     )
 
 
@@ -129,7 +137,10 @@ async def list_tasks(
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
 ):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
     return get_task_service().list_tasks(
         db,
         project_id=project_id,
@@ -142,48 +153,48 @@ async def list_tasks(
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, db: Session = Depends(get_db)):
+async def get_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task(db, task_id)
 
 
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
-async def get_task_result(task_id: str, db: Session = Depends(get_db)):
+async def get_task_result(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_result(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
-async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
+async def list_task_sessions(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().list_task_sessions(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)
-async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
+async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_session_file(db, task_id, path)
 
 
 @router.get("/tasks/{task_id}/evaluation", response_model=TaskEvaluationResponse)
-async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
+async def get_task_evaluation(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_evaluation(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str, db: Session = Depends(get_db)):
-    return get_task_service().cancel_task(db, task_id)
+async def cancel_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    return await get_task_service().cancel_task(db, task_id)
 
 
 @router.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(task_id: str, db: Session = Depends(get_db)):
+async def delete_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     get_task_service().delete_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
-async def restart_task(task_id: str, db: Session = Depends(get_db)):
+async def restart_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     """Reset and restart an existing task in-place, reusing the same task ID."""
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
-async def resume_task(task_id: str, db: Session = Depends(get_db)):
+async def resume_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     """Resume an interrupted task from the last completed stage (断点续跑)."""
     return get_task_service().resume_task(db, task_id)
 
@@ -193,6 +204,7 @@ async def delete_task(
     task_id: str,
     delete_files: bool = Query(default=True),
     db: Session = Depends(get_db),
+    _=Depends(get_current_user),
 ) -> Response:
     """删除任务记录（软删除），并可选同步删除输出目录下的任务文件。"""
     get_task_service().delete_task(db, task_id, delete_files=delete_files)
@@ -200,7 +212,7 @@ async def delete_task(
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+async def get_task_logs(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     """Return stages_json for the task (stage events used as structured log stream)."""
     from app.db.models import AppEaTask
     row = db.query(AppEaTask).filter(
@@ -218,14 +230,17 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/generate-prompt")
-async def generate_prompt(body: GeneratePromptRequest):
+async def generate_prompt(body: GeneratePromptRequest, _=Depends(get_current_user)):
     """Auto-generate a prompt from an input path."""
     from app.service.task_service import generate_prompt_from_path
     return {"prompt": generate_prompt_from_path(body.input_path)}
 
 
 @router.get("/modules")
-async def list_modules(base_path: str = Query(..., description="模块目录（含 files.list 或子模块）")):
+async def list_modules(
+    base_path: str = Query(..., description="模块目录（含 files.list 或子模块）"),
+    _=Depends(get_current_user),
+):
     """列出指定目录下可用的模块名列表。"""
     from app.module_loader import list_modules as _list_modules
     import os

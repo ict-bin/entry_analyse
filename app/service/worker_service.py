@@ -1,0 +1,340 @@
+"""Worker execution service for entry-analysis tasks."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from types import SimpleNamespace
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
+from app.config import build_task_config
+from app.db import get_db
+from app.db.models import AppEaTask
+from app.logging_utils import log_event
+from app.orchestrator import Orchestrator
+from app.time_utils import now_local
+
+logger = logging.getLogger("ea.worker")
+
+_running_tasks: dict[str, asyncio.Task] = {}
+WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
+
+
+class WorkerService:
+    def __init__(self):
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    def has_local_task(self, task_id: str) -> bool:
+        task = _running_tasks.get(task_id)
+        if task is None:
+            return False
+        if task.done():
+            _running_tasks.pop(task_id, None)
+            return False
+        return True
+
+    def start_task(self, task_id: str) -> asyncio.Task:
+        existing = _running_tasks.get(task_id)
+        if existing is not None and not existing.done():
+            return existing
+        if existing is not None and existing.done():
+            _running_tasks.pop(task_id, None)
+        task = asyncio.create_task(
+            self._execute_task(task_id),
+            name=f"ea_task_{task_id}",
+        )
+        _running_tasks[task_id] = task
+        return task
+
+    async def _discover_active_projects(self) -> list[str]:
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            rows = (
+                db.query(AppEaTask.project_id)
+                .filter(
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.status.in_(["pending", "running"]),
+                )
+                .distinct()
+                .all()
+            )
+            return [str(row[0]) for row in rows if row and row[0]]
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    async def _loop(self) -> None:
+        from app.service import task_service as task_mod
+
+        while self._running:
+            try:
+                project_ids = await self._discover_active_projects()
+                for project_id in project_ids:
+                    task_mod.get_task_service().schedule_dispatch(project_id)
+            except Exception as exc:
+                logger.warning("worker poll failed: %s", exc)
+            await asyncio.sleep(WORKER_POLL_SECONDS)
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
+        logger.info("Entry-analysis worker started (poll=%ss)", WORKER_POLL_SECONDS)
+
+    def stop(self) -> None:
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+
+    def is_running(self) -> bool:
+        return self._running
+
+    async def _renew_task_lease(self, task_id: str, stop_event: asyncio.Event) -> None:
+        from app.service import task_service as task_mod
+
+        while not stop_event.is_set():
+            await asyncio.sleep(task_mod.LEASE_RENEW_INTERVAL_SECONDS)
+            if stop_event.is_set():
+                break
+            db_gen = get_db()
+            db: Session = next(db_gen)
+            try:
+                row = (
+                    db.query(AppEaTask)
+                    .filter(
+                        AppEaTask.task_id == task_id,
+                        AppEaTask.is_deleted.is_(False),
+                        AppEaTask.owner_pod == task_mod.POD_NAME,
+                    )
+                    .first()
+                )
+                if row is None or row.status != "running" or row.cancel_requested:
+                    stop_event.set()
+                    return
+                row.lease_expires_at = task_mod._lease_deadline()
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+
+    async def _watch_task_control(
+        self,
+        task_id: str,
+        stop_event: asyncio.Event,
+        cancel_event: asyncio.Event,
+        orch: Orchestrator,
+    ) -> None:
+        from app.service import task_service as task_mod
+
+        while not stop_event.is_set():
+            await asyncio.sleep(task_mod.CANCEL_POLL_INTERVAL_SECONDS)
+            if stop_event.is_set():
+                break
+            db_gen = get_db()
+            db: Session = next(db_gen)
+            try:
+                row = (
+                    db.query(AppEaTask)
+                    .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
+                    .first()
+                )
+                if row is None:
+                    stop_event.set()
+                    cancel_event.set()
+                    orch.abort()
+                    return
+                if row.owner_pod != task_mod.POD_NAME:
+                    stop_event.set()
+                    cancel_event.set()
+                    orch.abort()
+                    return
+                if row.cancel_requested or row.status == "cancelled":
+                    cancel_event.set()
+                    orch.abort()
+                    return
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+
+    async def _execute_task(self, task_id: str) -> None:
+        from app.service import task_service as task_mod
+
+        event_buffer: list[dict] = []
+        project_id: str | None = None
+        lease_stop_event = asyncio.Event()
+        control_cancel_event = asyncio.Event()
+        cancel_requested = False
+        lease_task: asyncio.Task | None = None
+        control_task: asyncio.Task | None = None
+
+        def on_event(event) -> None:
+            event_buffer.append({"ts": task_mod._time.time(), "type": event.type, "data": dict(event.data)})
+            n = len(event_buffer)
+            if n == 1 or n % 3 == 0:
+                task_mod._flush_stages(task_id, event_buffer)
+
+        try:
+            db_gen = get_db()
+            db: Session = next(db_gen)
+            try:
+                row = (
+                    db.query(AppEaTask)
+                    .filter_by(task_id=task_id)
+                    .filter(AppEaTask.owner_pod == task_mod.POD_NAME)
+                    .first()
+                )
+                if not row or row.status == "cancelled" or row.cancel_requested:
+                    return
+                project_id = row.project_id
+                row.status = "running"
+                row.owner_pod = task_mod.POD_NAME
+                row.lease_expires_at = task_mod._lease_deadline()
+                db.commit()
+
+                svc = task_mod._load_svc_config_from_db(db, row.project_id)
+                tcfg = dict(row.task_config_json or {})
+                if row.output_path:
+                    svc.output_dir = row.output_path
+                    svc.archive_dir = row.output_path
+                    svc.result_dir = row.output_path
+                task_snapshot = SimpleNamespace(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    prompt_content=row.prompt_content,
+                    input_path=row.input_path,
+                    source_path=row.source_path,
+                    module_name=row.module_name,
+                    output_path=row.output_path,
+                    task_origin_type=row.task_origin_type,
+                    status=row.status,
+                    task_config_json=tcfg,
+                    result_json=row.result_json,
+                    stages_json=row.stages_json,
+                )
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+
+            cfg = build_task_config(
+                svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path,
+                module_name=task_snapshot.module_name or "",
+                source_path=task_snapshot.source_path or "",
+                resume_task_id=tcfg.get("resume_task_id", ""),
+            )
+            orch = Orchestrator(config=cfg, on_event=on_event)
+            lease_task = asyncio.create_task(self._renew_task_lease(task_id, lease_stop_event), name=f"ea_lease_{task_id}")
+            control_task = asyncio.create_task(
+                self._watch_task_control(task_id, lease_stop_event, control_cancel_event, orch),
+                name=f"ea_control_{task_id}",
+            )
+            result = await orch.execute(task_id)
+            cancel_requested = control_cancel_event.is_set()
+            task_mod._flush_stages(task_id, event_buffer)
+
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = (
+                    db.query(AppEaTask)
+                    .filter_by(task_id=task_id)
+                    .filter(AppEaTask.owner_pod == task_mod.POD_NAME)
+                    .first()
+                )
+                if not row:
+                    return
+                cancel_requested = cancel_requested or row.cancel_requested or row.status == "cancelled"
+                row.status = "cancelled" if cancel_requested else (result.status.value if result else "error")
+                row.finished_at = now_local()
+                row.owner_pod = None
+                row.lease_expires_at = None
+                row.cancel_requested = False
+                prev = row.stages_json
+                prev_events = prev["events"] if isinstance(prev, dict) and isinstance(prev.get("events"), list) else []
+                row.stages_json = {"events": prev_events + event_buffer, "final": True}
+                if result and not cancel_requested:
+                    result_payload = result.model_dump(mode="json")
+                    result_file = task_mod._write_task_result_json(task_snapshot, result_payload)
+                    row.result_json = task_mod._lightweight_result_json(task_snapshot, result_payload, result_file)
+                    if result.error:
+                        row.error = result.error
+                elif cancel_requested:
+                    row.error = "任务已取消"
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        except asyncio.CancelledError:
+            cancel_requested = True
+        except Exception as exc:
+            log_event(logger, logging.ERROR, "task execution failed", event="task_error", task_id=task_id, error=str(exc))
+            try:
+                db_gen = get_db()
+                db = next(db_gen)
+                try:
+                    db.rollback()
+                    row = (
+                        db.query(AppEaTask)
+                        .filter_by(task_id=task_id)
+                        .filter(AppEaTask.owner_pod == task_mod.POD_NAME)
+                        .first()
+                    )
+                    if row and row.status == "running":
+                        if row.cancel_requested:
+                            row.status = "cancelled"
+                            row.error = "任务已取消"
+                        else:
+                            row.status = "error"
+                            row.error = str(exc)
+                        row.finished_at = now_local()
+                        row.owner_pod = None
+                        row.lease_expires_at = None
+                        row.cancel_requested = False
+                        prev = row.stages_json
+                        prev_events = prev["events"] if isinstance(prev, dict) and isinstance(prev.get("events"), list) else []
+                        row.stages_json = {"events": prev_events + event_buffer, "final": True}
+                        db.commit()
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
+            except Exception:
+                pass
+        finally:
+            lease_stop_event.set()
+            for bg_task in (lease_task, control_task):
+                if bg_task is not None:
+                    bg_task.cancel()
+                    try:
+                        await bg_task
+                    except asyncio.CancelledError:
+                        pass
+            _running_tasks.pop(task_id, None)
+            if project_id:
+                task_mod.get_task_service().schedule_dispatch(project_id)
+
+
+_worker_service: Optional[WorkerService] = None
+
+
+def get_worker_service() -> WorkerService:
+    global _worker_service
+    if _worker_service is None:
+        _worker_service = WorkerService()
+    return _worker_service

@@ -14,6 +14,7 @@ from app.db import get_db
 from app.service.config_service import get_config_service
 
 from . import router
+from .deps import ensure_project_access, get_current_user
 
 logger = logging.getLogger("ea.api.config")
 
@@ -24,7 +25,13 @@ class ConfigSaveRequest(BaseModel):
 
 
 @router.get("/config")
-async def get_config(project_id: str = Query(...), db: Session = Depends(get_db)):
+async def get_config(
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
     try:
         return get_config_service().get_config(db, project_id)
     except SQLAlchemyError as exc:
@@ -33,7 +40,13 @@ async def get_config(project_id: str = Query(...), db: Session = Depends(get_db)
 
 
 @router.put("/config")
-async def save_config(body: ConfigSaveRequest, db: Session = Depends(get_db)):
+async def save_config(
+    body: ConfigSaveRequest,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    await ensure_project_access(body.project_id, token)
     try:
         return get_config_service().save_config(db, body.project_id, body.config)
     except SQLAlchemyError as exc:

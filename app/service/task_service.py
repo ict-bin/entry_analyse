@@ -11,23 +11,31 @@ import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, load_only
 
-from app.config import build_task_config, load_service_config
+from app.config import load_service_config
 from app.db.models import AppEaTask
 from app.logging_utils import log_event
-from app.models import SwarmEvent, TaskStatus, normalize_max_concurrent_tasks
-from app.orchestrator import Orchestrator
-from app.time_utils import isoformat_local, now_local
+from app.models import normalize_max_concurrent_tasks
+from app.service.runtime_role import role_enabled
+from app.time_utils import add_seconds_local, isoformat_local, now_local
 
 logger = logging.getLogger("ea.task_service")
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
+LEASE_DURATION_SECONDS = int(os.environ.get("EA_TASK_LEASE_SECONDS", "120"))
+LEASE_RENEW_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_LEASE_RENEW_INTERVAL_SECONDS", "30"))
+CANCEL_POLL_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_CANCEL_POLL_INTERVAL_SECONDS", "3"))
+POD_NAME = (
+    os.environ.get("EA_POD_NAME")
+    or os.environ.get("POD_NAME")
+    or os.environ.get("HOSTNAME")
+    or f"ea-{uuid.uuid4().hex[:8]}"
+)
 
-_running_tasks: dict[str, asyncio.Task] = {}
 _dispatch_tasks: dict[str, asyncio.Task] = {}
 _dispatch_locks: dict[str, asyncio.Lock] = {}
 
@@ -48,6 +56,15 @@ _SESSION_THINKING_LEVEL_MAP: dict[str, str] = {
     "high": "high",
     "x-high": "xhigh",
 }
+
+
+def _lease_deadline() -> datetime:
+    return add_seconds_local(now_local(), LEASE_DURATION_SECONDS)
+
+
+def _lease_expired_expr():
+    now = now_local()
+    return or_(AppEaTask.lease_expires_at.is_(None), AppEaTask.lease_expires_at < now)
 
 
 def _task_root(row: AppEaTask) -> Path | None:
@@ -375,6 +392,11 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 class TaskService:
+    def schedule_dispatch(self, project_id: str) -> None:
+        if not role_enabled("worker"):
+            return
+        self._schedule_pending_dispatch(project_id)
+
     @staticmethod
     def _get_dispatch_lock(project_id: str) -> asyncio.Lock:
         lock = _dispatch_locks.get(project_id)
@@ -382,6 +404,49 @@ class TaskService:
             lock = asyncio.Lock()
             _dispatch_locks[project_id] = lock
         return lock
+
+    @staticmethod
+    def _claim_task_row(db: Session, row_id: int) -> AppEaTask | None:
+        row = (
+            db.query(AppEaTask)
+            .filter(
+                AppEaTask.id == row_id,
+                AppEaTask.is_deleted.is_(False),
+                AppEaTask.cancel_requested.is_(False),
+            )
+            .with_for_update()
+            .first()
+        )
+        if row is None:
+            return None
+        if row.status not in ("pending", "running"):
+            return None
+        if row.status == "running" and row.owner_pod and row.owner_pod != POD_NAME and row.lease_expires_at and row.lease_expires_at >= now_local():
+            return None
+        row.status = "running"
+        row.owner_pod = POD_NAME
+        row.lease_expires_at = _lease_deadline()
+        row.cancel_requested = False
+        if row.started_at is None:
+            row.started_at = now_local()
+        db.commit()
+        db.refresh(row)
+        return row
+
+    @staticmethod
+    def _active_running_count(db: Session, project_id: str) -> int:
+        return int(
+            db.query(AppEaTask)
+            .filter(
+                AppEaTask.project_id == project_id,
+                AppEaTask.is_deleted.is_(False),
+                AppEaTask.status == "running",
+                AppEaTask.cancel_requested.is_(False),
+                AppEaTask.lease_expires_at.is_not(None),
+                AppEaTask.lease_expires_at >= now_local(),
+            )
+            .count()
+        )
 
     def _schedule_pending_dispatch(self, project_id: str) -> None:
         existing = _dispatch_tasks.get(project_id)
@@ -405,38 +470,35 @@ class TaskService:
                 max_concurrent_tasks = normalize_max_concurrent_tasks(
                     getattr(svc, "max_concurrent_tasks", None)
                 )
-                running_count = int(
-                    db.query(AppEaTask)
-                    .filter(
-                        AppEaTask.project_id == project_id,
-                        AppEaTask.is_deleted.is_(False),
-                        AppEaTask.status == "running",
-                    )
-                    .count()
-                )
+                running_count = self._active_running_count(db, project_id)
                 if running_count >= max_concurrent_tasks:
                     return
-                pending_rows = (
+                candidate_rows = (
                     db.query(AppEaTask)
                     .filter(
                         AppEaTask.project_id == project_id,
                         AppEaTask.is_deleted.is_(False),
-                        AppEaTask.status == "pending",
+                        AppEaTask.cancel_requested.is_(False),
+                        or_(
+                            AppEaTask.status == "pending",
+                            (AppEaTask.status == "running") & _lease_expired_expr(),
+                        ),
                     )
                     .order_by(AppEaTask.created_at.asc(), AppEaTask.id.asc())
-                    .limit(max_concurrent_tasks - running_count)
+                    .limit((max_concurrent_tasks - running_count) * 2)
                     .all()
                 )
-                for row in pending_rows:
+                for row in candidate_rows:
                     if running_count >= max_concurrent_tasks:
                         break
-                    if row.task_id in _running_tasks:
+                    from app.service.worker_service import get_worker_service
+                    worker_service = get_worker_service()
+                    if worker_service.has_local_task(row.task_id):
                         continue
-                    asyncio_task = asyncio.create_task(
-                        self._execute_task(row.task_id),
-                        name=f"ea_task_{row.task_id}",
-                    )
-                    _running_tasks[row.task_id] = asyncio_task
+                    claimed = self._claim_task_row(db, row.id)
+                    if claimed is None:
+                        continue
+                    worker_service.start_task(claimed.task_id)
                     running_count += 1
             except Exception as exc:
                 logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)
@@ -766,6 +828,7 @@ class TaskService:
             source_path=source_path or None, module_name=module_name or None,
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=effective_prompt, status="pending", created_by=created_by,
+            owner_pod=None, lease_expires_at=None, cancel_requested=False,
             task_config_json=task_config_json,
             task_origin_type=str(task_origin_type or "").strip() or "manual",
             parent_project_id=parent_project_id,
@@ -794,6 +857,9 @@ class TaskService:
         row.status = "pending"
         row.started_at = None
         row.finished_at = None
+        row.owner_pod = None
+        row.lease_expires_at = None
+        row.cancel_requested = False
         row.stages_json = None
         row.result_json = None
         row.error = None
@@ -827,6 +893,9 @@ class TaskService:
         row.task_config_json = tcfg
         row.status = "pending"
         row.finished_at = None
+        row.owner_pod = None
+        row.lease_expires_at = None
+        row.cancel_requested = False
         row.result_json = None
         row.error = None
         flag_modified(row, "task_config_json")
@@ -836,15 +905,16 @@ class TaskService:
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
 
-    def cancel_task(self, db: Session, task_id: str) -> dict:
+    async def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row)
-        at = _running_tasks.get(task_id)
-        if at and not at.done():
-            at.cancel()
-        row.status = "cancelled"
-        row.finished_at = now_local()
+        row.cancel_requested = True
+        if row.status == "pending":
+            row.status = "cancelled"
+            row.finished_at = now_local()
+            row.owner_pod = None
+            row.lease_expires_at = None
         db.commit(); db.refresh(row)
         return self._row_to_dict(row)
 
@@ -865,121 +935,6 @@ class TaskService:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
         row.is_deleted = True
         db.commit()
-
-    async def _execute_task(self, task_id: str) -> None:
-        from app.db import get_db
-        event_buffer: list[dict] = []
-        project_id: str | None = None
-
-        def on_event(event: SwarmEvent) -> None:
-            event_buffer.append({"ts": _time.time(), "type": event.type,
-                                  "data": dict(event.data)})
-            n = len(event_buffer)
-            if n == 1 or n % 3 == 0:
-                _flush_stages(task_id, event_buffer)
-
-        try:
-            db_gen = get_db()
-            db: Session = next(db_gen)
-            try:
-                row = db.query(AppEaTask).filter_by(task_id=task_id).first()
-                if not row or row.status == "cancelled":
-                    return
-                project_id = row.project_id
-                row.status = "running"
-                if row.started_at is None:
-                    row.started_at = now_local()
-                db.commit()
-
-                svc = _load_svc_config_from_db(db, row.project_id)
-                tcfg = dict(row.task_config_json or {})
-                if row.output_path:
-                    svc.output_dir = row.output_path
-                    svc.archive_dir = row.output_path
-                    svc.result_dir = row.output_path
-                task_snapshot = SimpleNamespace(
-                    task_id=row.task_id,
-                    project_id=row.project_id,
-                    prompt_content=row.prompt_content,
-                    input_path=row.input_path,
-                    source_path=row.source_path,
-                    module_name=row.module_name,
-                    output_path=row.output_path,
-                    task_origin_type=row.task_origin_type,
-                    status=row.status,
-                    task_config_json=tcfg,
-                    result_json=row.result_json,
-                    stages_json=row.stages_json,
-                )
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-
-            cfg = build_task_config(
-                svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path,
-                module_name=task_snapshot.module_name or "",
-                source_path=task_snapshot.source_path or "",
-                resume_task_id=tcfg.get("resume_task_id", ""),
-            )
-            orch = Orchestrator(config=cfg, on_event=on_event)
-            result = await orch.execute(task_id)
-            _flush_stages(task_id, event_buffer)
-
-            db_gen = get_db()
-            db = next(db_gen)
-            try:
-                row = db.query(AppEaTask).filter_by(task_id=task_id).first()
-                if not row or row.status == "cancelled":
-                    return
-                row.status = result.status.value if result else "error"
-                row.finished_at = now_local()
-                _prev = row.stages_json
-                _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
-                row.stages_json = {"events": _prev_events + event_buffer, "final": True}
-                if result:
-                    result_payload = result.model_dump(mode="json")
-                    result_file = _write_task_result_json(task_snapshot, result_payload)
-                    row.result_json = _lightweight_result_json(task_snapshot, result_payload, result_file)
-                    if result.error:
-                        row.error = result.error
-                db.commit()
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            log_event(logger, logging.ERROR, "task execution failed",
-                      event="task_error", task_id=task_id, error=str(exc))
-            try:
-                db_gen = get_db()
-                db = next(db_gen)
-                try:
-                    db.rollback()
-                    r = db.query(AppEaTask).filter_by(task_id=task_id).first()
-                    if r and r.status == "running":
-                        r.status = "error"
-                        r.error = str(exc)
-                        r.finished_at = now_local()
-                        _prev2 = r.stages_json
-                        _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
-                        r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
-                        db.commit()
-                finally:
-                    try:
-                        next(db_gen)
-                    except StopIteration:
-                        pass
-            except Exception:
-                pass
-        finally:
-            _running_tasks.pop(task_id, None)
-            if project_id:
-                self._schedule_pending_dispatch(project_id)
 
     def _get_or_404(self, db: Session, task_id: str) -> AppEaTask:
         row = db.query(AppEaTask).filter(
@@ -1013,6 +968,9 @@ class TaskService:
                 AppEaTask.output_path,
                 AppEaTask.prompt_template_id,
                 AppEaTask.status,
+                AppEaTask.owner_pod,
+                AppEaTask.lease_expires_at,
+                AppEaTask.cancel_requested,
                 AppEaTask.error,
                 AppEaTask.created_by,
                 AppEaTask.created_at,
@@ -1034,6 +992,9 @@ class TaskService:
             "module_name": row.module_name, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
+            "owner_pod": row.owner_pod,
+            "lease_expires_at": fmt(row.lease_expires_at),
+            "cancel_requested": row.cancel_requested,
             "error": row.error,
             "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
             "stages_json": row.stages_json if include_heavy else None,

@@ -9,6 +9,11 @@ def now_local() -> datetime:
     return datetime.now(UTC_PLUS_8).replace(tzinfo=None)
 
 
+def add_seconds_local(dt: datetime | None, seconds: int) -> datetime:
+    base = ensure_local(dt) or now_local()
+    return base + timedelta(seconds=seconds)
+
+
 def ensure_local(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None

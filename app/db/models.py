@@ -43,6 +43,9 @@ class AppEaTask(Base):
 
     # Status: pending | running | passed | failed | error | cancelled
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    owner_pod: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
