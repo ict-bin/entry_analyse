@@ -81,6 +81,77 @@ class TaskSessionMetaResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class TaskSessionIndexNodeResponse(BaseModel):
+    node_id: str
+    relative_path: str
+    session_name: str
+    display_name: str
+    role: str
+    role_label: str
+    status: str
+    is_active: bool = False
+    stage_key: str
+    stage_label: str
+    stage_order: int = 0
+    stage_group: str
+    module_name: Optional[str] = None
+    attempt: Optional[int] = None
+    judge_index: Optional[int] = None
+    batch_index: Optional[int] = None
+    parent_relative_path: Optional[str] = None
+    parallel_group: Optional[str] = None
+    family_key: Optional[str] = None
+    flow_kind: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    started_ts: Optional[float] = None
+    last_event_at: Optional[str] = None
+    last_event_ts: Optional[float] = None
+    mtime: float = 0
+    size: int = 0
+    event_count: int = 0
+    line_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    session_header: dict[str, Any] = Field(default_factory=dict)
+    cwd: Optional[str] = None
+    model: Optional[str] = None
+    latest_round_ref: Optional[dict[str, Any]] = None
+    round_refs: list[dict[str, Any]] = Field(default_factory=list)
+    attempts_seen: list[int] = Field(default_factory=list)
+
+
+class TaskSessionIndexEdgeResponse(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: str
+    kind: str
+    label: str
+
+
+class TaskSessionIndexGroupResponse(BaseModel):
+    group_id: str
+    kind: str
+    label: str
+    stage_key: Optional[str] = None
+    module_name: Optional[str] = None
+    node_ids: list[str] = Field(default_factory=list)
+
+
+class TaskSessionIndexResponse(BaseModel):
+    version: int = 1
+    generated_at: Optional[str] = None
+    task_id: str
+    task_status: str
+    status: Optional[str] = None
+    sessions_root: Optional[str] = None
+    index_path: Optional[str] = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[TaskSessionIndexNodeResponse] = Field(default_factory=list)
+    edges: list[TaskSessionIndexEdgeResponse] = Field(default_factory=list)
+    groups: list[TaskSessionIndexGroupResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskSessionFileResponse(BaseModel):
     path: str
     session_meta: dict = Field(default_factory=dict)
@@ -165,6 +236,11 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db), _=Depends
 @router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
 async def list_task_sessions(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().list_task_sessions(db, task_id)
+
+
+@router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
+async def get_task_session_index(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    return get_task_service().get_task_session_index(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)

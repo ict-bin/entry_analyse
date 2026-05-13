@@ -20,6 +20,7 @@ from app.config import load_service_config
 from app.db.models import AppEaTask
 from app.logging_utils import log_event
 from app.models import normalize_max_concurrent_tasks
+from app.service.session_index import build_session_catalog
 from app.service.runtime_role import role_enabled
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 
@@ -392,6 +393,49 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 class TaskService:
+    def _build_session_catalog(self, row: AppEaTask) -> dict:
+        sessions_root = _task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "sessions_root": str(sessions_root) if sessions_root else None,
+                "index_path": str((sessions_root / "index.json")) if sessions_root else None,
+                "generated_at": isoformat_local(now_local()),
+                "items": [],
+                "index": {
+                    "version": 1,
+                    "generated_at": isoformat_local(now_local()),
+                    "task_id": row.task_id,
+                    "task_status": row.status,
+                    "sessions_root": str(sessions_root) if sessions_root else None,
+                    "summary": {
+                        "session_count": 0,
+                        "active_session_count": 0,
+                        "worker_count": 0,
+                        "judge_count": 0,
+                        "sub_worker_count": 0,
+                        "edge_count": 0,
+                        "parallel_group_count": 0,
+                        "stage_count": 0,
+                    },
+                    "nodes": [],
+                    "edges": [],
+                    "groups": [],
+                    "warnings": [],
+                },
+                "warnings": [],
+            }
+        result_json = _load_task_result_json(row)
+        return build_session_catalog(
+            task_id=row.task_id,
+            row_status=row.status,
+            sessions_root=sessions_root,
+            result_json=result_json,
+            parse_session_jsonl_file=_parse_session_jsonl_file,
+            write_json_atomic=_write_json_atomic,
+        )
+
     def schedule_dispatch(self, project_id: str) -> None:
         if not role_enabled("worker"):
             return
@@ -625,38 +669,19 @@ class TaskService:
 
     def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
         row = self._get_or_404(db, task_id)
-        sessions_root = _task_sessions_root(row)
-        if not sessions_root or not sessions_root.is_dir():
-            return []
-        now_ts = _time.time()
-        items: list[dict] = []
-        for session_file in sorted(sessions_root.rglob("*.jsonl")):
-            try:
-                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
-                relative_parts = relative_path.split("/")
-                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
-                session_name = session_file.stem
-                _, events, warnings, line_count = _parse_session_jsonl_file(session_file)
-                stat = session_file.stat()
-                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
-                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
-                items.append({
-                    "session_id": session_name,
-                    "session_name": session_name,
-                    "relative_path": relative_path,
-                    "stage_group": stage_group,
-                    "role_name": session_name,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "event_count": len(events),
-                    "line_count": line_count,
-                    "is_active": is_active,
-                    "display_name": display_name,
-                    "warnings": warnings,
-                })
-            except Exception as exc:
-                logger.warning("list_task_sessions failed to inspect %s: %s", session_file, exc)
-        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+        return self._build_session_catalog(row).get("items", [])
+
+    def get_task_session_index(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        catalog = self._build_session_catalog(row)
+        return {
+            "task_id": catalog.get("task_id") or row.task_id,
+            "status": catalog.get("status") or row.status,
+            "sessions_root": catalog.get("sessions_root"),
+            "index_path": catalog.get("index_path"),
+            "generated_at": catalog.get("generated_at"),
+            **(catalog.get("index") or {}),
+        }
 
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
         row = self._get_or_404(db, task_id)
