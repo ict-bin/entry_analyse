@@ -11,6 +11,7 @@ import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy.orm import Session, load_only
@@ -867,8 +868,6 @@ class TaskService:
 
     async def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
-        db_gen = get_db()
-        db: Session = next(db_gen)
         event_buffer: list[dict] = []
         project_id: str | None = None
 
@@ -880,72 +879,107 @@ class TaskService:
                 _flush_stages(task_id, event_buffer)
 
         try:
-            row = db.query(AppEaTask).filter_by(task_id=task_id).first()
-            if not row or row.status == "cancelled":
-                return
-            project_id = row.project_id
-            row.status = "running"
-            if row.started_at is None:
-                row.started_at = now_local()
-            db.commit()
+            db_gen = get_db()
+            db: Session = next(db_gen)
+            try:
+                row = db.query(AppEaTask).filter_by(task_id=task_id).first()
+                if not row or row.status == "cancelled":
+                    return
+                project_id = row.project_id
+                row.status = "running"
+                if row.started_at is None:
+                    row.started_at = now_local()
+                db.commit()
 
-            svc = _load_svc_config_from_db(db, row.project_id)
-            tcfg = row.task_config_json or {}
-            if row.output_path:
-                svc.output_dir = row.output_path
-                svc.archive_dir = row.output_path
-                svc.result_dir = row.output_path
+                svc = _load_svc_config_from_db(db, row.project_id)
+                tcfg = dict(row.task_config_json or {})
+                if row.output_path:
+                    svc.output_dir = row.output_path
+                    svc.archive_dir = row.output_path
+                    svc.result_dir = row.output_path
+                task_snapshot = SimpleNamespace(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    prompt_content=row.prompt_content,
+                    input_path=row.input_path,
+                    source_path=row.source_path,
+                    module_name=row.module_name,
+                    output_path=row.output_path,
+                    task_origin_type=row.task_origin_type,
+                    status=row.status,
+                    task_config_json=tcfg,
+                    result_json=row.result_json,
+                    stages_json=row.stages_json,
+                )
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+
             cfg = build_task_config(
-                svc, row.prompt_content, cwd=row.input_path,
-                module_name=row.module_name or "",
-                source_path=row.source_path or "",
+                svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path,
+                module_name=task_snapshot.module_name or "",
+                source_path=task_snapshot.source_path or "",
                 resume_task_id=tcfg.get("resume_task_id", ""),
             )
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute(task_id)
             _flush_stages(task_id, event_buffer)
 
-            db.expire(row); db.refresh(row)
-            if row.status == "cancelled":
-                return
-            row.status = result.status.value if result else "error"
-            row.finished_at = now_local()
-            _prev = row.stages_json
-            _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
-            row.stages_json = {"events": _prev_events + event_buffer, "final": True}
-            if result:
-                result_payload = result.model_dump(mode="json")
-                result_file = _write_task_result_json(row, result_payload)
-                row.result_json = _lightweight_result_json(row, result_payload, result_file)
-                if result.error:
-                    row.error = result.error
-            db.commit()
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = db.query(AppEaTask).filter_by(task_id=task_id).first()
+                if not row or row.status == "cancelled":
+                    return
+                row.status = result.status.value if result else "error"
+                row.finished_at = now_local()
+                _prev = row.stages_json
+                _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
+                row.stages_json = {"events": _prev_events + event_buffer, "final": True}
+                if result:
+                    result_payload = result.model_dump(mode="json")
+                    result_file = _write_task_result_json(task_snapshot, result_payload)
+                    row.result_json = _lightweight_result_json(task_snapshot, result_payload, result_file)
+                    if result.error:
+                        row.error = result.error
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             log_event(logger, logging.ERROR, "task execution failed",
                       event="task_error", task_id=task_id, error=str(exc))
             try:
-                db.rollback()
-                r = db.query(AppEaTask).filter_by(task_id=task_id).first()
-                if r and r.status == "running":
-                    r.status = "error"
-                    r.error = str(exc)
-                    r.finished_at = now_local()
-                    _prev2 = r.stages_json
-                    _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
-                    r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
-                    db.commit()
+                db_gen = get_db()
+                db = next(db_gen)
+                try:
+                    db.rollback()
+                    r = db.query(AppEaTask).filter_by(task_id=task_id).first()
+                    if r and r.status == "running":
+                        r.status = "error"
+                        r.error = str(exc)
+                        r.finished_at = now_local()
+                        _prev2 = r.stages_json
+                        _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
+                        r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
+                        db.commit()
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
             except Exception:
                 pass
         finally:
             _running_tasks.pop(task_id, None)
             if project_id:
                 self._schedule_pending_dispatch(project_id)
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
 
     def _get_or_404(self, db: Session, task_id: str) -> AppEaTask:
         row = db.query(AppEaTask).filter(

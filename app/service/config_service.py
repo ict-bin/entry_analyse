@@ -22,7 +22,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds_exceeded_action": "treat_as_passed",
     "min_rounds": 2,
     "pass_threshold": 0,
-    "max_concurrent_tasks": 64,
+    "max_concurrent_tasks": 8,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "agent_run_timeout_seconds": 3600,
