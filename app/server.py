@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -33,11 +34,13 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from .config import build_task_config, load_service_config
 from .logging_utils import configure_container_logging
+from .metrics import observe_request as observe_metrics_request, render_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .module_loader import list_modules
 from .orchestrator import Orchestrator
@@ -147,6 +150,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.middleware("http")
+async def collect_request_metrics(request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    observe_metrics_request(request.method, request.url.path, response.status_code, time.perf_counter() - started)
+    return response
+
 _svc_config = None
 
 
@@ -207,6 +218,12 @@ async def health():
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
     }
+
+
+@app.get("/metrics")
+@app.get("/api/app/entry-analyse/metrics", include_in_schema=False)
+async def metrics():
+    return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/modules")
