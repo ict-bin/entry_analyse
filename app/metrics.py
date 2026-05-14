@@ -264,6 +264,27 @@ def _render_task_metrics() -> list[str]:
     ])
     for status in sorted(result_counter):
         lines.append(f"secflow_ea_result_total{_labels(status=status)} {result_counter[status]}")
+    _append_ai_alias_metrics(
+        lines,
+        prefix="secflow_ea",
+        worker_count=worker_gauge,
+        judge_count=judge_gauge,
+        session_total=session_gauge,
+        round_total=round_total,
+        retry_total=retry_total,
+        timeout_total=timeout_total,
+        cancel_total=cancel_total,
+        failure_category_counts=failure_category_counts,
+        token_input_total=token_input_total,
+        token_output_total=token_output_total,
+        token_cache_read_total=token_cache_read_total,
+        token_cache_write_total=token_cache_write_total,
+        token_cost_total=token_cost_total,
+        review_pass_total=result_counter.get("passed", 0),
+        review_fail_total=sum(count for key, count in result_counter.items() if key != "passed"),
+        worker_duration_seconds=worker_duration_sum,
+        judge_duration_seconds=judge_duration_sum,
+    )
     return lines
 
 
@@ -330,3 +351,71 @@ def _labels(**labels: Any) -> str:
 
 def _fmt(value: float) -> str:
     return f"{float(value):.6f}"
+
+
+def _append_ai_alias_metrics(
+    lines: list[str],
+    *,
+    prefix: str,
+    worker_count: int,
+    judge_count: int,
+    session_total: int,
+    round_total: int,
+    retry_total: int,
+    timeout_total: int,
+    cancel_total: int,
+    failure_category_counts: dict[str, int],
+    token_input_total: int,
+    token_output_total: int,
+    token_cache_read_total: int,
+    token_cache_write_total: int,
+    token_cost_total: float,
+    review_pass_total: int,
+    review_fail_total: int,
+    worker_duration_seconds: float,
+    judge_duration_seconds: float,
+) -> None:
+    lines.extend([
+        f"# HELP {prefix}_ai_role_count Aggregated AI role counts for this service.",
+        f"# TYPE {prefix}_ai_role_count gauge",
+        f"# HELP {prefix}_ai_role_duration_seconds Aggregated AI role duration in seconds.",
+        f"# TYPE {prefix}_ai_role_duration_seconds gauge",
+        f"# HELP {prefix}_ai_session_total Aggregated AI session count by role.",
+        f"# TYPE {prefix}_ai_session_total counter",
+        f"# HELP {prefix}_ai_round_total Aggregated AI round counts by kind.",
+        f"# TYPE {prefix}_ai_round_total counter",
+        f"# HELP {prefix}_ai_retry_total Aggregated AI retry counts by reason.",
+        f"# TYPE {prefix}_ai_retry_total counter",
+        f"# HELP {prefix}_ai_timeout_total Aggregated AI timeout counts by scope.",
+        f"# TYPE {prefix}_ai_timeout_total counter",
+        f"# HELP {prefix}_ai_failure_total Aggregated AI failures by category.",
+        f"# TYPE {prefix}_ai_failure_total counter",
+        f"# HELP {prefix}_ai_token_usage_total Aggregated AI token usage by type.",
+        f"# TYPE {prefix}_ai_token_usage_total counter",
+        f"# HELP {prefix}_ai_token_cost_total Aggregated AI token cost.",
+        f"# TYPE {prefix}_ai_token_cost_total counter",
+        f"# HELP {prefix}_ai_review_total Aggregated AI review outcomes.",
+        f"# TYPE {prefix}_ai_review_total counter",
+    ])
+    lines.append(f'{prefix}_ai_role_count{{role="worker"}} {max(0, int(worker_count))}')
+    lines.append(f'{prefix}_ai_role_count{{role="judge"}} {max(0, int(judge_count))}')
+    lines.append(f'{prefix}_ai_role_duration_seconds{{role="worker"}} {_fmt(worker_duration_seconds)}')
+    lines.append(f'{prefix}_ai_role_duration_seconds{{role="judge"}} {_fmt(judge_duration_seconds)}')
+    lines.append(f'{prefix}_ai_session_total{{role="worker"}} {max(0, int(worker_count))}')
+    lines.append(f'{prefix}_ai_session_total{{role="judge"}} {max(0, int(judge_count))}')
+    lines.append(f'{prefix}_ai_session_total{{role="agent"}} {max(0, int(session_total))}')
+    lines.append(f'{prefix}_ai_round_total{{kind="round"}} {max(0, int(round_total))}')
+    lines.append(f'{prefix}_ai_retry_total{{reason="reflection"}} {max(0, int(retry_total))}')
+    lines.append(f'{prefix}_ai_timeout_total{{scope="task"}} {max(0, int(timeout_total))}')
+    lines.append(f'{prefix}_ai_failure_total{{category="cancel"}} {max(0, int(cancel_total))}')
+    for category in sorted(failure_category_counts):
+        lines.append(f'{prefix}_ai_failure_total{{category="{category}"}} {max(0, int(failure_category_counts[category]))}')
+    total_tokens = token_input_total + token_output_total + token_cache_read_total + token_cache_write_total
+    lines.append(f'{prefix}_ai_token_usage_total{{type="input"}} {max(0, int(token_input_total))}')
+    lines.append(f'{prefix}_ai_token_usage_total{{type="output"}} {max(0, int(token_output_total))}')
+    lines.append(f'{prefix}_ai_token_usage_total{{type="cache_read"}} {max(0, int(token_cache_read_total))}')
+    lines.append(f'{prefix}_ai_token_usage_total{{type="cache_write"}} {max(0, int(token_cache_write_total))}')
+    lines.append(f'{prefix}_ai_token_usage_total{{type="total"}} {max(0, int(total_tokens))}')
+    lines.append(f"{prefix}_ai_token_cost_total {_fmt(token_cost_total)}")
+    lines.append(f'{prefix}_ai_review_total{{result="pass"}} {max(0, int(review_pass_total))}')
+    lines.append(f'{prefix}_ai_review_total{{result="fail"}} {max(0, int(review_fail_total))}')

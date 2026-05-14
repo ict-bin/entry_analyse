@@ -11,6 +11,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import runner
 
 
+def _overflow_result() -> runner.AgentResult:
+    result = runner.AgentResult()
+    result.exit_code = 1
+    result.error = (
+        "400 litellm.BadRequestError: Hosted_vllmException - "
+        '{"error":{"message":"You passed 147421 input tokens and requested 16384 output tokens. '
+        "However, the model's context length is only 163804 tokens, resulting in a maximum input "
+        'length of 147420 tokens. Please reduce the length of the input prompt."}}'
+    )
+    return result
+
+
 class RunAgentPromptFileTests(unittest.TestCase):
     def test_run_agent_uses_prompt_file_instead_of_raw_argv(self):
         captured = {}
@@ -69,6 +81,39 @@ class RunAgentPromptFileTests(unittest.TestCase):
 
         self.assertEqual(attempts["count"], 2)
         self.assertIn("timed out", result.error or "")
+
+    def test_run_agent_triggers_compaction_then_retries_on_context_overflow(self):
+        prompts: list[str] = []
+
+        async def fake_run_with_pi_retry(**kwargs):
+            prompts.append(kwargs["stdin_data"].decode("utf-8"))
+            if len(prompts) == 1:
+                return _overflow_result()
+            result = runner.AgentResult()
+            result.output = "ok"
+            result.exit_code = 0
+            return result
+
+        with tempfile.TemporaryDirectory() as cwd:
+            with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
+                with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
+                    result = asyncio.run(
+                        runner.run_agent(
+                            "summary",
+                            model="MiniMax/MiniMax-M2.5",
+                            tools=["read"],
+                            cwd=cwd,
+                            session_file="/tmp/test-session.jsonl",
+                            max_retries=0,
+                            pi_max_retries=0,
+                        )
+                    )
+
+        self.assertEqual(result.output, "ok")
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(prompts[0], "summary")
+        self.assertIn("compaction", prompts[1].lower())
+        self.assertEqual(prompts[2], "summary")
 
 
 if __name__ == "__main__":
