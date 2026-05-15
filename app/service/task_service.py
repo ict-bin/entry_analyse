@@ -618,24 +618,7 @@ class TaskService:
                 warnings.append(err)
             else:
                 functions_list_markdown = text
-                # functions.list 为 JSON 数组格式（新格式），提取 function 字段作为函数名列表
-                # 兼容旧纯文本格式（每行一个函数名）
-                _stripped = (text or "").strip()
-                if _stripped.startswith("["):
-                    try:
-                        _items = json.loads(_stripped)
-                        if isinstance(_items, list):
-                            functions_list = [
-                                item.get("function", "")
-                                for item in _items
-                                if isinstance(item, dict) and item.get("function")
-                            ]
-                        else:
-                            functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
-                    except (json.JSONDecodeError, Exception):
-                        functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
-                else:
-                    functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
+                functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
 
         run_report_markdown: str | None = None
         if run_report_path:
