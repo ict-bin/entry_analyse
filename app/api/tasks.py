@@ -205,6 +205,8 @@ async def list_tasks(
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
@@ -218,6 +220,8 @@ async def list_tasks(
         page=page,
         per_page=per_page,
         status=status,
+        mode=mode,
+        parent_task_id=parent_task_id,
         sort_by=sort_by,
         sort_order=sort_order,
     )

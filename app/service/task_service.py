@@ -561,6 +561,8 @@ class TaskService:
         page: int = 1,
         per_page: int = 100,
         status: Optional[str] = None,
+        mode: Optional[str] = None,
+        parent_task_id: Optional[str] = None,
         sort_by: str = "created_at",
         sort_order: str = "desc",
     ) -> dict:
@@ -570,6 +572,24 @@ class TaskService:
         )
         if status:
             query = query.filter(AppEaTask.status == status)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "manual":
+            query = query.filter(
+                (AppEaTask.task_origin_type.is_(None)) | (AppEaTask.task_origin_type != "binary_security")
+            )
+        elif normalized_mode == "binary":
+            query = query.filter(
+                AppEaTask.task_origin_type == "binary_security",
+                (AppEaTask.parent_task_type.is_(None)) | (AppEaTask.parent_task_type != "source"),
+            )
+        elif normalized_mode == "source":
+            query = query.filter(
+                AppEaTask.task_origin_type == "binary_security",
+                AppEaTask.parent_task_type == "source",
+            )
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(AppEaTask.parent_task_id == normalized_parent_task_id)
         sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppEaTask.created_at)
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         total = query.count()
