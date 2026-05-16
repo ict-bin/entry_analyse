@@ -283,6 +283,73 @@ def _find_pi_command() -> list[str]:
         "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent")
 
 
+def _pi_config_dir() -> Path:
+    raw = os.environ.get("PI_CODING_AGENT_DIR")
+    if raw:
+        return Path(raw)
+    return Path.home() / ".pi" / "agent"
+
+
+def _resolve_model_for_pi(model: str) -> str:
+    """
+    将项目配置中的模型名解析成 pi 能稳定识别的 provider/model 形式。
+
+    pi CLI 在没有 provider 前缀时会按默认 provider 解析；而平台配置中心同步到
+    models.json 的模型经常只在 id 中保存真实模型名。这里用 models.json 做一次
+    本地匹配，避免裸模型名误落到 openrouter/google 等默认 provider。
+    """
+    requested = str(model or "").strip()
+    if not requested:
+        return requested
+
+    models_path = _pi_config_dir() / "models.json"
+    try:
+        data = json.loads(models_path.read_text(encoding="utf-8"))
+    except Exception:
+        return requested
+
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return requested
+
+    provider_names = {str(name) for name in providers.keys()}
+    first_segment = requested.split("/", 1)[0]
+    if first_segment in provider_names:
+        return requested
+
+    requested_lower = requested.lower()
+    exact_match: str | None = None
+    suffix_match: str | None = None
+    for provider_name, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        models = provider_cfg.get("models")
+        if not isinstance(models, list):
+            continue
+        for model_cfg in models:
+            if not isinstance(model_cfg, dict):
+                continue
+            for candidate in (model_cfg.get("id"), model_cfg.get("name")):
+                candidate_text = str(candidate or "").strip()
+                if not candidate_text:
+                    continue
+                resolved = f"{provider_name}/{candidate_text}"
+                candidate_lower = candidate_text.lower()
+                if requested_lower == candidate_lower:
+                    exact_match = exact_match or resolved
+                if (
+                    requested_lower.endswith(f"/{candidate_lower}")
+                    or candidate_lower.endswith(f"/{requested_lower}")
+                ):
+                    suffix_match = suffix_match or resolved
+
+    resolved = exact_match or suffix_match
+    if resolved and resolved != requested:
+        logger.info("resolved pi model %r -> %r via %s", requested, resolved, models_path)
+        return resolved
+    return requested
+
+
 def _build_args(
     pi_cmd: list[str], model: str, tools: list[str],
     thinking_level: str, session_file: str | None,
@@ -295,7 +362,7 @@ def _build_args(
     else:
         args.append("--no-session")
     if model:
-        args.extend(["--model", model])
+        args.extend(["--model", _resolve_model_for_pi(model)])
     if tools:
         args.extend(["--tools", ",".join(tools)])
     if thinking_level and thinking_level != "off":
