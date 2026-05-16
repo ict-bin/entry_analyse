@@ -1009,6 +1009,7 @@ class Orchestrator:
         # 程序级强制保证：functions.list 必须通过深度字段验证
         import json as _json
         _fl_raw = ""
+        _fl_parsed = []
         try:
             _fl_raw = Path(func_list_path).read_text(encoding="utf-8")
             _fl_parsed = _json.loads(_fl_raw)
@@ -1046,8 +1047,24 @@ class Orchestrator:
                   "_source_preview": _fl_raw[:300]}],
                 ensure_ascii=False, indent=2)
             Path(func_list_path).write_text(_err_marker, encoding="utf-8")
+            _fl_parsed = [
+                {
+                    "_error": str(_fl_err),
+                    "_source_preview": _fl_raw[:300],
+                }
+            ]
 
-        # 4) flag 文件：成功覆写为 1
+        # 4) entry-details.json：富结果权威产物，供下游与前端消费
+        entry_details_path = str(out_dir / "entry-details.json")
+        try:
+            Path(entry_details_path).write_text(
+                _json.dumps(_fl_parsed if isinstance(_fl_parsed, list) else [], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as _entry_details_err:
+            self._emit("entry_details_error", task_id, error=str(_entry_details_err))
+
+        # 5) flag 文件：成功覆写为 1
         if result.status == TaskStatus.PASSED:
             flag_path.write_text("1", encoding="utf-8")
 
@@ -1057,6 +1074,7 @@ class Orchestrator:
                     output_dir=str(out_dir),
                     result_file=str(out_dir / result_filename),
                     functions_list=func_list_path,
+                    entry_details=entry_details_path,
                     flag_file=str(out_dir / "flag"))
         self._cancel_event = None
         return result
@@ -1462,7 +1480,8 @@ class Orchestrator:
             f"1. 列出文件中所有函数\n"
             f"2. 对每个函数判断是否为外部入口（被动回调型 或 主动拉取型）\n"
             f"3. 如是入口，精确标注污点变量（区分外部可控 vs 内部标识）\n"
-            f"4. 如非入口，简要说明排除理由\n\n"
+            f"4. 如是入口，为函数补充职责说明，并为每个 taint 补充单独说明\n"
+            f"5. 如非入口，简要说明排除理由\n\n"
             f"注意同时搜索两类入口：\n"
             f"- 被动回调型：被框架/分发表调用，外部数据在参数中\n"
             f"- 主动拉取型：函数内调用 recv/read/mmap 等，外部数据在返回值/缓冲区中\n\n"
@@ -1512,7 +1531,9 @@ class Orchestrator:
             f"{file_list_str}\n\n"
             f"请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
             f"严格按照 system prompt 中的工作流程和过滤标准完成精筛合并，"
-            f"写入 `entry-list-merged.json`，并使用 `write-functions-list` skill 生成 `functions.list`。\n\n"
+            f"写入 `entry-list-merged.json`，并确保每个入口都包含 "
+            f"`function_description`、`entry_reason`、`taint_details`；"
+            f"再使用 `write-functions-list` skill 生成 `functions.list`。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
@@ -1534,7 +1555,9 @@ class Orchestrator:
             f"请根据以上反馈，严格按照 system prompt 中的工作流程和过滤标准，"
             f"重新读取相关 entry-list 文件并修正合并结果：\n\n"
             f"{file_list_str}\n\n"
-            f"重新写入 `entry-list-merged.json`，并使用 `write-functions-list` skill 重新生成 `functions.list`。\n\n"
+            f"重新写入 `entry-list-merged.json`，确保每个入口都保留 "
+            f"`function_description`、`entry_reason`、`taint_details`，"
+            f"并使用 `write-functions-list` skill 重新生成 `functions.list`。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 最终保留入口数量）。"
         )
 
@@ -1573,6 +1596,8 @@ class Orchestrator:
             "   - 数组为空 `[]` 且 entry-list 有入口函数条目 → Worker 漏掉所有入口\n"
             "   - 任一项缺少 `tag`/`file`/`function`/`taints` 字段，或 `taints` 为空数组\n"
             "   - `tag` 值不是 \"P\" 或 \"A\"\n"
+            "   - 缺少 `function_description` / `entry_reason` / `taint_details`，"
+            "或 taint_details 与 taints 不一致\n"
             "   - functions.list 条目数与 entry-list 入口函数数量不一致（误差超过 1 项）"
         )
 
@@ -1599,7 +1624,8 @@ class Orchestrator:
             f"② 不含 `_error` 字段（有则表示脚本解析失败）；\n"
             f"③ 若 entry-list 有入口函数，数组不得为空 `[]`；\n"
             f"④ 每项必须有非空的 `tag`（\"P\"/\"A\"）、`file`、`function`、`taints`；\n"
-            f"⑤ 条目数与 entry-list 入口数量一致（误差超过 1 项则 FAIL）。"
+            f"⑤ 必须有非空的 `function_description`、`entry_reason`，且 `taint_details` 与 `taints` 一一对应；\n"
+            f"⑥ 条目数与 entry-list 入口数量一致（误差超过 1 项则 FAIL）。"
             if functions_list_path else
             f"## {worker.worker_id} 的输出文件\n\n"
             f"摘要输出文件: `{output_path}`\n"

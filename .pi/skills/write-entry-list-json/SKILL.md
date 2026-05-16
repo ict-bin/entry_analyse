@@ -14,7 +14,7 @@ metadata:
 
 ## 输出文件格式
 
-文件名固定为 `entry-list-merged.json`，内容是一个 JSON 数组，每项 5 个字段，**全部必填**：
+文件名固定为 `entry-list-merged.json`，内容是一个 JSON 数组。每项至少包含以下 8 个字段，其中富说明字段也是必填：
 
 ```json
 [
@@ -23,14 +23,25 @@ metadata:
     "file":     "mle.cpp",
     "line":     1983,
     "function": "Mle::HandleUdpReceive(void*, otMessage*, otMessageInfo*)",
-    "taints":   ["aMessage", "aMessageInfo"]
+    "taints":   ["aMessage", "aMessageInfo"],
+    "function_description": "该函数负责处理收到的 UDP 消息，并驱动后续消息分发逻辑。",
+    "entry_reason": "该函数由外部协议栈回调触发，外部数据通过 aMessage 和 aMessageInfo 进入模块。",
+    "taint_details": [
+      {"name": "aMessage", "description": "消息体对象，承载外部网络报文内容。"},
+      {"name": "aMessageInfo", "description": "消息来源信息对象，包含外部地址与端口信息。"}
+    ]
   },
   {
     "tag":      "A",
     "file":     "key_manager.cpp",
     "line":     412,
     "function": "KeyManager::SetMasterKey(const uint8_t*, uint8_t)",
-    "taints":   ["aKey"]
+    "taints":   ["aKey"],
+    "function_description": "该函数负责接收并更新主密钥。",
+    "entry_reason": "该函数处理来自外部输入的密钥数据，参数 aKey 为外部可控输入。",
+    "taint_details": [
+      {"name": "aKey", "description": "外部提供的密钥缓冲区。"}
+    ]
   }
 ]
 ```
@@ -44,6 +55,9 @@ metadata:
 | `line` | integer | 函数定义行号；行号未知时填 `0`，**不能是字符串** |
 | `function` | string | 完整函数签名（含参数类型），如 `HandleUdpReceive(void*, otMessage*, otMessageInfo*)`，**不能为空** |
 | `taints` | array | 外部可控污点来源列表，**不能为空数组** |
+| `function_description` | string | 函数职责说明，**不能为空字符串**，不能写成模板占位话术 |
+| `entry_reason` | string | 判定该函数为入口的依据，**不能为空字符串**，应包含回调/调用/外部输入来源的具体原因 |
+| `taint_details` | array | 与 `taints` 一一对应的说明数组，**不能为空且数量必须一致** |
 
 ### taints 字段规范（高优先级）
 
@@ -135,3 +149,22 @@ python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_ent
 | `function` 填的是文件名 | 列映射错误 | `function` 填完整函数签名 |
 | `line` 是字符串 | JSON 类型错误 | `line` 必须是整数，如 `1983`，不是 `"1983"` |
 | `tag` 为空或其他值 | 忘记填写或填错 | 只能是 `"P"`（被动）或 `"A"`（主动） |
+### `function_description` / `entry_reason` / `taint_details` 要求
+
+- `function_description`：说明该函数在业务或控制流程中的作用
+- `entry_reason`：明确为什么它是入口，例如“由消息分发表回调”“函数内通过 recv 将外部数据写入 buf”
+- `taint_details`：每个 taint 都要单独说明其承载的外部数据语义
+
+格式示例：
+
+```json
+"function_description": "该函数负责处理接收到的控制报文并更新会话状态。",
+"entry_reason": "该函数由消息分发表直接回调，外部报文通过 aMsg 参数进入。",
+"taint_details": [
+  {"name": "aMsg", "description": "外部控制报文对象，携带未校验的输入字段。"},
+  {"name": "aInfo", "description": "报文来源信息，包含外部地址和端口。"}
+]
+```
+
+- `taint_details[i].name` 必须与 `taints[i]` 完全一致
+- `taint_details[i].description` 必须是针对该 taint 的具体说明，不能写“需要继续分析”这类空话

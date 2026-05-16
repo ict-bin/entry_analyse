@@ -10,18 +10,19 @@ metadata:
 
 # write-functions-list
 
-将 **`entry-list-merged.json`** 转换为 **`functions.list`**（JSON 数组格式）。
+将 **`entry-list-merged.json`** 转换为 **`functions.list`**（JSON 数组格式），并保留富说明字段。
 
 ## 操作流程
 
 1. 使用 `read` 工具读取 `entry-list-merged.json`
 2. 对每个条目**检查并修正** `taints` 字段（见下方规范）
-3. 使用 `write` 工具将修正后的数组写入 `functions.list`
-4. 运行验证脚本确认格式合法
+3. 保留 `function_description`、`entry_reason`、`taint_details`
+4. 使用 `write` 工具将修正后的数组写入 `functions.list`
+5. 运行验证脚本确认格式合法
 
 ## 输出文件格式
 
-文件名固定为 `functions.list`，内容是一个 JSON 数组，每项 5 个字段，**全部必填**：
+文件名固定为 `functions.list`，内容是一个 JSON 数组。兼容字段之外，还应保留富说明字段：
 
 ```json
 [
@@ -30,7 +31,13 @@ metadata:
     "file":     "mle.cpp",
     "line":     1983,
     "function": "Mle::HandleUdpReceive(void*, otMessage*, otMessageInfo*)",
-    "taints":   ["aMessage", "aMessageInfo"]
+    "taints":   ["aMessage", "aMessageInfo"],
+    "function_description": "该函数负责处理收到的 UDP 消息。",
+    "entry_reason": "由外部协议栈回调触发，外部输入通过 aMessage 和 aMessageInfo 进入。",
+    "taint_details": [
+      {"name": "aMessage", "description": "外部消息体。"},
+      {"name": "aMessageInfo", "description": "外部来源信息。"}
+    ]
   },
   {
     "tag":      "A",
@@ -51,6 +58,9 @@ metadata:
 | `line` | integer | 函数定义行号；行号未知时填 `0`，**不能是字符串** |
 | `function` | string | 完整函数签名（含参数类型），如 `HandleUdpReceive(void*, otMessage*, otMessageInfo*)`，**不能为空** |
 | `taints` | array | 外部可控污点来源列表，**不能为空数组** |
+| `function_description` | string | 函数职责说明，不能为空 |
+| `entry_reason` | string | 入口判定原因，不能为空 |
+| `taint_details` | array | 与 `taints` 一一对应的逐 taint 说明 |
 
 ## taints 字段规范（高优先级）
 

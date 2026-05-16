@@ -25,6 +25,9 @@ functions.list 固定输出格式（JSON 数组，不可变更）
   - line     : 函数定义行号，整数
   - function : 函数名（含参数类型），完整签名
   - taints   : 外部可控污点参数列表，至少 1 个元素
+  - function_description : 可选，函数职责说明
+  - entry_reason         : 可选，为什么判定为入口
+  - taint_details        : 可选，逐 taint 说明列表
 
 判 FAIL 条件（任一满足）：
   1. 含 `_error` 字段  → 脚本解析失败
@@ -39,6 +42,81 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+
+def _default_function_description(function_name: str) -> str:
+    fn = function_name.strip() or "该函数"
+    return f"{fn} 是当前识别到的外部入口函数，具体职责需结合源码进一步确认。"
+
+
+def _default_entry_reason(tag: str, function_name: str) -> str:
+    fn = function_name.strip() or "该函数"
+    if tag == "A":
+        return f"{fn} 被判定为主动拉取型入口，函数内部存在外部输入读取或接收行为。"
+    return f"{fn} 被判定为被动回调型入口，参数中携带来自外部的可控输入。"
+
+
+def _derive_description_source(raw_value: object) -> str:
+    return "agent" if str(raw_value or "").strip() else "default"
+
+
+def _normalize_taint_details(
+    taints: list[str],
+    details: object,
+) -> list[dict]:
+    normalized: list[dict] = []
+    detail_map: dict[str, dict] = {}
+
+    if isinstance(details, dict):
+        for raw_name, raw_desc in details.items():
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            if isinstance(raw_desc, dict):
+                desc = str(raw_desc.get("description") or "").strip()
+                source_kind = str(raw_desc.get("source_kind") or "").strip()
+                description_source = str(raw_desc.get("description_source") or "").strip() or ("agent" if desc else "")
+            else:
+                desc = str(raw_desc or "").strip()
+                source_kind = ""
+                description_source = "agent" if desc else ""
+            detail_map[name] = {
+                "name": name,
+                "description": desc,
+                **({"description_source": description_source} if description_source else {}),
+                **({"source_kind": source_kind} if source_kind else {}),
+            }
+    elif isinstance(details, list):
+        for raw_item in details:
+            if not isinstance(raw_item, dict):
+                continue
+            name = str(raw_item.get("name") or raw_item.get("taint") or raw_item.get("param") or "").strip()
+            if not name:
+                continue
+            desc = str(raw_item.get("description") or raw_item.get("summary") or "").strip()
+            source_kind = str(raw_item.get("source_kind") or "").strip()
+            description_source = str(raw_item.get("description_source") or "").strip() or ("agent" if desc else "")
+            detail_map[name] = {
+                "name": name,
+                "description": desc,
+                **({"description_source": description_source} if description_source else {}),
+                **({"source_kind": source_kind} if source_kind else {}),
+            }
+
+    for taint in taints:
+        item = dict(detail_map.get(taint) or {})
+        item["name"] = taint
+        if not str(item.get("description") or "").strip():
+            item["description"] = f"参数 `{taint}` 被识别为外部可控污点，需要在下游继续追踪其传播与使用。"
+        if not str(item.get("description_source") or "").strip():
+            item["description_source"] = "default"
+        source_kind = str(item.get("source_kind") or "").strip()
+        if source_kind:
+            item["source_kind"] = source_kind
+        else:
+            item.pop("source_kind", None)
+        normalized.append(item)
+    return normalized
 
 
 def _parse_markdown_fallback(content: str) -> list[dict]:
@@ -160,6 +238,11 @@ def _parse_markdown_fallback(content: str) -> list[dict]:
             "line": line_val,
             "function": func_raw,
             "taints": taints,
+            "function_description": _default_function_description(func_raw),
+            "function_description_source": "default",
+            "entry_reason": _default_entry_reason(tag, func_raw),
+            "entry_reason_source": "default",
+            "taint_details": _normalize_taint_details(taints, []),
         })
 
     return result
@@ -209,6 +292,14 @@ def generate_functions_list(entry_json: str) -> str:
                 "line": line if isinstance(line, int) else 0,
                 "function": item.get("function", ""),
                 "taints": taints,
+                "function_description": str(item.get("function_description") or "").strip(),
+                "function_description_source": _derive_description_source(item.get("function_description")),
+                "entry_reason": str(item.get("entry_reason") or "").strip(),
+                "entry_reason_source": _derive_description_source(item.get("entry_reason")),
+                "taint_details": _normalize_taint_details(
+                    [str(value).strip() for value in taints if str(value).strip()],
+                    item.get("taint_details") or item.get("taint_descriptions") or [],
+                ),
                 "definition_file": item.get("definition_file") or item.get("file", ""),
                 "definition_line": (
                     item.get("definition_line")
@@ -317,6 +408,28 @@ def validate_functions_list(items: list) -> list[str]:
                     f"@return，不能含空格/中文/带参括号）: {json.dumps(bad, ensure_ascii=False)}"
                 )
 
+        function_description = item.get("function_description")
+        if not isinstance(function_description, str) or not function_description.strip():
+            errors.append(f"{prefix} function_description 为空或非字符串: {function_description!r}")
+
+        entry_reason = item.get("entry_reason")
+        if not isinstance(entry_reason, str) or not entry_reason.strip():
+            errors.append(f"{prefix} entry_reason 为空或非字符串: {entry_reason!r}")
+
+        taint_details = item.get("taint_details")
+        if not isinstance(taint_details, list) or len(taint_details) != len(item.get("taints") or []):
+            errors.append(f"{prefix} taint_details 数量与 taints 不一致")
+        else:
+            names = [str(detail.get("name") or "").strip() for detail in taint_details if isinstance(detail, dict)]
+            if names != [str(t).strip() for t in item.get("taints") or []]:
+                errors.append(f"{prefix} taint_details.name 与 taints 顺序或名称不一致")
+            for detail_index, detail in enumerate(taint_details):
+                if not isinstance(detail, dict):
+                    errors.append(f"{prefix} taint_details[{detail_index}] 不是对象")
+                    continue
+                if not str(detail.get("description") or "").strip():
+                    errors.append(f"{prefix} taint_details[{detail_index}].description 为空")
+
     return errors
 
 
@@ -382,6 +495,22 @@ def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
             log.append(f"{prefix} 过滤后 taints 为空，跳过条目 function={fn!r}")
             continue
         item["taints"] = good
+        raw_function_description = str(item.get("function_description") or "").strip()
+        raw_entry_reason = str(item.get("entry_reason") or "").strip()
+        item["function_description"] = raw_function_description or _default_function_description(str(item.get("function") or ""))
+        item["function_description_source"] = "agent" if raw_function_description else "default"
+        item["entry_reason"] = raw_entry_reason or _default_entry_reason(str(item.get("tag") or ""), str(item.get("function") or ""))
+        item["entry_reason_source"] = "agent" if raw_entry_reason else "default"
+        normalized_details = _normalize_taint_details(good, item.get("taint_details") or item.get("taint_descriptions") or [])
+        raw_detail_map = {}
+        for raw_detail in item.get("taint_details") or item.get("taint_descriptions") or []:
+            if isinstance(raw_detail, dict):
+                raw_name = str(raw_detail.get("name") or raw_detail.get("taint") or raw_detail.get("param") or "").strip()
+                if raw_name:
+                    raw_detail_map[raw_name] = str(raw_detail.get("description") or raw_detail.get("summary") or "").strip()
+        for detail in normalized_details:
+            detail["description_source"] = "agent" if raw_detail_map.get(str(detail.get("name") or "").strip()) else "default"
+        item["taint_details"] = normalized_details
 
         fixed.append(item)
 

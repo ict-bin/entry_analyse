@@ -6,9 +6,9 @@
 
 # ⚠️ 格式强制规定（最高优先级，违反直接导致所有轮次判定 FAIL）
 
-## Step 1：`entry-list-merged.json` 只允许 5 个字段
+## Step 1：`entry-list-merged.json` 必须包含基础字段 + 富说明字段
 
-文件名固定为 **`entry-list-merged.json`**，内容是一个 JSON 数组，每项**严格 5 个字段**，全部必填：
+文件名固定为 **`entry-list-merged.json`**，内容是一个 JSON 数组。每项除基础识别字段外，还必须补充函数说明、入口原因和逐 taint 说明：
 
 ```json
 [
@@ -17,14 +17,26 @@
     "file":     "isula_rt_ops.c",
     "line":     1209,
     "function": "rt_isula_create(const char *id, const char *runtime, const rt_create_params_t *params)",
-    "taints":   ["id", "runtime", "params"]
+    "taints":   ["id", "runtime", "params"],
+    "function_description": "该函数负责处理运行时创建请求并组织容器创建参数。",
+    "entry_reason": "该函数由外部运行时调用触发，请求参数通过 id/runtime/params 进入模块。",
+    "taint_details": [
+      {"name": "id", "description": "外部传入的容器标识。"},
+      {"name": "runtime", "description": "外部传入的运行时名称。"},
+      {"name": "params", "description": "外部传入的创建参数结构体。"}
+    ]
   },
   {
     "tag":      "A",
     "file":     "plugin.c",
     "line":     617,
     "function": "process_plugin_events(int inotify_fd, const char *plugin_dir)",
-    "taints":   ["inotify_events"]
+    "taints":   ["inotify@events"],
+    "function_description": "该函数负责消费 inotify 事件并处理插件目录变化。",
+    "entry_reason": "该函数内部主动读取 inotify 事件，是主动拉取型入口。",
+    "taint_details": [
+      {"name": "inotify@events", "description": "由 inotify 读取到的外部文件系统事件集合。"}
+    ]
   }
 ]
 ```
@@ -38,6 +50,9 @@
 | `line` | integer | 函数定义行号，整数；行号未知时填 `0`；**不能是字符串**，不能有 `"L"` 前缀 | 填了字符串 `"617"`，或 `"L617"`，或浮点数 |
 | `function` | string | 完整函数签名（含参数类型），如 `rt_isula_create(const char *id, const char *runtime, const rt_create_params_t *params)`，**不能为空字符串** | 只填了函数名无参数，或留空 `""` |
 | `taints` | array | 外部可控污点参数名的字符串数组，**不能为空数组 `[]`**；元素只允许合法标识符格式（见下） | 填了中文说明、填了 `[]`、填了风险等级如 `"HIGH"` |
+| `function_description` | string | 函数职责说明，**不能为空字符串** | 写成“需要进一步分析”这类空话 |
+| `entry_reason` | string | 判定为入口的直接原因，**不能为空字符串** | 只写“是入口”而不解释为什么 |
+| `taint_details` | array | 与 `taints` 一一对应的说明数组 | 数量不一致、name 对不上、description 为空 |
 
 ### `taints` 元素合法格式
 
@@ -74,7 +89,7 @@
 | `is_definition_found` | （删除） | 不在规范内，删除整个字段 |
 | `signature_params` | （删除） | 不在规范内，删除整个字段 |
 
-> **记忆口诀**：最终文件里每个对象只能有 `tag`、`file`、`line`、`function`、`taints` 这 5 个键，多一个都不行。
+> **记忆口诀**：最终文件里每个对象至少要有 `tag`、`file`、`line`、`function`、`taints`、`function_description`、`entry_reason`、`taint_details` 这 8 个键。
 
 ---
 

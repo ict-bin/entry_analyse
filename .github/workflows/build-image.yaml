@@ -23,8 +23,31 @@ jobs:
         id: owner
         run: echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
-  build-amd64:
+  unit-tests:
     needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run targeted unit tests
+        run: |
+          python -m unittest \
+            test_runner.py \
+            test_functions_list_metadata.py
+
+  build-amd64:
+    needs: [prepare, unit-tests]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,7 +77,7 @@ jobs:
           docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
-    needs: prepare
+    needs: [prepare, unit-tests]
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
