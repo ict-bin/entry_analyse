@@ -493,6 +493,8 @@ class TaskService:
         )
 
     def _schedule_pending_dispatch(self, project_id: str) -> None:
+        if not role_enabled("worker"):
+            return
         existing = _dispatch_tasks.get(project_id)
         if existing and not existing.done():
             return
@@ -884,7 +886,7 @@ class TaskService:
             parent_stage_item_key=parent_stage_item_key,
         )
         db.add(row); db.commit(); db.refresh(row)
-        self._schedule_pending_dispatch(project_id)
+        self.schedule_dispatch(project_id)
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
         return self._row_to_dict(row)
@@ -918,7 +920,7 @@ class TaskService:
                     _shutil.rmtree(task_root)
                 except Exception as _e:
                     logger.warning("Failed to clean task dir %s: %s", task_root, _e)
-        self._schedule_pending_dispatch(row.project_id)
+        self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -945,7 +947,7 @@ class TaskService:
         row.error = None
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
-        self._schedule_pending_dispatch(row.project_id)
+        self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
