@@ -26,10 +26,20 @@ from app.time_utils import add_seconds_local, isoformat_local, now_local
 
 logger = logging.getLogger("ea.task_service")
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, value)
+
+
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 LEASE_DURATION_SECONDS = int(os.environ.get("EA_TASK_LEASE_SECONDS", "120"))
 LEASE_RENEW_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_LEASE_RENEW_INTERVAL_SECONDS", "30"))
 CANCEL_POLL_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_CANCEL_POLL_INTERVAL_SECONDS", "3"))
+DISPATCH_CLAIM_BATCH_SIZE = _positive_int_env("EA_WORKER_DISPATCH_CLAIM_BATCH_SIZE", 1)
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
     or os.environ.get("POD_NAME")
@@ -519,6 +529,9 @@ class TaskService:
                 running_count = self._active_running_count(db, project_id)
                 if running_count >= max_concurrent_tasks:
                     return
+                claim_slots = min(max_concurrent_tasks - running_count, DISPATCH_CLAIM_BATCH_SIZE)
+                if claim_slots <= 0:
+                    return
                 candidate_rows = (
                     db.query(AppEaTask)
                     .filter(
@@ -531,11 +544,12 @@ class TaskService:
                         ),
                     )
                     .order_by(AppEaTask.created_at.asc(), AppEaTask.id.asc())
-                    .limit((max_concurrent_tasks - running_count) * 2)
+                    .limit(claim_slots * 2)
                     .all()
                 )
+                claimed_count = 0
                 for row in candidate_rows:
-                    if running_count >= max_concurrent_tasks:
+                    if running_count >= max_concurrent_tasks or claimed_count >= claim_slots:
                         break
                     from app.service.worker_service import get_worker_service
                     worker_service = get_worker_service()
@@ -546,6 +560,7 @@ class TaskService:
                         continue
                     worker_service.start_task(claimed.task_id)
                     running_count += 1
+                    claimed_count += 1
             except Exception as exc:
                 logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)
             finally:
