@@ -182,7 +182,25 @@ class WorkerService:
         def on_event(event) -> None:
             event_buffer.append({"ts": task_mod._time.time(), "type": event.type, "data": dict(event.data)})
             n = len(event_buffer)
-            if n == 1 or n % 3 == 0:
+            immediate_events = {
+                "master_worker_start",
+                "master_worker_agent_start",
+                "master_worker_done",
+                "repair_plan_generated",
+                "repair_patch_applied",
+                "artifact_validate_done",
+                "artifact_validate_error",
+                "judge_start",
+                "judge_eval",
+                "round_start",
+                "round_end",
+                "workers_skipped",
+                "shard_merge_start",
+                "shard_merge_done",
+                "shard_master_start",
+                "shard_master_done",
+            }
+            if n == 1 or n % 3 == 0 or event.type in immediate_events:
                 task_mod._flush_stages(task_id, event_buffer)
 
         try:

@@ -32,6 +32,11 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pi_retry_delay": 5,
     "worker_parallel": False,
     "worker_parallelism": 128,
+    "master_merge_mode": "hierarchical",
+    "master_shard_size": 10,
+    "master_shard_parallelism": 4,
+    "model_capacity_enabled": True,
+    "model_max_concurrency": 32,
     "workers": {
         "default_model": "",
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
@@ -101,6 +106,21 @@ class ConfigService:
         normalized["worker_parallelism"] = normalize_worker_parallelism(
             normalized.get("worker_parallelism")
         )
+        try:
+            normalized["master_shard_size"] = max(2, min(int(normalized.get("master_shard_size", 10)), 100))
+        except (TypeError, ValueError):
+            normalized["master_shard_size"] = 10
+        try:
+            normalized["master_shard_parallelism"] = max(1, min(int(normalized.get("master_shard_parallelism", 4)), 64))
+        except (TypeError, ValueError):
+            normalized["master_shard_parallelism"] = 4
+        mode = str(normalized.get("master_merge_mode") or "hierarchical").strip().lower()
+        normalized["master_merge_mode"] = mode if mode in {"single", "hierarchical"} else "hierarchical"
+        try:
+            normalized["model_max_concurrency"] = max(1, min(int(normalized.get("model_max_concurrency", 32)), 512))
+        except (TypeError, ValueError):
+            normalized["model_max_concurrency"] = 32
+        normalized["model_capacity_enabled"] = bool(normalized.get("model_capacity_enabled", True))
         return normalized
 
     def get_config(self, db: Session, project_id: str) -> dict:

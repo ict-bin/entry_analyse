@@ -9,7 +9,7 @@ import uuid
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 MAX_ROUNDS_EXCEEDED_ACTIONS = {
@@ -21,6 +21,9 @@ MAX_CONCURRENT_TASKS_DEFAULT = 8
 MAX_CONCURRENT_TASKS_LIMIT = 128
 WORKER_PARALLELISM_DEFAULT = 128
 WORKER_PARALLELISM_LIMIT = 256
+MASTER_SHARD_SIZE_DEFAULT = 10
+MASTER_SHARD_PARALLELISM_DEFAULT = 4
+MODEL_MAX_CONCURRENCY_DEFAULT = 32
 
 
 def normalize_max_rounds_exceeded_action(value: str | None) -> str:
@@ -71,6 +74,8 @@ class RoleConfig(BaseModel):
 
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
+    model_config = ConfigDict(protected_namespaces=())
+
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
     max_rounds_exceeded_action: str = Field(
         default="treat_as_passed",
@@ -88,6 +93,11 @@ class ServiceConfig(BaseModel):
     pi_retry_delay: float = Field(default=5.0, description="pi 进程重试等待秒数")
     worker_parallel: bool = Field(default=False, description="并行 Worker 模式：多个 agents 实例同时各自分析文件分片，文件列表按 agents 数量均分")
     worker_parallelism: int = Field(default=WORKER_PARALLELISM_DEFAULT, description="单个任务内部 Worker 最大并发数")
+    master_merge_mode: str = Field(default="hierarchical", description="Master 合并模式：single/hierarchical")
+    master_shard_size: int = Field(default=MASTER_SHARD_SIZE_DEFAULT, description="分层合并时每个 shard 包含的 worker 结果数")
+    master_shard_parallelism: int = Field(default=MASTER_SHARD_PARALLELISM_DEFAULT, description="分层合并时 shard master 最大并发数")
+    model_capacity_enabled: bool = Field(default=True, description="是否启用单 pod 内按模型限流保护")
+    model_max_concurrency: int = Field(default=MODEL_MAX_CONCURRENCY_DEFAULT, description="单 pod 内同一模型最大并发 PI/LLM 调用数")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -101,6 +111,8 @@ class ServiceConfig(BaseModel):
 
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
+    model_config = ConfigDict(protected_namespaces=())
+
     # 用户输入部分
     task: str = Field(..., description="用户的一句话 prompt")
     module_name: str = Field(default="", description="从 prompt 解析出的模块名")
@@ -122,6 +134,11 @@ class TaskConfig(BaseModel):
     pi_retry_delay: float = Field(default=5.0)
     worker_parallel: bool = Field(default=False)
     worker_parallelism: int = Field(default=WORKER_PARALLELISM_DEFAULT)
+    master_merge_mode: str = Field(default="hierarchical")
+    master_shard_size: int = Field(default=MASTER_SHARD_SIZE_DEFAULT)
+    master_shard_parallelism: int = Field(default=MASTER_SHARD_PARALLELISM_DEFAULT)
+    model_capacity_enabled: bool = Field(default=True)
+    model_max_concurrency: int = Field(default=MODEL_MAX_CONCURRENCY_DEFAULT)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")

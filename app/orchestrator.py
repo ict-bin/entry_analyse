@@ -64,12 +64,20 @@ import math
 import os
 import re
 import time
+import shutil
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from .agent_capacity import model_capacity_slot
 from .config import load_system_prompts, resolve_system_prompt
+from .entry_artifacts import (
+    apply_feedback_repairs,
+    parse_feedback_repair_plan,
+    select_related_workers,
+    sync_functions_list_from_entry,
+)
 from .service.llm_provider_sync import sync_providers_to_pi
 from .service.svc_config import get_service_yaml
 from .models import (
@@ -156,7 +164,11 @@ def _check_agent_result(ar: AgentResult, context: str = "") -> None:
 
 async def _run_agent_checked(context: str = "", **kwargs) -> AgentResult:
     """run_agent 的包装：执行后自动检查致命错误。"""
-    ar = await run_agent(**kwargs)
+    capacity_enabled = bool(kwargs.pop("capacity_enabled", False))
+    capacity_limit = kwargs.pop("capacity_limit", 32)
+    model = str(kwargs.get("model") or "")
+    async with model_capacity_slot(model, enabled=capacity_enabled, limit=capacity_limit):
+        ar = await run_agent(**kwargs)
     _check_agent_result(ar, context)
     return ar
 
@@ -563,6 +575,8 @@ class Orchestrator:
                     "timeout_max_retries": cfg.agent_timeout_max_retries,
                     "pi_max_retries": cfg.pi_max_retries,
                     "pi_retry_delay": cfg.pi_retry_delay,
+                    "capacity_enabled": cfg.model_capacity_enabled,
+                    "capacity_limit": cfg.model_max_concurrency,
                 }
                 agents_desc = (
                     [f"worker={cfg.workers.agents[0].model}"]
@@ -781,7 +795,39 @@ class Orchestrator:
                                 except OSError:
                                     pass
 
-                    # ── Master Worker：合并所有文件 Worker 的分析结果 ──────────────
+                    master_input_workers = round_file_workers
+                    if (
+                        rnd_num == 1
+                        and str(cfg.master_merge_mode or "").lower() == "hierarchical"
+                        and len(round_file_workers) > max(1, cfg.master_shard_size)
+                    ):
+                        self._emit("shard_merge_start", task_id,
+                                   round=rnd_num,
+                                   workers=len(round_file_workers),
+                                   shard_size=cfg.master_shard_size,
+                                   shard_parallelism=cfg.master_shard_parallelism)
+                        _master_prompt_dir = str(
+                            Path(cfg.workers.system_prompt_dir).parent / "master_worker")
+                        _master_dir_prompts_for_shards = load_system_prompts(_master_prompt_dir, 1)
+                        _shard_master_sys = (
+                            _master_dir_prompts_for_shards[0]
+                            if _master_dir_prompts_for_shards and _master_dir_prompts_for_shards[0]
+                            else resolve_system_prompt(0, cfg.workers.agents[0], _w_dir_prompts)
+                        )
+                        master_input_workers = await self._run_shard_masters(
+                            acfg=cfg.workers.agents[0],
+                            master_sys_prompt=_shard_master_sys,
+                            round_file_workers=round_file_workers,
+                            worker_cwd=worker_cwd,
+                            sess_dir=sess_dir,
+                            task_id=task_id,
+                            rnd_num=rnd_num,
+                        )
+                        self._emit("shard_merge_done", task_id,
+                                   round=rnd_num,
+                                   shards=len(master_input_workers))
+
+                    # ── Master Worker：合并所有文件 Worker / Shard 的分析结果 ─────
                     master_acfg = cfg.workers.agents[0]
                     # 优先从专属 master_worker prompt 目录加载，回退到 workers prompt
                     _master_prompt_dir = str(
@@ -793,11 +839,12 @@ class Orchestrator:
                         master_sys = resolve_system_prompt(0, master_acfg, _w_dir_prompts)
                     master_sess = str(sess_dir / "master-worker.jsonl")
                     self._emit("master_worker_start", task_id, round=rnd_num,
-                               workers=len(round_file_workers))
+                               workers=len(master_input_workers),
+                               source="shards" if master_input_workers is not round_file_workers else "workers")
                     master_result = await self._run_master_worker(
                         acfg=master_acfg,
                         master_sys_prompt=master_sys,
-                        round_file_workers=round_file_workers,
+                        round_file_workers=master_input_workers,
                         worker_cwd=worker_cwd,
                         session_file=master_sess,
                         task_id=task_id,
@@ -974,37 +1021,32 @@ class Orchestrator:
             cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) functions.list——优先使用 agent（master worker）通过 skill 写入的版本；
-        #    若 agent 未写，则从 entry-list 文件程序化生成（兜底路径）
+        # 3) functions.list：始终从最佳 entry-list 确定性生成。
+        #    Agent 可以负责判断入口，但结构化下游产物必须由程序生成，
+        #    避免多轮修正时复用 LLM 写错的 functions.list。
         func_list_path = str(out_dir / "functions.list")
-
-        # 检查 agent 是否已写入 functions.list（agent 写在 worker_cwd 中）
-        _worker_cwd_fl = None
+        _entry_src = ""
         if best_wr.entry_file:
-            _worker_cwd_fl = Path(best_wr.entry_file).parent / "functions.list"
-
-        _agent_wrote_fl = False
-        for _candidate in [_worker_cwd_fl]:
-            if _candidate and _candidate.exists() and _candidate.stat().st_size > 2:
-                import shutil as _shutil
-                _shutil.copy2(str(_candidate), func_list_path)
-                self._emit("functions_list_from_skill", task_id,
-                           source=str(_candidate))
-                _agent_wrote_fl = True
-                break
-
-        if not _agent_wrote_fl:
-            # 兜底：用 Python 程序化解析 entry-list 生成 functions.list
-            _entry_src = ""
-            if best_wr.entry_file:
+            try:
+                entry_sync = sync_functions_list_from_entry(best_wr.entry_file, func_list_path)
+                self._emit("functions_list_synced", task_id,
+                           source=str(best_wr.entry_file),
+                           entry_count=entry_sync.entry_count,
+                           functions_count=entry_sync.functions_count,
+                           fixes=entry_sync.fixes[:20],
+                           errors=entry_sync.validation_errors[:20])
+            except Exception as _sync_err:
+                self._emit("functions_list_sync_error", task_id, error=str(_sync_err))
                 try:
                     _entry_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
                 except OSError:
                     pass
-            if _entry_src:
-                write_functions_list(_entry_src, func_list_path)
-            else:
-                write_functions_list(cleaned_output, func_list_path)
+                if _entry_src:
+                    write_functions_list(_entry_src, func_list_path)
+                else:
+                    write_functions_list(cleaned_output, func_list_path)
+        else:
+            write_functions_list(cleaned_output, func_list_path)
 
         # 程序级强制保证：functions.list 必须通过深度字段验证
         import json as _json
@@ -1124,6 +1166,8 @@ class Orchestrator:
             "timeout_max_retries": cfg.agent_timeout_max_retries,
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
+            "capacity_enabled": cfg.model_capacity_enabled,
+            "capacity_limit": cfg.model_max_concurrency,
         }
 
         total_tokens = TokenUsage()
@@ -1199,6 +1243,71 @@ class Orchestrator:
     # Master Worker（并行模式：合并所有文件 Worker 的分析结果）
     # ═══════════════════════════════════════════════════════════════════════
 
+    async def _run_shard_masters(
+        self,
+        acfg: AgentInstanceConfig,
+        master_sys_prompt: str,
+        round_file_workers: list[WorkerResult],
+        worker_cwd: str,
+        sess_dir: Path,
+        task_id: str,
+        rnd_num: int,
+    ) -> list[WorkerResult]:
+        """Hierarchical reduce: merge file-worker outputs into shard artifacts."""
+        cfg = self.cfg
+        shard_size = max(2, int(cfg.master_shard_size or 10))
+        shard_parallelism = max(1, int(cfg.master_shard_parallelism or 4))
+        shards = [
+            round_file_workers[index:index + shard_size]
+            for index in range(0, len(round_file_workers), shard_size)
+        ]
+        sem = asyncio.Semaphore(shard_parallelism)
+        shard_root = Path(worker_cwd) / ".merge_shards" / f"round_{rnd_num:03d}"
+        shard_root.mkdir(parents=True, exist_ok=True)
+
+        async def _run_one(shard_idx: int, workers: list[WorkerResult]) -> WorkerResult:
+            async with sem:
+                shard_dir = shard_root / f"shard_{shard_idx:03d}"
+                shard_dir.mkdir(parents=True, exist_ok=True)
+                shard_workers: list[WorkerResult] = []
+                for worker in workers:
+                    if worker.entry_file and Path(worker.entry_file).exists():
+                        dst = shard_dir / Path(worker.entry_file).name
+                        shutil.copy2(worker.entry_file, dst)
+                        shard_workers.append(worker.model_copy(update={"entry_file": str(dst)}))
+                    else:
+                        shard_workers.append(worker)
+
+                self._emit("shard_master_start", task_id,
+                           round=rnd_num,
+                           shard=shard_idx,
+                           workers=len(shard_workers))
+                result = await self._run_master_worker(
+                    acfg=acfg,
+                    master_sys_prompt=master_sys_prompt,
+                    round_file_workers=shard_workers,
+                    worker_cwd=str(shard_dir),
+                    session_file=str(sess_dir / f"shard-master-{shard_idx}-r{rnd_num}.jsonl"),
+                    task_id=task_id,
+                    rnd_num=1,
+                    feedback="",
+                )
+                final_name = f"shard-{shard_idx:03d}-entry-list-merged.json"
+                final_path = Path(worker_cwd) / final_name
+                if result.entry_file and Path(result.entry_file).exists():
+                    shutil.copy2(result.entry_file, final_path)
+                    result.entry_file = str(final_path)
+                self._emit("shard_master_done", task_id,
+                           round=rnd_num,
+                           shard=shard_idx,
+                           entry_file_found=bool(result.entry_file))
+                return result.model_copy(update={"worker_id": f"shard_master_{shard_idx}"})
+
+        return list(await asyncio.gather(*[
+            _run_one(idx, shard_workers)
+            for idx, shard_workers in enumerate(shards)
+        ]))
+
     async def _run_master_worker(
         self,
         acfg: AgentInstanceConfig,
@@ -1237,6 +1346,8 @@ class Orchestrator:
             "timeout_max_retries": cfg.agent_timeout_max_retries,
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
+            "capacity_enabled": cfg.model_capacity_enabled,
+            "capacity_limit": cfg.model_max_concurrency,
         }
 
         total_tokens = TokenUsage()
@@ -1245,9 +1356,40 @@ class Orchestrator:
             merge_prompt = self._build_master_worker_prompt(
                 cfg.task, cfg.module_name, round_file_workers)
         else:
-            merge_prompt = self._build_master_worker_retry_prompt(
-                cfg.task, cfg.module_name, round_file_workers, feedback, rnd_num)
+            repair_plan = parse_feedback_repair_plan(feedback)
+            previous_entry = Path(worker_cwd) / "entry-list-merged.json"
+            previous_functions = Path(worker_cwd) / "functions.list"
+            if previous_entry.exists():
+                removed = apply_feedback_repairs(previous_entry, repair_plan)
+                if removed:
+                    self._emit("repair_patch_applied", task_id,
+                               round=rnd_num,
+                               removed_functions=removed[:20])
+                try:
+                    sync_result = sync_functions_list_from_entry(previous_entry, previous_functions)
+                    self._emit("artifact_validate_done", task_id,
+                               round=rnd_num,
+                               entry_count=sync_result.entry_count,
+                               functions_count=sync_result.functions_count,
+                               fixes=sync_result.fixes[:20],
+                               errors=sync_result.validation_errors[:20])
+                except Exception as sync_exc:
+                    self._emit("artifact_validate_error", task_id,
+                               round=rnd_num, error=str(sync_exc))
 
+            related_workers = select_related_workers(round_file_workers, repair_plan)
+            prompt_workers = related_workers or round_file_workers
+            self._emit("repair_plan_generated", task_id,
+                       round=rnd_num,
+                       remove_functions=repair_plan.remove_functions[:20],
+                       related_files=repair_plan.related_files[:20],
+                       add_hints=repair_plan.add_hints[:10],
+                       prompt_workers=len(prompt_workers),
+                       total_workers=len(round_file_workers))
+            merge_prompt = self._build_master_worker_retry_prompt(
+                cfg.task, cfg.module_name, prompt_workers, feedback, rnd_num)
+
+        self._emit("master_worker_agent_start", task_id, round=rnd_num)
         ar = await _run_agent_checked(
             context="master_worker", prompt=merge_prompt, **master_kwargs)
         total_tokens += ar.token_usage
@@ -1266,6 +1408,19 @@ class Orchestrator:
                 or _find_entry_file(worker_cwd, cfg.module_name)
                 or ""
             )
+
+        if ef and Path(ef).name == "entry-list-merged.json":
+            try:
+                sync_result = sync_functions_list_from_entry(ef, Path(worker_cwd) / "functions.list")
+                self._emit("artifact_validate_done", task_id,
+                           round=rnd_num,
+                           entry_count=sync_result.entry_count,
+                           functions_count=sync_result.functions_count,
+                           fixes=sync_result.fixes[:20],
+                           errors=sync_result.validation_errors[:20])
+            except Exception as sync_exc:
+                self._emit("artifact_validate_error", task_id,
+                           round=rnd_num, error=str(sync_exc))
 
         return WorkerResult(
             worker_id="master_worker",
@@ -1323,6 +1478,8 @@ class Orchestrator:
             "timeout_max_retries": cfg.agent_timeout_max_retries,
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
+            "capacity_enabled": cfg.model_capacity_enabled,
+            "capacity_limit": cfg.model_max_concurrency,
         }
 
         # ═══ 步骤0：准备文件到 Judge 工作目录 ═══
@@ -1532,8 +1689,9 @@ class Orchestrator:
             f"请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
             f"严格按照 system prompt 中的工作流程和过滤标准完成精筛合并，"
             f"写入 `entry-list-merged.json`，并确保每个入口都包含 "
-            f"`function_description`、`entry_reason`、`taint_details`；"
-            f"再使用 `write-functions-list` skill 生成 `functions.list`。\n\n"
+            f"`function_description`、`entry_reason`、`taint_details`。"
+            f"`functions.list` 将由后端从 `entry-list-merged.json` 确定性生成，"
+            f"你不要手写或维护它。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
@@ -1552,12 +1710,14 @@ class Orchestrator:
             f"上一轮合并结果未通过评审，Judge 的反馈如下：\n\n"
             f"{feedback}\n\n"
             f"---\n\n"
-            f"请根据以上反馈，严格按照 system prompt 中的工作流程和过滤标准，"
-            f"重新读取相关 entry-list 文件并修正合并结果：\n\n"
+            f"请根据以上反馈做**增量修补**：优先读取当前工作目录中的 "
+            f"`entry-list-merged.json` 和 `functions.list`，再只读取下面列出的相关 "
+            f"entry-list 文件。不要重新全量读取所有 worker 产物，除非反馈明确要求。\n\n"
             f"{file_list_str}\n\n"
             f"重新写入 `entry-list-merged.json`，确保每个入口都保留 "
-            f"`function_description`、`entry_reason`、`taint_details`，"
-            f"并使用 `write-functions-list` skill 重新生成 `functions.list`。\n\n"
+            f"`function_description`、`entry_reason`、`taint_details`。"
+            f"`functions.list` 将由后端从 `entry-list-merged.json` 确定性生成，"
+            f"你不要手写或维护它。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 最终保留入口数量）。"
         )
 
