@@ -164,6 +164,10 @@ class TaskEvaluationResponse(BaseModel):
     task_id: str
     status: str
     available: bool
+    source: str = "none"
+    is_realtime: bool = False
+    snapshot_generated_at: Optional[str] = None
+    runtime_summary: Optional[dict[str, Any]] = None
     summary: Optional[dict[str, Any]] = None
     rounds: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

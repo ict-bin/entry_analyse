@@ -11,7 +11,7 @@ import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, load_only
@@ -111,6 +111,197 @@ def _load_task_result_json(row: AppEaTask) -> dict | None:
         except Exception as exc:
             logger.warning("failed to load task result file %s: %s", path, exc)
     return row.result_json if isinstance(row.result_json, dict) else None
+
+
+def _safe_load_json(path: Path) -> dict | None:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else None
+    except Exception:
+        return None
+
+
+def _round_number_from_path(path: Path) -> int | None:
+    match = re.search(r"round_(\d+)", path.name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _round_number_from_session_node(node: dict[str, Any]) -> int | None:
+    for value in (
+        node.get("latest_round_ref") if isinstance(node.get("latest_round_ref"), dict) else {},
+        node,
+    ):
+        if not isinstance(value, dict):
+            continue
+        for key in ("round", "stage_round", "attempt"):
+            try:
+                round_number = int(value.get(key) or 0)
+            except (TypeError, ValueError):
+                round_number = 0
+            if round_number > 0:
+                return round_number
+    text = " ".join(str(node.get(key) or "") for key in ("relative_path", "node_id", "session_name", "display_name"))
+    match = re.search(r"(?:round[_-]?|[-_]r)(\d+)", text, re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _build_runtime_evaluation_snapshot(row: AppEaTask, run_root: Path | None, warnings: list[str]) -> dict:
+    generated_at = isoformat_local(now_local())
+    if not run_root or not run_root.is_dir():
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "available": False,
+            "source": "none",
+            "is_realtime": False,
+            "snapshot_generated_at": generated_at,
+            "runtime_summary": None,
+            "summary": None,
+            "rounds": [],
+            "warnings": warnings,
+        }
+
+    index_path = run_root / "sessions" / "index.json"
+    session_index = _safe_load_json(index_path) if index_path.is_file() else None
+    session_summary = session_index.get("summary") if isinstance(session_index, dict) and isinstance(session_index.get("summary"), dict) else {}
+    session_nodes = session_index.get("nodes") if isinstance(session_index, dict) and isinstance(session_index.get("nodes"), list) else []
+    active_nodes = [node for node in session_nodes if isinstance(node, dict) and (node.get("is_active") or node.get("status") in ("active", "running"))]
+    active_rounds = {round_number for node in active_nodes if (round_number := _round_number_from_session_node(node))}
+
+    rounds: list[dict[str, Any]] = []
+    for round_dir in sorted(run_root.glob("round_*")):
+        if not round_dir.is_dir():
+            continue
+        round_number = _round_number_from_path(round_dir)
+        if round_number is None:
+            continue
+        worker_md = sorted((round_dir / "workers").glob("*.md")) if (round_dir / "workers").is_dir() else []
+        worker_json = sorted((round_dir / "workers").glob("*.json")) if (round_dir / "workers").is_dir() else []
+        judge_md = sorted((round_dir / "judges").rglob("*.md")) if (round_dir / "judges").is_dir() else []
+        judge_json = sorted((round_dir / "judges").rglob("*.json")) if (round_dir / "judges").is_dir() else []
+        round_active_nodes = [node for node in active_nodes if _round_number_from_session_node(node) == round_number]
+        round_session_nodes = [node for node in session_nodes if isinstance(node, dict) and _round_number_from_session_node(node) == round_number]
+        status = "running" if round_number in active_rounds else "completed"
+        if not judge_md and not judge_json:
+            status = "partial"
+
+        judges = []
+        for index, node in enumerate([n for n in round_session_nodes if n.get("role") == "judge"]):
+            judges.append({
+                "judge_id": node.get("session_name") or f"judge-{index}",
+                "model": node.get("model"),
+                "session_file": node.get("relative_path"),
+                "passed": None,
+                "score": None,
+                "status": node.get("status"),
+                "is_active": bool(node.get("is_active") or node.get("status") in ("active", "running")),
+            })
+        if not judges:
+            judges = [
+                {
+                    "judge_id": path.parent.name if path.parent.name != "judges" else path.stem,
+                    "model": None,
+                    "session_file": None,
+                    "passed": None,
+                    "score": None,
+                    "status": status,
+                    "is_active": False,
+                }
+                for path in judge_md
+            ]
+
+        rounds.append({
+            "task_id": row.task_id,
+            "module_name": row.module_name,
+            "stage": "entry_analysis",
+            "round": round_number,
+            "stage_round": round_number,
+            "status": status,
+            "worker": {
+                "count": len(worker_md) + len(worker_json),
+                "items": [
+                    {"artifact_path": str(path.relative_to(run_root)).replace("\\", "/"), "type": path.suffix.lstrip(".")}
+                    for path in (worker_md + worker_json)[:200]
+                ],
+            },
+            "judges": judges,
+            "metrics": {
+                "worker_artifact_count": len(worker_md) + len(worker_json),
+                "judge_artifact_count": len(judge_md) + len(judge_json),
+                "active_session_count": len(round_active_nodes),
+                "review_pass_rate": None,
+                "avg_judge_score": None,
+                "token_total": None,
+                "cost": None,
+            },
+            "extra": {
+                "source": "runtime_snapshot",
+                "active_sessions": [
+                    {
+                        "relative_path": node.get("relative_path"),
+                        "role": node.get("role"),
+                        "display_name": node.get("display_name"),
+                        "started_at": node.get("started_at"),
+                        "last_event_at": node.get("last_event_at"),
+                    }
+                    for node in round_active_nodes
+                ],
+                "round_dir": str(round_dir.relative_to(run_root)).replace("\\", "/"),
+            },
+        })
+
+    rounds.sort(key=lambda item: int(item.get("round") or 0))
+    runtime_summary = {
+        "session_count": int(session_summary.get("session_count") or len(session_nodes) or 0),
+        "active_session_count": int(session_summary.get("active_session_count") or len(active_nodes) or 0),
+        "worker_count": int(session_summary.get("worker_count") or 0),
+        "judge_count": int(session_summary.get("judge_count") or 0),
+        "latest_round": rounds[-1]["round"] if rounds else None,
+        "active_rounds": sorted(active_rounds),
+        "index_path": str(index_path) if index_path.is_file() else None,
+    }
+    summary = {
+        "task_id": row.task_id,
+        "task_status": row.status,
+        "module_name": row.module_name,
+        "round_count": len(rounds),
+        "passed_round_count": 0,
+        "failed_round_count": 0,
+        "total_duration_ms": None,
+        "total_tokens": 0,
+        "total_cost": 0,
+        "stage_summary": {
+            "entry_analysis": {
+                "round_count": len(rounds),
+                "passed_round_count": 0,
+                "avg_review_pass_rate": None,
+            }
+        },
+        "effectiveness": {"final_round_pass_rate": None},
+        "runtime_summary": runtime_summary,
+    }
+    return {
+        "task_id": row.task_id,
+        "status": row.status,
+        "available": bool(rounds or active_nodes),
+        "source": "runtime_snapshot" if (rounds or active_nodes) else "none",
+        "is_realtime": bool(rounds or active_nodes),
+        "snapshot_generated_at": generated_at,
+        "runtime_summary": runtime_summary,
+        "summary": summary if (rounds or active_nodes) else None,
+        "rounds": rounds,
+        "warnings": warnings,
+    }
 
 
 def _write_task_result_json(row: AppEaTask, payload: dict) -> str | None:
@@ -752,14 +943,7 @@ class TaskService:
         if run_result_path and run_result_path.is_file() and result_json is None:
             warnings.append("result.json 读取失败")
         if not result_json:
-            return {
-                "task_id": row.task_id,
-                "status": row.status,
-                "available": False,
-                "summary": None,
-                "rounds": [],
-                "warnings": warnings,
-            }
+            return _build_runtime_evaluation_snapshot(row, run_root, warnings)
 
         rounds_payload = result_json.get("rounds")
         rounds_payload = rounds_payload if isinstance(rounds_payload, list) else []
@@ -851,6 +1035,10 @@ class TaskService:
             "task_id": row.task_id,
             "status": row.status,
             "available": bool(rounds),
+            "source": "final_result",
+            "is_realtime": False,
+            "snapshot_generated_at": None,
+            "runtime_summary": None,
             "summary": summary,
             "rounds": rounds,
             "warnings": warnings,
