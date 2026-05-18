@@ -418,6 +418,79 @@ def _extract_functions_regex(file_path: str, lines: list[str]) -> list[dict]:
 
 # ─── 核心公开接口 ──────────────────────────────────────────────────────────────
 
+def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
+    """
+    扫描文件中可能通过宏定义的函数。
+
+    目标模式：
+      - 文件中存在 '#define MACRO_NAME(...)' 并且展开后含函数体
+      - 文件直接调用了这样的宏（如 DEFINE_HANDLER(auth) 展开为完整函数）
+
+    返回条目格式与 ctags/regex 兼容，但包含额外字段 _macro=True 和 _macro_name。
+    """
+    entries = []
+
+    # 提取所有宏定义，找到含函数体的宏（展开后有 { }）
+    # 格式: #define NAME(...) [\] ... { ... }
+    macro_defs: dict[str, int] = {}  # macro_name -> line_no
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith('#define '):
+            m = re.match(r'#define\s+(\w+)\s*\(', stripped)
+            if m:
+                macro_name = m.group(1)
+                # 收集连续行（反斜线续行）
+                define_body = stripped
+                j = i
+                while define_body.rstrip().endswith('\\') and j + 1 < len(lines):
+                    j += 1
+                    define_body += ' ' + lines[j].strip()
+                # 宏展开体内含 { 和 } 则认为这个完是一个函数定义完
+                if '{' in define_body and '}' in define_body:
+                    macro_defs[macro_name] = i + 1
+                i = j + 1
+                continue
+        i += 1
+
+    if not macro_defs:
+        return entries
+
+    # 在文件中找到这些完的调用位置
+    # 模式：行头是 MACRO_NAME(参数)、可能有多个参数
+    _MACRO_CALL_RE = re.compile(
+        r'^\s*(' + '|'.join(re.escape(n) for n in macro_defs) + r')\s*\(([^)]+)\)\s*;?\s*$'
+    )
+
+    seen: set[int] = set()
+    for li, line in enumerate(lines):
+        m = _MACRO_CALL_RE.match(line)
+        if not m:
+            continue
+        macro_name = m.group(1)
+        args = [a.strip() for a in m.group(2).split(',')]
+        call_line = li + 1
+        if call_line in seen:
+            continue
+        seen.add(call_line)
+
+        # 用第一个参数作为函数名的一部分（常见约定: HANDLER(name) 展开为 handle_name）
+        func_hint = f"{macro_name}({args[0]})"
+        entries.append({
+            "name":         func_hint,
+            "scope":        "",
+            "scopeKind":    "",
+            "line":         call_line,
+            "signature":    func_hint,
+            "_is_macro":    True,
+            "_macro_name":  macro_name,
+            "_macro_args":  args,
+            "_macro_def_line": macro_defs[macro_name],
+        })
+
+    return entries
+
+
 def extract_functions_static(file_path: str) -> list[FunctionExtract]:
     """
     静态提取文件中所有函数的定义（无 LLM）。
@@ -446,8 +519,20 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
         raw_entries = []
 
     if not raw_entries:
-        # ctags 无输出（非 C/C++ 文件、空文件）或不可用 → 降级到 regex
+        # ctags 无输出或不可用 → 降级到 regex
         raw_entries = _extract_functions_regex(file_path, lines)
+
+    # 补充扫描：宏定义的函数（ctags/regex 都无法识别）
+    macro_entries = _scan_macro_functions(file_path, lines)
+    if macro_entries:
+        # 去除与已有条目重复的行号
+        existing_lines = {e.get("line", 0) for e in raw_entries}
+        for me in macro_entries:
+            if me["line"] not in existing_lines:
+                raw_entries.append(me)
+                existing_lines.add(me["line"])
+        logger.info("%s: found %d macro-defined functions",
+                    Path(file_path).name, len(macro_entries))
 
     # ── Step 2 & 3: bracket-counter → end_line，提取 body ────────────────
     results: list[FunctionExtract] = []
@@ -468,11 +553,21 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
         # bracket-counter 求 end_line
         end_line = _find_function_end(lines, start_line)
 
-        # 提取 body（start_line ~ end_line，0 表示只取 start_line）
+        # 提取 body（start_line ~ end_line，0 表示需检查是否有函数体）
         if end_line > 0 and end_line >= start_line:
             body = "\n".join(lines[start_line - 1 : end_line])
         else:
-            # end_line 未知：取 start_line 开始最多 150 行（避免误截太多）
+            # bracket-counter 未找到结尾：
+            # 向后扫描最多 10 行，确认是否真的有函数体（{ 存在）
+            # 若无 { → 这是纯声明（函数原型），直接跳过
+            scan_end = min(start_line + 9, len(lines))
+            has_body = any(
+                '{' in lines[i]
+                for i in range(start_line - 1, scan_end)
+            )
+            if not has_body:
+                continue  # 纯声明，无函数体，跳过
+            # 有函数体但 bracket-counter 未能定位结尾（可能是超长函数或宏混合）
             body = "\n".join(lines[start_line - 1 : start_line - 1 + 150])
 
         results.append(FunctionExtract(
