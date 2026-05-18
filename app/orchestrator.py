@@ -98,6 +98,11 @@ from .functions_list import generate_functions_list, write_functions_list, valid
 from .module_loader import ModuleInfo, load_module, prepare_workspace
 from .runner import run_agent, AgentResult, PiFatalError
 
+# 模板脚本路径（相对于本文件）
+_GENERATE_FL_TEMPLATE = Path(__file__).parent / "generate_functions_list_template.py"
+# 在 master_worker 工作目录中的脚本名称（Agent 可见、可修改）
+_GENERATE_FL_SCRIPT_NAME = "generate_functions_list.py"
+
 
 # ─── 目录命名与输入元数据 ─────────────────────────────────────────────────────
 
@@ -401,6 +406,8 @@ class Orchestrator:
         self.on_event = on_event or (lambda e: None)
         self._cancel_event: asyncio.Event | None = None
         self.module_files: list[str] = []       # 拷贝到工作目录的文件路径列表
+        # Judge 预读 base session 缓存：key = (judge_idx, j_dir_str) -> base_session_path
+        self._judge_preread_base: dict[tuple[int, str], str] = {}
 
     def _emit(self, etype: str, task_id: str, **data):
         try:
@@ -1308,6 +1315,120 @@ class Orchestrator:
             for idx, shard_workers in enumerate(shards)
         ]))
 
+    def _deploy_generate_fl_script(self, worker_cwd: str) -> str:
+        """
+        将 generate_functions_list_template.py 复制到 master_worker 工作目录。
+
+        - Round 1：无条件覆盖（保证 agent 拿到最新模板）
+        - Round 2+：如果 agent 已修改了脚本（mtime > 模板 mtime），不覆盖，保留 agent 的版本
+
+        Returns:
+            部署后的脚本绝对路径
+        """
+        dst = Path(worker_cwd) / _GENERATE_FL_SCRIPT_NAME
+        if not _GENERATE_FL_TEMPLATE.exists():
+            import logging
+            logging.getLogger("ea.orchestrator").warning(
+                "generate_functions_list_template.py not found: %s", _GENERATE_FL_TEMPLATE
+            )
+            return str(dst)
+
+        should_deploy = True
+        if dst.exists():
+            # 如果 agent 在此轮已修改过脚本（文件更新时间晚于模板），保留 agent 的版本
+            try:
+                if dst.stat().st_mtime > _GENERATE_FL_TEMPLATE.stat().st_mtime:
+                    should_deploy = False
+            except OSError:
+                pass
+
+        if should_deploy:
+            shutil.copy2(_GENERATE_FL_TEMPLATE, dst)
+
+        return str(dst)
+
+    def _run_generate_fl_script(
+        self, worker_cwd: str, task_id: str, rnd_num: int
+    ) -> bool:
+        """
+        在 master_worker 工作目录中执行 generate_functions_list.py。
+
+        优先使用 agent 可能修改过的本地版本；若脚本不存在则跳过（回退到后端内置逻辑）。
+
+        Returns:
+            True = 脚本执行成功且 functions.list 校验通过
+            False = 执行失败或校验不通过
+        """
+        import subprocess, logging
+        logger = logging.getLogger("ea.orchestrator")
+
+        script = Path(worker_cwd) / _GENERATE_FL_SCRIPT_NAME
+        if not script.exists():
+            return False
+
+        entry_json_path = Path(worker_cwd) / "entry-list-merged.json"
+        if not entry_json_path.exists():
+            return False
+
+        try:
+            proc = subprocess.run(
+                ["python3", str(script)],
+                cwd=worker_cwd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            stdout = proc.stdout.strip()
+            stderr = proc.stderr.strip()
+            if stdout:
+                logger.info("[R%d] generate_fl_script stdout: %s", rnd_num, stdout[:500])
+            if stderr:
+                logger.info("[R%d] generate_fl_script stderr: %s", rnd_num, stderr[:1000])
+
+            if proc.returncode != 0:
+                self._emit("generate_fl_script_fail", task_id, round=rnd_num,
+                           returncode=proc.returncode, stderr=stderr[:500])
+                return False
+
+            # 快速校验输出
+            fl_path = Path(worker_cwd) / "functions.list"
+            if not fl_path.exists():
+                self._emit("generate_fl_script_fail", task_id, round=rnd_num,
+                           error="functions.list not created by script")
+                return False
+
+            fl_data = json.loads(fl_path.read_text(encoding="utf-8"))
+            if not isinstance(fl_data, list) or not fl_data:
+                self._emit("generate_fl_script_fail", task_id, round=rnd_num,
+                           error="functions.list is empty or not a list")
+                return False
+
+            # 检查关键字段是否非空（快速抽样）
+            empty_fields = [
+                i for i, item in enumerate(fl_data)
+                if isinstance(item, dict) and (
+                    not item.get("function", "").strip()
+                    or not item.get("file", "").strip()
+                    or not item.get("taints")
+                )
+            ]
+            if empty_fields:
+                self._emit("generate_fl_script_empty_fields", task_id, round=rnd_num,
+                           empty_count=len(empty_fields),
+                           sample_indices=empty_fields[:5])
+                return False
+
+            self._emit("generate_fl_script_ok", task_id, round=rnd_num,
+                       entry_count=len(fl_data))
+            return True
+
+        except subprocess.TimeoutExpired:
+            self._emit("generate_fl_script_fail", task_id, round=rnd_num, error="timeout")
+            return False
+        except Exception as exc:
+            self._emit("generate_fl_script_fail", task_id, round=rnd_num, error=str(exc))
+            return False
+
     async def _run_master_worker(
         self,
         acfg: AgentInstanceConfig,
@@ -1330,6 +1451,9 @@ class Orchestrator:
         _skill_path = "/opt/entry_analyse/.pi/skills/write-entry-list-json"
         # functions.list skill：指导 agent 从 entry-list-merged.json 生成 functions.list
         _fl_skill_path = "/opt/entry_analyse/.pi/skills/write-functions-list"
+
+        # Round 1 部署模板脚本；Round 2+ 如果 agent 已修改则保留
+        self._deploy_generate_fl_script(worker_cwd)
         master_kwargs: dict = {
             "model": acfg.model,
             "tools": acfg.tools or cfg.workers.default_tools,
@@ -1410,17 +1534,21 @@ class Orchestrator:
             )
 
         if ef and Path(ef).name == "entry-list-merged.json":
-            try:
-                sync_result = sync_functions_list_from_entry(ef, Path(worker_cwd) / "functions.list")
-                self._emit("artifact_validate_done", task_id,
-                           round=rnd_num,
-                           entry_count=sync_result.entry_count,
-                           functions_count=sync_result.functions_count,
-                           fixes=sync_result.fixes[:20],
-                           errors=sync_result.validation_errors[:20])
-            except Exception as sync_exc:
-                self._emit("artifact_validate_error", task_id,
-                           round=rnd_num, error=str(sync_exc))
+            # 优先使用 agent 修改过的本地脚本生成 functions.list
+            script_ok = self._run_generate_fl_script(worker_cwd, task_id, rnd_num)
+            if not script_ok:
+                # 回退：使用后端内置 sync 逻辑
+                try:
+                    sync_result = sync_functions_list_from_entry(ef, Path(worker_cwd) / "functions.list")
+                    self._emit("artifact_validate_done", task_id,
+                               round=rnd_num,
+                               entry_count=sync_result.entry_count,
+                               functions_count=sync_result.functions_count,
+                               fixes=sync_result.fixes[:20],
+                               errors=sync_result.validation_errors[:20])
+                except Exception as sync_exc:
+                    self._emit("artifact_validate_error", task_id,
+                               round=rnd_num, error=str(sync_exc))
 
         return WorkerResult(
             worker_id="master_worker",
@@ -1434,6 +1562,80 @@ class Orchestrator:
     # ═══════════════════════════════════════════════════════════════════════
     # Judge 评审
     # ═══════════════════════════════════════════════════════════════════════
+
+    # 预读阈値：模块文件数 >= 该値时才进行预读阶段
+    _JUDGE_PREREAD_MIN_FILES = 8
+
+    def _judge_preread_enabled(self) -> bool:
+        """Judge 预读开关：配置开启且模块文件数达到阈値。"""
+        cfg_enabled = getattr(self.cfg, "judge_preread_enabled", True)
+        if not cfg_enabled:
+            return False
+        return len(self.module_files) >= self._JUDGE_PREREAD_MIN_FILES
+
+    def _judge_base_session_path(self, judge_idx: int, sess_dir: Path) -> str:
+        """Judge base session 的文件路径（过轮共用）。"""
+        return str(sess_dir / f"judge-{judge_idx}-base.jsonl")
+
+    async def _prepare_judge_base_session(
+        self,
+        judge_idx: int,
+        judge_cfg,
+        judge_sys_prompt: str,
+        j_dir: Path,
+        sess_dir: Path,
+        task_id: str,
+        base_kwargs: dict,
+    ) -> tuple[str, TokenUsage]:
+        """
+        Judge 预读阶段：一次性读取所有模块源文件，保存 base session。
+
+        块中内容：
+          - 模块文件列表和数量
+          - 逐一使用 read 工具读取所有源文件
+
+        Returns:
+            (base_session_path, token_usage)
+        """
+        jid = f"judge-{judge_idx}"
+        base_session = self._judge_base_session_path(judge_idx, sess_dir)
+
+        # 如果已有 base session 且内容有效，直接复用
+        if Path(base_session).exists() and Path(base_session).stat().st_size > 100:
+            self._emit("judge_preread_reuse", task_id,
+                       judge_id=jid, base_session=base_session,
+                       file_count=len(self.module_files))
+            return base_session, TokenUsage()
+
+        self._emit("judge_preread_start", task_id,
+                   judge_id=jid, file_count=len(self.module_files))
+
+        file_list = "\n".join(f"{i+1}. `{f}`" for i, f in enumerate(self.module_files))
+        preread_prompt = (
+            f"# 源码预读阶段\n\n"
+            f"你正在准备对模块 **{self.cfg.module_name}** 进行多轮代码审查。"
+            f"以下是本模块的全部 {len(self.module_files)} 个源文件，"
+            f"请逐一使用 `read` 工具完整读取每个文件，"
+            f"建立对代码结构的全面理解，为后续多轮评审做准备：\n\n"
+            f"{file_list}\n\n"
+            f"跳过分析，仅需读取并记忆每个文件的内容。"
+            f"所有文件读取完毕后仅回复：`PRE_READ_COMPLETE：已读取 {len(self.module_files)} 个文件`。"
+        )
+
+        ar = await _run_agent_checked(
+            context=f"{jid} preread",
+            prompt=preread_prompt,
+            **{**base_kwargs, "session_file": base_session},
+        )
+
+        self._emit("judge_preread_done", task_id,
+                   judge_id=jid,
+                   base_session=base_session,
+                   file_count=len(self.module_files),
+                   token_input=ar.token_usage.input,
+                   token_output=ar.token_usage.output)
+
+        return base_session, ar.token_usage
 
     async def _run_judge_evaluation(
         self,
@@ -1482,7 +1684,25 @@ class Orchestrator:
             "capacity_limit": cfg.model_max_concurrency,
         }
 
-        # ═══ 步骤0：准备文件到 Judge 工作目录 ═══
+        # ═══ 预读阶段：第一次评审前建立 base session，后续轮次 fork 复用 ═══
+
+        if self._judge_preread_enabled():
+            base_session, preread_tok = await self._prepare_judge_base_session(
+                judge_idx=judge_idx,
+                judge_cfg=judge_cfg,
+                judge_sys_prompt=judge_sys_prompt,
+                j_dir=j_dir,
+                sess_dir=sess_dir,
+                task_id=task_id,
+                base_kwargs=base_kwargs,
+            )
+            j_result.token_usage += preread_tok
+            # fork：将 base session 复制为此轮的 round session
+            if Path(base_session).exists() and base_session != j_result.session_file:
+                shutil.copy2(base_session, j_result.session_file)
+                self._emit("judge_session_forked", task_id,
+                           judge_id=jid, round=rnd_num,
+                           source=base_session, dest=j_result.session_file)
 
         for w in round_workers:
             # Worker 摘要输出
@@ -1538,6 +1758,12 @@ class Orchestrator:
 
         # ═══ 步骤1：逐个评判 ═══
 
+        # 如果已完成预读，评审 prompt 不再指示重复读文件
+        preread_active = (
+            self._judge_preread_enabled()
+            and Path(j_result.session_file).exists()
+        )
+
         for w in round_workers:
             ef_ext = ".json" if (w.entry_file and w.entry_file.endswith(".json")) else ".md"
             fl_path = f"{w.worker_id}-functions.list"
@@ -1548,6 +1774,7 @@ class Orchestrator:
                 output_path=f"{w.worker_id}-output.md",
                 entry_path=f"{w.worker_id}-entry-list{ef_ext}",
                 functions_list_path=fl_path if fl_exists else "",
+                source_already_loaded=preread_active,
             )
 
             ar = await _run_agent_checked(
@@ -1679,6 +1906,10 @@ class Orchestrator:
             ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
             items.append(f"- `{ef_name}` （来自 {w.worker_id}）")
         file_list_str = "\n".join(items)
+        validate_cmd = (
+            "/opt/entry_analyse/.pi/skills"
+            "/write-entry-list-json/scripts/validate_entry_list.py"
+        )
         return (
             f"# 合并精筛任务\n\n"
             f"## 任务描述\n\n{task}\n\n"
@@ -1689,10 +1920,15 @@ class Orchestrator:
             f"请使用 `read` 工具逐一读取以上所有 entry-list 文件，"
             f"严格按照 system prompt 中的工作流程和过滤标准完成精筛合并，"
             f"写入 `entry-list-merged.json`，并确保每个入口都包含 "
-            f"`function_description`、`entry_reason`、`taint_details`。"
-            f"`functions.list` 将由后端从 `entry-list-merged.json` 确定性生成，"
-            f"你不要手写或维护它。\n\n"
-            f"写入完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
+            f"`function_description`、`entry_reason`、`taint_details`。\n\n"
+            f"写入 entry-list-merged.json 后，必须执行以下验证步骤：\n"
+            f"1. 验证 entry-list 格式："
+            f"`python3 {validate_cmd} entry-list-merged.json`\n"
+            f"2. 生成并检查 functions.list：`python3 generate_functions_list.py`\n"
+            f"   - 如果输出中出现 `[WARN]` 空字段警告，请对照 [FIELD_PROBE] 输出，"
+            f"检查 entry-list-merged.json 的实际字段名，"
+            f"修改脚本 `map_entry()` 中对应 `_get()` 的字段名后重运行。\n\n"
+            f"完成后，用 `<result>...</result>` 包裹摘要（保留入口数 + 过滤入口数 + 关键发现）。"
         )
 
     def _build_master_worker_retry_prompt(
@@ -1705,19 +1941,25 @@ class Orchestrator:
             ef_name = Path(w.entry_file).name if w.entry_file else f"entry-list-{w.worker_id}.md"
             items.append(f"- `{ef_name}` （来自 {w.worker_id}）")
         file_list_str = "\n".join(items)
+        validate_cmd = (
+            "/opt/entry_analyse/.pi/skills"
+            "/write-entry-list-json/scripts/validate_entry_list.py"
+        )
         return (
             f"# Round {rnd_num} — 重新精筛合并\n\n"
             f"上一轮合并结果未通过评审，Judge 的反馈如下：\n\n"
             f"{feedback}\n\n"
             f"---\n\n"
             f"请根据以上反馈做**增量修补**：优先读取当前工作目录中的 "
-            f"`entry-list-merged.json` 和 `functions.list`，再只读取下面列出的相关 "
+            f"`entry-list-merged.json`，再只读取下面列出的相关 "
             f"entry-list 文件。不要重新全量读取所有 worker 产物，除非反馈明确要求。\n\n"
             f"{file_list_str}\n\n"
             f"重新写入 `entry-list-merged.json`，确保每个入口都保留 "
-            f"`function_description`、`entry_reason`、`taint_details`。"
-            f"`functions.list` 将由后端从 `entry-list-merged.json` 确定性生成，"
-            f"你不要手写或维护它。\n\n"
+            f"`function_description`、`entry_reason`、`taint_details`。\n"
+            f"写入完成后必须执行：\n"
+            f"1. `python3 generate_functions_list.py` — 生成 functions.list；"
+            f"若发现 `[WARN]` 空字段，请对照 [FIELD_PROBE] 修改 `map_entry()` 中字段名后重运行。\n"
+            f"2. `python3 {validate_cmd} entry-list-merged.json` — 验证 entry-list。\n\n"
             f"写入完成后，用 `<result>...</result>` 包裹摘要（修正内容 + 最终保留入口数量）。"
         )
 
@@ -1725,7 +1967,8 @@ class Orchestrator:
                            worker: WorkerResult, rnd,
                            output_path: str = "",
                            entry_path: str = "",
-                           functions_list_path: str = ""):
+                           functions_list_path: str = "",
+                           source_already_loaded: bool = False):
         CRITERIA = (
             "重点评判维度：\n"
             "1. **无误报（最重要）**：入口列表中是否混入了非外部数据入口\n"
@@ -1778,7 +2021,7 @@ class Orchestrator:
             f"摘要输出文件: `{output_path}`\n"
             f"外部入口列表: `{entry_path}`"
             f"{fl_line}\n\n"
-            f"**请使用 read 工具读取以上文件和模块源代码，然后进行评测。**\n\n"
+            f"**{'源码文件在预读阶段已读入，可直接引用记忆中的内容。' if source_already_loaded else '请使用 read 工具读取以上文件和模块源代码，然后进行评测。'}**\n\n"
             f"**functions.list 必须校验（违反即判 FAIL）**：\n"
             f"① 读取文件，确认是合法 JSON 数组；\n"
             f"② 不含 `_error` 字段（有则表示脚本解析失败）；\n"
@@ -1790,7 +2033,7 @@ class Orchestrator:
             f"## {worker.worker_id} 的输出文件\n\n"
             f"摘要输出文件: `{output_path}`\n"
             f"外部入口列表: `{entry_path}`\n\n"
-            f"**请使用 read 工具读取以上文件和模块源代码，然后进行评测。**",
+            f"**{'源码文件在预读阶段已读入，可直接引用记忆中的内容。' if source_already_loaded else '请使用 read 工具读取以上文件和模块源代码，然后进行评测。'}**",
             "评测完成后，请严格按以下 markdown 格式输出结果：\n\n"
             "```\n"
             "## 评分: <0-100的整数>\n"

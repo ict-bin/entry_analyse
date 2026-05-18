@@ -204,21 +204,55 @@ def resolve_file_path(file_path: str, target_dir: str) -> str | None:
     return None
 
 
+def _link_file(src: str, dst: Path) -> str:
+    """
+    将源文件链接到目标路径，按优先级尝试三种策略：
+
+    1. 软链接（symlink）：指向源文件的绝对真实路径，最轻量，跨设备只读挂载首选。
+    2. 硬链接（hardlink）：同设备时节省空间，无需跨设备权限。
+    3. 拷贝（copy）：兜底，保证在任何文件系统下都能工作。
+
+    Returns:
+        实际使用的策略名称："symlink" | "hardlink" | "copy"
+    """
+    real_src = os.path.realpath(src)
+
+    # ── 策略 1：软链接 ──────────────────────────────────────────────
+    try:
+        os.symlink(real_src, str(dst))
+        return "symlink"
+    except OSError:
+        pass
+
+    # ── 策略 2：硬链接（同设备）────────────────────────────────────
+    try:
+        os.link(real_src, str(dst))
+        return "hardlink"
+    except OSError:
+        pass
+
+    # ── 策略 3：拷贝（兜底）────────────────────────────────────────
+    shutil.copy2(real_src, str(dst))
+    return "copy"
+
+
 def prepare_workspace(
     module_info: ModuleInfo,
     target_dir: str,
     workspace_dir: str,
 ) -> list[str]:
     """
-    将模块文件从 target_dir 拷贝到 workspace_dir。
-    保留相对目录结构避免同名冲突。
+    将模块文件链接（或拷贝）到 workspace_dir，保留相对目录结构避免同名冲突。
+
+    链接策略按优先级尝试：symlink → hardlink → copy。
+    symlink 指向源文件的绝对真实路径，agent 通过 read 工具直接读取原始内容。
 
     Returns:
-        拷贝成功的文件路径列表（相对于 workspace_dir）
+        成功链接/拷贝的文件路径列表（相对于 workspace_dir）
     """
     workspace = Path(workspace_dir)
     workspace.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
+    linked: list[str] = []
 
     for file_path in module_info.files:
         src = resolve_file_path(file_path, target_dir)
@@ -236,10 +270,10 @@ def prepare_workspace(
         dst = workspace / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         if not dst.exists():
-            shutil.copy2(src, str(dst))
-        copied.append(rel)
+            _link_file(src, dst)
+        linked.append(rel)
 
-    return copied
+    return linked
 
 
 def list_modules(target_dir: str) -> list[str]:
