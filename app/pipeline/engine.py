@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -248,7 +249,6 @@ class PipelineEngine:
 
         try:
             acfg = self.cfg.workers.agents[0]
-            sys_prompt = self._worker_sys_prompt(0)
 
             # R1 W 也需经过全局信号量（run_r1_worker 内部独立获取 capacity_slot）
             async with self._sem:
@@ -261,7 +261,7 @@ class PipelineEngine:
                     on_event=self._on_event,
                     cancel_event=self._cancel,
                     is_retry=(fs.r1_w_attempts > 1),
-                    system_prompt=sys_prompt,
+                    system_prompt=self._stage_sys_prompt('r1_worker'),
                 )
 
             state.register_functions(
@@ -337,7 +337,7 @@ class PipelineEngine:
                    file=Path(file_path).name)
         try:
             acfg = self._judge_acfg()
-            sys_prompt = self._judge_sys_prompt()
+            sys_prompt = self._stage_sys_prompt('r1_judge')
             prompt = P.build_r1_j_prompt(
                 func_file=dirs.r1_file_dir(file_hash) / f"{func_hash}.c",
                 func_name=func_state.name,
@@ -379,7 +379,6 @@ class PipelineEngine:
         }]
         try:
             acfg = self.cfg.workers.agents[0]
-            sys_prompt = self._worker_sys_prompt(0)
             async with self._sem:
                 await run_r1_worker(
                     file_path=file_path, dirs=dirs,
@@ -387,7 +386,7 @@ class PipelineEngine:
                     task_id=self.task_id, on_event=self._on_event,
                     cancel_event=self._cancel,
                     is_retry=True, failed_funcs=failed_funcs,
-                    system_prompt=sys_prompt,
+                    system_prompt=self._stage_sys_prompt('r1_worker'),
                 )
         except Exception as exc:
             logger.warning("R1 W retry for func %s failed: %s", func_hash, exc)
@@ -426,7 +425,7 @@ class PipelineEngine:
                        func_hash=func_hash, function=func_state.name)
             try:
                 acfg = self.cfg.workers.agents[0]
-                sys_prompt = self._worker_sys_prompt(0)
+                sys_prompt = self._stage_sys_prompt('r2_worker')
                 is_retry = func_state.r2_w_attempts > 1
                 # 优先使用 R2 专属反馈（R2 J 设置），其次才是 R1 J 反馈
                 r2_feedback = (
@@ -504,7 +503,7 @@ class PipelineEngine:
                        analysis_count=len(analysis_files))
             try:
                 acfg = self._judge_acfg()
-                sys_prompt = self._judge_sys_prompt()
+                sys_prompt = self._stage_sys_prompt('r2_judge')
                 prompt = P.build_r2_j_prompt(
                     file_path=file_path,
                     r2_dir=dirs.r2_file_dir(file_hash),
@@ -584,7 +583,7 @@ class PipelineEngine:
                        file_hash=file_hash, file=Path(file_path).name)
             try:
                 acfg = self.cfg.workers.agents[0]
-                sys_prompt = self._worker_sys_prompt(0)
+                sys_prompt = self._stage_sys_prompt('r3_worker')
                 is_retry = fs.r3_attempts > 1
                 prompt = P.build_r3_w_prompt(
                     file_path=file_path,
@@ -642,7 +641,7 @@ class PipelineEngine:
                    file_hash=file_hash, file=Path(file_path).name)
         try:
             acfg = self._judge_acfg()
-            sys_prompt = self._judge_sys_prompt()
+            sys_prompt = self._stage_sys_prompt('r3_judge')
             prompt = P.build_r3_j_prompt(
                 file_path=file_path,
                 r3_entries_path=dirs.r3_file_path(file_hash),
@@ -693,7 +692,7 @@ class PipelineEngine:
                        r3_file_count=len(r3_files))
             try:
                 acfg = self.cfg.workers.agents[0]
-                sys_prompt = self._worker_sys_prompt(0)
+                sys_prompt = self._stage_sys_prompt('r4_worker')
                 is_retry = state.r4_attempts > 1
                 prompt = P.build_r4_w_prompt(
                     r3_entries_files=r3_files,
@@ -752,7 +751,7 @@ class PipelineEngine:
         self._emit("r4_j_start")
         try:
             acfg = self._judge_acfg()
-            sys_prompt = self._judge_sys_prompt()
+            sys_prompt = self._stage_sys_prompt('r4_judge')
             prompt = P.build_r4_j_prompt(
                 r4_entries_path=dirs.r4_entries_path(),
                 module_name=self.cfg.module_name,
@@ -818,6 +817,31 @@ class PipelineEngine:
                 type=etype, task_id=self.task_id, data=data))
         except Exception:
             pass
+
+    def _stage_sys_prompt(self, stage: str) -> str:
+        """
+        按阶段加载专用系统提示词。
+
+        stage 取值：r1_worker, r1_judge, r2_worker, r2_judge,
+                      r3_worker, r3_judge, r4_worker, r4_judge
+
+        查找顺序：
+          1. {pipeline_prompts_dir}/{stage}.md  ← 阶段专用提示词
+          2. 回退到默认 workers/judges 目录
+        """
+        pipeline_dir = os.path.abspath(
+            getattr(self.cfg, 'pipeline_prompts_dir', './prompts/pipeline')
+        )
+        prompt_file = Path(pipeline_dir) / f"{stage}.md"
+        if prompt_file.exists():
+            text = prompt_file.read_text(encoding='utf-8').strip()
+            if text:
+                return text
+        # 回退到通用提示词
+        if 'worker' in stage:
+            return self._worker_sys_prompt(0)
+        else:
+            return self._judge_sys_prompt()
 
     def _worker_sys_prompt(self, idx: int = 0) -> str:
         prompts = load_system_prompts(self.cfg.workers.system_prompt_dir, idx + 1)

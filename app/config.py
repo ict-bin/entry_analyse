@@ -78,6 +78,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         pi_retry_delay=svc.pi_retry_delay,
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),
+        pipeline_prompts_dir=getattr(svc, 'pipeline_prompts_dir', './prompts/pipeline'),
         output_dir=svc.output_dir,
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,

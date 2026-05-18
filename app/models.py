@@ -101,6 +101,10 @@ class ServiceConfig(BaseModel):
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
+    pipeline_prompts_dir: str = Field(
+        default="./prompts/pipeline",
+        description="四阶段流水线各阶段系统提示词目录（r1_worker.md, r1_judge.md, ...）"
+    )
 
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
@@ -141,6 +145,10 @@ class TaskConfig(BaseModel):
     model_max_concurrency: int = Field(default=MODEL_MAX_CONCURRENCY_DEFAULT)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
+    pipeline_prompts_dir: str = Field(
+        default="./prompts/pipeline",
+        description="四阶段流水线各阶段系统提示词目录（r1_worker.md, r1_judge.md, ...）"
+    )
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
