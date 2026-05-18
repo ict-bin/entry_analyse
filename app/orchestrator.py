@@ -420,21 +420,19 @@ class Orchestrator:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def execute(self, task_id: str | None = None) -> TaskResult:
+        """
+        四阶段流水线执行入口（R1→R2→R3→R4）。
+
+        旧的 Worker/Judge 多轮循环架构已废弃，全部由 PipelineEngine 接管。
+        """
         cfg = self.cfg
         task_id = task_id or make_id()
         start = time.time()
         target_dir = os.path.abspath(cfg.cwd)
-        # source_path: 源码根目录（用于解析files.list中的文件路径）
-        # 若未指定，回退到 cwd（兼容旧任务）
         source_dir = os.path.abspath(cfg.source_path) if cfg.source_path else target_dir
-        # pass_threshold: -1=全部裁判通过, 0=大于半数通过 (ceil(n/2))
-        threshold = cfg.judge_count if cfg.pass_threshold == -1 else math.ceil(cfg.judge_count / 2)
-        max_rounds_action = str(
-            getattr(cfg, "max_rounds_exceeded_action", "treat_as_passed") or "treat_as_passed"
-        ).strip().lower()
         self._cancel_event = asyncio.Event()
 
-        # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
+        # ── 同步 LLM Provider → pi models.json ─────────────────────────────
         try:
             svc = get_service_yaml()
             await sync_providers_to_pi(
@@ -445,564 +443,95 @@ class Orchestrator:
         except Exception as _sync_err:
             import logging as _log
             _log.getLogger("ea.orchestrator").warning(
-                "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err
-            )
+                "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err)
 
-        # ── 断点续跑：覆盖 task_id 为已有任务，自动检测上次完成的轮次 ──────────
-        _resuming = False
-        _start_round = 1
-        _resume_feedback = ""
-        if cfg.resume_task_id:
-            task_id = cfg.resume_task_id  # 继承原任务目录结构
-            _probe_dir = Path(os.path.abspath(cfg.output_dir)) / task_id / "run"
-            if _probe_dir.is_dir():
-                _done = sorted(
-                    [
-                        round_num
-                        for d in _probe_dir.iterdir()
-                        if d.is_dir()
-                        and (round_num := _round_number_from_dir(d)) is not None
-                        and (d / "feedback.md").exists()
-                    ],
-                    key=int,
-                )
-                if _done:
-                    _start_round = _done[-1] + 1
-                    _resume_feedback = (
-                        _find_existing_round_dir(_probe_dir, _done[-1]) / "feedback.md"
-                    ).read_text("utf-8")
-                    _resuming = True
+        # ── 目录初始化 ───────────────────────────────────────────────────────
+        base_dir   = Path(os.path.abspath(cfg.output_dir)) / task_id
+        input_dir  = base_dir / "input"
+        run_dir    = base_dir / "run"
+        out_dir    = base_dir / "output"
 
-        # 每个任务平行独立目录结构：
-        #   {output_dir}/{task_id}/run/    — 中间过程文件（不删除、不压缩）
-        #   {output_dir}/{task_id}/output/ — 最终输出文件
-        base_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
-        input_dir = base_dir / "input"
-        run_dir = base_dir / "run"
-        out_dir = base_dir / "output"
-        _write_input_metadata(input_dir, task_id=task_id, cfg=cfg, source_dir=source_dir, target_dir=target_dir)
+        _write_input_metadata(
+            input_dir, task_id=task_id, cfg=cfg,
+            source_dir=source_dir, target_dir=target_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         out_dir.mkdir(parents=True, exist_ok=True)
-        sess_dir = run_dir / "sessions"
-        sess_dir.mkdir(exist_ok=True)
 
         result = TaskResult(
             task_id=task_id, status=TaskStatus.RUNNING,
             task=cfg.task, module_name=cfg.module_name,
             config_snapshot=cfg.model_dump())
-        # 保底 worker 结果必须在 try 外准备好。
-        # 否则一旦准备阶段在进入主循环前抛错，收尾归档再访问 best_wr
-        # 会覆盖掉原始异常，表现成 “best_wr 未关联值”。
-        best_wr: WorkerResult = WorkerResult(worker_id="worker-0")
 
-        # flag 文件：提前写 0，保证任何异常退出时都有 flag
         flag_path = out_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")
 
+        entries: list[dict] = []
+
         try:
-            # ═══════════════════════════════════════════════════════
-            # 0. 准备阶段：加载模块 → 拷贝代码文件（断点续跑时复用已有工作目录）
-            # ═══════════════════════════════════════════════════════
+            # ── 0. 加载模块文件列表 ──────────────────────────────────────────
+            self._emit("module_load", task_id, module=cfg.module_name)
+            module_info = load_module(cfg.module_name, target_dir)
+            self._emit("module_found", task_id,
+                       module=cfg.module_name, files=module_info.files)
 
-            worker_cwd_path = run_dir / "workspace-worker"
+            # 解析为实际绝对路径（files.list 可能含相对路径或旧系统绝对路径）
+            from .module_loader import resolve_file_path
+            resolved_files: list[str] = []
+            for fp in module_info.files:
+                resolved = (resolve_file_path(fp, source_dir)
+                            or resolve_file_path(fp, target_dir))
+                if resolved:
+                    resolved_files.append(os.path.abspath(resolved))
 
-            if _resuming and worker_cwd_path.is_dir():
-                # ── 断点续跑：复用已有工作目录，跳过文件拷贝 ──
-                worker_cwd = str(worker_cwd_path)
-                mi_path = run_dir / "module-info.json"
-                if mi_path.exists():
-                    mi_data = json.loads(mi_path.read_text("utf-8"))
-                    self.module_files = mi_data.get("copied_to_workspace", [])
-                    result.module_files = self.module_files
-                self._emit("task_resume", task_id,
-                           start_round=_start_round,
-                           worker_cwd=worker_cwd,
-                           files=self.module_files)
+            if not resolved_files:
+                raise FileNotFoundError(
+                    f"模块 '{cfg.module_name}' 的所有文件均未找到: {module_info.files}")
+
+            self.module_files = resolved_files
+            result.module_files = resolved_files
+            self._emit("module_ready", task_id,
+                       count=len(resolved_files), copied=resolved_files)
+
+            # ── 1. 记录任务开始（保持事件格式兼容） ─────────────────────────
+            agents_desc = (
+                ([f"worker={cfg.workers.agents[0].model}"]
+                 if cfg.workers.agents else ["worker=default"])
+                + [f"judge-{i}={a.model}"
+                   for i, a in enumerate(cfg.judges.agents)]
+            )
+            self._emit("task_start", task_id,
+                       task=cfg.task, module=cfg.module_name,
+                       files=resolved_files, agents=agents_desc)
+
+            # ── 2. 运行四阶段流水线 ──────────────────────────────────────────
+            from .pipeline.engine import PipelineEngine
+            engine = PipelineEngine(
+                cfg=cfg,
+                task_id=task_id,
+                on_event=self.on_event,
+                cancel_event=self._cancel_event,
+            )
+            entries = await engine.run(
+                module_files=resolved_files,
+                run_dir=run_dir,
+                source_dir=source_dir,
+            )
+
+            if self._cancel_event.is_set():
+                result.status = TaskStatus.FAILED
+                result.error = "任务已被取消"
+            elif entries:
+                result.status = TaskStatus.PASSED
             else:
-                # ── 正常首次运行 ──
-                self._emit("module_load", task_id, module=cfg.module_name)
+                result.status = TaskStatus.FAILED
+                result.error = "流水线未产生任何外部入口结果"
 
-                module_info = load_module(cfg.module_name, target_dir)
-                self._emit("module_found", task_id,
-                            module=cfg.module_name,
-                            files=module_info.files)
-
-                worker_cwd_path.mkdir(exist_ok=True)
-                copied = prepare_workspace(module_info, source_dir, str(worker_cwd_path))
-                worker_cwd = str(worker_cwd_path)
-
-                self.module_files = copied
-                result.module_files = copied
-
-                if not copied:
-                    raise FileNotFoundError(
-                        f"模块 '{cfg.module_name}' 的所有文件均未找到: {module_info.files}")
-
-                self._emit("module_ready", task_id,
-                            copied=copied, count=len(copied))
-
-                # 保存模块信息（中间文件）
-                (run_dir / "module-info.json").write_text(
-                    json.dumps({
-                        "module_name": module_info.module_name,
-                        "files": module_info.files,
-                        "copied_to_workspace": copied,
-                    }, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-
-            # ═══════════════════════════════════════════════════════
-            # Worker / Judge 配置（单 Worker，串行逐文件）
-            # ═══════════════════════════════════════════════════════
-
-            judge_dir_prompts = load_system_prompts(
-                cfg.judges.system_prompt_dir, cfg.judge_count)
-
-            # 串行模式准备 worker base；并行模式在 _run_one_worker 内部构建
-            _parallel = cfg.worker_parallel and cfg.worker_count > 0 and cfg.worker_parallelism > 1
-            if not _parallel:
-                worker_dir_prompts = load_system_prompts(
-                    cfg.workers.system_prompt_dir, 1)
-                worker_session = str(sess_dir / "worker.jsonl")
-                acfg = cfg.workers.agents[0]
-                worker_sys_prompt = resolve_system_prompt(
-                    0, acfg, worker_dir_prompts)
-                worker_base = {
-                    "model": acfg.model,
-                    "tools": acfg.tools or cfg.workers.default_tools,
-                    "system_prompt": worker_sys_prompt,
-                    "cwd": worker_cwd,
-                    "thinking_level": (
-                        acfg.thinking_level or cfg.workers.default_thinking_level),
-                    "session_file": worker_session,
-                    "cancel_event": self._cancel_event,
-                    "max_retries": cfg.agent_max_retries,
-                    "retry_delay": cfg.agent_retry_delay,
-                    "run_timeout_seconds": cfg.agent_run_timeout_seconds,
-                    "timeout_retry_enabled": cfg.agent_timeout_retry_enabled,
-                    "timeout_max_retries": cfg.agent_timeout_max_retries,
-                    "pi_max_retries": cfg.pi_max_retries,
-                    "pi_retry_delay": cfg.pi_retry_delay,
-                    "capacity_enabled": cfg.model_capacity_enabled,
-                    "capacity_limit": cfg.model_max_concurrency,
-                }
-                agents_desc = (
-                    [f"worker={cfg.workers.agents[0].model}"]
-                    + [f"judge-{i}={a.model}"
-                       for i, a in enumerate(cfg.judges.agents)]
-                )
-            else:
-                acfg = cfg.workers.agents[0]
-                worker_base = {}  # 并行模式不在此处使用
-                agents_desc = (
-                    [f"worker-profile-{i}={a.model}"
-                     for i, a in enumerate(cfg.workers.agents)]
-                    + [f"worker_parallelism={cfg.worker_parallelism}"]
-                    + [f"master_worker={cfg.workers.agents[0].model}"]
-                    + [f"judge-{i}={a.model}"
-                       for i, a in enumerate(cfg.judges.agents)]
-                )
-
-            self._emit("task_start", task_id, task=cfg.task,
-                        module=cfg.module_name, files=self.module_files,
-                        agents=agents_desc)
-
-            # ═══════════════════════════════════════════════════════
-            # 主循环：Worker 串行逐文件 + Judge 评审
-            # ═══════════════════════════════════════════════════════
-
-            feedback_for_workers = _resume_feedback
-            # 并行模式：缓存 Round 1 的文件 Worker 结果，后续轮直接复用，
-            # 跳过重新分析，只让 Master Worker 根据反馈修正合并结果。
-            _cached_file_workers: list[WorkerResult] | None = None
-
-            _rnd_iter = range(_start_round, cfg.max_rounds + 1) if cfg.max_rounds != -1 else __import__('itertools').count(_start_round)
-            for rnd_num in _rnd_iter:
-                if self._cancel_event.is_set():
-                    break
-
-                self._emit("round_start", task_id, round=rnd_num)
-                rnd_dir = _round_dir(run_dir, rnd_num)
-                rnd_workers_dir = rnd_dir / "workers"
-                rnd_judges_dir = rnd_dir / "judges"
-                rnd_workers_dir.mkdir(parents=True, exist_ok=True)
-                rnd_judges_dir.mkdir(parents=True, exist_ok=True)
-
-                # ───────────────────────────────────────────────
-                # 1. Worker 分析（串行 or 并行）
-                # ───────────────────────────────────────────────
-
-                wid = "worker-0"          # serial default
-                worker_result: WorkerResult  # set in both branches
-                _parallel_file_workers: list[WorkerResult] = []  # set in parallel branch
-
-                if not _parallel:
-                    # ── 串行单 Worker 逐文件分析（原有逻辑）──────────
-                    total_worker_tokens = TokenUsage()
-                    last_output = ""
-
-                    self._emit("worker_start", task_id, worker_id=wid,
-                               model=acfg.model, round=rnd_num)
-
-                    if rnd_num == 1:
-                        overview_prompt = self._build_worker_overview(
-                            cfg.task, cfg.module_name, self.module_files)
-                        ar = await _run_agent_checked(
-                            context="worker overview",
-                            prompt=overview_prompt, **worker_base)
-                        total_worker_tokens += ar.token_usage
-                    elif feedback_for_workers:
-                        fb_prompt = (
-                            f"# Round {rnd_num} — 改进\n\n"
-                            f"上一轮评审未通过，以下是评审反馈：\n\n"
-                            f"{feedback_for_workers}\n\n"
-                            f"请根据反馈重新分析所有文件，修正遗漏。"
-                            f"我将再次逐文件发送给你分析。")
-                        ar = await _run_agent_checked(
-                            context="worker feedback",
-                            prompt=fb_prompt, **worker_base)
-                        total_worker_tokens += ar.token_usage
-
-                    for file_idx, file_path in enumerate(self.module_files):
-                        if self._cancel_event.is_set():
-                            break
-                        self._emit("worker_file", task_id,
-                                   file=file_path,
-                                   index=file_idx + 1,
-                                   total=len(self.module_files),
-                                   round=rnd_num)
-                        file_prompt = self._build_file_prompt(
-                            file_path, file_idx, len(self.module_files))
-                        ar = await _run_agent_checked(
-                            context=f"worker file {file_path}",
-                            prompt=file_prompt, **worker_base)
-                        total_worker_tokens += ar.token_usage
-                        last_output = _extract_result(ar.output)
-
-                    summary_prompt = self._build_summary_file_prompt(
-                        cfg.module_name, self.module_files)
-                    ar = await _run_agent_checked(
-                        context="worker summary",
-                        prompt=summary_prompt, **worker_base)
-                    total_worker_tokens += ar.token_usage
-                    last_output = _extract_result(ar.output)
-
-                    ef = _find_entry_file(worker_cwd, cfg.module_name)
-                    ef_content = ""
-                    if ef:
-                        try:
-                            ef_content = Path(ef).read_text(encoding="utf-8")
-                        except OSError:
-                            pass
-
-                    self._emit("worker_done", task_id, worker_id=wid,
-                               output=last_output[:500],
-                               entry_file_found=bool(ef))
-
-                    worker_result = WorkerResult(
-                        worker_id=wid, model=acfg.model,
-                        output=last_output, entry_file=ef or "",
-                        token_usage=total_worker_tokens)
-                    round_workers: list[WorkerResult] = [worker_result]
-
-                    (rnd_workers_dir / f"{wid}-output.md").write_text(
-                        last_output, encoding="utf-8")
-                    if ef_content:
-                        (rnd_workers_dir / f"{wid}-entry-list.md").write_text(
-                            ef_content, encoding="utf-8")
-
-                else:
-                    # ── 并行模式 ────────────────────────────────────────────────
-                    # Round 1：每文件一个 Worker 并行分析，结果缓存到 _cached_file_workers
-                    # Round 2+：文件内容未变，跳过重新分析，直接复用缓存，
-                    #            由 Master Worker 根据 Judge 反馈修正合并结果。
-                    _w_dir_prompts = load_system_prompts(
-                        cfg.workers.system_prompt_dir, cfg.worker_count)
-
-                    if _cached_file_workers is None:
-                        # ── 断点续跑：从磁盘恢复已完成的文件 Worker 结果 ──────
-                        _recovered_workers: dict[int, WorkerResult] = {}
-                        if _resuming:
-                            for _fi in range(len(self.module_files)):
-                                _w_out_path = rnd_workers_dir / f"worker-{_fi}-output.md"
-                                if _w_out_path.exists():
-                                    _recovered_workers[_fi] = WorkerResult(
-                                        worker_id=f"worker-{_fi}",
-                                        model=cfg.workers.agents[_fi % cfg.worker_count].model,
-                                        output=_w_out_path.read_text("utf-8"),
-                                        entry_file="",
-                                        token_usage=TokenUsage(),
-                                    )
-                            if _recovered_workers:
-                                self._emit("task_resume_workers", task_id,
-                                           recovered=len(_recovered_workers),
-                                           total=len(self.module_files))
-
-                        # 信号量限制单任务内部最大并发数，由 worker_parallelism 控制
-                        _sem = asyncio.Semaphore(cfg.worker_parallelism)
-                        # 共享完成计数器 [done, total]，asyncio 单线程安全
-                        _progress = [len(_recovered_workers), len(self.module_files)]
-
-                        async def _launch_file_worker(
-                            file_idx: int, file_path: str,
-                        ) -> WorkerResult:
-                            # 断点续跑：直接返回已从磁盘恢复的 Worker 结果
-                            if file_idx in _recovered_workers:
-                                return _recovered_workers[file_idx]
-                            w_idx = file_idx % cfg.worker_count
-                            w_acfg = cfg.workers.agents[w_idx]
-                            w_sys = resolve_system_prompt(w_idx, w_acfg, _w_dir_prompts)
-                            # 每文件独立 session，按文件索引命名，跨 round 持续
-                            w_sess = str(sess_dir / f"worker-file-{file_idx}.jsonl")
-                            async with _sem:
-                                return await self._run_one_worker(
-                                    worker_idx=file_idx, acfg=w_acfg,
-                                    worker_sys_prompt=w_sys,
-                                    file_shard=[file_path],
-                                    all_files=self.module_files,
-                                    worker_cwd=worker_cwd,
-                                    session_file=w_sess,
-                                    task_id=task_id,
-                                    rnd_num=rnd_num,
-                                    feedback=feedback_for_workers,
-                                    _progress=_progress,
-                                )
-
-                        round_file_workers = list(await asyncio.gather(*[
-                            _launch_file_worker(i, fp)
-                            for i, fp in enumerate(self.module_files)
-                        ]))
-                        _cached_file_workers = round_file_workers
-
-                        # 归档各文件 Worker 输出
-                        for wr in round_file_workers:
-                            (rnd_workers_dir / f"{wr.worker_id}-output.md").write_text(
-                                wr.output, encoding="utf-8")
-                            if wr.entry_file:
-                                try:
-                                    ef_txt = Path(wr.entry_file).read_text(encoding="utf-8")
-                                    (rnd_workers_dir / f"{wr.worker_id}-entry-list.md").write_text(
-                                        ef_txt, encoding="utf-8")
-                                except OSError:
-                                    pass
-                    else:
-                        # ── Round 2+：复用缓存，Master Worker 直接根据反馈修正 ──────
-                        round_file_workers = _cached_file_workers
-                        self._emit("workers_skipped", task_id, round=rnd_num,
-                                   workers=len(round_file_workers),
-                                   reason="files unchanged, master-worker will revise based on feedback")
-                        # 将上一轮的文件 Worker entry-list 软链/复制到本轮目录，
-                        # 方便 Master Worker 和 Judge 读取（路径不变，Master Worker 直接用 cwd 中的文件）
-                        for wr in round_file_workers:
-                            if wr.entry_file:
-                                try:
-                                    ef_txt = Path(wr.entry_file).read_text(encoding="utf-8")
-                                    ef_name = Path(wr.entry_file).name
-                                    (rnd_workers_dir / ef_name).write_text(
-                                        ef_txt, encoding="utf-8")
-                                except OSError:
-                                    pass
-
-                    master_input_workers = round_file_workers
-                    if (
-                        rnd_num == 1
-                        and str(cfg.master_merge_mode or "").lower() == "hierarchical"
-                        and len(round_file_workers) > max(1, cfg.master_shard_size)
-                    ):
-                        self._emit("shard_merge_start", task_id,
-                                   round=rnd_num,
-                                   workers=len(round_file_workers),
-                                   shard_size=cfg.master_shard_size,
-                                   shard_parallelism=cfg.master_shard_parallelism)
-                        _master_prompt_dir = str(
-                            Path(cfg.workers.system_prompt_dir).parent / "master_worker")
-                        _master_dir_prompts_for_shards = load_system_prompts(_master_prompt_dir, 1)
-                        _shard_master_sys = (
-                            _master_dir_prompts_for_shards[0]
-                            if _master_dir_prompts_for_shards and _master_dir_prompts_for_shards[0]
-                            else resolve_system_prompt(0, cfg.workers.agents[0], _w_dir_prompts)
-                        )
-                        master_input_workers = await self._run_shard_masters(
-                            acfg=cfg.workers.agents[0],
-                            master_sys_prompt=_shard_master_sys,
-                            round_file_workers=round_file_workers,
-                            worker_cwd=worker_cwd,
-                            sess_dir=sess_dir,
-                            task_id=task_id,
-                            rnd_num=rnd_num,
-                        )
-                        self._emit("shard_merge_done", task_id,
-                                   round=rnd_num,
-                                   shards=len(master_input_workers))
-
-                    # ── Master Worker：合并所有文件 Worker / Shard 的分析结果 ─────
-                    master_acfg = cfg.workers.agents[0]
-                    # 优先从专属 master_worker prompt 目录加载，回退到 workers prompt
-                    _master_prompt_dir = str(
-                        Path(cfg.workers.system_prompt_dir).parent / "master_worker")
-                    _master_dir_prompts = load_system_prompts(_master_prompt_dir, 1)
-                    if _master_dir_prompts and _master_dir_prompts[0]:
-                        master_sys = _master_dir_prompts[0]
-                    else:
-                        master_sys = resolve_system_prompt(0, master_acfg, _w_dir_prompts)
-                    master_sess = str(sess_dir / "master-worker.jsonl")
-                    self._emit("master_worker_start", task_id, round=rnd_num,
-                               workers=len(master_input_workers),
-                               source="shards" if master_input_workers is not round_file_workers else "workers")
-                    master_result = await self._run_master_worker(
-                        acfg=master_acfg,
-                        master_sys_prompt=master_sys,
-                        round_file_workers=master_input_workers,
-                        worker_cwd=worker_cwd,
-                        session_file=master_sess,
-                        task_id=task_id,
-                        rnd_num=rnd_num,
-                        feedback=feedback_for_workers,
-                    )
-                    self._emit("master_worker_done", task_id, round=rnd_num,
-                               entry_file_found=bool(master_result.entry_file),
-                               output=master_result.output[:500])
-
-                    # 归档 Master Worker 输出
-                    (rnd_workers_dir / "master-worker-output.md").write_text(
-                        master_result.output, encoding="utf-8")
-                    if master_result.entry_file:
-                        try:
-                            ef_txt = Path(master_result.entry_file).read_text(encoding="utf-8")
-                            ef_archive_name = (
-                                "master-worker-entry-list.json"
-                                if master_result.entry_file.endswith(".json")
-                                else "master-worker-entry-list.md"
-                            )
-                            (rnd_workers_dir / ef_archive_name).write_text(
-                                ef_txt, encoding="utf-8")
-                        except OSError:
-                            pass
-
-                    # Judge 只评审 Master Worker 的合并结果（1 次而不是 N 次）
-                    round_workers = [master_result]
-                    worker_result = master_result
-
-                # ───────────────────────────────────────────────
-                # 2. Judge 评审
-                # ───────────────────────────────────────────────
-
-                for j_idx, j_acfg in enumerate(cfg.judges.agents):
-                    self._emit("judge_start", task_id,
-                               judge_id=f"judge-{j_idx}",
-                               model=j_acfg.model, round=rnd_num)
-
-                async def _run_one_judge(
-                    j_idx: int, j_acfg: AgentInstanceConfig,
-                ) -> JudgeRoundResult:
-                    return await self._run_judge_evaluation(
-                        judge_idx=j_idx,
-                        judge_cfg=j_acfg,
-                        judge_sys_prompt=resolve_system_prompt(
-                            j_idx, j_acfg, judge_dir_prompts),
-                        round_workers=round_workers,
-                        worker_cwd=worker_cwd,
-                        task_id=task_id,
-                        rnd_num=rnd_num,
-                        sess_dir=sess_dir,
-                        rnd_judges_dir=rnd_judges_dir,
-                    )
-
-                judge_tasks_async = [
-                    _run_one_judge(j_idx, j_acfg)
-                    for j_idx, j_acfg in enumerate(cfg.judges.agents)
-                ]
-                round_judges: list[JudgeRoundResult] = list(
-                    await asyncio.gather(*judge_tasks_async))
-
-                # 汇总
-                for j_idx, j_result in enumerate(round_judges):
-                    jid = f"judge-{j_idx}"
-                    result.total_tokens += j_result.token_usage
-                    for ev in j_result.evaluations:
-                        self._emit("judge_eval", task_id, judge_id=jid,
-                                   worker_id=ev.worker_id, passed=ev.passed,
-                                   score=ev.score, feedback=ev.feedback[:200])
-                    if j_result.summary:
-                        self._emit("judge_summary", task_id, judge_id=jid,
-                                   best=j_result.summary.best_worker_id,
-                                   overall_passed=j_result.summary.overall_passed,
-                                   reasoning=j_result.summary.reasoning[:200])
-
-                # worker token 累加（串行用 total_worker_tokens，并行从 file workers + master worker 汇总）
-                if not _parallel:
-                    result.total_tokens += total_worker_tokens
-                else:
-                    # _cached_file_workers 在首轮后已设置；round_workers 为 [master_result]
-                    for _wr in (_cached_file_workers or []) + round_workers:
-                        result.total_tokens += _wr.token_usage
-
-                # ───────────────────────────────────────────────
-                # 3. 投票
-                # ───────────────────────────────────────────────
-
-                pass_count = sum(
-                    1 for j in round_judges
-                    if j.summary and j.summary.overall_passed)
-                is_passed = pass_count >= threshold
-
-                # 最终输出：并行模式取 master worker 结果，串行取 worker_result
-                best_wid = worker_result.worker_id
-                best_wr = worker_result
-
-                feedback_md = self._build_feedback_md(
-                    round_workers, round_judges, best_wid, rnd_num)
-                (rnd_dir / "feedback.md").write_text(
-                    feedback_md, encoding="utf-8")
-
-                rnd = RoundResult(
-                    round=rnd_num,
-                    worker_results=(
-                        _parallel_file_workers + round_workers
-                        if _parallel else round_workers),
-                    judge_results=round_judges,
-                    pass_count=pass_count,
-                    total_judges=cfg.judge_count,
-                    passed=is_passed,
-                    best_worker_id=best_wid,
-                    feedback_to_workers=feedback_md,
-                )
-                result.rounds.append(rnd)
-
-                self._emit("round_end", task_id, round=rnd_num,
-                           passed=is_passed, pass_count=pass_count,
-                           total_judges=cfg.judge_count,
-                           best_worker=best_wid)
-
-                if is_passed and rnd_num >= cfg.min_rounds:
-                    result.status = TaskStatus.PASSED
-                    result.final_output = _get_best_output(best_wr)
-                    break
-
-                if is_passed and rnd_num < cfg.min_rounds:
-                    self._emit("round_reflection", task_id, round=rnd_num,
-                               message=(f"Round {rnd_num} passed but "
-                                        f"min_rounds={cfg.min_rounds}, "
-                                        f"forcing reflection"))
-
-                feedback_for_workers = feedback_md
-                if cfg.max_rounds != -1 and rnd_num >= cfg.max_rounds:
-                    if max_rounds_action == "treat_as_passed":
-                        result.status = TaskStatus.PASSED
-                        result.error = None
-                    else:
-                        result.status = TaskStatus.FAILED
-                        result.error = (
-                            f"已执行 {cfg.max_rounds} 轮，评审仍未通过"
-                            f"（最后一轮通过票 {pass_count}/{cfg.judge_count}，需 {threshold}）"
-                        )
-                    result.final_output = _get_best_output(best_wr)
-                    break
+            result.final_output = json.dumps(entries, ensure_ascii=False, indent=2)
 
         except PiFatalError as e:
             result.status = TaskStatus.FAILED
             result.error = str(e)
-            self._emit("error", task_id, error=str(e),
-                       fatal=True)
+            self._emit("error", task_id, error=str(e), fatal=True)
 
         except Exception as e:
             result.status = TaskStatus.ERROR
@@ -1011,122 +540,57 @@ class Orchestrator:
 
         result.total_duration_ms = (time.time() - start) * 1000
 
-        # ═══════════════════════════════════════════════════════════════
-        # 输出归档（不压缩、不删除）
-        # ═══════════════════════════════════════════════════════════════
+        # ── 3. 产物写出 ──────────────────────────────────────────────────────
 
-        # 1) 运行报告 + 中间结果 → run_dir
-        (run_dir / "report.md").write_text(
-            self._report(result), encoding="utf-8")
+        # result.json（中间过程）
         (run_dir / "result.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8")
 
-        # 2) 格式化最终输出 → out_dir
-        cleaned_output = self._format_final_output(result)
-        result_filename = self._make_result_filename(cfg, "md")
-        (out_dir / result_filename).write_text(
-            cleaned_output, encoding="utf-8")
-        result.final_output = cleaned_output
-
-        # 3) functions.list：始终从最佳 entry-list 确定性生成。
-        #    Agent 可以负责判断入口，但结构化下游产物必须由程序生成，
-        #    避免多轮修正时复用 LLM 写错的 functions.list。
+        # functions.list：直接写 pipeline 产出的 entries（已是正确格式）
         func_list_path = str(out_dir / "functions.list")
-        _entry_src = ""
-        if best_wr.entry_file:
-            try:
-                entry_sync = sync_functions_list_from_entry(best_wr.entry_file, func_list_path)
-                self._emit("functions_list_synced", task_id,
-                           source=str(best_wr.entry_file),
-                           entry_count=entry_sync.entry_count,
-                           functions_count=entry_sync.functions_count,
-                           fixes=entry_sync.fixes[:20],
-                           errors=entry_sync.validation_errors[:20])
-            except Exception as _sync_err:
-                self._emit("functions_list_sync_error", task_id, error=str(_sync_err))
-                try:
-                    _entry_src = Path(best_wr.entry_file).read_text(encoding="utf-8")
-                except OSError:
-                    pass
-                if _entry_src:
-                    write_functions_list(_entry_src, func_list_path)
-                else:
-                    write_functions_list(cleaned_output, func_list_path)
-        else:
-            write_functions_list(cleaned_output, func_list_path)
+        _fl_to_write: list[dict] = entries if isinstance(entries, list) else []
 
-        # 程序级强制保证：functions.list 必须通过深度字段验证
-        import json as _json
-        _fl_raw = ""
-        _fl_parsed = []
-        try:
-            _fl_raw = Path(func_list_path).read_text(encoding="utf-8")
-            _fl_parsed = _json.loads(_fl_raw)
-            if not isinstance(_fl_parsed, list):
-                raise ValueError(
-                    f"functions.list 不是 JSON 数组，实际类型: {type(_fl_parsed).__name__}"
-                )
-
-            # 自动修复格式问题（过滤非法 taints、修复 tag/line 等）
-            _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl_parsed)
+        # 自动修复格式问题
+        if _fl_to_write:
+            _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl_to_write)
             if _fl_fix_log:
                 self._emit("functions_list_autofix", task_id,
                            fixes=_fl_fix_log[:20],
-                           original_count=len(_fl_parsed),
+                           original_count=len(_fl_to_write),
                            fixed_count=len(_fl_fixed))
-                # 如果有修复，重写修复后的版本
-                Path(func_list_path).write_text(
-                    _json.dumps(_fl_fixed, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-                _fl_parsed = _fl_fixed
+                _fl_to_write = _fl_fixed
 
-            _fl_errors = validate_functions_list(_fl_parsed)
+            _fl_errors = validate_functions_list(_fl_to_write)
             if _fl_errors:
-                raise ValueError(
-                    "functions.list 字段验证失败:\n" + "\n".join(f"  • {e}" for e in _fl_errors)
-                )
-            _fl_count = len(_fl_parsed)
-        except (json.JSONDecodeError, ValueError, OSError) as _fl_err:
-            _fl_count = -1
-            self._emit("functions_list_error", task_id, error=str(_fl_err))
-            # 写入错误标记（合法 JSON，但含 _error 字段，Judge 见到即判 FAIL）
-            # 不能写 []，空数组会让下游误认为「无入口函数」
-            _err_marker = _json.dumps(
-                [{"_error": str(_fl_err),
-                  "_source_preview": _fl_raw[:300]}],
-                ensure_ascii=False, indent=2)
-            Path(func_list_path).write_text(_err_marker, encoding="utf-8")
-            _fl_parsed = [
-                {
-                    "_error": str(_fl_err),
-                    "_source_preview": _fl_raw[:300],
-                }
-            ]
+                self._emit("functions_list_error", task_id,
+                           error="; ".join(_fl_errors[:5]))
 
-        # 4) entry-details.json：富结果权威产物，供下游与前端消费
+        Path(func_list_path).write_text(
+            json.dumps(_fl_to_write, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
+        # entry-details.json（与 functions.list 相同，供前端消费）
         entry_details_path = str(out_dir / "entry-details.json")
-        try:
-            Path(entry_details_path).write_text(
-                _json.dumps(_fl_parsed if isinstance(_fl_parsed, list) else [], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as _entry_details_err:
-            self._emit("entry_details_error", task_id, error=str(_entry_details_err))
+        Path(entry_details_path).write_text(
+            json.dumps(_fl_to_write, ensure_ascii=False, indent=2),
+            encoding="utf-8")
 
-        # 5) flag 文件：成功覆写为 1
+        # flag：通过才写 1
         if result.status == TaskStatus.PASSED:
             flag_path.write_text("1", encoding="utf-8")
 
+        # task_end 事件
         self._emit("task_end", task_id,
-                    status=result.status.value,
-                    run_dir=str(run_dir),
-                    output_dir=str(out_dir),
-                    result_file=str(out_dir / result_filename),
-                    functions_list=func_list_path,
-                    entry_details=entry_details_path,
-                    flag_file=str(out_dir / "flag"))
+                   status=result.status.value,
+                   run_dir=str(run_dir),
+                   output_dir=str(out_dir),
+                   functions_list=func_list_path,
+                   entry_details=entry_details_path,
+                   flag_file=str(flag_path))
+
         self._cancel_event = None
         return result
+
 
     def abort(self):
         if self._cancel_event:
