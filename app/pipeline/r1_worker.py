@@ -60,9 +60,9 @@ def build_r1_w_initial_prompt(
       4. 更新 _meta.json（若发现新函数须添加记录）
     """
     basename = os.path.basename(file_path)
+    abs_file_path = os.path.abspath(file_path)
     # 工作目录相对路径（agent 的 cwd 是 source/）
     r1_dir = dirs.r1_file_dir(file_hash)
-    rel_r1 = r1_dir.relative_to(dirs.run.parent.parent) if dirs.run.parent.parent in r1_dir.parents else r1_dir
 
     # ctags 预提取清单
     if static_funcs:
@@ -97,9 +97,11 @@ def build_r1_w_initial_prompt(
         "2. 逐函数核查 ctags 结果：\n"
         "   - **补充遗漏**：ctags 可能遗漏宏展开函数、模板特化、匿名 namespace 内函数等\n"
         "   - **修正行号**：确认每个函数的实际起始行和结束行（匹配花括号）\n"
-        "   - **新函数**：若发现 ctags 未覆盖的函数，用 "
-        "`echo -n \"<file_path>::<func_name>::<start_line>\" | md5sum | cut -c1-12` "
-        "计算新 func_hash\n\n"
+        "   - **新函数**：若发现 ctags 未覆盖的函数，用以下命令计算 func_hash\n"
+        "     （注意：路径必须是绝对路径，格式固定为 abspath::func_name::start_line）\n"
+        f"     ```bash\n"
+        f"     echo -n \"{abs_file_path}::<完整限定函数名>::<起始行号>\" | md5sum | cut -c1-12\n"
+        f"     ```\n\n"
         f"3. 对每个函数，使用 `write` 工具写出 `{r1_dir}/<func_hash>.c`，格式：\n"
         "```\n"
         f"// EA_SOURCE_FILE: {basename}\n"

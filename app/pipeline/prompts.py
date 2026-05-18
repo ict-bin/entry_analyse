@@ -256,7 +256,13 @@ def build_r4_w_prompt(
     且 funcY 的外部数据实际来自 funcX 的参数，
     则 funcY 在模块级不是最外层入口。
     """
-    file_list = "\n".join(f"  - `{f.name}`  ({f.stem})" for f in sorted(r3_entries_files))
+    if r3_entries_files:
+        # Show full absolute paths so agent can read directly without guessing
+        file_list = "\n".join(f"  - `{f}`" for f in sorted(r3_entries_files))
+        r3_dir = sorted(r3_entries_files)[0].parent
+    else:
+        file_list = "  (no R3 results)"
+        r3_dir = r4_out_path.parent  # fallback
     retry_section = (
         f"\n## 上次分析有问题，请修正\n\n{feedback}\n"
         if is_retry and feedback
@@ -267,10 +273,10 @@ def build_r4_w_prompt(
         f"# R4 Worker — 模块级外部入口汇总\n\n"
         f"模块：`{module_name}`\n"
         f"{retry_section}\n"
-        f"## R3 各文件入口结果\n\n"
+        f"## R3 各文件入口结果（完整路径，可直接 read）\n\n"
         f"{file_list if file_list else '  （无 R3 结果）'}\n\n"
         f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取以上所有 R3 结果文件（路径：`{r4_out_path.parent}/<hash>.json`）\n"
+        f"1. 使用 `read` 工具读取以上所有 R3 结果文件（路径：`{r3_dir}/<hash>.json (same as listed above)`）\n"
         f"2. 分析跨文件调用关系：\n"
         f"   - 若文件 A 的 funcX 调用了文件 B 的 funcY\n"
         f"     且 funcY 接收的外部数据来自 funcX 传入的参数\n"

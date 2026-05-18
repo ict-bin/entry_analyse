@@ -55,6 +55,7 @@ class FunctionState:
     # R2 W：外部输入分析
     r2_w_state:    NodeState = NodeState.PENDING
     r2_w_attempts: int = 0
+    r2_w_feedback: str = ""     # R2 J 反馈（R2 W 重试 prompt 用）
     has_external_input: Optional[bool] = None   # None=尚未分析
 
     # 时间戳（秒级 unix，仅供调试）

@@ -250,17 +250,19 @@ class PipelineEngine:
             acfg = self.cfg.workers.agents[0]
             sys_prompt = self._worker_sys_prompt(0)
 
-            token_usage, funcs, func_hashes = await run_r1_worker(
-                file_path=file_path,
-                dirs=dirs,
-                acfg=acfg,
-                cfg=self.cfg,
-                task_id=self.task_id,
-                on_event=self._on_event,
-                cancel_event=self._cancel,
-                is_retry=(fs.r1_w_attempts > 1),
-                system_prompt=sys_prompt,
-            )
+            # R1 W 也需经过全局信号量（run_r1_worker 内部独立获取 capacity_slot）
+            async with self._sem:
+                token_usage, funcs, func_hashes = await run_r1_worker(
+                    file_path=file_path,
+                    dirs=dirs,
+                    acfg=acfg,
+                    cfg=self.cfg,
+                    task_id=self.task_id,
+                    on_event=self._on_event,
+                    cancel_event=self._cancel,
+                    is_retry=(fs.r1_w_attempts > 1),
+                    system_prompt=sys_prompt,
+                )
 
             state.register_functions(
                 file_hash,
@@ -274,7 +276,7 @@ class PipelineEngine:
             logger.error("R1 W failed for %s: %s", file_path, exc)
             fs.r1_w_state = NodeState.FAILED
             state.save(dirs.state_file)
-            raise
+            # 不向上抛出：让其他文件的 pipeline 继续运行，失败文件跳过即可
 
     # ── R1 J → R2 W 串链（每函数）────────────────────────────────────────────
 
@@ -378,14 +380,15 @@ class PipelineEngine:
         try:
             acfg = self.cfg.workers.agents[0]
             sys_prompt = self._worker_sys_prompt(0)
-            await run_r1_worker(
-                file_path=file_path, dirs=dirs,
-                acfg=acfg, cfg=self.cfg,
-                task_id=self.task_id, on_event=self._on_event,
-                cancel_event=self._cancel,
-                is_retry=True, failed_funcs=failed_funcs,
-                system_prompt=sys_prompt,
-            )
+            async with self._sem:
+                await run_r1_worker(
+                    file_path=file_path, dirs=dirs,
+                    acfg=acfg, cfg=self.cfg,
+                    task_id=self.task_id, on_event=self._on_event,
+                    cancel_event=self._cancel,
+                    is_retry=True, failed_funcs=failed_funcs,
+                    system_prompt=sys_prompt,
+                )
         except Exception as exc:
             logger.warning("R1 W retry for func %s failed: %s", func_hash, exc)
 
@@ -425,12 +428,17 @@ class PipelineEngine:
                 acfg = self.cfg.workers.agents[0]
                 sys_prompt = self._worker_sys_prompt(0)
                 is_retry = func_state.r2_w_attempts > 1
+                # 优先使用 R2 专属反馈（R2 J 设置），其次才是 R1 J 反馈
+                r2_feedback = (
+                    func_state.r2_w_feedback
+                    or func_state.r1_j_feedback
+                ) if is_retry else ""
                 prompt = P.build_r2_w_prompt(
                     func_file=dirs.r1_file_dir(file_hash) / f"{func_hash}.c",
                     r2_dir=r2_dir,
                     func_hash=func_hash,
                     is_retry=is_retry,
-                    feedback=func_state.r1_j_feedback if is_retry else "",
+                    feedback=r2_feedback,
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
@@ -524,6 +532,8 @@ class PipelineEngine:
                     for fh in failed:
                         if fh in fs.functions:
                             fs.functions[fh].r2_w_state = NodeState.PENDING
+                            # 将 R2 J 的文件级反馈传递给每个需要重跑的函数
+                            fs.functions[fh].r2_w_feedback = feedback
                     state.save(dirs.state_file)
                     if failed:
                         await asyncio.gather(*[
