@@ -103,8 +103,8 @@ def _run_ctags(file_path: str) -> list[dict]:
         "--output-format=json",
         f"--kinds-C={_CTAGS_KINDS}",
         f"--kinds-C++={_CTAGS_KINDS}",
-        "--fields=+nS",          # n=行号, S=签名
-        "--extras=-F",           # 不输出 fileScope
+        "--fields=+nSsZ",     # n=行号, S=签名, s=scope名称, Z=scopeKind
+        "--extras=-F",        # 不输出 fileScope
         file_path,
     ]
     try:
@@ -305,40 +305,112 @@ _FUNC_DEF_RE = re.compile(
 )
 
 
+# 匹配 class/struct/namespace 开头行，用于 inline 方法的 scope 追踪
+_SCOPE_OPEN_RE = re.compile(
+    r'^\s*(?:class|struct|namespace)\s+(\w[\w:]*)\s*(?::[^{;]*)?\{\s*$'
+)
+
+
+def _count_braces(line: str) -> tuple[int, int]:
+    """计算一行中有效花括号数（跳过字符串和行注释）。"""
+    opens = closes = 0
+    in_str = escape = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if escape:
+            escape = False; i += 1; continue
+        if ch == '\\' and in_str:
+            escape = True; i += 1; continue
+        if ch == '"':
+            in_str = not in_str; i += 1; continue
+        if in_str:
+            i += 1; continue
+        if ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
+            break
+        if ch == '{':
+            opens += 1
+        elif ch == '}':
+            closes += 1
+        i += 1
+    return opens, closes
+
+
 def _extract_functions_regex(file_path: str, lines: list[str]) -> list[dict]:
     """
     Regex 降级提取：扫描所有行，找函数定义起始行。
+
+    C++ scope 处理策略：
+    - 类外定义 `NS::Class::method()` → scope 直接从函数名解析
+    - 类内 inline 定义 → 追踪 class/struct/namespace 层级栈补充 scope
+    - operator 重载、析构函数等特殊名称均正确处理
 
     返回格式与 ctags 条目兼容，但 signature 可能不如 ctags 精确。
     """
     entries = []
     seen_starts: set[int] = set()
 
+    # scope 追踪栈: 每项 (scope_name, brace_depth_when_opened)
+    scope_stack: list[tuple[str, int]] = []
+    brace_depth = 0
+
     for li, line in enumerate(lines):
+        opens, closes = _count_braces(line)
+
+        # 进入新 scope 前先记录（scope 声明行上有 {）
+        sm = _SCOPE_OPEN_RE.match(line)
+        if sm and opens > 0:
+            scope_stack.append((sm.group(1), brace_depth))
+
+        brace_depth += opens - closes
+
+        # 移除已关闭的 scope
+        while scope_stack and brace_depth <= scope_stack[-1][1]:
+            scope_stack.pop()
+
+        # 尝试匹配函数定义
         m = _FUNC_DEF_RE.match(line)
         if not m:
             continue
-        # 过滤掉 lambda、函数指针声明等假阳性
-        name = m.group(1)
-        if not name or name in (
+
+        raw_name = m.group(1)
+        if not raw_name or raw_name in (
             "if", "else", "for", "while", "switch",
             "return", "do", "case", "namespace",
         ):
             continue
-        # 行号去重
+
         start_line = li + 1
         if start_line in seen_starts:
             continue
         seen_starts.add(start_line)
 
         signature = line.strip().rstrip("{").rstrip()
+
+        # 解析 scope 和最终函数名
+        if '::' in raw_name:
+            # 类外定义: NS::Class::method  →  scope=NS::Class, name=method
+            parts = raw_name.rsplit('::', 1)
+            scope      = parts[0]
+            name       = parts[1]
+            scope_kind = 'class'
+        elif scope_stack:
+            # inline 类内定义: 从 scope 栈还原完整限定名
+            scope      = '::'.join(s for s, _ in scope_stack)
+            name       = raw_name
+            scope_kind = 'class'
+        else:
+            scope      = ''
+            name       = raw_name
+            scope_kind = ''
+
         entries.append({
-            "name": name.split("::")[-1],
-            "scope": "::".join(name.split("::")[:-1]),
-            "scopeKind": "class" if "::" in name else "",
-            "line": start_line,
-            "signature": "",
-            "_regex_signature": signature,   # 完整签名行（regex 特有）
+            "name":             name,
+            "scope":            scope,
+            "scopeKind":        scope_kind,
+            "line":             start_line,
+            "signature":        "",
+            "_regex_signature": signature,
         })
 
     return entries

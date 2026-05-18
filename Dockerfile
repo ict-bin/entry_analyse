@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     curl wget gnupg ca-certificates git zip \
     python3 python3-pip python3-venv \
     bubblewrap \
+    universal-ctags \
     && rm -rf /var/lib/apt/lists/*
 
 # ═══ Node.js 22 ═══════════════════════════════════════════════════════════════
