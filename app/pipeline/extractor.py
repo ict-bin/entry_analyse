@@ -97,6 +97,11 @@ def _run_ctags(file_path: str) -> list[dict]:
         signature 函数签名（ctags 提供时）
         scope     所在类/命名空间（C++ 时有值）
         scopeKind scope 的类型（class / namespace 等）
+
+    过滤规则：
+        - kind=="function": 直接保留（C 自由函数 / C++ 非成员函数）
+        - kind=="member" 且 signature 非空：保留（类方法/成员函数）
+        - kind=="member" 且 signature 为空：丢弃（结构体数据字段，非函数）
     """
     cmd = [
         _CTAGS_CMD,
@@ -128,10 +133,16 @@ def _run_ctags(file_path: str) -> list[dict]:
         if not isinstance(obj, dict):
             continue
         kind = obj.get("kind", "")
-        # 只保留函数/成员函数定义
-        if kind not in ("function", "member"):
-            continue
-        entries.append(obj)
+        if kind == "function":
+            # C 自由函数 / C++ 非成员函数 — 直接保留
+            entries.append(obj)
+        elif kind == "member":
+            # C++ 成员：必须有 signature（成员方法）才保留
+            # 无 signature = 结构体数据字段，不是函数，丢弃
+            if obj.get("signature", "").strip():
+                entries.append(obj)
+            # 否则不加入（静默过滤）
+        # 其他 kind（variable/type/macro/...）一律丢弃
 
     return entries
 

@@ -50,7 +50,8 @@ class FunctionState:
     # R1 J：函数提取质量评审
     r1_j_state:    NodeState = NodeState.PENDING
     r1_j_attempts: int = 0
-    r1_j_feedback: str = ""  # 最后一次 J 反馈（重试 prompt 用）
+    r1_j_feedback: str = ""       # 最后一次 J 反馈文本（fallback）
+    r1_j_feedback_path: str = ""  # Judge 反馈写入的文件路径（优先引用）
 
     # R2 W：外部输入分析
     r2_w_state:    NodeState = NodeState.PENDING
