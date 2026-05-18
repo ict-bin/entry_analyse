@@ -68,11 +68,19 @@ def build_r2_w_prompt(
     - 有外部输入：写出 {func_hash}.json 到 r2_dir
     - 无外部输入：不写文件，在 <result> 中标注
     """
-    retry_section = (
-        f"\n## 上次分析有问题，请修正\n\n{feedback}\n"
-        if is_retry and feedback
-        else ""
-    )
+    # feedback 字段：若是文件路径（由 engine 写入）则引用文件，否则嵌入文本
+    from pathlib import Path as _Path
+    if is_retry and feedback:
+        if _Path(feedback).exists():
+            retry_section = (
+                f"\n## Judge 评审意见\n\n"
+                f"上一次分析有问题，Judge 评审意见已保存至：`{feedback}`\n"
+                f"请先使用 `read` 工具查阅该文件，再修正本次分析。\n"
+            )
+        else:
+            retry_section = f"\n## 上次分析有问题，请修正\n\n{feedback}\n"
+    else:
+        retry_section = ""
     return (
         f"# R2 Worker — 函数外部输入分析\n\n"
         f"{retry_section}"
@@ -175,11 +183,19 @@ def build_r3_w_prompt(
     """
     basename = os.path.basename(file_path)
     file_list = "\n".join(f"  - `{f.name}`" for f in analysis_files)
-    retry_section = (
-        f"\n## 上次过滤有问题，请修正\n\n{feedback}\n"
-        if is_retry and feedback
-        else ""
-    )
+    # feedback 字段：若是文件路径则引用，否则嵌入文本
+    from pathlib import Path as _Path
+    if is_retry and feedback:
+        if _Path(feedback).exists():
+            retry_section = (
+                f"\n## Judge 评审意见\n\n"
+                f"Judge 评审意见已保存至：`{feedback}`\n"
+                f"请先使用 `read` 工具查阅，再修正过滤结果。\n"
+            )
+        else:
+            retry_section = f"\n## 上次过滤有问题，请修正\n\n{feedback}\n"
+    else:
+        retry_section = ""
 
     return (
         f"# R3 Worker — 文件级外部入口过滤\n\n"
@@ -263,11 +279,19 @@ def build_r4_w_prompt(
     else:
         file_list = "  (no R3 results)"
         r3_dir = r4_out_path.parent  # fallback
-    retry_section = (
-        f"\n## 上次分析有问题，请修正\n\n{feedback}\n"
-        if is_retry and feedback
-        else ""
-    )
+    # feedback 字段：若是文件路径则引用，否则嵌入文本
+    from pathlib import Path as _Path
+    if is_retry and feedback:
+        if _Path(feedback).exists():
+            retry_section = (
+                f"\n## Judge 评审意见\n\n"
+                f"Judge 评审意见已保存至：`{feedback}`\n"
+                f"请先使用 `read` 工具查阅，再修正最终入口分析。\n"
+            )
+        else:
+            retry_section = f"\n## 上次分析有问题，请修正\n\n{feedback}\n"
+    else:
+        retry_section = ""
 
     return (
         f"# R4 Worker — 模块级外部入口汇总\n\n"

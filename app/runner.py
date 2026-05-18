@@ -585,6 +585,7 @@ async def run_agent(
     timeout_max_retries: int = 3,
     pi_max_retries: int = -1,
     pi_retry_delay: float = 5.0,
+    timeout_continue_prompt: str = "",
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
@@ -617,16 +618,26 @@ async def run_agent(
     # prompt 通过 stdin 传递，而非命令行参数，避免超出 Linux ARG_MAX 限制。
     # pi 在 print/json 模式下会读取 piped stdin 并将其合并到初始 prompt。
     stdin_data: bytes = prompt.encode("utf-8") if prompt else b""
+    # 超时/排队失败后发送的 continue 提示（短消息，而非重发完整 prompt）
+    _CONTINUE_DEFAULT = "前次执行因超时或网络问题中断，请继续完成之前的任务，从上次进度继续工作。"
+    continue_stdin: bytes = (
+        (timeout_continue_prompt or _CONTINUE_DEFAULT).encode("utf-8")
+        if session_file  # 只有有 session 时才能 continue，否则必须重发 prompt
+        else stdin_data
+    )
 
     timeout_seconds = _normalize_timeout_seconds(run_timeout_seconds)
     timeout_failures = 0
+    first_attempt = True
     try:
         while True:
+            current_stdin = stdin_data if first_attempt else continue_stdin
+            first_attempt = False
             try:
                 coro = _run_with_context_overflow_recovery(
                     pi_cmd=pi_cmd,
                     args=args,
-                    stdin_data=stdin_data,
+                    stdin_data=current_stdin,
                     prompt=prompt,
                     system_prompt=system_prompt,
                     model=model,

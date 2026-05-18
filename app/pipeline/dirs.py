@@ -118,6 +118,22 @@ class PipelineDirs:
         """R1 Judge session：每次评审新建（attempt 从 1 开始）。"""
         return self.sessions / f"r1-j-{func_hash}-a{attempt}.jsonl"
 
+    def r1_j_feedback_file(self, file_hash: str, func_hash: str, attempt: int) -> Path:
+        """R1 Judge 反馈文件：Judge 审核后写入，R1 W retry 时只引用此路径。"""
+        return self.r1_file_dir(file_hash) / f"judge_feedback_{func_hash}_a{attempt}.txt"
+
+    def r2_j_feedback_file(self, file_hash: str, attempt: int) -> Path:
+        """R2 Judge 反馈文件（文件级）：R2 W retry 时引用。"""
+        return self.r2_file_dir(file_hash) / f"judge_feedback_a{attempt}.txt"
+
+    def r3_j_feedback_file(self, file_hash: str, attempt: int) -> Path:
+        """R3 Judge 反馈文件：R3 W retry 时引用。"""
+        return self.r3 / f"{file_hash}_judge_feedback_a{attempt}.txt"
+
+    def r4_j_feedback_file(self, attempt: int) -> Path:
+        """R4 Judge 反馈文件：R4 W retry 时引用。"""
+        return self.r4 / f"judge_feedback_a{attempt}.txt"
+
     def r2_w_session(self, file_hash: str, func_hash: str) -> Path:
         """R2 Worker session：每函数独立，跨重试共享。"""
         return self.sessions / f"r2-w-{file_hash}-{func_hash}.jsonl"

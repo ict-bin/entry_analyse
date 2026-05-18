@@ -351,6 +351,12 @@ class PipelineEngine:
             passed, feedback = _parse_j_result(ar.output)
             func_state.r1_j_feedback = feedback
             func_state.r1_j_state = NodeState.PASSED if passed else NodeState.FAILED
+            # 写出 feedback 文件（供 retry 时引用，不重发原 prompt）
+            if not passed and feedback:
+                fb_file = dirs.r1_j_feedback_file(file_hash, func_hash, attempt)
+                fb_file.parent.mkdir(parents=True, exist_ok=True)
+                fb_file.write_text(feedback, encoding="utf-8")
+                func_state.r1_j_feedback_path = str(fb_file)
             state.save(dirs.state_file)
             self._emit("r1_j_done",
                        func_hash=func_hash, function=func_state.name,
@@ -375,7 +381,8 @@ class PipelineEngine:
         failed_funcs = [{
             "func_hash": func_hash,
             "name": func_state.name,
-            "feedback": func_state.r1_j_feedback,
+            "feedback_path": getattr(func_state, "r1_j_feedback_path", "") or "",
+            "feedback": func_state.r1_j_feedback,  # fallback 纯文本（若未写文件）
         }]
         try:
             acfg = self.cfg.workers.agents[0]
@@ -527,12 +534,16 @@ class PipelineEngine:
                 else:
                     fs.r2_j_state = NodeState.FAILED
                     # 解析 J 指出的失败函数并重跑 R2 W
+                    # 写出 feedback 文件，供 retry 时引用（而非嵌入原文本到 prompt）
+                    fb_file = dirs.r2_j_feedback_file(file_hash, attempt)
+                    fb_file.parent.mkdir(parents=True, exist_ok=True)
+                    fb_file.write_text(feedback, encoding="utf-8")
                     failed = _parse_failed_func_hashes(ar.output, fs.functions)
                     for fh in failed:
                         if fh in fs.functions:
                             fs.functions[fh].r2_w_state = NodeState.PENDING
-                            # 将 R2 J 的文件级反馈传递给每个需要重跑的函数
-                            fs.functions[fh].r2_w_feedback = feedback
+                            # 传递 feedback 文件路径，而非嵌入文本
+                            fs.functions[fh].r2_w_feedback = str(fb_file)
                     state.save(dirs.state_file)
                     if failed:
                         await asyncio.gather(*[
@@ -654,6 +665,11 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
             fs.r3_feedback = feedback
+            if not passed and feedback:
+                fb_file = dirs.r3_j_feedback_file(file_hash, attempt)
+                fb_file.parent.mkdir(parents=True, exist_ok=True)
+                fb_file.write_text(feedback, encoding="utf-8")
+                fs.r3_feedback = str(fb_file)  # 转存文件路径，供 retry 引用
             self._emit("r3_j_done",
                        file_hash=file_hash, file=Path(file_path).name,
                        passed=passed, feedback=feedback[:200])
@@ -763,6 +779,11 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
             state.r4_feedback = feedback
+            if not passed and feedback:
+                fb_file = dirs.r4_j_feedback_file(attempt)
+                fb_file.parent.mkdir(parents=True, exist_ok=True)
+                fb_file.write_text(feedback, encoding="utf-8")
+                state.r4_feedback = str(fb_file)  # 转存文件路径，供 retry 引用
             self._emit("r4_j_done", passed=passed, feedback=feedback[:200])
             return passed
         except Exception as exc:
