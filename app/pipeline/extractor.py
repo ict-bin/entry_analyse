@@ -61,7 +61,7 @@ _CTAGS_CMD = shutil.which("ctags") or shutil.which("universal-ctags") or "ctags"
 
 # ctags kinds for C/C++:
 #   f = function definition   m = member function
-_CTAGS_KINDS = "f,m"
+_CTAGS_KINDS = "fm"   # ctags 多种 kind 格式为拼接，不加逗号（'f,m' 会触发 warning 且被忽略）
 
 _CTAGS_AVAILABLE: bool | None = None   # None = 未检测
 
@@ -388,6 +388,9 @@ def _extract_functions_regex(file_path: str, lines: list[str]) -> list[dict]:
         if not raw_name or raw_name in (
             "if", "else", "for", "while", "switch",
             "return", "do", "case", "namespace",
+            # GCC/Clang/MSVC 编译器属性关键字，不是函数
+            "__attribute__", "__declspec", "__cdecl", "__stdcall",
+            "__fastcall", "__thiscall", "__forceinline", "__asm",
         ):
             continue
 
@@ -524,14 +527,14 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
     lines = raw.splitlines()
 
     # ── Step 1: 获取 ctags 条目 ──────────────────────────────────────────
-    if _check_ctags():
+    ctags_ok = _check_ctags()
+    if ctags_ok:
         raw_entries = _run_ctags(file_path)
+        # ctags 可用时不回退 regex：结果为空是合法的（如纯结构体头文件）
+        # 只有 ctags 完全不可用时才用 regex 兜底
     else:
-        raw_entries = []
-
-    if not raw_entries:
-        # ctags 无输出或不可用 → 降级到 regex
         raw_entries = _extract_functions_regex(file_path, lines)
+        logger.debug("ctags not available, using regex for %s", Path(file_path).name)
 
     # 补充扫描：宏定义的函数（ctags/regex 都无法识别）
     macro_entries = _scan_macro_functions(file_path, lines)
