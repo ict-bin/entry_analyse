@@ -345,6 +345,11 @@ async def run_r1_worker(
             static_funcs, func_hashes_static,
             file_hash, file_path, dirs.r1,
         )
+        # 同步写入 SQLite（Agent 可按 func_hash 精确查询，无 50KB 截断问题）
+        from .funcdb import FunctionDB as _FDB
+        _FDB.open(dirs.r1, file_hash).write_functions(
+            file_hash, file_path, static_funcs, func_hashes_static
+        )
 
         _safe_emit(on_event, "r1_static_done", task_id,
                    file=basename, file_hash=file_hash,
@@ -403,6 +408,9 @@ async def run_r1_worker(
             tmp.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(str(tmp), str(dst))
+            # 同步到 SQLite（全量重同步，确保一致性）
+            from .funcdb import FunctionDB as _FDB
+            _FDB.open(dirs.r1, file_hash).sync_from_json(data)
     else:
         logger.warning("R1 W: could not parse corrections for %s, keeping static results",
                        basename)

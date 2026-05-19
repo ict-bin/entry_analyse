@@ -587,3 +587,29 @@ def load_functions_json(out_dir: Path, file_hash: str) -> dict:
 def functions_json_path(out_dir: Path, file_hash: str) -> Path:
     """返回 {out_dir}/{file_hash}_functions.json 路径（不检查是否存在）。"""
     return out_dir / f"{file_hash}_functions.json"
+
+
+def write_functions_db(
+    funcs: list[FunctionExtract],
+    func_hashes: list[str],
+    file_hash: str,
+    original_path: str,
+    out_dir: Path,
+) -> None:
+    """
+    将提取到的所有函数写入 SQLite 数据库 out_dir/{file_hash}_functions.db。
+
+    与 write_functions_json() 同步调用，提供 Agent 可查询的结构化存储：
+    - Agent 通过 `ea_db.py get <db> <func_hash>` 按需查询单条（无截断）
+    - R2-W 分析结果通过 FunctionDB.set_analysis() 写回（无需 asyncio.Lock）
+
+    Args:
+        funcs:         FunctionExtract 列表
+        func_hashes:   与 funcs 一一对应的 hash 列表
+        file_hash:     文件 hash（12位 hex）
+        original_path: 源文件绝对路径
+        out_dir:       输出目录（r1-functions/）
+    """
+    from .funcdb import FunctionDB
+    db = FunctionDB.open(out_dir, file_hash)
+    db.write_functions(file_hash, original_path, funcs, func_hashes)

@@ -34,6 +34,9 @@ from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
 
+# 函数数超过此阈值时跳过逐函数 R1-J（ctags 对大文件整体可靠，避免 N×2 次 LLM 调用）
+R1_J_SKIP_THRESHOLD = int(os.getenv("EA_R1J_SKIP_THRESHOLD", "80"))
+
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -167,14 +170,7 @@ class PipelineEngine:
             or getattr(cfg, "worker_parallelism", 64)
         )
         self._sem = asyncio.Semaphore(int(parallelism))
-        # 每文件一把锁，保护 {file_hash}_functions.json 的并发读改写
-        self._functions_json_locks: dict[str, asyncio.Lock] = {}
-
-    def _get_functions_lock(self, file_hash: str) -> asyncio.Lock:
-        """获取（懒创建）对应 file_hash 的 functions.json 写锁。"""
-        if file_hash not in self._functions_json_locks:
-            self._functions_json_locks[file_hash] = asyncio.Lock()
-        return self._functions_json_locks[file_hash]
+        # SQLite WAL 天然支持并发读写，删除应用层 asyncio.Lock
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -296,7 +292,7 @@ class PipelineEngine:
 
             state.register_functions(
                 file_hash,
-                [(fh, fe.name, fe.start_line, fe.end_line)
+                [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
                  for fe, fh in zip(funcs, func_hashes)],
             )
             fs.r1_w_state = NodeState.PASSED
@@ -319,6 +315,19 @@ class PipelineEngine:
         state: PipelineState,
     ) -> None:
         """流水线：R1 J 通过后立即触发 R2 W（每函数独立协程）。"""
+        fs = state.files[file_hash]
+
+        # 超大文件跳过逐函数 R1-J：ctags 批量提取可靠，避免 N×2 次 LLM 调用
+        if len(fs.functions) > R1_J_SKIP_THRESHOLD:
+            func_state = fs.functions.get(func_hash)
+            if func_state and func_state.r1_j_state != NodeState.PASSED:
+                func_state.r1_j_state = NodeState.PASSED
+                state.save(dirs.state_file)
+            func_state = fs.functions.get(func_hash)
+            if func_state and func_state.r2_w_state != NodeState.PASSED:
+                await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
+            return
+
         max_rounds = int(getattr(self.cfg, "r1_max_rounds", 3))
 
         # R1 J 重试循环
@@ -369,9 +378,10 @@ class PipelineEngine:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r1_judge')
             prompt = P.build_r1_j_prompt(
-                functions_file=dirs.r1_functions_file(file_hash),
                 func_hash=func_hash,
                 func_name=func_state.name,
+                start_line=func_state.start_line,
+                end_line=func_state.end_line,
                 file_path=file_path,
             )
             ar = await self._call_agent(
@@ -449,7 +459,7 @@ class PipelineEngine:
         func_state = state.files[file_hash].functions[func_hash]
         max_rounds = int(getattr(self.cfg, "r2_max_rounds", 3))
         session_file = str(dirs.r2_w_session(file_hash, func_hash))
-        functions_file = dirs.r1_functions_file(file_hash)
+        db_path = dirs.r1_functions_db(file_hash)
 
         while not self._cancel.is_set():
             if func_state.r2_w_state == NodeState.PASSED:
@@ -473,10 +483,18 @@ class PipelineEngine:
                     func_state.r2_w_feedback
                     or func_state.r1_j_feedback_path
                 ) if is_retry else ""
+                body_lines = max(
+                    0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
+                )
                 prompt = P.build_r2_w_prompt(
-                    functions_file=functions_file,
                     func_hash=func_hash,
                     func_name=func_state.name,
+                    signature=func_state.signature,
+                    start_line=func_state.start_line,
+                    end_line=func_state.end_line,
+                    body_lines=body_lines,
+                    file_path=file_path,
+                    db_path=db_path,
                     is_retry=is_retry,
                     feedback=r2_feedback,
                 )
@@ -492,13 +510,13 @@ class PipelineEngine:
                     has_input = bool(analysis.get("has_external_input", True))
                     func_state.has_external_input = has_input
                     if has_input:
-                        # 加锁原子写回 functions.json：读取→更新→写回
-                        lock = self._get_functions_lock(file_hash)
-                        async with lock:
-                            self._update_function_analysis(
-                                functions_file, func_hash, analysis)
+                        # SQLite WAL 天然并发安全，无需 asyncio.Lock
+                        from .funcdb import FunctionDB
+                        FunctionDB.open(dirs.r1, file_hash).set_analysis(
+                            func_hash, analysis
+                        )
                 else:
-                    # 兖底：解析失败时从输出文本判断
+                    # 兜底：解析失败时从输出文本判断
                     func_state.has_external_input = _parse_has_external_input(ar.output)
 
                 func_state.r2_w_state = NodeState.PASSED
@@ -513,36 +531,6 @@ class PipelineEngine:
                 func_state.r2_w_state = NodeState.FAILED
                 state.save(dirs.state_file)
 
-    @staticmethod
-    def _update_function_analysis(
-        functions_file: Path, func_hash: str, analysis: dict
-    ) -> None:
-        """
-        将 analysis dict 写回 functions.json 中对应函数的 analysis 字段。
-
-        必须在 asyncio.Lock 保护下调用（防止并发写竞争）。
-        使用原子写：tmp 文件 + rename。
-        """
-        if not functions_file.exists():
-            return
-        try:
-            data = json.loads(functions_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return
-        for item in data.get("functions", []):
-            if item.get("func_hash") == func_hash:
-                # 将 R2 分析结果合并进 analysis 字段
-                item["analysis"] = {
-                    "has_external_input": True,
-                    "function": item.get("name", ""),
-                    **analysis,
-                }
-                break
-        tmp = functions_file.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        import os as _os
-        _os.replace(str(tmp), str(functions_file))
 
     # ── R2 Judge ──────────────────────────────────────────────────────────────
 
@@ -570,19 +558,13 @@ class PipelineEngine:
             state.save(dirs.state_file)
 
             session_file = str(dirs.r2_j_session(file_hash, fs.r2_j_attempts))
-            functions_file = dirs.r1_functions_file(file_hash)
-            # 统计已分析的函数数（analysis 字段非 null）
-            analysis_count = 0
+            db_path = dirs.r1_functions_db(file_hash)
+            # 用 SQLite stats 统计已分析函数数（无需读 JSON）
             try:
-                import json as _json
-                _data = _json.loads(functions_file.read_text(encoding="utf-8")) \
-                    if functions_file.exists() else {}
-                analysis_count = sum(
-                    1 for f in _data.get("functions", [])
-                    if f.get("analysis") is not None
-                )
+                from .funcdb import FunctionDB
+                analysis_count = FunctionDB.open(dirs.r1, file_hash).stats()["analysed"]
             except Exception:
-                pass
+                analysis_count = 0
 
             self._emit("r2_j_start",
                        file_hash=file_hash, file=Path(file_path).name,
@@ -592,7 +574,7 @@ class PipelineEngine:
                 sys_prompt = self._stage_sys_prompt('r2_judge')
                 prompt = P.build_r2_j_prompt(
                     file_path=file_path,
-                    functions_file=functions_file,
+                    db_path=db_path,
                     source_cwd=dirs.source,
                 )
                 ar = await self._call_agent(
@@ -665,7 +647,7 @@ class PipelineEngine:
             state.save(dirs.state_file)
 
             dirs.r3.mkdir(parents=True, exist_ok=True)
-            functions_file = dirs.r1_functions_file(file_hash)
+            r3_db_path = dirs.r1_functions_db(file_hash)
 
             self._emit("r3_w_start",
                        file_hash=file_hash, file=Path(file_path).name)
@@ -675,7 +657,7 @@ class PipelineEngine:
                 is_retry = fs.r3_attempts > 1
                 prompt = P.build_r3_w_prompt(
                     file_path=file_path,
-                    functions_file=functions_file,
+                    db_path=r3_db_path,
                     r3_out_path=dirs.r3_file_path(file_hash),
                     is_retry=is_retry,
                     feedback=fs.r3_feedback if is_retry else "",
@@ -732,7 +714,7 @@ class PipelineEngine:
             prompt = P.build_r3_j_prompt(
                 file_path=file_path,
                 r3_entries_path=dirs.r3_file_path(file_hash),
-                functions_file=dirs.r1_functions_file(file_hash),
+                db_path=dirs.r1_functions_db(file_hash),
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,

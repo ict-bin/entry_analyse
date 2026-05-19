@@ -96,6 +96,17 @@ class PipelineDirs:
         """
         return self.r1 / f"{file_hash}_functions.json"
 
+    def r1_functions_db(self, file_hash: str) -> Path:
+        """
+        R1+R2 SQLite 数据库：{r1}/{file_hash}_functions.db
+
+        替代 functions.json 供 Agent 查询：
+          - `ea_db.py get <db> <func_hash>` 找单个函数（没有 50KB 截断）
+          - `ea_db.py list-entries <db>` 获取外部入口列表（R3/R4 用）
+          - set_analysis() 不需 asyncio.Lock（SQLite WAL 天然并发安全）
+        """
+        return self.r1 / f"{file_hash}_functions.db"
+
     def r3_file_path(self, file_hash: str) -> Path:
         """R3 某文件的入口列表文件：{r3}/{file_hash}.json"""
         return self.r3 / f"{file_hash}.json"

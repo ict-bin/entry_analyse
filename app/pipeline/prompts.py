@@ -1,13 +1,15 @@
 """
 entry_analyse — Pipeline 各阶段 Prompt 构建器
 
-每个函数对应一个阶段的 Agent 调用 prompt。
-系统 prompt（system_prompt）从 prompts/ 目录加载，这里只构建用户侧 prompt。
+设计原则（v2）：
+  - 初始 prompt = 纯元数据（func_hash/name/行号/路径），固定大小
+  - 函数体 = Agent 按需 bash fetch → 进入 tool_result（非 prompt）
+  - 验证逻辑 = bash sed/grep（精确，无 off-by-one），不用 read 工具计数
+  - Agent 访问函数数据 = ea_db.py CLI（按 func_hash 查询，无截断）
 
-IO 设计：
-  R1/R2 所有函数数据存放在 {file_hash}_functions.json（单文件）。
-  R2 Worker 不写文件：分析结果输出在 <result> 标签中，由引擎加锁写回 JSON。
-  R3/R4 不变。
+R1-J：完全不需要 body，用 sed 验证行号
+R2-W：三档策略（≤60/61-200/>200行），按 body_lines 选命令
+R2-J/R3/R4：ea_db.py list-entries/list-meta（无 body，不截断）
 """
 
 from __future__ import annotations
@@ -42,34 +44,50 @@ def _retry_section(feedback: str, label: str = "Judge 评审意见") -> str:
 # ─── R1 Judge ─────────────────────────────────────────────────────────────────
 
 def build_r1_j_prompt(
-    functions_file: Path,
     func_hash: str,
     func_name: str,
+    start_line: int,
+    end_line: int,
     file_path: str,
 ) -> str:
     """
-    R1 Judge：评审单个函数的提取质量。
+    R1 Judge：验证 ctags 提取的函数行号是否正确。
 
-    从 {file_hash}_functions.json 中找到对应函数条目，对照源文件验证。
+    设计要点：
+    - 不传 functions_file（省去读 1MB JSON 导致截断）
+    - 不传 body（body 无需嵌入 prompt；用 sed 精确验证行号）
+    - 行号和文件路径由引擎从 FunctionState 直接注入
+    - 用 bash sed 而非 read+offset+手工计数（消除 off-by-one）
+
+    Prompt 固定大小约 500 字节，与函数大小无关。
     """
     basename = os.path.basename(file_path)
     return (
-        f"# R1 Judge — 函数提取质量评审\n\n"
-        f"请评审函数 `{func_name}`（func_hash: `{func_hash}`）的提取质量。\n\n"
-        f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取函数列表文件：`{functions_file}`\n"
-        f"   找到 `\"func_hash\": \"{func_hash}\"` 的条目，查看其 "
-        f"`start_line`、`end_line`、`body` 字段。\n\n"
-        f"2. 使用 `read` 工具读取原始源文件：`{file_path}`\n"
-        f"   （或通过 workspace/source/ 下的软链接访问 `{basename}`）\n\n"
-        f"3. 对照源文件验证：\n"
-        f"   - `start_line` / `end_line` 是否对应源文件中该函数的真实行号\n"
-        f"   - `body` 是否完整（花括号匹配，无截断，与源文件对应行一致）\n"
-        f"   - `name` 是否包含完整的类/命名空间限定符\n\n"
+        f"# R1 Judge — 函数行号验证\n\n"
+        f"| 字段       | 值                |\n"
+        f"|------------|-------------------|\n"
+        f"| func_hash  | `{func_hash}`     |\n"
+        f"| name       | `{func_name}`     |\n"
+        f"| start_line | {start_line}      |\n"
+        f"| end_line   | {end_line}        |\n"
+        f"| 源文件     | `{basename}`      |\n\n"
+        f"## 验证步骤（必须用 bash，不要用 read 工具计数）\n\n"
+        f"**步骤 1**：用 bash 精确读取 ctags 记录的行范围：\n"
+        f"```bash\n"
+        f"sed -n '{start_line},{end_line}p' {file_path}\n"
+        f"```\n\n"
+        f"**步骤 2**：判断 bash 输出的**第一行**：\n"
+        f"- ✅ **通过条件**：第一行包含函数名 `{func_name}` 且不是注释行（`/*`、`*`、`*/`、`//`）\n"
+        f"- ❌ **失败条件**：第一行是注释行、空行或仅含 `{{`\n\n"
+        f"**步骤 3（仅当步骤 2 失败时）**：grep 定位真实函数签名行：\n"
+        f"```bash\n"
+        f"grep -n '{func_name}(' {file_path} | head -5\n"
+        f"```\n\n"
         f"## 输出格式\n\n"
         f"```\n"
         f"通过: <是/否>\n"
-        f"反馈: <若不通过，说明具体问题（行号偏差、body 截断、函数名错误等）>\n"
+        f"反馈: <若不通过：start_line={start_line} 实际对应 \"...\" 行，"
+        f"应修正为 start_line=N（来自 grep 结果）>\n"
         f"```\n"
     )
 
@@ -77,41 +95,105 @@ def build_r1_j_prompt(
 # ─── R2 Worker ────────────────────────────────────────────────────────────────
 
 def build_r2_w_prompt(
-    functions_file: Path,
     func_hash: str,
     func_name: str,
+    signature: str,
+    start_line: int,
+    end_line: int,
+    body_lines: int,
+    file_path: str,
+    db_path: Path,
     is_retry: bool = False,
     feedback: str = "",
 ) -> str:
     """
     R2 Worker：分析单个函数是否有外部输入。
 
-    从 {file_hash}_functions.json 读取函数体，分析后将结果输出到 <result> 标签。
-    引擎负责将分析结果写回 JSON（加锁保证并发安全，无文件写竞争）。
-
-    分析目标：
-    - 被动型（P）：函数参数中是否含有来自外部的可控数据
-    - 主动型（A）：函数体内是否调用 recv/read/mmap/ioctl/fgets 等系统调用
-    - 无外部输入：纯内部函数
+    设计要点：
+    - 初始 prompt 只含元数据（signature + 行号），固定约 700 字节
+    - 函数体按需通过 bash 获取，进入 tool_result（非 prompt）
+    - 按 body_lines 三档选择策略（消除大函数 prompt 爆炸）：
+        ≤ 60 行：sed 读全量（小 tool_result，约 ≤2KB）
+        61-200行：python3 扫描关键字 + sed 读签名（仅命中行）
+        > 200 行：awk 行级过滤（只返回外部 I/O 命中行）
+    - 分析结果输出 <result> 标签，引擎负责写回 DB（无需 Agent 写文件）
     """
+    basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
+
+    # 外部 I/O 模式（用于 python3/awk 扫描）
+    _PATTERNS = "recv,recvfrom,recvmsg,mmap,ioctl,fgets,fread,getline,MsgReceive,Receive,accept"
+    _AWK_REGEX = r"recv|recvfrom|recvmsg|mmap|ioctl|fgets|fread|getline|MsgReceive|Receive|accept"
+    _PY_PATTERNS = (
+        "['recv','recvfrom','recvmsg','mmap','ioctl','fgets',"
+        "'fread','getline','MsgReceive','Receive','accept']"
+    )
+
+    # ── 三档策略 ──────────────────────────────────────────────────────────────
+    if body_lines <= 60:
+        step1 = (
+            f"**步骤 1**：读取完整函数体（共 {body_lines} 行）：\n"
+            f"```bash\n"
+            f"sed -n '{start_line},{end_line}p' {file_path}\n"
+            f"```\n"
+        )
+    elif body_lines <= 200:
+        step1 = (
+            f"**步骤 1**：扫描函数内外部 I/O 调用（共 {body_lines} 行，仅返回命中行）：\n"
+            f"```bash\n"
+            f"python3 -c \"\n"
+            f"lines = open('{file_path}').readlines()[{start_line}-1:{end_line}]\n"
+            f"for i, l in enumerate(lines, {start_line}):\n"
+            f"    if any(p in l for p in {_PY_PATTERNS}):\n"
+            f"        print(i, l.rstrip())\n"
+            f"\"\n"
+            f"```\n"
+            f"并读取函数签名行确认入参：\n"
+            f"```bash\n"
+            f"sed -n '{start_line}p' {file_path}\n"
+            f"```\n"
+        )
+    else:
+        step1 = (
+            f"**步骤 1**：awk 行级扫描外部 I/O 调用（共 {body_lines} 行，只返回命中行）：\n"
+            f"```bash\n"
+            f"awk 'NR>={start_line} && NR<={end_line} && \\\n"
+            f"     /{_AWK_REGEX}/ \\\n"
+            f"     {{print NR\": \"$0}}' {file_path}\n"
+            f"```\n"
+            f"并读取函数签名行：\n"
+            f"```bash\n"
+            f"sed -n '{start_line}p' {file_path}\n"
+            f"```\n"
+        )
+
+    if body_lines <= 60:
+        step2 = (
+            f"**步骤 2**：分析是否有外部输入：\n\n"
+            f"   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
+            f"   **主动型（A）**：函数体调用 {_PATTERNS} 等\n"
+        )
+    else:
+        step2 = (
+            f"**步骤 2**：分析结果：\n\n"
+            f"   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet 类名称\n"
+            f"     → `has_external_input: false`\n"
+            f"   - 有命中行：精确定位（`sed -n '<行号>p' {file_path}`）确认后分析 taint\n"
+            f"   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）\n"
+        )
+
     return (
         f"# R2 Worker — 函数外部输入分析\n\n"
-        f"分析函数 `{func_name}`（func_hash: `{func_hash}`）是否有外部输入。\n"
+        f"| 字段      | 值                       |\n"
+        f"|-----------|-------------------------|\n"
+        f"| func_hash | `{func_hash}`            |\n"
+        f"| name      | `{func_name}`            |\n"
+        f"| signature | `{signature}`            |\n"
+        f"| 行范围    | {start_line}~{end_line}（共 {body_lines} 行）|\n"
         f"{retry}\n"
-        f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取：`{functions_file}`\n"
-        f"   找到 `\"func_hash\": \"{func_hash}\"` 的条目，读取其 `body` 和 `signature` 字段。\n\n"
-        f"2. 分析函数是否存在外部输入：\n\n"
-        f"   **被动型（P）**：函数签名中的参数是否携带外部数据？\n"
-        f"   - 参数类型/名称暗示网络消息、请求体、外部缓冲区\n"
-        f"   - 参数被框架（gRPC/HTTP/IPC）直接注入的函数属于此类\n\n"
-        f"   **主动型（A）**：函数体内是否调用以下接口？\n"
-        f"   - `recv`, `recvfrom`, `recvmsg`, `read`, `readv`\n"
-        f"   - `mmap`（外部文件/设备映射）\n"
-        f"   - `ioctl`, `fgets`, `fread`, `getline`\n"
-        f"   - 特定 SDK 的消息接收接口（如 `MsgReceive`, `Receive` 等）\n\n"
-        f"3. 将分析结果输出在 `<result>` 标签中（**不要写任何文件**，引擎负责持久化）：\n\n"
+        f"{step1}\n"
+        f"{step2}\n"
+        f"**步骤 3**：将分析结果输出在 `<result>` 标签中（**不要写任何文件**，引擎负责持久化）：\n\n"
         f"   **有外部输入时**：\n"
         f"   ```\n"
         f"   <result>\n"
@@ -127,8 +209,7 @@ def build_r2_w_prompt(
         f"   }}\n"
         f"   </result>\n"
         f"   ```\n\n"
-        f"   `tag` 取值：`\"P\"`（被动）或 `\"A\"`（主动）\n"
-        f"   `entry_source_lines` 填写外部数据**进入**的那行代码（recv 调用行或参数被读取行）\n\n"
+        f"   `tag` 取值：`\"P\"`（被动）或 `\"A\"`（主动）\n\n"
         f"   **无外部输入时**：\n"
         f"   ```\n"
         f"   <result>\n"
@@ -142,33 +223,50 @@ def build_r2_w_prompt(
 
 def build_r2_j_prompt(
     file_path: str,
-    functions_file: Path,
+    db_path: Path,
     source_cwd: Path,
 ) -> str:
     """
     R2 Judge：一次性评审文件内所有函数的外部输入分析结果。
 
-    从 {file_hash}_functions.json 读取所有带 analysis 字段的函数，逐一评审。
+    设计要点：
+    - 用 ea_db.py list-entries 获取已分析函数列表（无 body，无截断）
+    - 用 ea_db.py list-meta 获取全量元数据（发现漏判）
+    - 按需 sed 抽查具体行（不读整个源文件）
     """
     basename = os.path.basename(file_path)
     return (
         f"# R2 Judge — 函数外部输入分析评审\n\n"
         f"文件：`{basename}`\n\n"
         f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取：`{functions_file}`\n"
-        f"   找出所有 `analysis` 字段不为 null 的函数（即已分析的函数）。\n\n"
-        f"2. 使用 `read` 工具读取源文件 `{file_path}` 进行对照验证。\n\n"
-        f"3. 对每个已分析函数，检查：\n"
-        f"   - `tag`（P/A）分类是否正确\n"
-        f"   - `taints` 中的参数名是否真实存在于函数签名中\n"
-        f"   - `entry_source_lines` 是否是外部数据实际进入的代码行\n"
-        f"   - 是否有明显漏判（源文件中有 recv/参数回调但 `analysis` 为 null 或 "
-        f"`has_external_input=false`）\n\n"
+        f"**步骤 1**：获取所有已分析函数列表（含分析结果，不含 body）：\n"
+        f"```bash\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py list-entries {db_path}\n"
+        f"```\n"
+        f"输出格式：`[{{func_hash, name, start_line, analysis:{{tag,taints,...}}}}, ...]`\n\n"
+        f"**步骤 2**：抽查可疑函数——对每个 `has_external_input=true` 的函数，"
+        f"用 sed 验证签名行：\n"
+        f"```bash\n"
+        f"sed -n '<start_line>p' {file_path}\n"
+        f"```\n"
+        f"确认 `taints` 中的参数名是否真实存在于函数签名中。\n\n"
+        f"**步骤 3**：检查漏判——获取全量元数据，扫描未分析或判为无输入的可疑函数：\n"
+        f"```bash\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}\n"
+        f"```\n"
+        f"对 `has_external_input=null` 或 `0` 但函数名含 recv/read/handler 的函数，"
+        f"用 awk 扫描：\n"
+        f"```bash\n"
+        f"awk 'NR>=<start_line> && NR<=<end_line> && "
+        f"/recv|recvfrom|read|mmap|ioctl/ {{print NR\": \"$0}}' {file_path}\n"
+        f"```\n\n"
         f"## 输出格式\n\n"
         f"```\n"
         f"通过: <是/否>\n"
-        f"反馈: <若不通过，列出具体问题：哪个 func_hash 的哪个字段有误，"
-        f"或哪个函数被漏判（列出 func_hash + 函数名）>\n"
+        f"反馈: <若不通过，列出具体问题：\n"
+        f"- <func_hash> 的 taints 字段错误：参数名 xxx 不存在于函数签名\n"
+        f"- 函数 FooBar（hash: <12位hex>）被遗漏，该函数在第N行调用了 recv()\n"
+        f">\n"
         f"```\n"
     )
 
@@ -177,16 +275,17 @@ def build_r2_j_prompt(
 
 def build_r3_w_prompt(
     file_path: str,
-    functions_file: Path,
+    db_path: Path,
     r3_out_path: Path,
     is_retry: bool = False,
     feedback: str = "",
 ) -> str:
     """
-    R3 Worker：从文件的所有函数分析中，筛选出真正的外部入口。
+    R3 Worker：从文件所有函数中筛选出真正的外部入口。
 
-    从 {file_hash}_functions.json 读取所有 has_external_input=true 的函数，
-    过滤掉被其他入口"包含"的内部子函数，输出最终入口列表。
+    设计要点：
+    - 用 ea_db.py list-entries 获取 has_external_input=true 的函数（无 body）
+    - 调用关系分析用 grep 按需查询（非读整个源文件）
     """
     basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
@@ -195,18 +294,21 @@ def build_r3_w_prompt(
         f"文件：`{basename}`\n"
         f"{retry}\n"
         f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取：`{functions_file}`\n"
-        f"   找出所有 `analysis.has_external_input == true` 的函数条目。\n\n"
-        f"2. 使用 `read` 工具读取源文件 `{file_path}`，分析函数间调用关系。\n\n"
-        f"3. 过滤规则（**只保留数据流源头**）：\n"
-        f"   - 若 funcA 调用 funcB，且 funcB 接收的外部数据是从 funcA 参数传入\n"
-        f"     → funcB 不是独立入口，**删除 funcB**\n"
-        f"   - 若 funcB 直接调用 recv() 或直接被外部框架以回调形式调用\n"
-        f"     → funcB 是真正入口，**保留**\n"
-        f"   - 若两个函数各自独立接收外部数据 → **都保留**\n\n"
-        f"4. 使用 `write` 工具将过滤后的入口列表写出到：`{r3_out_path}`\n"
-        f"   格式：JSON 数组，每项复制自 functions JSON 中对应函数的 `analysis` 对象，\n"
-        f"   并补充 `func_hash`、`name`、`start_line` 字段：\n"
+        f"**步骤 1**：获取所有已确认外部输入的函数：\n"
+        f"```bash\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py list-entries {db_path}\n"
+        f"```\n\n"
+        f"**步骤 2**：分析函数间调用关系（按需 grep，不读整个源文件）：\n"
+        f"```bash\n"
+        f"# 查看 funcA 是否调用了 funcB（判断包含关系）\n"
+        f"grep -n 'funcB(' {file_path} | awk -F: '$1>=<funcA_start> && $1<=<funcA_end>'\n"
+        f"```\n\n"
+        f"**步骤 3**：过滤规则（**只保留数据流源头**）：\n"
+        f"- 若 funcA 调用 funcB 且 funcB 的外部数据来自 funcA 传入 → **删除 funcB**\n"
+        f"- 若 funcB 直接调用 recv() 或被框架回调 → **保留 funcB**\n"
+        f"- 若两函数各自独立接收数据 → **都保留**\n\n"
+        f"**步骤 4**：使用 `write` 工具将过滤后的入口列表写出到：`{r3_out_path}`\n"
+        f"   格式：JSON 数组，每项从 list-entries 结果中复制，补充 `func_hash`/`name`/`start_line`：\n"
         f"   ```json\n"
         f"   [\n"
         f"     {{\n"
@@ -231,7 +333,7 @@ def build_r3_w_prompt(
 def build_r3_j_prompt(
     file_path: str,
     r3_entries_path: Path,
-    functions_file: Path,
+    db_path: Path,
 ) -> str:
     """
     R3 Judge：评审文件级入口过滤结果。
@@ -241,14 +343,22 @@ def build_r3_j_prompt(
         f"# R3 Judge — 文件级入口过滤评审\n\n"
         f"文件：`{basename}`\n\n"
         f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取 R3 过滤结果：`{r3_entries_path}`\n\n"
-        f"2. 使用 `read` 工具读取函数分析数据：`{functions_file}`\n"
-        f"   查看所有 `has_external_input=true` 的函数，了解过滤前的完整情况。\n\n"
-        f"3. 使用 `read` 工具读取源文件 `{file_path}` 验证调用关系。\n\n"
-        f"4. 评审：\n"
-        f"   - 保留的每个函数是否确实是本文件内最靠近外部数据来源的入口\n"
-        f"   - 是否有被删除的函数其实是独立入口（误删）\n"
-        f"   - 是否有保留的函数其实是另一个入口的内部子函数（误留）\n\n"
+        f"**步骤 1**：读取 R3 过滤结果：\n"
+        f"```bash\n"
+        f"read {r3_entries_path}\n"
+        f"```\n\n"
+        f"**步骤 2**：获取过滤前的完整外部输入函数列表（了解被删除了哪些）：\n"
+        f"```bash\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py list-entries {db_path}\n"
+        f"```\n\n"
+        f"**步骤 3**：按需验证调用关系（对有疑问的函数用 grep 确认）：\n"
+        f"```bash\n"
+        f"grep -n '<func_name>(' {file_path} | head -10\n"
+        f"```\n\n"
+        f"**步骤 4**：评审：\n"
+        f"- 保留的每个函数是否是本文件内最靠近外部数据来源的入口\n"
+        f"- 是否有被删除的函数其实是独立入口（误删）\n"
+        f"- 是否有保留的函数其实是另一个入口的内部子函数（误留）\n\n"
         f"## 输出格式\n\n"
         f"```\n"
         f"通过: <是/否>\n"
@@ -269,10 +379,8 @@ def build_r4_w_prompt(
     """R4 Worker：模块级跨文件分析，输出最终外部入口列表。"""
     if r3_entries_files:
         file_list = "\n".join(f"  - `{f}`" for f in sorted(r3_entries_files))
-        r3_dir = sorted(r3_entries_files)[0].parent
     else:
         file_list = "  (no R3 results)"
-        r3_dir = r4_out_path.parent
     retry = _retry_section(feedback) if is_retry else ""
     return (
         f"# R4 Worker — 模块级外部入口汇总\n\n"

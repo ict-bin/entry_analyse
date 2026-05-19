@@ -46,6 +46,7 @@ class FunctionState:
     name:       str          # qualified name（如 ClassName::Method）
     start_line: int
     end_line:   int = 0
+    signature:  str = ""    # 函数完整签名（R1-W 写入，R2-W prompt 中配置策略用）
 
     # R1 J：函数提取质量评审
     r1_j_state:    NodeState = NodeState.PENDING
@@ -265,23 +266,24 @@ class PipelineState:
     def register_functions(
         self,
         file_hash: str,
-        func_hash_names: list[tuple[str, str, int, int]],
+        func_hash_names: list[tuple[str, str, str, int, int]],
     ) -> None:
         """
         将 R1 W 提取的函数列表注册到对应文件的 state（仅注册尚未存在的）。
 
         Args:
             file_hash:       文件 hash
-            func_hash_names: [(func_hash, name, start_line, end_line), ...]
+            func_hash_names: [(func_hash, name, signature, start_line, end_line), ...]
         """
         if file_hash not in self.files:
             return
         fs = self.files[file_hash]
-        for fh, name, start_line, end_line in func_hash_names:
+        for fh, name, signature, start_line, end_line in func_hash_names:
             if fh not in fs.functions:
                 fs.functions[fh] = FunctionState(
                     func_hash=fh,
                     name=name,
+                    signature=signature,
                     start_line=start_line,
                     end_line=end_line,
                 )
