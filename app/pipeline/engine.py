@@ -63,8 +63,30 @@ def _parse_j_result(output: str) -> tuple[bool, str]:
     return passed, feedback
 
 
+def _parse_r2_analysis(output: str) -> dict | None:
+    """
+    从 R2 W 的 <result> 标签中解析分析结果 dict。
+    格式：{"has_external_input": bool, "tag": ..., "taints": [...], ...}
+    返回 None 表示解析失败。
+    """
+    m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
+    if not m:
+        return None
+    text = m.group(1).strip()
+    # 兼容 markdown 代码块包裹
+    text = re.sub(r"^```(?:json)?\s*", "", text).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
 def _parse_has_external_input(output: str) -> bool:
-    """从 R2 W 输出中判断函数是否有外部输入（当没有写出 JSON 文件时使用）。"""
+    """从 R2 W 输出中判断函数是否有外部输入（兜底，当 <result> 解析失败时使用）。"""
     lower = output.lower()
     no_patterns = [
         r"no_external_input",
@@ -145,6 +167,14 @@ class PipelineEngine:
             or getattr(cfg, "worker_parallelism", 64)
         )
         self._sem = asyncio.Semaphore(int(parallelism))
+        # 每文件一把锁，保护 {file_hash}_functions.json 的并发读改写
+        self._functions_json_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_functions_lock(self, file_hash: str) -> asyncio.Lock:
+        """获取（懒创建）对应 file_hash 的 functions.json 写锁。"""
+        if file_hash not in self._functions_json_locks:
+            self._functions_json_locks[file_hash] = asyncio.Lock()
+        return self._functions_json_locks[file_hash]
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -339,7 +369,8 @@ class PipelineEngine:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r1_judge')
             prompt = P.build_r1_j_prompt(
-                func_file=dirs.r1_file_dir(file_hash) / f"{func_hash}.c",
+                functions_file=dirs.r1_functions_file(file_hash),
+                func_hash=func_hash,
                 func_name=func_state.name,
                 file_path=file_path,
             )
@@ -408,10 +439,17 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2 Worker：分析单个函数外部输入（session 跨重试共享）。"""
+        """
+        R2 Worker：分析单个函数外部输入（session 跨重试共享）。
+
+        并发安全：LLM 输出分析结果到 <result> 标签，
+        引擎持每文件独立的 asyncio.Lock 将结果写回
+        {file_hash}_functions.json，消除并发读改写竞争。
+        """
         func_state = state.files[file_hash].functions[func_hash]
         max_rounds = int(getattr(self.cfg, "r2_max_rounds", 3))
         session_file = str(dirs.r2_w_session(file_hash, func_hash))
+        functions_file = dirs.r1_functions_file(file_hash)
 
         while not self._cancel.is_set():
             if func_state.r2_w_state == NodeState.PASSED:
@@ -425,24 +463,20 @@ class PipelineEngine:
             func_state.r2_w_attempts += 1
             state.save(dirs.state_file)
 
-            r2_dir = dirs.r2_file_dir(file_hash)
-            r2_dir.mkdir(parents=True, exist_ok=True)
-
             self._emit("r2_w_start",
                        func_hash=func_hash, function=func_state.name)
             try:
                 acfg = self.cfg.workers.agents[0]
                 sys_prompt = self._stage_sys_prompt('r2_worker')
                 is_retry = func_state.r2_w_attempts > 1
-                # 优先使用 R2 专属反馈（R2 J 设置），其次是 R1 J 反馈文件路径（避免原始文本导致 OSError）
                 r2_feedback = (
                     func_state.r2_w_feedback
                     or func_state.r1_j_feedback_path
                 ) if is_retry else ""
                 prompt = P.build_r2_w_prompt(
-                    func_file=dirs.r1_file_dir(file_hash) / f"{func_hash}.c",
-                    r2_dir=r2_dir,
+                    functions_file=functions_file,
                     func_hash=func_hash,
+                    func_name=func_state.name,
                     is_retry=is_retry,
                     feedback=r2_feedback,
                 )
@@ -452,17 +486,20 @@ class PipelineEngine:
                     context=f"r2_w:{func_hash}", acfg=acfg,
                 )
 
-                out_json = r2_dir / f"{func_hash}.json"
-                if out_json.exists():
-                    try:
-                        data = json.loads(out_json.read_text(encoding="utf-8"))
-                        func_state.has_external_input = bool(
-                            data.get("has_external_input", True))
-                    except Exception:
-                        func_state.has_external_input = True
+                # 解析 <result> 标签中的分析结果
+                analysis = _parse_r2_analysis(ar.output)
+                if analysis is not None:
+                    has_input = bool(analysis.get("has_external_input", True))
+                    func_state.has_external_input = has_input
+                    if has_input:
+                        # 加锁原子写回 functions.json：读取→更新→写回
+                        lock = self._get_functions_lock(file_hash)
+                        async with lock:
+                            self._update_function_analysis(
+                                functions_file, func_hash, analysis)
                 else:
-                    func_state.has_external_input = _parse_has_external_input(
-                        ar.output)
+                    # 兖底：解析失败时从输出文本判断
+                    func_state.has_external_input = _parse_has_external_input(ar.output)
 
                 func_state.r2_w_state = NodeState.PASSED
                 state.save(dirs.state_file)
@@ -475,6 +512,37 @@ class PipelineEngine:
                 logger.error("R2 W failed for %s: %s", func_hash, exc)
                 func_state.r2_w_state = NodeState.FAILED
                 state.save(dirs.state_file)
+
+    @staticmethod
+    def _update_function_analysis(
+        functions_file: Path, func_hash: str, analysis: dict
+    ) -> None:
+        """
+        将 analysis dict 写回 functions.json 中对应函数的 analysis 字段。
+
+        必须在 asyncio.Lock 保护下调用（防止并发写竞争）。
+        使用原子写：tmp 文件 + rename。
+        """
+        if not functions_file.exists():
+            return
+        try:
+            data = json.loads(functions_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        for item in data.get("functions", []):
+            if item.get("func_hash") == func_hash:
+                # 将 R2 分析结果合并进 analysis 字段
+                item["analysis"] = {
+                    "has_external_input": True,
+                    "function": item.get("name", ""),
+                    **analysis,
+                }
+                break
+        tmp = functions_file.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        import os as _os
+        _os.replace(str(tmp), str(functions_file))
 
     # ── R2 Judge ──────────────────────────────────────────────────────────────
 
@@ -502,19 +570,29 @@ class PipelineEngine:
             state.save(dirs.state_file)
 
             session_file = str(dirs.r2_j_session(file_hash, fs.r2_j_attempts))
-            analysis_files = sorted(dirs.r2_file_dir(file_hash).glob("*.json")) \
-                if dirs.r2_file_dir(file_hash).exists() else []
+            functions_file = dirs.r1_functions_file(file_hash)
+            # 统计已分析的函数数（analysis 字段非 null）
+            analysis_count = 0
+            try:
+                import json as _json
+                _data = _json.loads(functions_file.read_text(encoding="utf-8")) \
+                    if functions_file.exists() else {}
+                analysis_count = sum(
+                    1 for f in _data.get("functions", [])
+                    if f.get("analysis") is not None
+                )
+            except Exception:
+                pass
 
             self._emit("r2_j_start",
                        file_hash=file_hash, file=Path(file_path).name,
-                       analysis_count=len(analysis_files))
+                       analysis_count=analysis_count)
             try:
                 acfg = self._judge_acfg()
                 sys_prompt = self._stage_sys_prompt('r2_judge')
                 prompt = P.build_r2_j_prompt(
                     file_path=file_path,
-                    r2_dir=dirs.r2_file_dir(file_hash),
-                    analysis_files=analysis_files,
+                    functions_file=functions_file,
                     source_cwd=dirs.source,
                 )
                 ar = await self._call_agent(
@@ -587,8 +665,7 @@ class PipelineEngine:
             state.save(dirs.state_file)
 
             dirs.r3.mkdir(parents=True, exist_ok=True)
-            analysis_files = sorted(dirs.r2_file_dir(file_hash).glob("*.json")) \
-                if dirs.r2_file_dir(file_hash).exists() else []
+            functions_file = dirs.r1_functions_file(file_hash)
 
             self._emit("r3_w_start",
                        file_hash=file_hash, file=Path(file_path).name)
@@ -598,9 +675,8 @@ class PipelineEngine:
                 is_retry = fs.r3_attempts > 1
                 prompt = P.build_r3_w_prompt(
                     file_path=file_path,
-                    r2_dir=dirs.r2_file_dir(file_hash),
+                    functions_file=functions_file,
                     r3_out_path=dirs.r3_file_path(file_hash),
-                    analysis_files=analysis_files,
                     is_retry=is_retry,
                     feedback=fs.r3_feedback if is_retry else "",
                 )
@@ -656,7 +732,7 @@ class PipelineEngine:
             prompt = P.build_r3_j_prompt(
                 file_path=file_path,
                 r3_entries_path=dirs.r3_file_path(file_hash),
-                r2_dir=dirs.r2_file_dir(file_hash),
+                functions_file=dirs.r1_functions_file(file_hash),
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
