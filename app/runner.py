@@ -819,19 +819,31 @@ async def _run_with_api_retry(
         if cancel_event:
             async def _cancel_monitor():
                 await cancel_event.wait()
-                # 向整个 process group 发 SIGTERM（杀 pi 及其所有工具子进程）
+                # 在 kill 前先记录 pgid，防止 pi 退出后无法获取
+                pgid: int | None = None
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    pgid = os.getpgid(proc.pid)
                 except (ProcessLookupError, OSError):
                     pass
-                # 等待 5 秒，若仍未退出则 SIGKILL
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
+                # Step1：向整个 process group 发 SIGTERM（杀 pi 及其工具子进程）
+                if pgid is not None:
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        os.killpg(pgid, signal.SIGTERM)
                     except (ProcessLookupError, OSError):
                         pass
+                # Step2：等待 pi 进程退出（最多 3 秒）
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    pass
+                # Step3：无论 pi 是否已退出，对整个 group 强制 SIGKILL
+                # 关键：SIGTERM 后 pi 已死，但 bash/工具子进程可能存活并持有 stdout pipe
+                # 必须 SIGKILL 才能迎强关闭 pipe，否则 proc.stdout.read() 永久阻塞
+                if pgid is not None:
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass  # group 已全部退出，正常
             cancel_task = asyncio.create_task(_cancel_monitor())
 
         # ── 读取 JSON Lines 输出（try/except 保护管道断裂）──
