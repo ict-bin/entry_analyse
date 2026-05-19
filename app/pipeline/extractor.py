@@ -434,19 +434,27 @@ def _extract_functions_regex(file_path: str, lines: list[str]) -> list[dict]:
 
 def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
     """
-    扫描文件中可能通过宏定义的函数。
+    扫描文件中通过宏定义的函数。
 
-    目标模式：
-      - 文件中存在 '#define MACRO_NAME(...)' 并且展开后含函数体
-      - 文件直接调用了这样的宏（如 DEFINE_HANDLER(auth) 展开为完整函数）
+    两种模式：
 
-    返回条目格式与 ctags/regex 兼容，但包含额外字段 _macro=True 和 _macro_name。
+    1. 有 ## 的宏（参数化函数定义）：
+       #define DEFINE_HANDLER(name) static void handle_##name(msg *m) { recv(...); }
+       每次调用展开为不同名称的函数，需要扫描调用位置才知道具体存在哪些函数。
+       -> 返回每个调用位置的条目，函数名 = 宏名(第一参数)
+
+    2. 无 ## 的宏（固定代码块）：
+       #define MyFunc(msg) { msg = recv(); }
+       宏展开内容不随参数变化，宏定义行本身就是函数体。
+       -> 返回宏定义行的一个条目，函数名 = 宏名
+       注：RETURN_GUARDED 这类纯控制流宏无外部输入，R2 会自动过滤，无需在此排除。
     """
     entries = []
 
-    # 提取所有宏定义，找到含函数体的宏（展开后有 { }）
-    # 格式: #define NAME(...) [\] ... { ... }
-    macro_defs: dict[str, int] = {}  # macro_name -> line_no
+    # 收集所有宏定义，按有无 ## 分两类
+    macro_with_paste: dict[str, int] = {}   # 有 ## -> 扫调用位置
+    macro_fixed_body: dict[str, int] = {}   # 无 ## -> 用定义行
+
     i = 0
     while i < len(lines):
         stripped = lines[i].strip()
@@ -454,53 +462,62 @@ def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
             m = re.match(r'#define\s+(\w+)\s*\(', stripped)
             if m:
                 macro_name = m.group(1)
-                # 收集连续行（反斜线续行）
                 define_body = stripped
                 j = i
-                while define_body.rstrip().endswith('\\') and j + 1 < len(lines):
+                bs = chr(92)  # backslash
+                while define_body.rstrip().endswith(bs) and j + 1 < len(lines):
                     j += 1
                     define_body += ' ' + lines[j].strip()
-                # 宏展开体内含 { 和 } 则认为这个完是一个函数定义完
-                # 函数定义宏必须有 ##（token pasting）将参数拼入函数名
-                # 无 ## 的宏（如 RETURN_GUARDED、LOG_MACRO）只是代码块，不创建函数
-                if '{' in define_body and '}' in define_body and '##' in define_body:
-                    macro_defs[macro_name] = i + 1
+                if '{' in define_body and '}' in define_body:
+                    if '##' in define_body:
+                        macro_with_paste[macro_name] = i + 1
+                    else:
+                        macro_fixed_body[macro_name] = i + 1
                 i = j + 1
                 continue
         i += 1
 
-    if not macro_defs:
-        return entries
+    # 类型 1：有 ## 的宏 -> 每个调用位置一个条目
+    if macro_with_paste:
+        _CALL_RE = re.compile(
+            r'^\s*(' + '|'.join(re.escape(n) for n in macro_with_paste)
+            + r')\s*\(([^)]+)\)\s*;?\s*$'
+        )
+        seen: set[int] = set()
+        for li, line in enumerate(lines):
+            m = _CALL_RE.match(line)
+            if not m:
+                continue
+            macro_name = m.group(1)
+            args = [a.strip() for a in m.group(2).split(',')]
+            call_line = li + 1
+            if call_line in seen:
+                continue
+            seen.add(call_line)
+            func_hint = f"{macro_name}({args[0]})"
+            entries.append({
+                "name":            func_hint,
+                "scope":           "",
+                "scopeKind":       "",
+                "line":            call_line,
+                "signature":       func_hint,
+                "_is_macro":       True,
+                "_macro_name":     macro_name,
+                "_macro_args":     args,
+                "_macro_def_line": macro_with_paste[macro_name],
+            })
 
-    # 在文件中找到这些宏的调用位置
-    _MACRO_CALL_RE = re.compile(
-        r'^\s*(' + '|'.join(re.escape(n) for n in macro_defs) + r')\s*\(([^)]+)\)\s*;?\s*$'
-    )
-
-    seen: set[int] = set()
-    for li, line in enumerate(lines):
-        m = _MACRO_CALL_RE.match(line)
-        if not m:
-            continue
-        macro_name = m.group(1)
-        args = [a.strip() for a in m.group(2).split(',')]
-        call_line = li + 1
-        if call_line in seen:
-            continue
-        seen.add(call_line)
-
-        # 用第一个参数作为函数名的一部分（常见约定: HANDLER(name) 展开为 handle_name）
-        func_hint = f"{macro_name}({args[0]})"
+    # 类型 2：无 ## 的宏 -> 宏定义行本身作为函数
+    for macro_name, def_line in macro_fixed_body.items():
         entries.append({
-            "name":         func_hint,
-            "scope":        "",
-            "scopeKind":    "",
-            "line":         call_line,
-            "signature":    func_hint,
-            "_is_macro":    True,
-            "_macro_name":  macro_name,
-            "_macro_args":  args,
-            "_macro_def_line": macro_defs[macro_name],
+            "name":        macro_name,
+            "scope":       "",
+            "scopeKind":   "",
+            "line":        def_line,
+            "signature":   macro_name,
+            "_is_macro":   True,
+            "_macro_name": macro_name,
+            "_macro_args": [],
         })
 
     return entries
