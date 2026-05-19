@@ -15,6 +15,29 @@ _REQUEST_LOCK = threading.Lock()
 _REQUEST_TOTAL = defaultdict(int)
 _REQUEST_DURATION = defaultdict(lambda: {"count": 0, "sum": 0.0})
 _TERMINAL_STATUSES = {"passed", "failed", "error", "cancelled"}
+_STAGE_ORDER = ("r1", "r2", "r3", "r4")
+_STAGE_EVENT_MAP: dict[str, tuple[str, str, str]] = {
+    "r1_w_agent_start": ("r1", "worker", "start"),
+    "r1_w_agent_done": ("r1", "worker", "done"),
+    "r1_j_start": ("r1", "judge", "start"),
+    "r1_j_done": ("r1", "judge", "done"),
+    "r1_j_retry": ("r1", "judge", "retry"),
+    "r2_w_start": ("r2", "worker", "start"),
+    "r2_w_done": ("r2", "worker", "done"),
+    "r2_j_start": ("r2", "judge", "start"),
+    "r2_j_done": ("r2", "judge", "done"),
+    "r2_j_retry": ("r2", "judge", "retry"),
+    "r3_w_start": ("r3", "worker", "start"),
+    "r3_w_done": ("r3", "worker", "done"),
+    "r3_j_start": ("r3", "judge", "start"),
+    "r3_j_done": ("r3", "judge", "done"),
+    "r3_j_retry": ("r3", "judge", "retry"),
+    "r4_w_start": ("r4", "worker", "start"),
+    "r4_w_done": ("r4", "worker", "done"),
+    "r4_j_start": ("r4", "judge", "start"),
+    "r4_j_done": ("r4", "judge", "done"),
+    "r4_j_retry": ("r4", "judge", "retry"),
+}
 
 
 def observe_request(method: str, path: str, status_code: int, duration_seconds: float) -> None:
@@ -91,6 +114,10 @@ def _render_task_metrics() -> list[str]:
     result_counter: dict[str, int] = defaultdict(int)
     file_total = 0
     session_gauge = worker_gauge = judge_gauge = 0
+    stage_status_counts: dict[tuple[str, str], int] = defaultdict(int)
+    stage_duration: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: {"count": 0, "sum": 0.0})
+    stage_role_counts: dict[tuple[str, str], int] = defaultdict(int)
+    stage_session_counts: dict[str, int] = defaultdict(int)
 
     for row in rows:
         status = str(row.status or "unknown")
@@ -147,6 +174,24 @@ def _render_task_metrics() -> list[str]:
                 judge_duration_sum += max(0.0, float(actor.get("duration_ms") or 0.0) / 1000.0)
                 if actor.get("session_file"):
                     session_gauge += 1
+
+        stage_events = row.stages_json.get("events") if isinstance(row.stages_json, dict) and isinstance(row.stages_json.get("events"), list) else []
+        if stage_events:
+            _accumulate_stage_events(
+                stage_events,
+                stage_status_counts=stage_status_counts,
+                stage_duration=stage_duration,
+                stage_role_counts=stage_role_counts,
+                stage_session_counts=stage_session_counts,
+            )
+        else:
+            _accumulate_stage_fallback_from_result(
+                rounds,
+                stage_status_counts=stage_status_counts,
+                stage_duration=stage_duration,
+                stage_role_counts=stage_role_counts,
+                stage_session_counts=stage_session_counts,
+            )
 
         classification = _classify_failure(row.error, result_json, row.cancel_requested)
         if classification == "timeout":
@@ -250,9 +295,27 @@ def _render_task_metrics() -> list[str]:
         "# TYPE secflow_ea_judge_duration_seconds summary",
         f"secflow_ea_judge_duration_seconds_count {judge_total}",
         f"secflow_ea_judge_duration_seconds_sum {_fmt(judge_duration_sum)}",
+        "# HELP secflow_ea_stage_rounds Aggregated stage executions by stage and status.",
+        "# TYPE secflow_ea_stage_rounds gauge",
+        "# HELP secflow_ea_stage_duration_seconds Aggregated stage duration by stage and status.",
+        "# TYPE secflow_ea_stage_duration_seconds summary",
+        "# HELP secflow_ea_stage_role_total Aggregated stage actor invocations by stage and role.",
+        "# TYPE secflow_ea_stage_role_total gauge",
+        "# HELP secflow_ea_stage_session_total Aggregated stage session references.",
+        "# TYPE secflow_ea_stage_session_total gauge",
         "# HELP secflow_ea_module_total Aggregated module executions by module name.",
         "# TYPE secflow_ea_module_total counter",
     ])
+    for stage, status_name in sorted(stage_status_counts):
+        lines.append(f"secflow_ea_stage_rounds{_labels(stage=stage, status=status_name)} {stage_status_counts[(stage, status_name)]}")
+    for stage, status_name in sorted(stage_duration):
+        bucket = stage_duration[(stage, status_name)]
+        lines.append(f"secflow_ea_stage_duration_seconds_count{_labels(stage=stage, status=status_name)} {int(bucket['count'])}")
+        lines.append(f"secflow_ea_stage_duration_seconds_sum{_labels(stage=stage, status=status_name)} {_fmt(bucket['sum'])}")
+    for stage, role in sorted(stage_role_counts):
+        lines.append(f"secflow_ea_stage_role_total{_labels(stage=stage, role=role)} {stage_role_counts[(stage, role)]}")
+    for stage in sorted(stage_session_counts):
+        lines.append(f"secflow_ea_stage_session_total{_labels(stage=stage)} {stage_session_counts[stage]}")
     for module_name in sorted(module_counter):
         lines.append(f"secflow_ea_module_total{_labels(module=module_name)} {module_counter[module_name]}")
     lines.extend([
@@ -286,6 +349,156 @@ def _render_task_metrics() -> list[str]:
         judge_duration_seconds=judge_duration_sum,
     )
     return lines
+
+
+def _accumulate_stage_events(
+    events: list[dict[str, Any]],
+    *,
+    stage_status_counts: dict[tuple[str, str], int],
+    stage_duration: dict[tuple[str, str], dict[str, float]],
+    stage_role_counts: dict[tuple[str, str], int],
+    stage_session_counts: dict[str, int],
+) -> None:
+    open_events: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    seen_sessions: set[tuple[str, str]] = set()
+    ordered = sorted(
+        (item for item in events if isinstance(item, dict)),
+        key=lambda item: float(item.get("ts") or 0.0),
+    )
+    for item in ordered:
+        event_type = str(item.get("type") or "")
+        spec = _STAGE_EVENT_MAP.get(event_type)
+        if not spec:
+            continue
+        stage, role, phase = spec
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        event_ts = float(item.get("ts") or 0.0)
+        key = (stage, role, _stage_event_identity(data))
+        session_path = _event_session_path(data)
+        if session_path and (stage, session_path) not in seen_sessions:
+            seen_sessions.add((stage, session_path))
+            stage_session_counts[stage] += 1
+        if phase == "start":
+            stage_role_counts[(stage, role)] += 1
+            open_events[key].append(event_ts)
+            continue
+        if phase == "retry":
+            stage_status_counts[(stage, "retry")] += 1
+            continue
+        status_name = _stage_status_from_event(stage, role, data)
+        stage_status_counts[(stage, status_name)] += 1
+        if open_events[key]:
+            started = open_events[key].pop(0)
+            duration = max(0.0, event_ts - started)
+            bucket = stage_duration[(stage, status_name)]
+            bucket["count"] += 1
+            bucket["sum"] += duration
+
+    for stage, role, _identity in list(open_events):
+        pending = len(open_events[(stage, role, _identity)])
+        if pending > 0:
+            stage_status_counts[(stage, "running")] += pending
+
+
+def _accumulate_stage_fallback_from_result(
+    rounds: list[Any],
+    *,
+    stage_status_counts: dict[tuple[str, str], int],
+    stage_duration: dict[tuple[str, str], dict[str, float]],
+    stage_role_counts: dict[tuple[str, str], int],
+    stage_session_counts: dict[str, int],
+) -> None:
+    seen_sessions: set[tuple[str, str]] = set()
+    for item in rounds:
+        if not isinstance(item, dict):
+            continue
+        round_status = "passed" if item.get("passed") else "failed"
+        for actor in item.get("worker_results") or []:
+            if not isinstance(actor, dict):
+                continue
+            stage = _infer_stage_name(actor.get("session_file"), actor.get("entry_file"))
+            if not stage:
+                continue
+            stage_role_counts[(stage, "worker")] += 1
+            stage_status_counts[(stage, round_status)] += 1
+            duration = max(0.0, float(actor.get("duration_ms") or 0.0) / 1000.0)
+            if duration > 0:
+                bucket = stage_duration[(stage, round_status)]
+                bucket["count"] += 1
+                bucket["sum"] += duration
+            session_path = str(actor.get("session_file") or "").strip()
+            if session_path and (stage, session_path) not in seen_sessions:
+                seen_sessions.add((stage, session_path))
+                stage_session_counts[stage] += 1
+        for actor in item.get("judge_results") or []:
+            if not isinstance(actor, dict):
+                continue
+            stage = _infer_stage_name(actor.get("session_file"), None)
+            if not stage:
+                continue
+            actor_status = "passed" if _judge_actor_passed(actor) else "failed"
+            stage_role_counts[(stage, "judge")] += 1
+            stage_status_counts[(stage, actor_status)] += 1
+            duration = max(0.0, float(actor.get("duration_ms") or 0.0) / 1000.0)
+            if duration > 0:
+                bucket = stage_duration[(stage, actor_status)]
+                bucket["count"] += 1
+                bucket["sum"] += duration
+            session_path = str(actor.get("session_file") or "").strip()
+            if session_path and (stage, session_path) not in seen_sessions:
+                seen_sessions.add((stage, session_path))
+                stage_session_counts[stage] += 1
+
+
+def _stage_event_identity(data: dict[str, Any]) -> str:
+    for key in ("func_hash", "file_hash", "attempt", "function", "file"):
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return "__task__"
+
+
+def _event_session_path(data: dict[str, Any]) -> str:
+    for key in ("session_file", "relative_path", "path"):
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _stage_status_from_event(stage: str, role: str, data: dict[str, Any]) -> str:
+    if role == "judge":
+        passed = data.get("passed")
+        if isinstance(passed, bool):
+            return "passed" if passed else "failed"
+    if stage == "r2" and role == "worker":
+        return "passed"
+    if stage in ("r3", "r4") and role == "worker":
+        return "passed"
+    if stage == "r1" and role == "worker":
+        return "passed"
+    return "completed"
+
+
+def _infer_stage_name(*values: Any) -> str | None:
+    for raw in values:
+        text = str(raw or "").lower()
+        if not text:
+            continue
+        for stage in _STAGE_ORDER:
+            if f"{stage}-" in text or f"/{stage}/" in text or f"_{stage}_" in text or text.startswith(f"{stage}_"):
+                return stage
+    return None
+
+
+def _judge_actor_passed(actor: dict[str, Any]) -> bool:
+    summary = actor.get("summary") if isinstance(actor.get("summary"), dict) else {}
+    if summary.get("overall_passed") is not None:
+        return bool(summary.get("overall_passed"))
+    evaluations = actor.get("evaluations") if isinstance(actor.get("evaluations"), list) else []
+    if evaluations:
+        return all(bool(item.get("passed")) for item in evaluations if isinstance(item, dict))
+    return False
 
 
 def _estimate_file_total(worker_results: list[dict[str, Any]]) -> int:
