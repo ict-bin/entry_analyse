@@ -461,7 +461,9 @@ def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
                     j += 1
                     define_body += ' ' + lines[j].strip()
                 # 宏展开体内含 { 和 } 则认为这个完是一个函数定义完
-                if '{' in define_body and '}' in define_body:
+                # 函数定义宏必须有 ##（token pasting）将参数拼入函数名
+                # 无 ## 的宏（如 RETURN_GUARDED、LOG_MACRO）只是代码块，不创建函数
+                if '{' in define_body and '}' in define_body and '##' in define_body:
                     macro_defs[macro_name] = i + 1
                 i = j + 1
                 continue
@@ -470,25 +472,13 @@ def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
     if not macro_defs:
         return entries
 
-    # 在文件中找到这些完的调用位置（只处理文件作用域，brace_depth==0）
-    # 函数体内的完调用（RETURN_GUARDED、LOG完等）一律跳过
+    # 在文件中找到这些宏的调用位置
     _MACRO_CALL_RE = re.compile(
         r'^\s*(' + '|'.join(re.escape(n) for n in macro_defs) + r')\s*\(([^)]+)\)\s*;?\s*$'
     )
 
     seen: set[int] = set()
-    brace_depth = 0
-
     for li, line in enumerate(lines):
-        # 跟踪花括号深度
-        import re as _re
-        _clean = line.split('//')[0]  # remove line comment
-        # (string content ignored for brace counting - close enough)
-        brace_depth += _clean.count('{') - _clean.count('}')
-        brace_depth = max(brace_depth, 0)
-        if brace_depth != 0:
-            continue
-
         m = _MACRO_CALL_RE.match(line)
         if not m:
             continue
