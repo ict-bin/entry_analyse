@@ -470,14 +470,25 @@ def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
     if not macro_defs:
         return entries
 
-    # 在文件中找到这些完的调用位置
-    # 模式：行头是 MACRO_NAME(参数)、可能有多个参数
+    # 在文件中找到这些完的调用位置（只处理文件作用域，brace_depth==0）
+    # 函数体内的完调用（RETURN_GUARDED、LOG完等）一律跳过
     _MACRO_CALL_RE = re.compile(
         r'^\s*(' + '|'.join(re.escape(n) for n in macro_defs) + r')\s*\(([^)]+)\)\s*;?\s*$'
     )
 
     seen: set[int] = set()
+    brace_depth = 0
+
     for li, line in enumerate(lines):
+        # 跟踪花括号深度
+        import re as _re
+        _clean = line.split('//')[0]  # remove line comment
+        # (string content ignored for brace counting - close enough)
+        brace_depth += _clean.count('{') - _clean.count('}')
+        brace_depth = max(brace_depth, 0)
+        if brace_depth != 0:
+            continue
+
         m = _MACRO_CALL_RE.match(line)
         if not m:
             continue
