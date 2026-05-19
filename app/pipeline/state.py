@@ -57,8 +57,14 @@ class FunctionState:
     # R2 W：外部输入分析
     r2_w_state:    NodeState = NodeState.PENDING
     r2_w_attempts: int = 0
-    r2_w_feedback: str = ""     # R2 J 反馈（R2 W 重试 prompt 用）
+    r2_w_feedback: str = ""     # R2 J 反馈（格式：「摘要」+ 详细文件路径）
     has_external_input: Optional[bool] = None   # None=尚未分析
+
+    # R2 J：函数级评审（每函数独立，每次新 session）
+    r2_j_state:    NodeState = NodeState.PENDING
+    r2_j_attempts: int = 0
+    r2_j_feedback_path:    str = ""   # 详细反馈文件路径（供 retry 时 Agent read）
+    r2_j_feedback_summary: str = ""   # 摘要（≤60字，嵌入 retry prompt 标题）
 
     # 时间戳（秒级 unix，仅供调试）
     updated_at: float = field(default_factory=time.time)
@@ -67,6 +73,7 @@ class FunctionState:
         d = asdict(self)
         d['r1_j_state'] = self.r1_j_state.value
         d['r2_w_state'] = self.r2_w_state.value
+        d['r2_j_state'] = self.r2_j_state.value
         return d
 
     @classmethod
@@ -74,6 +81,7 @@ class FunctionState:
         data = dict(data)
         data['r1_j_state'] = NodeState(data.get('r1_j_state', 'pending'))
         data['r2_w_state'] = NodeState(data.get('r2_w_state', 'pending'))
+        data['r2_j_state'] = NodeState(data.get('r2_j_state', 'pending'))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 

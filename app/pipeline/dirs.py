@@ -122,8 +122,12 @@ class PipelineDirs:
         return self.r1 / f"{file_hash}_r1j_{func_hash}_a{attempt}.txt"
 
     def r2_j_feedback_file(self, file_hash: str, attempt: int) -> Path:
-        """R2 Judge 反馈文件：{r1}/{file_hash}_r2j_a{n}.txt"""
+        """R2 Judge 文件级反馈文件（已废弃，保留干点续跳兼容）。"""
         return self.r1 / f"{file_hash}_r2j_a{attempt}.txt"
+
+    def r2_j_feedback_file_func(self, func_hash: str, attempt: int) -> Path:
+        """R2 Judge 函数级详细反馈文件（供 retry 时 Agent read）。"""
+        return self.r1 / f"{func_hash}_r2j_a{attempt}.txt"
 
     def r3_j_feedback_file(self, file_hash: str, attempt: int) -> Path:
         """R3 Judge 反馈文件：{r3}/{file_hash}_r3j_a{n}.txt"""
@@ -148,8 +152,12 @@ class PipelineDirs:
         return self.sessions / f"r2-w-{file_hash}-{func_hash}.jsonl"
 
     def r2_j_session(self, file_hash: str, attempt: int) -> Path:
-        """R2 Judge session（文件级）：每次新建。"""
+        """R2 Judge session（文件级，已废弃，保留干点续跳兼容）。"""
         return self.sessions / f"r2-j-{file_hash}-a{attempt}.jsonl"
+
+    def r2_j_session_func(self, func_hash: str, attempt: int) -> Path:
+        """R2 Judge 函数级 session（每函数独立，每次新建）。"""
+        return self.sessions / f"r2-j-{func_hash}-a{attempt}.jsonl"
 
     def r3_w_session(self, file_hash: str) -> Path:
         """R3 Worker session：跨重试共享。"""
