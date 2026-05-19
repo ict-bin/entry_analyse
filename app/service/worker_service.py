@@ -115,28 +115,31 @@ class WorkerService:
             await asyncio.sleep(task_mod.LEASE_RENEW_INTERVAL_SECONDS)
             if stop_event.is_set():
                 break
-            db_gen = get_db()
-            db: Session = next(db_gen)
             try:
-                row = (
-                    db.query(AppEaTask)
-                    .filter(
-                        AppEaTask.task_id == task_id,
-                        AppEaTask.is_deleted.is_(False),
-                        AppEaTask.owner_pod == task_mod.POD_NAME,
-                    )
-                    .first()
-                )
-                if row is None or row.status != "running" or row.cancel_requested:
-                    stop_event.set()
-                    return
-                row.lease_expires_at = task_mod._lease_deadline()
-                db.commit()
-            finally:
+                db_gen = get_db()
+                db: Session = next(db_gen)
                 try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
+                    row = (
+                        db.query(AppEaTask)
+                        .filter(
+                            AppEaTask.task_id == task_id,
+                            AppEaTask.is_deleted.is_(False),
+                            AppEaTask.owner_pod == task_mod.POD_NAME,
+                        )
+                        .first()
+                    )
+                    if row is None or row.status != "running" or row.cancel_requested:
+                        stop_event.set()
+                        return
+                    row.lease_expires_at = task_mod._lease_deadline()
+                    db.commit()
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
+            except Exception as exc:
+                logger.warning("lease renewal DB error for %s: %s", task_id, exc)
 
     async def _watch_task_control(
         self,
@@ -163,33 +166,37 @@ class WorkerService:
                 wake.clear()
                 if stop_event.is_set():
                     break
-                db_gen = get_db()
-                db: Session = next(db_gen)
                 try:
-                    row = (
-                        db.query(AppEaTask)
-                        .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
-                        .first()
-                    )
-                    if row is None:
-                        stop_event.set()
-                        cancel_event.set()
-                        orch.abort()
-                        return
-                    if row.owner_pod != task_mod.POD_NAME:
-                        stop_event.set()
-                        cancel_event.set()
-                        orch.abort()
-                        return
-                    if row.cancel_requested or row.status == "cancelled":
-                        cancel_event.set()
-                        orch.abort()
-                        return
-                finally:
+                    db_gen = get_db()
+                    db: Session = next(db_gen)
                     try:
-                        next(db_gen)
-                    except StopIteration:
-                        pass
+                        row = (
+                            db.query(AppEaTask)
+                            .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
+                            .first()
+                        )
+                        if row is None:
+                            stop_event.set()
+                            cancel_event.set()
+                            orch.abort()
+                            return
+                        if row.owner_pod != task_mod.POD_NAME:
+                            stop_event.set()
+                            cancel_event.set()
+                            orch.abort()
+                            return
+                        if row.cancel_requested or row.status == "cancelled":
+                            cancel_event.set()
+                            orch.abort()
+                            return
+                    finally:
+                        try:
+                            next(db_gen)
+                        except StopIteration:
+                            pass
+                except Exception as exc:
+                    # DB 异常不能终止监控循环，记录日志后继续等待下一次 wake
+                    logger.warning("cancel watch DB error for %s: %s", task_id, exc)
         finally:
             _cancel_wake.pop(task_id, None)
 
