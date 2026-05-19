@@ -46,6 +46,12 @@ POD_NAME = (
     or os.environ.get("HOSTNAME")
     or f"ea-{uuid.uuid4().hex[:8]}"
 )
+POD_IP = (
+    os.environ.get("EA_POD_IP")
+    or os.environ.get("MY_POD_IP")
+    or os.environ.get("POD_IP")
+    or ""
+)
 
 _dispatch_tasks: dict[str, asyncio.Task] = {}
 _dispatch_locks: dict[str, asyncio.Lock] = {}
@@ -1160,13 +1166,34 @@ class TaskService:
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row)
         row.cancel_requested = True
+        owner_pod_ip = row.owner_pod_ip or ""
         if row.status == "pending":
             row.status = "cancelled"
             row.finished_at = now_local()
             row.owner_pod = None
+            row.owner_pod_ip = None
             row.lease_expires_at = None
         db.commit(); db.refresh(row)
+        # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
+        if owner_pod_ip and row.status == "running":
+            import asyncio as _asyncio
+            _asyncio.create_task(self._notify_cancel(owner_pod_ip, task_id))
         return self._row_to_dict(row)
+
+    @staticmethod
+    async def _notify_cancel(pod_ip: str, task_id: str) -> None:
+        """HTTP POST 到 worker 内置 cancel server，封装网络错误不抛出。"""
+        import asyncio as _asyncio
+        import urllib.request
+        try:
+            url = f"http://{pod_ip}:3001/cancel/{task_id}"
+            req = urllib.request.Request(url, method="POST", data=b"")
+            await _asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: urllib.request.urlopen(req, timeout=2)
+            )
+        except Exception:
+            pass  # 发送失败无关紧要，轮询机制不受影响
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
         """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务不允许删除。"""

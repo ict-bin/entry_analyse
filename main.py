@@ -16,10 +16,41 @@ from dotenv import load_dotenv
 from app.db import init_db
 from app.service.runtime_role import get_runtime_role, role_enabled
 from app.service.scheduler_service import get_scheduler_service
-from app.service.worker_service import get_worker_service
+from app.service.worker_service import get_worker_service, trigger_instant_cancel
 from app.service.svc_config import get_service_yaml
 
 load_dotenv()
+
+_CANCEL_SERVER_PORT = int(os.environ.get("EA_CANCEL_SERVER_PORT", "3001"))
+
+
+async def _handle_cancel_request(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """mini HTTP server handler：解析 POST /cancel/{task_id} 并触发内存取消。"""
+    try:
+        raw = await asyncio.wait_for(reader.read(512), timeout=1)
+        text = raw.decode("utf-8", errors="replace")
+        # 抽取 task_id：第一行格式为 "POST /cancel/{task_id} HTTP/1.1"
+        task_id = ""
+        first_line = text.split("\n", 1)[0].strip()
+        parts = first_line.split(" ")
+        if len(parts) >= 2 and "/cancel/" in parts[1]:
+            task_id = parts[1].rsplit("/", 1)[-1]
+        triggered = trigger_instant_cancel(task_id) if task_id else False
+        body = b"{\"triggered\": true}" if triggered else b"{\"triggered\": false}"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
 
 async def _run_background_runtime() -> None:
     svc_yaml = get_service_yaml()
@@ -30,6 +61,14 @@ async def _run_background_runtime() -> None:
     )
     scheduler_service = get_scheduler_service() if role_enabled("scheduler") else None
     worker_service = get_worker_service() if role_enabled("worker") else None
+
+    # 内置 cancel HTTP server（只在 worker role 下启动）
+    cancel_server = None
+    if role_enabled("worker"):
+        cancel_server = await asyncio.start_server(
+            _handle_cancel_request, "0.0.0.0", _CANCEL_SERVER_PORT
+        )
+
     try:
         if scheduler_service is not None:
             scheduler_service.start()
@@ -38,6 +77,9 @@ async def _run_background_runtime() -> None:
         while True:
             await asyncio.sleep(3600)
     finally:
+        if cancel_server is not None:
+            cancel_server.close()
+            await cancel_server.wait_closed()
         if scheduler_service is not None:
             scheduler_service.stop()
         if worker_service is not None:

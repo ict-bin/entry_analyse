@@ -20,7 +20,18 @@ from app.time_utils import now_local
 logger = logging.getLogger("ea.worker")
 
 _running_tasks: dict[str, asyncio.Task] = {}
+# task_id -> asyncio.Event: 外部信号立即唤醒 _watch_task_control，无需等待轮询间隔
+_cancel_wake: dict[str, asyncio.Event] = {}
 WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
+
+
+def trigger_instant_cancel(task_id: str) -> bool:
+    """由内置 cancel HTTP server 调用，立即唤醒 _watch_task_control。"""
+    ev = _cancel_wake.get(task_id)
+    if ev:
+        ev.set()
+        return True
+    return False
 
 
 class WorkerService:
@@ -136,37 +147,51 @@ class WorkerService:
     ) -> None:
         from app.service import task_service as task_mod
 
-        while not stop_event.is_set():
-            await asyncio.sleep(task_mod.CANCEL_POLL_INTERVAL_SECONDS)
-            if stop_event.is_set():
-                break
-            db_gen = get_db()
-            db: Session = next(db_gen)
-            try:
-                row = (
-                    db.query(AppEaTask)
-                    .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
-                    .first()
-                )
-                if row is None:
-                    stop_event.set()
-                    cancel_event.set()
-                    orch.abort()
-                    return
-                if row.owner_pod != task_mod.POD_NAME:
-                    stop_event.set()
-                    cancel_event.set()
-                    orch.abort()
-                    return
-                if row.cancel_requested or row.status == "cancelled":
-                    cancel_event.set()
-                    orch.abort()
-                    return
-            finally:
+        # 注册 wake event，供内置 cancel server 立即唤醒
+        wake = asyncio.Event()
+        _cancel_wake[task_id] = wake
+        try:
+            while not stop_event.is_set():
+                # 等待 wake 信号 或 轮询定时到
                 try:
-                    next(db_gen)
-                except StopIteration:
+                    await asyncio.wait_for(
+                        wake.wait(),
+                        timeout=task_mod.CANCEL_POLL_INTERVAL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
                     pass
+                wake.clear()
+                if stop_event.is_set():
+                    break
+                db_gen = get_db()
+                db: Session = next(db_gen)
+                try:
+                    row = (
+                        db.query(AppEaTask)
+                        .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
+                        .first()
+                    )
+                    if row is None:
+                        stop_event.set()
+                        cancel_event.set()
+                        orch.abort()
+                        return
+                    if row.owner_pod != task_mod.POD_NAME:
+                        stop_event.set()
+                        cancel_event.set()
+                        orch.abort()
+                        return
+                    if row.cancel_requested or row.status == "cancelled":
+                        cancel_event.set()
+                        orch.abort()
+                        return
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
+        finally:
+            _cancel_wake.pop(task_id, None)
 
     async def _execute_task(self, task_id: str) -> None:
         from app.service import task_service as task_mod
@@ -218,6 +243,7 @@ class WorkerService:
                 project_id = row.project_id
                 row.status = "running"
                 row.owner_pod = task_mod.POD_NAME
+                row.owner_pod_ip = task_mod.POD_IP
                 row.lease_expires_at = task_mod._lease_deadline()
                 db.commit()
 

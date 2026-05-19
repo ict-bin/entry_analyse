@@ -34,6 +34,8 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN owner_pod VARCHAR(128) NULL",
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN lease_expires_at DATETIME NULL",
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
+    # Add owner_pod_ip for instant cancel notification without DNS lookup (added 2026-05)
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN owner_pod_ip VARCHAR(64) NULL",
     "CREATE INDEX ix_ea_tasks_project_deleted_created_id ON secflow_app_ea_tasks (project_id, is_deleted, created_at, id)",
     "CREATE INDEX ix_ea_tasks_project_created_id ON secflow_app_ea_tasks (project_id, created_at, id)",
     "CREATE INDEX ix_ea_tasks_project_deleted_status_created_id ON secflow_app_ea_tasks (project_id, is_deleted, status, created_at, id)",
