@@ -71,7 +71,12 @@ def build_r2_w_prompt(
     # feedback 字段：若是文件路径（由 engine 写入）则引用文件，否则嵌入文本
     from pathlib import Path as _Path
     if is_retry and feedback:
-        if _Path(feedback).exists():
+        _is_path = len(feedback) <= 4096 and "\n" not in feedback
+        try:
+            _fb_exists = _is_path and _Path(feedback).exists()
+        except OSError:
+            _fb_exists = False
+        if _fb_exists:
             retry_section = (
                 f"\n## Judge 评审意见\n\n"
                 f"上一次分析有问题，Judge 评审意见已保存至：`{feedback}`\n"
@@ -186,7 +191,12 @@ def build_r3_w_prompt(
     # feedback 字段：若是文件路径则引用，否则嵌入文本
     from pathlib import Path as _Path
     if is_retry and feedback:
-        if _Path(feedback).exists():
+        _is_path = len(feedback) <= 4096 and "\n" not in feedback
+        try:
+            _fb_exists = _is_path and _Path(feedback).exists()
+        except OSError:
+            _fb_exists = False
+        if _fb_exists:
             retry_section = (
                 f"\n## Judge 评审意见\n\n"
                 f"Judge 评审意见已保存至：`{feedback}`\n"
@@ -196,9 +206,7 @@ def build_r3_w_prompt(
             retry_section = f"\n## 上次过滤有问题，请修正\n\n{feedback}\n"
     else:
         retry_section = ""
-
     return (
-        f"# R3 Worker — 文件级外部入口过滤\n\n"
         f"文件：`{basename}`\n"
         f"{retry_section}\n"
         f"## 已分析的含外部输入函数\n\n"
@@ -282,7 +290,12 @@ def build_r4_w_prompt(
     # feedback 字段：若是文件路径则引用，否则嵌入文本
     from pathlib import Path as _Path
     if is_retry and feedback:
-        if _Path(feedback).exists():
+        _is_path = len(feedback) <= 4096 and "\n" not in feedback
+        try:
+            _fb_exists = _is_path and _Path(feedback).exists()
+        except OSError:
+            _fb_exists = False
+        if _fb_exists:
             retry_section = (
                 f"\n## Judge 评审意见\n\n"
                 f"Judge 评审意见已保存至：`{feedback}`\n"
@@ -292,7 +305,6 @@ def build_r4_w_prompt(
             retry_section = f"\n## 上次分析有问题，请修正\n\n{feedback}\n"
     else:
         retry_section = ""
-
     return (
         f"# R4 Worker — 模块级外部入口汇总\n\n"
         f"模块：`{module_name}`\n"

@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -801,6 +802,7 @@ async def _run_with_api_retry(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,
+            start_new_session=True,   # 独立 process group，cancel 时可 killpg 杀全组
         )
 
         # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
@@ -817,10 +819,19 @@ async def _run_with_api_retry(
         if cancel_event:
             async def _cancel_monitor():
                 await cancel_event.wait()
+                # 向整个 process group 发 SIGTERM（杀 pi 及其所有工具子进程）
                 try:
-                    proc.terminate()
-                except ProcessLookupError:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
                     pass
+                # 等待 5 秒，若仍未退出则 SIGKILL
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
             cancel_task = asyncio.create_task(_cancel_monitor())
 
         # ── 读取 JSON Lines 输出（try/except 保护管道断裂）──

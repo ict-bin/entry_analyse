@@ -434,10 +434,10 @@ class PipelineEngine:
                 acfg = self.cfg.workers.agents[0]
                 sys_prompt = self._stage_sys_prompt('r2_worker')
                 is_retry = func_state.r2_w_attempts > 1
-                # 优先使用 R2 专属反馈（R2 J 设置），其次才是 R1 J 反馈
+                # 优先使用 R2 专属反馈（R2 J 设置），其次是 R1 J 反馈文件路径（避免原始文本导致 OSError）
                 r2_feedback = (
                     func_state.r2_w_feedback
-                    or func_state.r1_j_feedback
+                    or func_state.r1_j_feedback_path
                 ) if is_retry else ""
                 prompt = P.build_r2_w_prompt(
                     func_file=dirs.r1_file_dir(file_hash) / f"{func_hash}.c",
@@ -535,7 +535,7 @@ class PipelineEngine:
                     fs.r2_j_state = NodeState.FAILED
                     # 解析 J 指出的失败函数并重跑 R2 W
                     # 写出 feedback 文件，供 retry 时引用（而非嵌入原文本到 prompt）
-                    fb_file = dirs.r2_j_feedback_file(file_hash, attempt)
+                    fb_file = dirs.r2_j_feedback_file(file_hash, fs.r2_j_attempts)
                     fb_file.parent.mkdir(parents=True, exist_ok=True)
                     fb_file.write_text(feedback, encoding="utf-8")
                     failed = _parse_failed_func_hashes(ar.output, fs.functions)
@@ -666,7 +666,7 @@ class PipelineEngine:
             passed, feedback = _parse_j_result(ar.output)
             fs.r3_feedback = feedback
             if not passed and feedback:
-                fb_file = dirs.r3_j_feedback_file(file_hash, attempt)
+                fb_file = dirs.r3_j_feedback_file(file_hash, fs.r3_attempts)
                 fb_file.parent.mkdir(parents=True, exist_ok=True)
                 fb_file.write_text(feedback, encoding="utf-8")
                 fs.r3_feedback = str(fb_file)  # 转存文件路径，供 retry 引用
@@ -780,7 +780,7 @@ class PipelineEngine:
             passed, feedback = _parse_j_result(ar.output)
             state.r4_feedback = feedback
             if not passed and feedback:
-                fb_file = dirs.r4_j_feedback_file(attempt)
+                fb_file = dirs.r4_j_feedback_file(state.r4_attempts)
                 fb_file.parent.mkdir(parents=True, exist_ok=True)
                 fb_file.write_text(feedback, encoding="utf-8")
                 state.r4_feedback = str(fb_file)  # 转存文件路径，供 retry 引用
