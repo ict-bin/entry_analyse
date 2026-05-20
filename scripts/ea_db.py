@@ -7,32 +7,42 @@ ea_db.py — entry_analyse 函数数据库 CLI 工具
 
 只使用 Python 标准库，无额外依赖（sqlite3 / json / sys / pathlib）。
 
-用法：
-  python3 /opt/entry_analyse/scripts/ea_db.py get         <db_path> <func_hash>
-  python3 /opt/entry_analyse/scripts/ea_db.py list-meta   <db_path>
+用法（函数数据库命令）：
+  python3 /opt/entry_analyse/scripts/ea_db.py get          <db_path> <func_hash>
+  python3 /opt/entry_analyse/scripts/ea_db.py list-meta    <db_path>
   python3 /opt/entry_analyse/scripts/ea_db.py list-entries <db_path>
   python3 /opt/entry_analyse/scripts/ea_db.py set-analysis <db_path> <func_hash> '<json>'
-  python3 /opt/entry_analyse/scripts/ea_db.py stats       <db_path>
+  python3 /opt/entry_analyse/scripts/ea_db.py stats        <db_path>
 
-命令说明：
+用法（调用链数据库命令）：
+  python3 /opt/entry_analyse/scripts/ea_db.py callchain-callers  <cc_db_path> <func_hash>
+  python3 /opt/entry_analyse/scripts/ea_db.py callchain-callees  <cc_db_path> <func_hash>
+  python3 /opt/entry_analyse/scripts/ea_db.py callchain-tree     <cc_db_path> <root_hash>
+  python3 /opt/entry_analyse/scripts/ea_db.py callchain-role     <cc_db_path> <func_hash>
+  python3 /opt/entry_analyse/scripts/ea_db.py callchain-stats    <cc_db_path>
+
+命令说明（函数数据库）：
   get          输出单个函数的完整信息（含 body）。func_hash 找不到时 exit(1)。
   list-meta    输出所有函数的元数据（不含 body），按 start_line 升序。
   list-entries 输出 has_external_input=1 的函数（含 analysis，不含 body）。
   set-analysis 写入分析结果（主要用于调试；pipeline 引擎直接用 funcdb.py）。
   stats        输出统计：total / analysed / with_input。
 
+命令说明（调用链数据库）：
+  callchain-callers  查谁调用了该函数（一阶上游）
+  callchain-callees  查该函数调用了谁（一阶下游）
+  callchain-tree     展开以 root_hash 为根的完整子树（来自 entry_trees 表）
+  callchain-role     查该函数的调用链角色（供 R4-W Agent 判断）
+  callchain-stats    调用链 DB 统计
+
 示例：
-  # R1-J 验证前查看函数行号（无需读 1MB JSON）
+  # R2-J 验证前查看函数行号（无需读 1MB JSON）
   python3 /opt/entry_analyse/scripts/ea_db.py get \\
       /data/.../r1-functions/84f839ab0069_functions.db b9a4a82cac75
 
-  # R2-J 获取所有已分析入口列表
-  python3 /opt/entry_analyse/scripts/ea_db.py list-entries \\
-      /data/.../r1-functions/84f839ab0069_functions.db
-
-  # R3-W 获取全量函数元数据（用于判断调用关系）
-  python3 /opt/entry_analyse/scripts/ea_db.py list-meta \\
-      /data/.../r1-functions/84f839ab0069_functions.db
+  # R4-W 认证入口角色
+  python3 /opt/entry_analyse/scripts/ea_db.py callchain-role \\
+      /data/.../callchain/callchain.db abc123def456
 """
 
 import json
@@ -226,6 +236,244 @@ def cmd_stats(db_path: Path) -> None:
     print(json.dumps({"total": total, "analysed": analysed, "with_input": with_input}))
 
 
+# ─── 调用链 DB 命令（callchain.db） ────────────────────────────────────────────────────
+
+def _get_cc_conn(cc_db_path: Path) -> sqlite3.Connection:
+    """调用链 DB 连接（只读场景，无需 WAL）。"""
+    if not cc_db_path.exists():
+        _die(f"Callchain DB not found: {cc_db_path}")
+    conn = sqlite3.connect(str(cc_db_path), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def cmd_callchain_callers(cc_db_path: Path, func_hash: str) -> None:
+    """
+    输出直接调用该函数的所有函数（一阶上游）。
+
+    输出示例：
+    [
+      {
+        "caller_hash": "abc123",
+        "name": "IPSEC_CFG_AppCfgOperDispatch",
+        "call_type": "extern_table",
+        "call_site_line": 2773,
+        "is_r3_entry": 1,
+        "is_external": 0
+      }
+    ]
+    """
+    with _get_cc_conn(cc_db_path) as conn:
+        rows = conn.execute("""
+            SELECT e.caller_hash, n.name, e.call_type, e.call_site_line,
+                   COALESCE(n.is_r3_entry, 0) as is_r3_entry,
+                   COALESCE(n.is_external, 0) as is_external
+            FROM edges e
+            LEFT JOIN nodes n ON n.func_hash = e.caller_hash
+            WHERE e.callee_hash = ?
+            ORDER BY e.call_site_line
+        """, (func_hash,)).fetchall()
+    print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+
+
+def cmd_callchain_callees(cc_db_path: Path, func_hash: str) -> None:
+    """
+    输出该函数直接调用的所有函数（一阶下游）。
+    """
+    with _get_cc_conn(cc_db_path) as conn:
+        rows = conn.execute("""
+            SELECT e.callee_hash, n.name, e.call_type, e.call_site_line,
+                   COALESCE(n.is_r3_entry, 0) as is_r3_entry
+            FROM edges e
+            LEFT JOIN nodes n ON n.func_hash = e.callee_hash
+            WHERE e.caller_hash = ?
+            ORDER BY e.call_site_line
+        """, (func_hash,)).fetchall()
+    print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+
+
+def cmd_callchain_tree(cc_db_path: Path, root_hash: str) -> None:
+    """
+    展开以 root_hash 为根的完整子树（来自 entry_trees 表）。
+
+    输出示例：
+    {
+      "root_hash": "abc123",
+      "root_name": "IPSEC_CFG_AppCfgOperDispatch",
+      "total_nodes": 32,
+      "tree": [
+        {"depth": 0, "node_hash": "abc123", "name": "...", "path": ["abc123"]},
+        {"depth": 1, "node_hash": "def456", "name": "...", "path": ["abc123", "def456"]},
+        ...
+      ]
+    }
+    """
+    with _get_cc_conn(cc_db_path) as conn:
+        root_node = conn.execute(
+            "SELECT name FROM nodes WHERE func_hash=?", (root_hash,)
+        ).fetchone()
+        rows = conn.execute("""
+            SELECT et.node_hash, n.name, et.depth, et.path_json,
+                   COALESCE(n.is_r3_entry, 0) as is_r3_entry,
+                   COALESCE(n.entry_role, '') as entry_role,
+                   n.entry_confidence
+            FROM entry_trees et
+            LEFT JOIN nodes n ON n.func_hash = et.node_hash
+            WHERE et.root_hash = ?
+            ORDER BY et.depth, et.node_hash
+        """, (root_hash,)).fetchall()
+
+    tree_nodes = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["path"] = json.loads(d.get("path_json") or "[]")
+        except Exception:
+            d["path"] = []
+        d.pop("path_json", None)
+        tree_nodes.append(d)
+
+    result = {
+        "root_hash": root_hash,
+        "root_name": root_node["name"] if root_node else "",
+        "total_nodes": len(tree_nodes),
+        "tree": tree_nodes,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_callchain_role(cc_db_path: Path, func_hash: str) -> None:
+    """
+    查该函数的调用链角色，供 R4-W Agent 判断是否应保留。
+
+    输出示例：
+    {
+      "func_hash": "abc123",
+      "name": "IPSEC_CFG_SACreate",
+      "entry_role": "dispatch_target",
+      "callers_count": 1,
+      "callers_in_r3": ["IPSEC_CFG_AppCfgOperDispatch"],
+      "callers_outside_module": 0,
+      "is_only_called_by_dispatcher": true,
+      "in_how_many_trees": 1,
+      "suggested_entry_role": "dispatch_target",
+      "confidence_delta": 0.05,
+      "recommendation": "保留（dispatch_target，推荐作为污点追踪起点）"
+    }
+    """
+    with _get_cc_conn(cc_db_path) as conn:
+        node = conn.execute(
+            "SELECT func_hash, name, entry_role, entry_confidence FROM nodes WHERE func_hash=?",
+            (func_hash,)
+        ).fetchone()
+        if node is None:
+            _die(f"func_hash '{func_hash}' not found in callchain DB")
+
+        callers = conn.execute("""
+            SELECT e.caller_hash, n.name, e.call_type,
+                   COALESCE(n.is_r3_entry, 0) as is_r3_entry,
+                   COALESCE(n.is_external, 0) as is_external
+            FROM edges e
+            LEFT JOIN nodes n ON n.func_hash = e.caller_hash
+            WHERE e.callee_hash = ?
+        """, (func_hash,)).fetchall()
+
+        tree_count = conn.execute(
+            "SELECT COUNT(DISTINCT root_hash) FROM entry_trees WHERE node_hash=?",
+            (func_hash,)
+        ).fetchone()[0]
+
+    callers_list = [dict(c) for c in callers]
+    r3_callers = [c["name"] for c in callers_list if c.get("is_r3_entry")]
+    ext_callers = sum(1 for c in callers_list if c.get("is_external"))
+
+    dispatcher_kws = ("dispatch", "procmsg", "msgproc", "handler", "process", "router")
+    is_only_dispatcher = bool(callers_list) and all(
+        any(kw in (c.get("name") or "").lower() for kw in dispatcher_kws)
+        for c in callers_list if not c.get("is_external")
+    )
+
+    existing_role = str(node["entry_role"] or "")
+    if existing_role:
+        suggested = existing_role
+    elif is_only_dispatcher:
+        suggested = "dispatch_target"
+    elif ext_callers or not callers_list:
+        suggested = "boundary"
+    else:
+        suggested = "boundary"
+
+    confidence_delta = 0.0
+    if not callers_list or ext_callers:
+        confidence_delta += 0.15
+    if is_only_dispatcher:
+        confidence_delta += 0.05
+    if len(callers_list) > 3 and not ext_callers:
+        confidence_delta -= 0.10
+
+    if suggested == "dispatch_target":
+        recommendation = "保留（dispatch_target，推荐作为污点追踪起点）"
+    elif suggested == "boundary" and not callers_list:
+        recommendation = "保留（boundary，没有模块内调用者，是模块内最外层入口）"
+    elif len(callers_list) > 3 and not ext_callers:
+        recommendation = "建议考虑删除（被多个模块内函数调用，可能是工具函数）"
+    else:
+        recommendation = "保留"
+
+    result = {
+        "func_hash": func_hash,
+        "name": str(node["name"]),
+        "entry_role": existing_role,
+        "entry_confidence": node["entry_confidence"],
+        "callers_count": len(callers_list),
+        "callers_in_r3": r3_callers,
+        "callers_outside_module": ext_callers,
+        "is_only_called_by_dispatcher": is_only_dispatcher,
+        "in_how_many_trees": tree_count,
+        "suggested_entry_role": suggested,
+        "confidence_delta": round(confidence_delta, 2),
+        "recommendation": recommendation,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_callchain_stats(cc_db_path: Path) -> None:
+    """
+    输出调用链 DB 统计和构建状态。
+    """
+    with _get_cc_conn(cc_db_path) as conn:
+        nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        r3 = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE is_r3_entry=1"
+        ).fetchone()[0]
+        edges_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        closure_pairs = conn.execute("SELECT COUNT(*) FROM closure").fetchone()[0]
+        tree_nodes = conn.execute("SELECT COUNT(*) FROM entry_trees").fetchone()[0]
+        tree_roots = conn.execute(
+            "SELECT COUNT(DISTINCT root_hash) FROM entry_trees"
+        ).fetchone()[0]
+        status_row = conn.execute("SELECT * FROM build_status WHERE id=1").fetchone()
+
+    status = dict(status_row) if status_row else {}
+    try:
+        status["cycles"] = json.loads(status.get("cycles_json") or "[]")
+    except Exception:
+        status["cycles"] = []
+    status.pop("cycles_json", None)
+
+    result = {
+        "nodes": nodes,
+        "r3_entries": r3,
+        "edges": edges_count,
+        "closure_pairs": closure_pairs,
+        "tree_nodes": tree_nodes,
+        "tree_roots": tree_roots,
+        "build_status": status,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 # ─── 入口 ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -255,9 +503,33 @@ def main() -> None:
     elif cmd == "stats":
         cmd_stats(db_path)
 
+    elif cmd in ("callchain-callers", "callchain-callees", "callchain-tree",
+                 "callchain-role", "callchain-stats"):
+        # callchain 命令组：db_path 实际上是 callchain.db 路径
+        cc_db = db_path  # 复用第二个参数位置
+        if cmd == "callchain-callers":
+            if len(sys.argv) < 4:
+                _die("Usage: ea_db.py callchain-callers <cc_db_path> <func_hash>")
+            cmd_callchain_callers(cc_db, sys.argv[3])
+        elif cmd == "callchain-callees":
+            if len(sys.argv) < 4:
+                _die("Usage: ea_db.py callchain-callees <cc_db_path> <func_hash>")
+            cmd_callchain_callees(cc_db, sys.argv[3])
+        elif cmd == "callchain-tree":
+            if len(sys.argv) < 4:
+                _die("Usage: ea_db.py callchain-tree <cc_db_path> <root_hash>")
+            cmd_callchain_tree(cc_db, sys.argv[3])
+        elif cmd == "callchain-role":
+            if len(sys.argv) < 4:
+                _die("Usage: ea_db.py callchain-role <cc_db_path> <func_hash>")
+            cmd_callchain_role(cc_db, sys.argv[3])
+        elif cmd == "callchain-stats":
+            cmd_callchain_stats(cc_db)
+
     else:
         _die(f"Unknown command: {cmd!r}. "
-             f"Valid commands: get, list-meta, list-entries, set-analysis, stats")
+             f"Valid commands: get, list-meta, list-entries, set-analysis, stats, "
+             f"callchain-callers, callchain-callees, callchain-tree, callchain-role, callchain-stats")
 
 
 if __name__ == "__main__":

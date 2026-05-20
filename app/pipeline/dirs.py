@@ -75,6 +75,11 @@ class PipelineDirs:
         return self.run / "workspace" / "r4-module"
 
     @property
+    def callchain(self) -> Path:
+        """CC 调用链产物目录：模块级调用关系数据库。"""
+        return self.run / "workspace" / "callchain"
+
+    @property
     def sessions(self) -> Path:
         """所有阶段的 pi session 文件目录。"""
         return self.run / "sessions"
@@ -114,6 +119,10 @@ class PipelineDirs:
     def r4_entries_path(self) -> Path:
         """R4 模块级最终入口文件：{r4}/entries.json"""
         return self.r4 / "entries.json"
+
+    def callchain_db_path(self) -> Path:
+        """CC 调用链 SQLite 数据库：{callchain}/callchain.db"""
+        return self.callchain / "callchain.db"
 
     # ─── Feedback 文件路径 ────────────────────────────────────────────────────
 
@@ -179,7 +188,7 @@ class PipelineDirs:
 
     def setup(self) -> None:
         """预创建所有必要目录。"""
-        for d in (self.source, self.r1, self.r3, self.r4, self.sessions):
+        for d in (self.source, self.r1, self.r3, self.r4, self.callchain, self.sessions):
             d.mkdir(parents=True, exist_ok=True)
 
     # ─── 工厂方法 ─────────────────────────────────────────────────────────────
