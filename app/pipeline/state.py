@@ -189,6 +189,10 @@ class PipelineState:
     r4_attempts: int = 0
     r4_feedback: str = ""
 
+    # CC：调用链静态分析（R3 完成后、R4 之前）
+    cc_state:    NodeState = NodeState.PENDING
+    cc_attempts: int = 0
+
     # 文件级状态（file_hash → FileState）
     files: dict[str, FileState] = field(default_factory=dict)
 
@@ -210,6 +214,8 @@ class PipelineState:
             'r4_state':    self.r4_state.value,
             'r4_attempts': self.r4_attempts,
             'r4_feedback': self.r4_feedback,
+            'cc_state':    self.cc_state.value,
+            'cc_attempts': self.cc_attempts,
             'updated_at':  self.updated_at,
             'files': {fh: fs.to_dict() for fh, fs in self.files.items()},
         }
@@ -228,6 +234,9 @@ class PipelineState:
     def from_dict(cls, data: dict) -> "PipelineState":
         files_raw = data.pop('files', {})
         data['r4_state'] = NodeState(data.get('r4_state', 'pending'))
+        # cc_state 向前兼容：旧状态文件没有此字段时默认 pending
+        data['cc_state'] = NodeState(data.get('cc_state', 'pending'))
+        data.setdefault('cc_attempts', 0)
         obj = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         obj.files = {
             fh: FileState.from_dict(fd) for fh, fd in files_raw.items()

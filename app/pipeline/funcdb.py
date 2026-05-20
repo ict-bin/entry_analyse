@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS functions (
     analysis           TEXT DEFAULT NULL,
     has_external_input INTEGER DEFAULT NULL,
     entry_role         TEXT DEFAULT '',
+    entry_confidence   REAL DEFAULT NULL,
     updated_at         REAL,
     FOREIGN KEY (file_hash) REFERENCES file_meta(file_hash)
 );
@@ -101,6 +102,10 @@ class FunctionDB:
             # 向前兼容迁移：老 DB 可能没有 entry_role 列
             try:
                 conn.execute("ALTER TABLE functions ADD COLUMN entry_role TEXT DEFAULT ''")
+            except Exception:
+                pass  # 列已存在，忽略
+            try:
+                conn.execute("ALTER TABLE functions ADD COLUMN entry_confidence REAL DEFAULT NULL")
             except Exception:
                 pass  # 列已存在，忽略
 
@@ -193,13 +198,29 @@ class FunctionDB:
         from ..functions_list import VALID_ENTRY_ROLES
         role = str(analysis_dict.get("entry_role") or "").strip()
         entry_role = role if role in VALID_ENTRY_ROLES else ""
+        # 计算初始置信度（不依赖 callchain，将在 CC 阶段完成后更新）
+        from .confidence import compute_confidence
+        confidence = compute_confidence(analysis_dict)
         analysis_json = json.dumps(analysis_dict, ensure_ascii=False)
         with self._get_conn() as conn:
             conn.execute(
                 """UPDATE functions
-                   SET analysis = ?, has_external_input = ?, entry_role = ?, updated_at = ?
+                   SET analysis = ?, has_external_input = ?, entry_role = ?,
+                       entry_confidence = ?, updated_at = ?
                    WHERE func_hash = ?""",
-                (analysis_json, has_input, entry_role, time.time(), func_hash),
+                (analysis_json, has_input, entry_role, confidence, time.time(), func_hash),
+            )
+
+    def update_confidence(self, func_hash: str, confidence: float) -> None:
+        """
+        用 callchain 信息重新计算并更新置信度分数。
+
+        一般在 CC 阶段完成后调用，是对 set_analysis 初始分数的修正。
+        """
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE functions SET entry_confidence=?, updated_at=? WHERE func_hash=?",
+                (round(float(confidence), 4), time.time(), func_hash),
             )
 
     def sync_from_json(self, data: dict) -> None:
@@ -333,7 +354,7 @@ class FunctionDB:
         with self._get_conn() as conn:
             rows = conn.execute(
                 """SELECT func_hash, name, signature,
-                          start_line, end_line, body_lines, entry_role, analysis
+                          start_line, end_line, body_lines, entry_role, entry_confidence, analysis
                    FROM functions
                    WHERE has_external_input = 1
                    ORDER BY start_line"""

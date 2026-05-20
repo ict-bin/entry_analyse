@@ -958,7 +958,12 @@ class TaskService:
                 result_file_path = next(iter(sorted(output_root.glob("*.md"))), None)
 
         functions_list_path = output_root / "functions.list" if output_root else None
-        run_report_path = run_root / "report.md" if run_root else None
+        # 优先读新格式的 final_report.md（如果存在），否则实验性地定位 run/report.md
+        _final_report = output_root / "final_report.md" if output_root else None
+        run_report_path = (
+            _final_report if (_final_report and _final_report.is_file())
+            else (run_root / "report.md" if run_root else None)
+        )
         run_result_path = run_root / "result.json" if run_root else None
 
         result_markdown: str | None = None
@@ -1003,11 +1008,13 @@ class TaskService:
             "result_file_path": str(result_file_path) if result_file_path else None,
             "functions_list_path": str(functions_list_path) if functions_list_path else None,
             "run_report_path": str(run_report_path) if run_report_path else None,
+            "final_report_path": str(_final_report) if (_final_report and _final_report.is_file()) else None,
             "run_result_path": str(run_result_path) if run_result_path else None,
             "result_markdown": result_markdown,
             "functions_list_markdown": functions_list_markdown,
             "functions": functions_list,
             "run_report_markdown": run_report_markdown,
+            "final_report_markdown": run_report_markdown if (_final_report and _final_report.is_file()) else None,
             "result_json": run_result_json,
             "summary": {
                 "module_name": row.module_name,

@@ -57,6 +57,8 @@ class TaskResultResponse(BaseModel):
     functions_list_path: Optional[str] = None
     run_report_path: Optional[str] = None
     run_result_path: Optional[str] = None
+    final_report_path: Optional[str] = None
+    final_report_markdown: Optional[str] = None
     result_markdown: Optional[str] = None
     functions_list_markdown: Optional[str] = None
     functions: list[str] = Field(default_factory=list)

@@ -9,12 +9,13 @@ functions.list 固定输出格式（JSON 数组，不可变更）
 
     [
       {
-        "tag":        "P",                         // 必须: "P"=被动回调 | "A"=主动拉取
-        "file":       "announce_begin_server.cpp", // 必须: 源文件名，非空字符串
-        "line":       45,                          // 必须: 整数行号（未知时为 0）
-        "function":   "HandleRequest()",           // 必须: 完整函数签名，非空字符串
-        "taints":     ["aMessage", "aMessageInfo"] // 必须: 外部可控参数，非空数组
-        "entry_role": "boundary"                  // 可选: 入口在模块中的角色（见下）
+        "tag":              "P",                         // 必须: "P"=被动回调 | "A"=主动拉取
+        "file":             "announce_begin_server.cpp", // 必须: 源文件名，非空字符串
+        "line":             45,                          // 必须: 整数行号（未知时为 0）
+        "function":         "HandleRequest()",           // 必须: 完整函数签名，非空字符串
+        "taints":           ["aMessage", "aMessageInfo"] // 必须: 外部可控参数，非空数组
+        "entry_role":       "boundary",                 // 可选: 入口在模块中的角色（见下）
+        "entry_confidence": 0.87                        // 可选: 入口置信度（0.0-1.0，越高越可信）
       },
       ...
     ]
@@ -330,6 +331,12 @@ def generate_functions_list(entry_json: str) -> str:
             }
             if entry_role:
                 flat["entry_role"] = entry_role
+            entry_confidence = item.get("entry_confidence")
+            if entry_confidence is not None:
+                try:
+                    flat["entry_confidence"] = round(float(entry_confidence), 2)
+                except (TypeError, ValueError):
+                    pass
             result.append(flat)
 
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -439,6 +446,20 @@ def validate_functions_list(items: list) -> list[str]:
                     f"必须是 {sorted(VALID_ENTRY_ROLES)} 之一"
                 )
 
+        # entry_confidence（可选，若存在则必须是 0.0-1.0 之间的浮点数）
+        entry_confidence = item.get("entry_confidence")
+        if entry_confidence is not None:
+            try:
+                v = float(entry_confidence)
+                if not (0.0 <= v <= 1.0):
+                    errors.append(
+                        f"{prefix} entry_confidence={entry_confidence!r} 超出范围 [0.0, 1.0]"
+                    )
+            except (TypeError, ValueError):
+                errors.append(
+                    f"{prefix} entry_confidence={entry_confidence!r} 不是有效浮点数"
+                )
+
         function_description = item.get("function_description")
         if not isinstance(function_description, str) or not function_description.strip():
             errors.append(f"{prefix} function_description 为空或非字符串: {function_description!r}")
@@ -534,7 +555,16 @@ def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
                 item["entry_role"] = "boundary"
             else:
                 item["entry_role"] = raw_role
-        # 如果字典中根本没有 entry_role字段，不填充默认值（向后兼容）
+        # entry_confidence：透传并浏诈范围，非法时修复为 None
+        raw_conf = item.get("entry_confidence")
+        if raw_conf is not None:
+            try:
+                v = float(raw_conf)
+                item["entry_confidence"] = round(max(0.0, min(1.0, v)), 2)
+            except (TypeError, ValueError):
+                log.append(f"{prefix} entry_confidence={raw_conf!r} 非法，设置为 None")
+                item.pop("entry_confidence", None)
+        # 如果字典中根本没有 entry_role/confidence 字段，不填充默认值（向后兼容）
         raw_function_description = str(item.get("function_description") or "").strip()
         raw_entry_reason = str(item.get("entry_reason") or "").strip()
         item["function_description"] = raw_function_description or _default_function_description(str(item.get("function") or ""))

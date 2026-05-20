@@ -215,6 +215,9 @@ class PipelineEngine:
         if self._cancel.is_set():
             return []
 
+        # CC：R3 全部完成后、R4 之前，进行静态调用链分析（无 LLM）
+        await self._run_callchain_analysis(dirs, state, module_files, file_hash_paths)
+
         # R4：全部文件完成 R3 后执行模块级分析
         return await self._run_r4_pipeline(dirs, state)
 
@@ -791,6 +794,116 @@ class PipelineEngine:
 
     # ── R4 ─────────────────────────────────────────────────────────────────────
 
+    # ── CC（调用链静态分析）─────────────────────────────────────────────────────────────
+
+    async def _run_callchain_analysis(
+        self,
+        dirs: PipelineDirs,
+        state: PipelineState,
+        module_files: list[str],
+        file_hash_paths: list[tuple[str, str]],
+    ) -> None:
+        """
+        CC 阶段：静态提取模块内调用关系，构建调用链 DB。
+
+        无 LLM 调用，纯 Python，预计耗时 < 10s。
+        失败不阻塞主流程（R4 仍可正常运行，只是缺少 callchain 辅助信息）。
+        """
+        if state.cc_state == NodeState.PASSED:
+            logger.debug("CC already done, skipping")
+            return
+
+        state.cc_state = NodeState.RUNNING
+        state.cc_attempts += 1
+        state.save(dirs.state_file)
+
+        try:
+            from .callchain_extractor import collect_known_funcs_from_dbs, extract_call_edges
+            from .callchain_db import CallchainDB
+            from .funcdb import FunctionDB
+            from .confidence import compute_confidence
+
+            # 收集全量已知函数信息
+            known_funcs, file_hash_map = collect_known_funcs_from_dbs(
+                file_hash_paths, dirs.r1
+            )
+
+            # 提取调用边
+            edges = extract_call_edges(module_files, known_funcs, file_hash_map)
+
+            # 收集 R3 保留的候选入口
+            r3_entry_hashes: list[str] = []
+            for r3_file in sorted(dirs.r3.glob("*.json")):
+                try:
+                    entries = json.loads(r3_file.read_text(encoding="utf-8"))
+                    for e in (entries if isinstance(entries, list) else []):
+                        fh = e.get("func_hash")
+                        if fh:
+                            r3_entry_hashes.append(fh)
+                except Exception:
+                    pass
+
+            # 构建 callchain.db
+            cc_db = CallchainDB.open(dirs.callchain)
+            nodes_list = [
+                {
+                    "func_hash":   fh,
+                    "name":        info.get("name", ""),
+                    "signature":   info.get("signature", ""),
+                    "file_hash":   info.get("file_hash", ""),
+                    "start_line":  info.get("start_line", 0),
+                    "is_r3_entry": 1 if fh in r3_entry_hashes else 0,
+                    "entry_role":  info.get("entry_role", ""),
+                }
+                for fh, info in known_funcs.items()
+            ]
+            cc_db.insert_nodes(nodes_list)
+            cc_db.insert_edges(edges)
+            cc_db.mark_r3_entries(r3_entry_hashes)
+            cc_db.build_closure(max_depth=10)
+            cc_db.build_entry_trees(r3_entry_hashes, max_depth=10)
+
+            # 用 callchain 信息更新函数置信度
+            for fh in r3_entry_hashes:
+                try:
+                    role_info = cc_db.get_callchain_role(fh)
+                    node = cc_db.get_node(fh)
+                    if node is None:
+                        continue
+                    file_hash = node.get("file_hash", "")
+                    if not file_hash:
+                        continue
+                    func_db = FunctionDB.open(dirs.r1, file_hash)
+                    func_info = func_db.get_function(fh)
+                    if not func_info or not func_info.get("analysis"):
+                        continue
+                    new_conf = compute_confidence(
+                        analysis=func_info["analysis"],
+                        callchain_role=role_info,
+                    )
+                    func_db.update_confidence(fh, new_conf)
+                    cc_db.update_entry_confidence(fh, new_conf)
+                except Exception as exc:
+                    logger.debug("confidence update failed for %s: %s", fh, exc)
+
+            cc_db.mark_build_done()
+            cc_stats = cc_db.stats()
+
+            state.cc_state = NodeState.PASSED
+            state.save(dirs.state_file)
+            self._emit("callchain_done",
+                       nodes=cc_stats["nodes"],
+                       edges=cc_stats["edges"],
+                       r3_entries=len(r3_entry_hashes))
+            logger.info("CC done: %d nodes, %d edges, %d R3 entries",
+                        cc_stats["nodes"], cc_stats["edges"], len(r3_entry_hashes))
+
+        except Exception as exc:
+            logger.warning("CC analysis failed (non-fatal): %s", exc)
+            state.cc_state = NodeState.FAILED
+            state.save(dirs.state_file)
+
+
     async def _run_r4_pipeline(
         self,
         dirs: PipelineDirs,
@@ -825,6 +938,7 @@ class PipelineEngine:
                     r3_entries_files=r3_files,
                     r4_out_path=dirs.r4_entries_path(),
                     module_name=self.cfg.module_name,
+                    callchain_db=dirs.callchain_db_path() if dirs.callchain_db_path().exists() else None,
                     is_retry=is_retry,
                     feedback=state.r4_feedback if is_retry else "",
                 )

@@ -78,10 +78,13 @@ def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
             "end_line":             e.get("end_line") or 0,
             "body_lines":           e.get("body_lines") or 0,
         }
-        # entry_role：从 analysis 或顶层透传（若存在）
+        # entry_confidence：从 analysis 或顶层透传（若存在）
         entry_role = a.get("entry_role") or e.get("entry_role") or ""
         if entry_role:
             flat["entry_role"] = entry_role
+        entry_confidence = a.get("entry_confidence") or e.get("entry_confidence")
+        if entry_confidence is not None:
+            flat["entry_confidence"] = round(float(entry_confidence), 2)
         result.append(flat)
     return result
 from .models import (
@@ -301,6 +304,24 @@ class Orchestrator:
         Path(entry_details_path).write_text(
             json.dumps(_fl, ensure_ascii=False, indent=2),
             encoding="utf-8")
+
+        # final_report.md — 人类可读的 Markdown 报告
+        try:
+            from .pipeline.report_generator import generate_report as _gen_report
+            _stats = {
+                "module_name":       cfg.module_name,
+                "file_count":        len(resolved_files) if resolved_files else 0,
+                "total_duration_ms": result.total_duration_ms,
+                "total_tokens":      result.total_tokens.model_dump()
+                                     if hasattr(result, "total_tokens") and result.total_tokens
+                                     else {},
+            }
+            _report_md = _gen_report(_fl, cfg.module_name, _stats)
+            (out_dir / "final_report.md").write_text(_report_md, encoding="utf-8")
+        except Exception as _rep_exc:
+            import logging as _log
+            _log.getLogger("ea.orchestrator").warning(
+                "final_report.md generation failed: %s", _rep_exc)
 
         # flag：成功写 1
         if result.status == TaskStatus.PASSED:

@@ -458,6 +458,7 @@ def build_r4_w_prompt(
     r3_entries_files: list[Path],
     r4_out_path: Path,
     module_name: str,
+    callchain_db: "Path | None" = None,
     is_retry: bool = False,
     feedback: str = "",
 ) -> str:
@@ -467,12 +468,27 @@ def build_r4_w_prompt(
     else:
         file_list = "  (no R3 results)"
     retry = _retry_section(feedback) if is_retry else ""
+    # callchain 辅助块（仅当 DB 存在时展示）
+    cc_section = ""
+    if callchain_db is not None:
+        cc_section = (
+            f"## 调用链辅助分析（callchain.db 已就绪）\n\n"
+            f"对于每个 R3 候选入口，可用以下命令查询其调用链角色：\n"
+            f"```bash\n"
+            f"python3 /opt/entry_analyse/scripts/ea_db.py callchain-role {callchain_db} <func_hash>\n"
+            f"```\n\n"
+            f"根据输出的 `recommendation` 字段决定是否保留：\n"
+            f"- `保留（dispatch_target）` → 污点追踪推荐起点，**保留**\n"
+            f"- `保留（boundary）` → 没有模块内调用者，**保留**\n"
+            f"- `建议考虑删除` → 被多个内部函数调用，需配合代码确认后再决定\n\n"
+        )
     return (
         f"# R4 Worker — 模块级外部入口汇总\n\n"
         f"模块：`{module_name}`\n"
         f"{retry}\n"
+        f"{cc_section}"
         f"## R3 各文件入口结果（完整路径，可直接 read）\n\n"
-        f"{file_list if file_list else '  （无 R3 结果）'}\n\n"
+        f"{file_list if file_list else '（无 R3 结果）'}\n\n"
         f"## 步骤\n\n"
         f"1. 使用 `read` 工具读取以上所有 R3 结果文件\n"
         f"2. 分析跨文件调用关系：\n"
@@ -480,8 +496,9 @@ def build_r4_w_prompt(
         f"且 funcY 接收的外部数据来自 funcX 传入的参数\n"
         f"     → funcY 不是模块级最外层入口，**删除 funcY**，保留 funcX\n"
         f"   - 若 funcY 直接调用 recv() 或直接被模块外部框架回调 → 独立入口，**保留**\n"
+        f"   - **dispatch_target 不要因存在上层 dispatcher 就删除**（它们是污点追踪推荐起点）\n"
         f"3. 使用 `write` 工具将最终入口列表写出到：`{r4_out_path}`\n"
-        f"   格式：JSON 数组，每项与 R3 输出格式一致。\n\n"
+        f"   格式：JSON 数组，每项与 R3 输出格式一致（保留 entry_role 字段）。\n\n"
         f"完成后用 `<result>` 包裹摘要：各文件入口总数 → 模块级最终入口数，跨文件删除了哪些。\n"
     )
 
