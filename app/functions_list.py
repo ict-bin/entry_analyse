@@ -9,11 +9,12 @@ functions.list 固定输出格式（JSON 数组，不可变更）
 
     [
       {
-        "tag":      "P",                         // 必须: "P"=被动回调 | "A"=主动拉取
-        "file":     "announce_begin_server.cpp", // 必须: 源文件名，非空字符串
-        "line":     45,                          // 必须: 整数行号（未知时为 0）
-        "function": "HandleRequest()",           // 必须: 完整函数签名，非空字符串
-        "taints":   ["aMessage", "aMessageInfo"] // 必须: 外部可控参数，非空数组
+        "tag":        "P",                         // 必须: "P"=被动回调 | "A"=主动拉取
+        "file":       "announce_begin_server.cpp", // 必须: 源文件名，非空字符串
+        "line":       45,                          // 必须: 整数行号（未知时为 0）
+        "function":   "HandleRequest()",           // 必须: 完整函数签名，非空字符串
+        "taints":     ["aMessage", "aMessageInfo"] // 必须: 外部可控参数，非空数组
+        "entry_role": "boundary"                  // 可选: 入口在模块中的角色（见下）
       },
       ...
     ]
@@ -25,6 +26,15 @@ functions.list 固定输出格式（JSON 数组，不可变更）
   - line     : 函数定义行号，整数
   - function : 函数名（含参数类型），完整签名
   - taints   : 外部可控污点参数列表，至少 1 个元素
+  - entry_role（可选）:
+               "boundary"        模块边界入口，直接从模块外接收原始数据
+                                 （网络包/消息队列/IPC等），无本模块上层函数作为其数据流入口
+               "dispatch_target" 分发目标入口，被上层 dispatcher（switch-case/函数指针表）
+                                 按消息类型/操作码分发，直接处理特定类型的外部数据；
+                                 **推荐作为污点追踪起点**（避免从 dispatcher 追踪造成分支爆炸）
+               "callback"        框架注册回调，被外部框架（HA/Timer等）直接回调，
+                                 接收框架传入的状态/消息数据
+               "ipc_handler"     IPC 消息处理器，处理进程间通信消息（消息队列/pipe/socket）
   - function_description : 可选，函数职责说明
   - entry_reason         : 可选，为什么判定为入口
   - taint_details        : 可选，逐 taint 说明列表
@@ -42,6 +52,14 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+# entry_role 合法取值集合
+VALID_ENTRY_ROLES: frozenset[str] = frozenset({
+    "boundary",        # 模块边界入口，直接从模块外接收原始数据
+    "dispatch_target", # 分发目标入口，被 dispatcher 按类型分发，直接处理特定类型外部数据
+    "callback",        # 框架注册回调，被外部框架直接回调
+    "ipc_handler",     # IPC 消息处理器，处理进程间通信消息
+})
 
 
 def _default_function_description(function_name: str) -> str:
@@ -286,7 +304,8 @@ def generate_functions_list(entry_json: str) -> str:
                 "A" if any(isinstance(t, str) and "@" in t for t in taints) else "P"
             )
             line = item.get("line", 0)
-            result.append({
+            entry_role = str(item.get("entry_role") or "").strip()
+            flat: dict = {
                 "tag": tag,
                 "file": item.get("file", ""),
                 "line": line if isinstance(line, int) else 0,
@@ -308,7 +327,10 @@ def generate_functions_list(entry_json: str) -> str:
                 ),
                 "is_definition_found": bool(item.get("is_definition_found", True)),
                 "signature_params": item.get("signature_params") if isinstance(item.get("signature_params"), list) else [],
-            })
+            }
+            if entry_role:
+                flat["entry_role"] = entry_role
+            result.append(flat)
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -408,6 +430,15 @@ def validate_functions_list(items: list) -> list[str]:
                     f"@return，不能含空格/中文/带参括号）: {json.dumps(bad, ensure_ascii=False)}"
                 )
 
+        # entry_role（可选，若存在则必须是合法值）
+        entry_role = item.get("entry_role")
+        if entry_role is not None:
+            if str(entry_role) not in VALID_ENTRY_ROLES:
+                errors.append(
+                    f"{prefix} entry_role={entry_role!r} 不合法，"
+                    f"必须是 {sorted(VALID_ENTRY_ROLES)} 之一"
+                )
+
         function_description = item.get("function_description")
         if not isinstance(function_description, str) or not function_description.strip():
             errors.append(f"{prefix} function_description 为空或非字符串: {function_description!r}")
@@ -495,6 +526,15 @@ def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
             log.append(f"{prefix} 过滤后 taints 为空，跳过条目 function={fn!r}")
             continue
         item["taints"] = good
+        # entry_role：透传并校验，非法值修复为 "boundary"
+        raw_role = str(item.get("entry_role") or "").strip()
+        if raw_role:
+            if raw_role not in VALID_ENTRY_ROLES:
+                log.append(f"{prefix} entry_role={raw_role!r} 非法，修复为 'boundary'")
+                item["entry_role"] = "boundary"
+            else:
+                item["entry_role"] = raw_role
+        # 如果字典中根本没有 entry_role字段，不填充默认值（向后兼容）
         raw_function_description = str(item.get("function_description") or "").strip()
         raw_entry_reason = str(item.get("entry_reason") or "").strip()
         item["function_description"] = raw_function_description or _default_function_description(str(item.get("function") or ""))

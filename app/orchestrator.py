@@ -34,6 +34,56 @@ from pathlib import Path
 from typing import Callable
 
 from .functions_list import auto_fix_functions_list, validate_functions_list
+
+
+# ─── 格式转换 ─────────────────────────────────────────────────────────────────
+
+def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
+    """
+    将 R4 engine 输出的嵌套 analysis 格式转为 functions.list 平铺格式。
+
+    R3/R4 中间格式（嵌套）：
+        {func_hash, name, signature, start_line, end_line, body_lines,
+         analysis: {tag, taints, entry_role, entry_reason, ...}}
+
+    functions.list 平铺格式：
+        {tag, file, line, function, taints, entry_role,
+         function_description, entry_reason, taint_details, ...}
+
+    两种格式均兼容：若顶层已有 tag in ('P','A') 则直接透传。
+    """
+    result = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        # 已是平铺格式（顶层有合法 tag）
+        if e.get("tag") in ("P", "A"):
+            result.append(e)
+            continue
+        # 嵌套格式：从 analysis 子字典提取
+        a = e.get("analysis") or {}
+        flat: dict = {
+            "tag":                  a.get("tag") or "P",
+            "file":                 e.get("file") or "",
+            "line":                 e.get("start_line") or 0,
+            "function":             e.get("name") or "",
+            "taints":               a.get("taints") or [],
+            "function_description": a.get("function_description") or "",
+            "entry_reason":         a.get("entry_reason") or "",
+            "taint_details":        a.get("taint_details") or [],
+            # 保留原始字段供下游扩展（不影响 auto_fix）
+            "func_hash":            e.get("func_hash") or "",
+            "signature":            e.get("signature") or "",
+            "start_line":           e.get("start_line") or 0,
+            "end_line":             e.get("end_line") or 0,
+            "body_lines":           e.get("body_lines") or 0,
+        }
+        # entry_role：从 analysis 或顶层透传（若存在）
+        entry_role = a.get("entry_role") or e.get("entry_role") or ""
+        if entry_role:
+            flat["entry_role"] = entry_role
+        result.append(flat)
+    return result
 from .models import (
     SwarmEvent,
     TaskConfig,
@@ -226,7 +276,7 @@ class Orchestrator:
 
         # functions.list：pipeline 产出的 entries 已是正确格式
         func_list_path = str(out_dir / "functions.list")
-        _fl: list[dict] = entries if isinstance(entries, list) else []
+        _fl: list[dict] = _flatten_r4_entries(entries) if isinstance(entries, list) else []
 
         if _fl:
             _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl)

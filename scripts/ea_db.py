@@ -157,7 +157,7 @@ def cmd_list_entries(db_path: Path) -> None:
     with _get_conn(db_path) as conn:
         rows = conn.execute(
             """SELECT func_hash, name, signature,
-                      start_line, end_line, body_lines, analysis
+                      start_line, end_line, body_lines, entry_role, analysis
                FROM functions
                WHERE has_external_input = 1
                ORDER BY start_line"""
@@ -167,6 +167,12 @@ def cmd_list_entries(db_path: Path) -> None:
     for r in rows:
         d = dict(r)
         d["analysis"] = _parse_analysis(d.get("analysis"))
+        # entry_role 写入 analysis 中（方便 Agent 看到角色信息）
+        role = d.pop("entry_role", "") or ""
+        if role and isinstance(d["analysis"], dict):
+            d["analysis"].setdefault("entry_role", role)
+        elif role:
+            d["entry_role"] = role
         result.append(d)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -186,12 +192,15 @@ def cmd_set_analysis(db_path: Path, func_hash: str, analysis_json: str) -> None:
         _die(f"Invalid JSON: {e}")
 
     has_input = 1 if analysis.get("has_external_input") else 0
+    valid_roles = {"boundary", "dispatch_target", "callback", "ipc_handler"}
+    role = str(analysis.get("entry_role") or "").strip()
+    entry_role = role if role in valid_roles else ""
     with _get_conn(db_path) as conn:
         cur = conn.execute(
             """UPDATE functions
-               SET analysis = ?, has_external_input = ?, updated_at = ?
+               SET analysis = ?, has_external_input = ?, entry_role = ?, updated_at = ?
                WHERE func_hash = ?""",
-            (analysis_json, has_input, time.time(), func_hash),
+            (analysis_json, has_input, entry_role, time.time(), func_hash),
         )
         if cur.rowcount == 0:
             _die(f"func_hash '{func_hash}' not found")

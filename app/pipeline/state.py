@@ -66,6 +66,10 @@ class FunctionState:
     r2_j_feedback_path:    str = ""   # 详细反馈文件路径（供 retry 时 Agent read）
     r2_j_feedback_summary: str = ""   # 摘要（≤60字，嵌入 retry prompt 标题）
 
+    # R2-W 得出的入口角色（boundary/dispatch_target/callback/ipc_handler）
+    # None = 尚未分析；"" = 已分析但没有外部输入
+    entry_role: str = ""
+
     # 时间戳（秒级 unix，仅供调试）
     updated_at: float = field(default_factory=time.time)
 
@@ -82,6 +86,8 @@ class FunctionState:
         data['r1_j_state'] = NodeState(data.get('r1_j_state', 'pending'))
         data['r2_w_state'] = NodeState(data.get('r2_w_state', 'pending'))
         data['r2_j_state'] = NodeState(data.get('r2_j_state', 'pending'))
+        # entry_role 字段向前兼容：旧状态文件中没有此字段时保持空字符串
+        data.setdefault('entry_role', '')
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 

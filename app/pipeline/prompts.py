@@ -187,31 +187,30 @@ def build_r2_w_prompt(
         f"   <result>\n"
         f"   {{\n"
         f'     "has_external_input": true,\n'
-
         f'     "tag": "P",\n'
-
+        f'     "entry_role": "boundary",\n'
         f'     "taints": ["参数名"],\n'
-
         f'     "entry_source_lines": [{{"line": 42, "code": "  实际代码行"}}],\n'
-
         f'     "function_description": "函数职责描述",\n'
-
         f'     "entry_reason": "为什么是外部入口",\n'
-
         f'     "taint_details": [{{"name": "参数名", "description": "承载的外部数据语义"}}],\n'
-
         f'     "justification": "判断依据"\n'
-
         f"   }}\n"
         f"   </result>\n"
         f"   ```\n\n"
         f'   `tag` 取值：`"P"`（被动）或 `"A"`（主动）\n\n'
-
+        f"   `entry_role` 判断入口在模块中的角色：\n"
+        f"   | 值 | 适用场景 |\n"
+        f"   |---|---|\n"
+        f"   | `boundary` | 模块边界入口，直接从模块外接收原始数据 |\n"
+        f"   | `dispatch_target` | 被 dispatcher 按类型分发，直接处理特定类型外部数据；**推荐作为污点追踪起点** |\n"
+        f"   | `callback` | 被外部框架（HA/Timer等）直接回调 |\n"
+        f"   | `ipc_handler` | 处理进程间通信消息 |\n\n"
+        f"   如不确定则填 `boundary`（保守默认）\n\n"
         f"   **无外部输入时**：\n"
         f"   ```\n"
         f"   <result>\n"
         f'   {{"has_external_input": false}}\n'
-
         f"   </result>\n"
         f"   ```\n"
     )

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS functions (
     body_lines         INTEGER DEFAULT 0,
     analysis           TEXT DEFAULT NULL,
     has_external_input INTEGER DEFAULT NULL,
+    entry_role         TEXT DEFAULT '',
     updated_at         REAL,
     FOREIGN KEY (file_hash) REFERENCES file_meta(file_hash)
 );
@@ -97,6 +98,11 @@ class FunctionDB:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._get_conn() as conn:
             conn.executescript(_SCHEMA)
+            # 向前兼容迁移：老 DB 可能没有 entry_role 列
+            try:
+                conn.execute("ALTER TABLE functions ADD COLUMN entry_role TEXT DEFAULT ''")
+            except Exception:
+                pass  # 列已存在，忽略
 
     # ── 写方法 ─────────────────────────────────────────────────────────────────
 
@@ -174,7 +180,7 @@ class FunctionDB:
 
     def set_analysis(self, func_hash: str, analysis_dict: dict) -> None:
         """
-        写入 R2-W 分析结果。
+        写入 R2-W 分析结果，同时更新 entry_role 字段。
 
         SQLite WAL 原子写，无需外部 asyncio.Lock。
         多个 R2-W 协程可安全并发调用。
@@ -184,13 +190,16 @@ class FunctionDB:
             analysis_dict: R2-W 输出的分析 dict（含 has_external_input 字段）
         """
         has_input = 1 if analysis_dict.get("has_external_input") else 0
+        from ..functions_list import VALID_ENTRY_ROLES
+        role = str(analysis_dict.get("entry_role") or "").strip()
+        entry_role = role if role in VALID_ENTRY_ROLES else ""
         analysis_json = json.dumps(analysis_dict, ensure_ascii=False)
         with self._get_conn() as conn:
             conn.execute(
                 """UPDATE functions
-                   SET analysis = ?, has_external_input = ?, updated_at = ?
+                   SET analysis = ?, has_external_input = ?, entry_role = ?, updated_at = ?
                    WHERE func_hash = ?""",
-                (analysis_json, has_input, time.time(), func_hash),
+                (analysis_json, has_input, entry_role, time.time(), func_hash),
             )
 
     def sync_from_json(self, data: dict) -> None:
@@ -313,18 +322,18 @@ class FunctionDB:
 
     def get_entries(self) -> list[dict]:
         """
-        查询 has_external_input=1 的函数（含 analysis，不含 body）。
+        查询 has_external_input=1 的函数（含 analysis 和 entry_role，不含 body）。
 
         供 R2-J/R3-W/R3-J/R4-W Agent 获取已确认外部入口列表。
 
         Returns:
             按 start_line 升序的 list，每项含
-            func_hash/name/signature/start_line/end_line/body_lines/analysis（dict）。
+            func_hash/name/signature/start_line/end_line/body_lines/entry_role/analysis（dict）。
         """
         with self._get_conn() as conn:
             rows = conn.execute(
                 """SELECT func_hash, name, signature,
-                          start_line, end_line, body_lines, analysis
+                          start_line, end_line, body_lines, entry_role, analysis
                    FROM functions
                    WHERE has_external_input = 1
                    ORDER BY start_line"""

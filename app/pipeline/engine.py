@@ -527,6 +527,11 @@ class PipelineEngine:
                     has_input = bool(analysis.get("has_external_input", True))
                     func_state.has_external_input = has_input
                     if has_input:
+                        # 写入 entry_role 到 FunctionState
+                        from ..functions_list import VALID_ENTRY_ROLES
+                        role = str(analysis.get("entry_role") or "").strip()
+                        if role in VALID_ENTRY_ROLES:
+                            func_state.entry_role = role
                         # SQLite WAL 天然并发安全，无需 asyncio.Lock
                         from .funcdb import FunctionDB
                         FunctionDB.open(dirs.r1, file_hash).set_analysis(
@@ -540,7 +545,8 @@ class PipelineEngine:
                 state.save(dirs.state_file)
                 self._emit("r2_w_done",
                            func_hash=func_hash, function=func_state.name,
-                           has_external_input=func_state.has_external_input)
+                           has_external_input=func_state.has_external_input,
+                           entry_role=func_state.entry_role or None)
                 break
 
             except Exception as exc:
