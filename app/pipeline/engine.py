@@ -631,23 +631,25 @@ class PipelineEngine:
     # ── R3 ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    @staticmethod
     def _r3_pre_filter(funcs_with_input: dict) -> tuple:
         """
         规则预过滤：快速排除明确非入口函数（名字匹配）。
-        返回 (keep_hashes, excluded_hashes)。白名单优先，黑名单次之。
+        返回 (keep_hashes, excluded_hashes)。
+        静默运行：不将排除列表传给 Agent，仅在 engine 侧生效。
         """
         import re
         KEEP_ALWAYS = [
-            r'HandleInput', r'HandleOutput', r'ProcMsg', r'MsgProc',
-            r'ProcPipe', r'RecvMsg', r'OnMsg[A-Z]', r'ProcData',
+            r"HandleInput", r"HandleOutput", r"ProcMsg", r"MsgProc",
+            r"ProcPipe", r"RecvMsg", r"OnMsg[A-Z]", r"ProcData",
         ]
         EXCLUDE = [
-            r'_Fill[A-Z]',
-            r'(?i)Display|_Disp[A-Z]',
-            r'AesCbc|Des[13]_|Sha[12]_|Md5_',
-            r'_PrepareContext$',
-            r'Subscribe|UnSubscribe',
-            r'TimerCreate$|TimerDelete$',
+            r"_Fill[A-Z]",
+            r"(?i)Display|_Disp[A-Z]",
+            r"AesCbc|Des[13]_|Sha[12]_|Md5_",
+            r"_PrepareContext$",
+            r"Subscribe|UnSubscribe",
+            r"TimerCreate$|TimerDelete$",
         ]
         keep, excluded = [], []
         for fh, fs_func in funcs_with_input.items():
@@ -667,132 +669,220 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R3 Worker + Judge：文件级入口过滤（session 共享，J 每次新建）。
-        R3 只在 R2 结果基础上过滤，不触发任何 R2 重跑。"""
+        """R3 v4: 函数级并行，pre-filter静默，再跑文件级J。"""
         fs = state.files[file_hash]
         max_rounds = int(getattr(self.cfg, "r3_max_rounds", 3))
-        session_file = str(dirs.r3_w_session(file_hash))
 
-        # 规则预过滤（一次性，不随重试重复计算）
         funcs_with_input = {
             fh: func_st
             for fh, func_st in fs.functions.items()
             if func_st.has_external_input is True
         }
-        _keep, _excluded = self._r3_pre_filter(funcs_with_input)
-        pre_filtered_names = [
-            funcs_with_input[fh].name
-            for fh in _excluded
-            if fh in funcs_with_input
-        ]
+        _keep_hashes, _excluded_hashes = self._r3_pre_filter(funcs_with_input)
         logger.info(
             "R3 pre-filter [%s]: %d candidates, %d rule-excluded, %d to LLM",
-            Path(file_path).name, len(funcs_with_input), len(_excluded), len(_keep)
+            Path(file_path).name, len(funcs_with_input),
+            len(_excluded_hashes), len(_keep_hashes)
         )
 
-        while not self._cancel.is_set():
-            if fs.r3_state == NodeState.PASSED:
-                break
-            if fs.r3_attempts >= max_rounds:
-                fs.r3_state = NodeState.PASSED
-                state.save(dirs.state_file)
-                break
+        if fs.r3_state == NodeState.PASSED:
+            return
 
-            fs.r3_state = NodeState.RUNNING
-            fs.r3_attempts += 1
-            state.save(dirs.state_file)
+        fs.r3_state = NodeState.RUNNING
+        fs.r3_attempts += 1
+        state.save(dirs.state_file)
+        dirs.r3.mkdir(parents=True, exist_ok=True)
 
-            dirs.r3.mkdir(parents=True, exist_ok=True)
-            r3_db_path = dirs.r1_functions_db(file_hash)
+        self._emit("r3_w_start", file_hash=file_hash, file=Path(file_path).name)
+        try:
+            r3_keep_entries = await self._run_r3_funcs_parallel(
+                file_hash, file_path, dirs, state, _keep_hashes, funcs_with_input
+            )
+            r3_out = dirs.r3_file_path(file_hash)
+            r3_out.write_text(
+                json.dumps(r3_keep_entries, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            self._emit("r3_w_done",
+                       file_hash=file_hash, file=Path(file_path).name,
+                       entry_count=len(r3_keep_entries))
 
-            self._emit("r3_w_start",
-                       file_hash=file_hash, file=Path(file_path).name)
-            try:
-                acfg = self.cfg.workers.agents[0]
-                sys_prompt = self._stage_sys_prompt('r3_worker')
-                is_retry = fs.r3_attempts > 1
-                prompt = P.build_r3_w_prompt(
-                    file_path=file_path,
-                    db_path=r3_db_path,
-                    r3_out_path=dirs.r3_file_path(file_hash),
-                    pre_filtered_names=pre_filtered_names,
-                    is_retry=is_retry,
-                    feedback=fs.r3_feedback if is_retry else "",
-                )
-                ar = await self._call_agent(
-                    prompt=prompt, system_prompt=sys_prompt,
-                    session_file=session_file, cwd=str(dirs.source),
-                    context=f"r3_w:{file_hash}", acfg=acfg,
-                )
-
-                r3_path = dirs.r3_file_path(file_hash)
-                if not r3_path.exists():
-                    r3_path.write_text("[]", encoding="utf-8")
-
-                entry_count = _count_json_array(r3_path)
-                self._emit("r3_w_done",
-                           file_hash=file_hash, file=Path(file_path).name,
-                           entry_count=entry_count)
-
-                # R3 Judge（每次新 session）
+            if max_rounds > 0:
                 j_session = str(dirs.r3_j_session(file_hash, fs.r3_attempts))
                 j_passed = await self._run_r3_j(
                     file_hash, file_path, dirs, state, j_session)
-
                 if j_passed:
                     fs.r3_state = NodeState.PASSED
-                    state.save(dirs.state_file)
-                    break
                 else:
-                    fs.r3_state = NodeState.FAILED
-                    state.save(dirs.state_file)
+                    fs.r3_state = NodeState.PASSED if fs.r3_attempts >= max_rounds else NodeState.FAILED
+            else:
+                fs.r3_state = NodeState.PASSED
 
-            except Exception as exc:
-                logger.error("R3 failed for %s: %s", file_hash, exc)
-                fs.r3_state = NodeState.FAILED
-                state.save(dirs.state_file)
+            state.save(dirs.state_file)
 
-    async def _run_r3_j(
+        except Exception as exc:
+            logger.error("R3 failed for %s: %s", file_hash, exc)
+            fs.r3_state = NodeState.FAILED
+            state.save(dirs.state_file)
+
+    async def _run_r3_funcs_parallel(
         self,
         file_hash: str,
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
-        session_file: str,
-    ) -> bool:
-        """R3 Judge（每次新 session）。返回 passed。"""
-        fs = state.files[file_hash]
-        self._emit("r3_j_start",
-                   file_hash=file_hash, file=Path(file_path).name)
-        try:
-            acfg = self._judge_acfg()
-            sys_prompt = self._stage_sys_prompt('r3_judge')
-            prompt = P.build_r3_j_prompt(
-                file_path=file_path,
-                r3_entries_path=dirs.r3_file_path(file_hash),
-                db_path=dirs.r1_functions_db(file_hash),
-            )
-            ar = await self._call_agent(
-                prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.source),
-                context=f"r3_j:{file_hash}", acfg=acfg,
-            )
-            passed, feedback = _parse_j_result(ar.output)
-            fs.r3_feedback = feedback
-            if not passed and feedback:
-                fb_file = dirs.r3_j_feedback_file(file_hash, fs.r3_attempts)
-                fb_file.parent.mkdir(parents=True, exist_ok=True)
-                fb_file.write_text(feedback, encoding="utf-8")
-                fs.r3_feedback = str(fb_file)  # 转存文件路径，供 retry 引用
-            self._emit("r3_j_done",
-                       file_hash=file_hash, file=Path(file_path).name,
-                       passed=passed, feedback=feedback[:200])
-            return passed
-        except Exception as exc:
-            logger.error("R3 J failed for %s: %s", file_hash, exc)
-            return False
+        keep_hashes: list,
+        funcs_with_input: dict,
+    ) -> list:
+        """并行运行文件内所有候选函数的 R3-W session，聚合 keep 结果。"""
+        from .funcdb import FunctionDB
+        func_db = FunctionDB.open(dirs.r1, file_hash)
+        all_meta = func_db.get_all_meta()
 
-    # ── R4 ─────────────────────────────────────────────────────────────────────
+        keep_info = []
+        for fh in keep_hashes:
+            meta = all_meta.get(fh, {})
+            func_st = funcs_with_input[fh]
+            keep_info.append({
+                "func_hash":  fh,
+                "name":       func_st.name or meta.get("name", ""),
+                "signature":  func_st.signature or meta.get("signature", ""),
+                "start_line": meta.get("start_line", 0),
+                "end_line":   meta.get("end_line", 0),
+            })
+
+        tasks = [
+            self._run_r3_w_for_func(
+                file_hash=file_hash,
+                file_path=file_path,
+                func_info=info,
+                other_candidates=[o for o in keep_info if o["func_hash"] != info["func_hash"]],
+                dirs=dirs,
+                state=state,
+            )
+            for info in keep_info
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        keep_entries = []
+        for info, result in zip(keep_info, results):
+            if isinstance(result, Exception):
+                logger.warning("R3-W-func error for %s: %s, keeping", info["name"], result)
+                keep_entries.append(self._make_r3_entry(info, "boundary", "keep (error, conservative)"))
+            elif result is not None:
+                keep_entries.append(result)
+
+        logger.info("R3 parallel [%s]: %d -> %d kept",
+                    Path(file_path).name, len(keep_hashes), len(keep_entries))
+        return keep_entries
+
+    @staticmethod
+    def _make_r3_entry(func_info: dict, entry_role: str, reason: str) -> dict:
+        return {
+            "func_hash":    func_info["func_hash"],
+            "function":     func_info.get("name", ""),
+            "signature":    func_info.get("signature", ""),
+            "entry_role":   entry_role,
+            "entry_reason": reason,
+        }
+
+
+    async def _run_r3_w_for_func(
+        self,
+        file_hash: str,
+        file_path: str,
+        func_info: dict,
+        other_candidates: list,
+        dirs: PipelineDirs,
+        state: PipelineState,
+    ):
+        """单个函数的 R3-W session。返回 entry dict(keep) 或 None(filter)。"""
+        fs = state.files[file_hash]
+        func_hash = func_info["func_hash"]
+        func_name = func_info.get("name", "")
+        max_attempts = int(getattr(self.cfg, "r3_max_rounds", 3))
+
+        existing = fs.r3_func_state.get(func_hash, "pending")
+        if existing == "passed_keep":
+            r3_func_dir = dirs.r3.parent / "r3_func"
+            out_path = r3_func_dir / f"{func_hash}.json"
+            if out_path.exists():
+                try:
+                    return json.loads(out_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        elif existing == "passed_filter":
+            return None
+
+        session_dir = dirs.r3_w_session(file_hash).parent
+        session_file = str(session_dir / f"r3-w-{file_hash}-{func_hash[:8]}.jsonl")
+        r3_func_dir = dirs.r3.parent / "r3_func"
+        r3_func_dir.mkdir(parents=True, exist_ok=True)
+        r3_func_out = r3_func_dir / f"{func_hash}.json"
+
+        acfg = self.cfg.workers.agents[0]
+        sys_prompt = self._stage_sys_prompt("r3_worker")
+
+        for attempt in range(1, max_attempts + 1):
+            if self._cancel.is_set():
+                return None
+
+            prompt = P.build_r3_w_func_prompt(
+                func_hash=func_hash,
+                func_name=func_name,
+                signature=func_info.get("signature", ""),
+                start_line=func_info.get("start_line", 0),
+                end_line=func_info.get("end_line", 0),
+                file_path=file_path,
+                r3_func_out_path=r3_func_out,
+                other_candidates=other_candidates,
+                is_retry=(attempt > 1),
+                feedback=fs.r3_func_state.get(f"{func_hash}_feedback", ""),
+            )
+
+            try:
+                await self._call_agent(
+                    prompt=prompt, system_prompt=sys_prompt,
+                    session_file=session_file, cwd=str(dirs.source),
+                    context=f"r3_w_func:{func_name}",
+                    acfg=acfg,
+                )
+            except Exception as exc:
+                logger.warning("R3-W-func agent error for %s: %s", func_name, exc)
+                if attempt >= max_attempts:
+                    return self._make_r3_entry(func_info, "boundary", "keep (agent error, conservative)")
+                continue
+
+            if not r3_func_out.exists():
+                if attempt >= max_attempts:
+                    return self._make_r3_entry(func_info, "boundary", "keep (no output, conservative)")
+                continue
+
+            try:
+                decision_data = json.loads(r3_func_out.read_text(encoding="utf-8"))
+            except Exception:
+                if attempt >= max_attempts:
+                    return self._make_r3_entry(func_info, "boundary", "keep (parse error, conservative)")
+                continue
+
+            decision = str(decision_data.get("decision", "keep")).lower().strip()
+            entry_role = str(decision_data.get("entry_role", "") or "boundary").strip()
+            reason = str(decision_data.get("reason", ""))[:200]
+
+            if decision == "filter":
+                fs.r3_func_state[func_hash] = "passed_filter"
+                state.save(dirs.state_file)
+                return None
+            else:
+                entry = self._make_r3_entry(func_info, entry_role, reason)
+                r3_func_out.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+                fs.r3_func_state[func_hash] = "passed_keep"
+                state.save(dirs.state_file)
+                return entry
+
+        return self._make_r3_entry(func_info, "boundary", "keep (max retries, conservative)")
+
+
 
     # ── CC（调用链静态分析）─────────────────────────────────────────────────────────────
 

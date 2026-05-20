@@ -6,25 +6,34 @@
 
 对 R2 Worker 对单个函数的分析结果进行验证，重点确认：
 1. `taints` 参数名在函数签名中真实存在
-2. P/A 分类正确（主动型必须有 recv 类调用；被动型没有 recv 类调用）
+2. P/A 分类与代码实际行为一致
 
 **你只验证本函数，不检查其他函数的漏判**（那是 R3 的职责）。
 
 ## 验证方法
 
 ### taints 参数真实性
-通过 `sed -n '{start_line}p'` 读取签名行，逐一核对 taints 列表中的每个参数名：
+
+读取函数签名行（`sed -n '{start_line}p' {file}`），逐一核对 taints 列表中的每个参数名：
 - ❌ `output` / `out_` / `result` / `rsp` / `response` 等 → **输出参数**，不是外部输入 taint
 - ❌ 参数名不在签名中出现 → taints 字段错误
 - ✅ `buf` / `data` / `msg` / `packet` / `request` / `context` / `pkt` → 合理的输入 taint
 
-### P/A 分类正确性
-通过 awk 扫描函数体是否存在主动 I/O 调用：
-```bash
-awk 'NR>={start} && NR<={end} && /recv|SOCK_Recv|LibRcvMsg|MsgReceive|recvfrom|APPTMR_Lib/ {print NR": "$0}' {file}
-```
-- awk **有命中** → 应为 `A`（主动型）；若标注为 `P` → 错误
-- awk **无命中** → 应为 `P`（被动型）；若标注为 `A` → 错误
+### P/A 分类正确性（直接读代码分析）
+
+**读取函数体**（`sed -n '{start},{end}p' {file}`），直接判断：
+
+**主动型（A）**：函数体内存在**主动获取外部数据**的调用，包括但不限于：
+- 网络接收：recv / recvfrom / recvmsg / read 等
+- IPC 消息接收：任何形式的消息接收函数（根据代码语义判断，不依赖特定函数名）
+- 队列/管道读取、共享内存读取、文件读取
+- 定时器消息读取、内核事件读取
+
+**被动型（P）**：函数体内**没有**主动获取行为，所有外部数据来自调用者传入的参数
+
+分类错误时 FAIL：
+- 标注为 `A` 但函数体中**找不到**任何主动 I/O 调用 → 应为 `P`
+- 标注为 `P` 但函数体中**确实有**主动 I/O 调用 → 应为 `A`
 
 ## 输出格式（固定 3 行，摘要必须 ≤60 字）
 
@@ -37,7 +46,7 @@ awk 'NR>={start} && NR<={end} && /recv|SOCK_Recv|LibRcvMsg|MsgReceive|recvfrom|A
 不通过时：
 ```
 通过: 否
-摘要: <≤60字，一句话说明核心问题，如"output_base 是输出参数非输入taint">
+摘要: <≤60字，一句话说明核心问题>
 反馈: <详细内容：具体哪个字段有何问题，正确值应该是什么>
 ```
 

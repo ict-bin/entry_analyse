@@ -114,6 +114,8 @@ class FileState:
     r3_state:    NodeState = NodeState.PENDING
     r3_attempts: int = 0
     r3_feedback: str = ""
+    # R3 函数级并行状态：func_hash → NodeState.value（向后兼容：旧状态文件没有此字段）
+    r3_func_state: dict = field(default_factory=dict)
 
     # 函数级状态（func_hash → FunctionState）
     functions: dict[str, FunctionState] = field(default_factory=dict)
@@ -158,6 +160,7 @@ class FileState:
             'r3_state':      self.r3_state.value,
             'r3_attempts':   self.r3_attempts,
             'r3_feedback':   self.r3_feedback,
+            'r3_func_state': self.r3_func_state,
             'updated_at':    self.updated_at,
             'functions': {
                 fh: fs.to_dict() for fh, fs in self.functions.items()
@@ -170,6 +173,7 @@ class FileState:
         data['r1_w_state'] = NodeState(data.get('r1_w_state', 'pending'))
         data['r2_j_state'] = NodeState(data.get('r2_j_state', 'pending'))
         data['r3_state']   = NodeState(data.get('r3_state',   'pending'))
+        data.setdefault('r3_func_state', {})
         obj = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         obj.functions = {
             fh: FunctionState.from_dict(fd) for fh, fd in funcs_raw.items()

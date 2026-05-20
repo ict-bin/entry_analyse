@@ -226,173 +226,157 @@ def build_r2_j_func_prompt(
     end_line: int,
     body_lines: int,
     file_path: str,
-    db_path: Path,
+    db_path: "Path",
 ) -> str:
     """
     R2 Judge（函数级）：验证单个函数的 R2 分析质量。
 
-    设计要点：
-    - 只验证本函数，不查其他函数（漏判检测是 R3 的职责）
-    - 输出固定 3 行格式：通过 + 摘要(≤60字) + 反馈
-    - 摘要由 engine 提取后直接嵌入下一轮 R2-W retry prompt 标题
-    - 验证重点：taints 参数真实性 + P/A 分类正确性
+    v2 变化：
+    - 删除 awk 硬编码模式扫描（仅适用于特定项目）
+    - 改为：读取函数体后由 Agent 直接语义分析 P/A 分类
+    - 更准确且适用于任意代码库
     """
     basename = os.path.basename(file_path)
-    _AWK = r"recv|SOCK_Recv|LibRcvMsg|MsgReceive|recvfrom|recvmsg|APPTMR_Lib"
+    sed_body = f"sed -n '{start_line},{end_line}p' {file_path}"
 
     return (
-        f"# R2 Judge — 函数级分析验证\n\n"
-        f"| 字段      | 值                       |\n"
+        f"# R2 Judge \u2014 \u51fd\u6570\u7ea7\u5206\u6790\u9a8c\u8bc1\n\n"
+        f"| \u5b57\u6bb5      | \u5024                       |\n"
         f"|-----------|-------------------------|\n"
         f"| func_hash | `{func_hash}`            |\n"
         f"| name      | `{func_name}`            |\n"
-        f"| 行范围    | {start_line}~{end_line}（共 {body_lines} 行）|\n"
-        f"| 文件      | `{basename}`             |\n\n"
-        f"## 步骤 1：获取 R2 分析结果\n\n"
+        f"| \u884c\u8303\u56f4    | {start_line}~{end_line}\uff08\u5171 {body_lines} \u884c\uff09|\n"
+        f"| \u6587\u4ef6      | `{basename}`             |\n\n"
+        f"## \u6b65\u9aa4 1\uff1a\u83b7\u53d6 R2 \u5206\u6790\u7ed3\u679c\n\n"
         f"```bash\n"
         f"python3 /opt/entry_analyse/scripts/ea_db.py get {db_path} {func_hash}\n"
         f"```\n\n"
-        f"若结果为 `has_external_input: false` → 直接输出**通过: 是**，无需后续步骤。\n\n"
-        f"## 步骤 2：验证 taints 参数（仅当 has_external_input=true）\n\n"
+        f"\u82e5\u7ed3\u679c\u4e3a `has_external_input: false` \u2192 \u76f4\u63a5\u8f93\u51fa**\u901a\u8fc7: \u662f**\uff0c\u65e0\u9700\u540e\u7eed\u6b65\u9aa4\u3002\n\n"
+        f"## \u6b65\u9aa4 2\uff1a\u9a8c\u8bc1 taints \u53c2\u6570\u771f\u5b9e\u6027\uff08\u4ec5\u5f53 has_external_input=true\uff09\n\n"
         f"```bash\n"
         f"sed -n '{start_line}p' {file_path}\n"
         f"```\n\n"
-        f"对比 `taints` 列表中每个参数名是否在签名中**真实出现**：\n"
-        f"- ❌ `output`/`out_`/`result`/`rsp`/`response` 等是**输出参数**，不是外部输入 taint\n"
-        f"- ❌ 参数名不在签名中 → taints 字段错误\n"
-        f"- ✅ buf/data/msg/packet/request/context/pkt 类参数名 → 合理的输入 taint\n\n"
-        f"## 步骤 3：验证 P/A 分类（仅当 has_external_input=true）\n\n"
-        f"用 awk 扫描函数体是否存在主动 I/O 调用：\n"
-        f"```bash\n"
-        f"awk 'NR>={start_line} && NR<={end_line} && /{_AWK}/ {{print NR" + chr(34) + f": " + chr(34) + f"$0}}' {file_path}\n"
-
-        f"```\n\n"
-        f"判断规则：\n"
-        f"- awk **有命中** → 应为 `A`（主动型）；若标注为 `P` → 需修正\n"
-        f"- awk **无命中** → 应为 `P`（被动型，数据来自调用者参数）；若标注为 `A` → 需修正\n\n"
-        f"## 输出格式（固定 3 行，摘要必须 ≤60 字）\n\n"
+        f"\u5bf9\u6bd4 `taints` \u5217\u8868\u4e2d\u6bcf\u4e2a\u53c2\u6570\u540d\u662f\u5426\u5728\u7b7e\u540d\u4e2d**\u771f\u5b9e\u51fa\u73b0**\uff1a\n"
+        f"- \u274c `output`/`out_`/`result`/`rsp`/`response` \u7b49\u662f**\u8f93\u51fa\u53c2\u6570**\uff0c\u4e0d\u662f\u5916\u90e8\u8f93\u5165 taint\n"
+        f"- \u274c \u53c2\u6570\u540d\u4e0d\u5728\u7b7e\u540d\u4e2d \u2192 taints \u5b57\u6bb5\u9519\u8bef\n"
+        f"- \u2705 buf/data/msg/packet/request/context/pkt \u7c7b\u53c2\u6570\u540d \u2192 \u5408\u7406\u7684\u8f93\u5165 taint\n\n"
+        f"## \u6b65\u9aa4 3\uff1a\u9a8c\u8bc1 P/A \u5206\u7c7b\uff08\u76f4\u63a5\u8bfb\u4ee3\u7801\u5206\u6790\uff09\n\n"
+        f"```bash\n{sed_body}\n```\n\n"
+        f"\u9605\u8bfb\u51fd\u6570\u4f53\uff0c\u76f4\u63a5\u5224\u65ad\uff1a\n\n"
+        f"**\u4e3b\u52a8\u578b\uff08A\uff09**\uff1a\u51fd\u6570\u4f53\u5185\u5b58\u5728**\u4e3b\u52a8\u83b7\u53d6\u5916\u90e8\u6570\u636e**\u7684\u8c03\u7528\uff0c\u5305\u62ec\u4f46\u4e0d\u9650\u4e8e\uff1a\n"
+        f"  - \u7f51\u7edc\u63a5\u6536\uff08recv\u3001recvfrom\u3001recvmsg\u3001read\u7b49\uff09\n"
+        f"  - IPC \u6d88\u606f\u63a5\u6536\uff08\u6839\u636e\u4ee3\u7801\u8bed\u4e49\u5224\u65ad\uff0c\u4e0d\u4f9d\u8d56\u5177\u4f53\u51fd\u6570\u540d\uff09\n"
+        f"  - \u961f\u5217/\u7ba1\u9053\u8bfb\u53d6\u3001\u5171\u4eab\u5185\u5b58\u8bfb\u53d6\u3001\u6587\u4ef6\u8bfb\u53d6\u7b49\n"
+        f"  - \u5b9a\u65f6\u5668\u6d88\u606f\u8bfb\u53d6\u3001\u5185\u6838\u4e8b\u4ef6\u8bfb\u53d6\n\n"
+        f"**\u88ab\u52a8\u578b\uff08P\uff09**\uff1a\u51fd\u6570\u4f53\u5185**\u6ca1\u6709**\u4e3b\u52a8\u83b7\u53d6\u884c\u4e3a\uff0c\u6570\u636e\u5168\u90e8\u6765\u81ea\u8c03\u7528\u8005\u4f20\u5165\u7684\u53c2\u6570\n\n"
+        f"\u5982\u679c\u5206\u7c7b\u4e0e\u4e0a\u8ff0\u4e0d\u7b26\uff1a\n"
+        f"- R2 \u6807\u6ce8\u4e3a `A` \u4f46\u4ee3\u7801\u4e2d**\u627e\u4e0d\u5230**\u4e3b\u52a8 I/O \u8c03\u7528 \u2192 \u5e94\u4e3a `P`\uff0c\u9519\u8bef\n"
+        f"- R2 \u6807\u6ce8\u4e3a `P` \u4f46\u4ee3\u7801\u4e2d**\u786e\u5b9e\u6709**\u4e3b\u52a8 I/O \u8c03\u7528 \u2192 \u5e94\u4e3a `A`\uff0c\u9519\u8bef\n\n"
+        f"## \u8f93\u51fa\u683c\u5f0f\uff08\u56fa\u5b9a 3 \u884c\uff0c\u6458\u8981\u5fc5\u987b \u226460 \u5b57\uff09\n\n"
         f"```\n"
-        f"通过: 是\n"
-        f"摘要: taints 参数真实，P/A 分类正确\n"
+        f"\u901a\u8fc7: \u662f\n"
+        f"\u6458\u8981: taints \u53c2\u6570\u771f\u5b9e\uff0cP/A \u5206\u7c7b\u6b63\u786e\n"
         f"```\n\n"
-        f"或：\n\n"
+        f"\u6216\uff1a\n\n"
         f"```\n"
-        f"通过: 否\n"
-        f"摘要: <≤60字，一句话说明核心问题>\n"
-        f"反馈: <详细内容：具体哪个字段有何问题，正确值应该是什么>\n"
+        f"\u901a\u8fc7: \u5426\n"
+        f"\u6458\u8981: <\u226460\u5b57\uff0c\u4e00\u53e5\u8bdd\u8bf4\u660e\u6838\u5fc3\u95ee\u9898\uff0c\u5982\u201coutput_base \u662f\u8f93\u51fa\u53c2\u6570\u975e\u8f93\u5165taint\u201d>\n"
+        f"\u53cd\u9988: <\u8be6\u7ec6\u5185\u5bb9\uff1a\u5177\u4f53\u54ea\u4e2a\u5b57\u6bb5\u6709\u4f55\u95ee\u9898\uff0c\u6b63\u786e\u5024\u5e94\u8be5\u662f\u4ec0\u4e48>\n"
         f"```\n\n"
-        f"**重要**：只验证本函数，不检查漏判（那是 R3 的职责）。\n"
+        f"## \u539f\u5219\n\n"
+        f"- \u53ea\u9a8c\u8bc1\u672c\u51fd\u6570\uff0c\u4e0d\u505a\u8de8\u51fd\u6570\u6f0f\u5224\u68c0\u6d4b\n"
+        f"- \u53d1\u73b0\u771f\u5b9e\u5b57\u6bb5\u9519\u8bef\u624d FAIL\uff0c\u4e0d\u4e3a\u683c\u5f0f\u6216\u63cf\u8ff0\u95ee\u9898 FAIL\n"
+        f"- \u9047\u5230\u5f02\u5e38\uff08\u51fd\u6570\u4f53\u8bfb\u53d6\u5931\u8d25\u7b49\uff09\u2192 \u9ed8\u8ba4\u901a\u8fc7\uff0c\u4e0d\u963b\u585e\u6d41\u7a0b\n"
+        f"- has_external_input=false \u7684\u51fd\u6570 \u2192 \u76f4\u63a5\u8f93\u51fa\u901a\u8fc7\uff0c\u65e0\u9700\u9a8c\u8bc1\n"
     )
 
 
-# ─── R3 Worker ────────────────────────────────────────────────────────────────
-
-def build_r3_w_prompt(
+def build_r3_w_func_prompt(
+    func_hash: str,
+    func_name: str,
+    signature: str,
+    start_line: int,
+    end_line: int,
     file_path: str,
-    db_path: Path,
-    r3_out_path: Path,
-    pre_filtered_names: list[str] | None = None,
+    r3_func_out_path: "Path",
+    other_candidates: "list[dict]",
     is_retry: bool = False,
     feedback: str = "",
 ) -> str:
     """
-    R3 Worker：从 R2 候选中筛选出真正的外部入口。
+    R3 Worker（函数级并行）：对单个候选函数判断是否为模块外部入口。
 
-    核心原则变化（v3）：
-    - 旧：保守保留（宁可多保留不漏判）→ 导致 169/171 误留
-    - 新：主动过滤，默认删除，仅保留可证明为顶层入口的函数
-
-    R2 是单函数视角（只能看到自己的代码），存在系统性误判：
-    - Fill/Disp/Crypto 类函数被误判为"被动型入口"
-    - 子函数被误判为独立入口
-    R3 是文件级视角，负责纠正这些误判。
-
-    engine 已完成规则预过滤（pre_filtered_names）。
+    设计原则：
+    - 每个函数独立决策，不再单 session 串行处理整个文件
+    - pre-filter 在 engine 侧静默执行，此处不列出被排除的函数
+    - 只给「本函数」+ 「同文件其他候选函数名列表」（供 caller 检查）
+    - 输出：一个 JSON 对象，decision=keep|filter + entry_role + reason
     """
     basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
 
-    pre_filter_section = ""
-    if pre_filtered_names:
-        _n = len(pre_filtered_names)
-        _shown = pre_filtered_names[:20]
-        _more = ("  (…共 %d 个)" % _n) if _n > 20 else ""
-        _names_str = "\n".join("  - " + nm for nm in _shown)
-        if _more:
-            _names_str += "\n" + _more
-        pre_filter_section = (
-            "\n## 已由规则预过滤排除（无需分析，直接跳过）\n\n"
-            + "**以下 %d 个函数**已由名字规则确认为非入口（Fill/Disp/Crypto/Subscribe/Init 类），已从候选列表中排除：\n\n" % _n
-            + _names_str + "\n\n"
-            + "请只对 `ea_db.py list-entries` 返回的其余函数进行调用链分析。\n"
+    if other_candidates:
+        others_str = "\n".join(
+            f"  - `{c['name']}` (line {c['start_line']}-{c['end_line']})"
+            for c in other_candidates[:40]
         )
+        if len(other_candidates) > 40:
+            others_str += f"\n  (\u2026\u5171 {len(other_candidates)} \u4e2a)"
+    else:
+        others_str = "  \uff08\u65e0\u5176\u4ed6\u5019\u9009\u51fd\u6570\uff09"
+
+    grep_cb  = f"grep -n '{func_name}' {file_path} | grep -i 'register" + r"\|hook\|bind\|RegFunc\|SubIf\|MsgBind\|callback'" + "'"
+    grep_cal = f"grep -n '{func_name}(' {file_path} | grep -v '^{start_line}:' | head -10"
+    sed_body = f"sed -n '{start_line},{end_line}p' {file_path}"
 
     return (
-        f"# R3 Worker — 文件级外部入口过滤\n\n"
-        f"文件：`{basename}`\n"
+        f"# R3 Worker \u2014 \u5355\u51fd\u6570\u5165\u53e3\u5224\u65ad\n\n"
         f"{retry}"
-        f"{pre_filter_section}\n"
-        f"## 背景\n\n"
-        f"R2 是单函数视角，每个函数只能看到自己的代码，无法判断自己是否被调用——\n"
-        f"因此 R2 存在系统性误判：真正的子函数（数据来自调用者传入）也可能被标记为有外部输入。\n"
-        f'**R3 负责纠正这些误判**，区分真正的顶层入口和"处理已传入数据的子函数"。\n\n'
-
-        f"## 核心过滤原则\n\n"
-        f"**默认过滤，仅保留可证明为顶层入口的函数。**\n\n"
-        f"### 步骤 1：获取 R2 候选列表\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py list-entries {db_path}\n"
+        f"| \u5b57\u6bb5 | \u5024 |\n"
+        f"|------|-------|\n"
+        f"| func_hash | `{func_hash}` |\n"
+        f"| name | `{func_name}` |\n"
+        f"| \u884c\u8303\u56f4 | {start_line}~{end_line} |\n"
+        f"| \u6587\u4ef6 | `{basename}` |\n\n"
+        f"**\u540c\u6587\u4ef6\u5176\u4ed6 R2 \u5019\u9009\u51fd\u6570**\uff08\u53ef\u80fd\u8c03\u7528\u672c\u51fd\u6570\uff0c\u53ef\u80fd\u662f\u672c\u51fd\u6570\u7684\u8c03\u7528\u8005\uff09\uff1a\n\n"
+        f"{others_str}\n\n"
+        f"## \u4efb\u52a1\n\n"
+        f"\u5224\u65ad `{func_name}` \u662f\u5426\u662f\u6a21\u5757\u7684**\u5916\u90e8\u5165\u53e3**"
+        f"\uff08\u76f4\u63a5\u6216\u95f4\u63a5\u63a5\u6536\u6765\u81ea\u6a21\u5757\u5916\u90e8\u7684\u6570\u636e\uff09\u3002\n\n"
+        f"## \u5206\u6790\u6b65\u9aa4\n\n"
+        f"### \u6b65\u9aa4 1\uff1a\u8bfb\u53d6\u51fd\u6570\u4f53\n\n"
+        f"```bash\n{sed_body}\n```\n\n"
+        f"\u76f4\u63a5\u9605\u8bfb\u4ee3\u7801\uff0c\u5224\u65ad\uff1a\n"
+        f"- \u6709\u6ca1\u6709\u4ece\u5916\u90e8\u6e90\u4e3b\u52a8\u83b7\u53d6\u6570\u636e\u7684\u8c03\u7528\uff08\u7f51\u7edc recv/read\u3001IPC \u6d88\u606f\u63a5\u6536\u3001\u961f\u5217/\u7ba1\u9053\u8bfb\u53d6\u3001\u5b9a\u65f6\u5668\u6d88\u606f\u7b49\uff09\n"
+        f"- \u6839\u636e**\u4ee3\u7801\u8bed\u4e49**\u5224\u65ad\uff0c\u4e0d\u4f9d\u8d56\u7279\u5b9a\u51fd\u6570\u540d\u6a21\u5f0f\n\n"
+        f"### \u6b65\u9aa4 2\uff1a\u68c0\u67e5\u56de\u8c03\u6ce8\u518c\uff08\u88ab\u52a8\u578b\uff09\n\n"
+        f"```bash\n{grep_cb}\n```\n"
+        f"\u6709\u547d\u4e2d \u2192 **\u88ab\u52a8\u578b\u56de\u8c03\u5165\u53e3\uff08P\uff09**\uff0c`entry_role=callback`\n\n"
+        f"### \u6b65\u9aa4 3\uff1a\u68c0\u67e5\u8c03\u7528\u8005\uff08\u533a\u5206\u9876\u5c42\u5165\u53e3 vs \u5b50\u51fd\u6570\uff09\n\n"
+        f"```bash\n{grep_cal}\n```\n\n"
+        f"\u5bf9\u547d\u4e2d\u7684**\u8c03\u7528\u8005**\u9010\u4e00\u5224\u65ad\uff1a\n"
+        f"- \u8c03\u7528\u8005\u5728\u4e0a\u65b9\u300c\u5176\u4ed6\u5019\u9009\u51fd\u6570\u300d\u5217\u8868\u4e2d \u2192 \u672c\u51fd\u6570\u662f**\u5b50\u51fd\u6570**\uff0c**\u5220\u9664**\n"
+        f"- \u8c03\u7528\u8005\u51fd\u6570\u540d\u542b `Dispatch/ProcMsg/MsgProc/Handler` \u7b49\u5206\u53d1\u7279\u5f81"
+        f" \u2192 dispatch_target\uff0c**\u4fdd\u7559**\uff08`entry_role=dispatch_target`\uff09\n"
+        f"- \u8c03\u7528\u8005\u4e0d\u5728\u5019\u9009\u5217\u8868\u4e14\u4e0d\u662f dispatcher \u2192 \u5de5\u5177\u51fd\u6570 \u2192 **\u5220\u9664**\n"
+        f"- \u65e0\u8c03\u7528\u8005\uff08\u6216\u4ec5\u5728\u5176\u4ed6\u6587\u4ef6\u4e2d\u88ab\u8c03\u7528\uff09 \u2192 **\u4fdd\u7559**\n\n"
+        f"### \u6b65\u9aa4 4\uff1a\u5199\u51fa\u5224\u65ad\u7ed3\u679c\n\n"
+        f"\u4f7f\u7528 `write` \u5de5\u5177\u5199\u51fa\u5230\uff1a`{r3_func_out_path}`\n\n"
+        f"\u683c\u5f0f\uff08JSON \u5355\u5bf9\u8c61\uff09\uff1a\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "decision": "keep",\n'
+        f'  "entry_type": "A",\n'
+        f'  "entry_role": "boundary",\n'
+        f'  "reason": "\u51fd\u6570\u4f53\u4e2d\u76f4\u63a5\u8c03\u7528\u4e86 xxx \u63a5\u6536\u5916\u90e8\u7f51\u7edc\u6570\u636e"\n'
+        f"}}\n"
         f"```\n\n"
-        f"### 步骤 2：规则快速过滤（名字匹配即删除）\n\n"
-        f"以下函数名模式**默认过滤**（除非步骤 3 确认有 recv 类调用）：\n\n"
-        f"| 模式 | 原因 |\n"
-        f"|------|------|\n"
-        f"| `Fill*` / `*Fill[A-Z]*` | 写入输出缓冲区，数据流向是 **OUT** 不是 IN |\n"
-        f"| `*Disp*` / `*Display*` | 查询显示类，读取内部状态返回给用户 |\n"
-        f"| `*AesCbc*` / `*Des[13]*` / `*Sha[12]*` / `*Md5*` | 加密算法原语，数据在上层已进入 |\n"
-        f"| `*PrepareContext*` | 加密上下文初始化 |\n"
-        f"| `*Subscribe*` / `*UnSubscribe*` | 注册订阅操作，不是数据接收 |\n"
-        f"| `*TimerCreate*` / `*TimerDelete*` | 定时器生命周期管理 |\n"
-        f"| `*Init*` / `*Create*` / `*Destroy*` / `*Delete*` | 生命周期函数（无 recv 调用时）|\n\n"
-        f"### 步骤 3：入口确认（对未被规则过滤的候选函数）\n\n"
-        f"对每个候选函数，通过以下方法之一确认是真正入口，否则删除：\n\n"
-        f"**方法 A（主动型）**：函数体直接调用外部 I/O 接口：\n"
-        f"```bash\n"
-        f"awk 'NR>=<start> && NR<=<end> && /recv|SOCK_Recv|LibRcvMsg|MsgReceive|APPTMR_Lib|recvfrom/ "
-        f"{{print NR" + chr(34) + f": " + chr(34) + f"$0}}' {file_path}\n"
-
-        f"```\n"
-        f"有命中 → **确认为主动型入口（A），保留**\n\n"
-        f"**方法 B（被动型/框架回调）**：函数被框架注册为回调：\n"
-        f"```bash\n"
-        f"grep -n '<func_name>' {file_path} | grep -i 'register\\|RegFunc\\|SubIf\\|MsgBind\\|hook'\n"
-        f"```\n"
-        f"有命中 → **确认为被动型回调入口（P），保留**\n\n"
-        f"**方法 C（消息分发表/switch）**：函数名出现在 dispatch table 中：\n"
-        f"```bash\n"
-        f"grep -n '<func_name>' {file_path} | head -5\n"
-        f"```\n"
-        f"若仅出现在 `switch/case` 分发中，需继续判断：\n"
-        f"- 该 dispatcher 本身是入口 → 本函数是子函数 → **删除**\n"
-        f"- 该 dispatcher 不在候选列表中 → 本函数可能是独立入口 → **保留**\n\n"
-        f"### 步骤 4：调用链兜底（对方法 A/B/C 仍不确定的函数）\n\n"
-        f"```bash\n"
-        f"grep -n '<func_name>(' {file_path} | head -10\n"
-        f"```\n"
-        f"- 调用者也在候选列表中 → 本函数是调用者的子函数 → **删除**\n"
-        f"- 调用者不在候选列表中（或无调用者）→ 本函数是独立入口 → **保留**\n\n"
-        f"### 步骤 5：写出过滤结果\n\n"
-        f"使用 `write` 工具写出到：`{r3_out_path}`\n"
-        f"格式：JSON 数组，直接从 `list-entries` 结果中选取保留项（**不修改任何字段内容**）。\n"
-        f"若无任何入口则写 `[]`。\n\n"
-        f"完成后输出 `<result>` 摘要：\n"
-        f"```\n"
-        f"原始候选: N 个（其中规则预过滤排除 X 个）\n"
-        f"规则过滤: Y 个（Fill M个, Crypto K个, 其他L个）\n"
-        f"调用链过滤: Z 个（列出函数名和删除原因，一行一个）\n"
-        f"最终保留: M 个\n"
-        f"```\n"
+        f"- `decision`: `keep` \u6216 `filter`\n"
+        f"- `entry_type`: `A`\uff08\u4e3b\u52a8\uff09/ `P`\uff08\u88ab\u52a8/\u56de\u8c03/dispatch_target\uff09/ `-`\uff08filter \u65f6\uff09\n"
+        f"- `entry_role`: `boundary`/`dispatch_target`/`callback`/`ipc_handler`\uff08filter \u65f6\u7559\u7a7a\uff09\n"
+        f"- `reason`: \u4e00\u53e5\u8bdd\u8bf4\u660e\u5224\u65ad\u4f9d\u636e\uff08\u226480\u5b57\uff09\n"
     )
+
 
 
 # ─── R3 Judge ─────────────────────────────────────────────────────────────────
