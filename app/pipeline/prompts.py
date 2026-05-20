@@ -509,3 +509,48 @@ def build_r4_j_prompt(
         f"反馈: <若不通过，说明哪个入口有问题及原因>\n"
         f"```\n"
     )
+
+
+# ─── Report Worker / Judge ───────────────────────────────────────────────────────────────
+
+def build_report_w_prompt(
+    draft_path: "Path",
+    report_out_path: "Path",
+    module_name: str,
+    is_retry: bool = False,
+    feedback: str = "",
+) -> str:
+    """Report Worker：读取草稿 Markdown，丰富化内容，写出最终报告。"""
+    retry = _retry_section(feedback) if is_retry else ""
+    return (
+        f"# Report Worker — 安全分析报告丰富化\n\n"
+        f"模块：`{module_name}`\n"
+        f"{retry}\n"
+        f"## 步骤\n\n"
+        f"1. 使用 `read` 工具读取草稿文件：`{draft_path}`\n"
+        f"2. 阐读内容，按系统提示中的要求对每个入口条目进行丰富化：\n"
+        f"   - 补充缺失的 function_description/entry_reason/taint_details\n"
+        f"   - 每组入口角色末尾添加 `### 安全测试建议` 段落\n"
+        f"   - 在报告末尾添加 `## 覆盖率评估` 章节\n"
+        f"3. 将优化后的完整 Markdown 内容写入：`{report_out_path}`\n\n"
+        f"完成后用 `<result>` 包裹摘要：优化了哪些条目，添加了哪些内容。\n"
+    )
+
+
+def build_report_j_prompt(
+    report_path: "Path",
+    module_name: str,
+) -> str:
+    """Report Judge：评审安全分析报告质量。"""
+    return (
+        f"# Report Judge — 安全分析报告质量审核\n\n"
+        f"模块：`{module_name}`\n\n"
+        f"## 步骤\n\n"
+        f"1. 使用 `read` 工具读取报告文件：`{report_path}`\n"
+        f"2. 按系统提示中的维度逐一检查\n\n"
+        f"## 输出格式\n\n"
+        f"```\n"
+        f"通过: <是/否>\n"
+        f"反馈: <若不通过，说明具体缺陷和建议>\n"
+        f"```\n"
+    )

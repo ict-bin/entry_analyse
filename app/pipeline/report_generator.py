@@ -344,3 +344,158 @@ def generate_report(
     lines.append("")
 
     return "\n".join(lines)
+
+
+# ─── 从 funcDB 提取草稿 ──────────────────────────────────────────────────────────────────
+
+def generate_draft_from_db(
+    run_dir: "Path",
+    fl_entries: list[dict],
+    module_name: str,
+    stats: dict[str, Any] | None = None,
+) -> str:
+    """
+    从 funcDB 直接提取完整分析数据，生成结构化草稿 Markdown。
+
+    调用方式：先由本函数生成草稿，再交由 W+J 优化。
+
+    Args:
+        run_dir:    任务 run 目录（用于定位 funcDB）
+        fl_entries: 已写入 functions.list 的条目（平铺格式）
+        module_name: 模块名称
+        stats:      统计内容（可选）
+    """
+    from pathlib import Path as _Path
+    import sqlite3 as _sqlite3, json as _json
+
+    stats = stats or {}
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 从所有 funcDB 提取完整 R2 分析数据
+    db_entries: list[dict] = []
+    func_hash_index: dict[str, dict] = {}
+    funcs_db_dir = _Path(run_dir) / "workspace" / "r1-functions"
+    if funcs_db_dir.exists():
+        for db_file in sorted(funcs_db_dir.glob("*_functions.db")):
+            try:
+                conn = _sqlite3.connect(str(db_file))
+                conn.row_factory = _sqlite3.Row
+                rows = conn.execute(
+                    """SELECT f.func_hash, f.name, f.signature,
+                              f.start_line, f.end_line, f.body_lines,
+                              f.entry_role, f.entry_confidence, f.analysis,
+                              fm.rel_path AS file_path
+                       FROM functions f
+                       LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
+                       WHERE f.has_external_input = 1
+                       ORDER BY f.start_line"""
+                ).fetchall()
+                for r in rows:
+                    d = dict(r)
+                    if d.get("analysis"):
+                        try:
+                            d["analysis"] = _json.loads(d["analysis"])
+                        except Exception:
+                            pass
+                    db_entries.append(d)
+                    func_hash_index[d["func_hash"]] = d
+                conn.close()
+            except Exception:
+                pass
+
+    # 用 functions.list 条目补充/覆盖（优先级更高，因为已经过 auto_fix）
+    fl_index: dict[str, dict] = {e.get("func_hash", ""): e for e in fl_entries if e.get("func_hash")}
+
+    # 建立合并列表：以 functions.list 为主，用 DB 补充缺失字段
+    merged: list[dict] = []
+    for e in fl_entries:
+        fh = e.get("func_hash", "")
+        db_e = func_hash_index.get(fh, {})
+        db_a = db_e.get("analysis") or {}
+        merged.append({
+            "func_hash":            fh,
+            "file":                 e.get("file") or db_e.get("file_path") or "",
+            "line":                 e.get("line") or e.get("start_line") or 0,
+            "function":             e.get("function") or db_e.get("name") or "",
+            "signature":            e.get("signature") or db_e.get("signature") or "",
+            "tag":                  e.get("tag") or db_a.get("tag") or "P",
+            "entry_role":           e.get("entry_role") or db_e.get("entry_role") or "",
+            "taints":               e.get("taints") or db_a.get("taints") or [],
+            "taint_details":        e.get("taint_details") or db_a.get("taint_details") or [],
+            "function_description": e.get("function_description") or db_a.get("function_description") or "",
+            "entry_reason":         e.get("entry_reason") or db_a.get("entry_reason") or "",
+            "entry_source_lines":   db_a.get("entry_source_lines") or [],
+            "entry_confidence":     e.get("entry_confidence") or db_e.get("entry_confidence"),
+            "body_lines":           db_e.get("body_lines") or e.get("body_lines") or 0,
+        })
+
+    # 按 entry_role 分组
+    groups = _group_entries(merged)
+
+    # 概要表
+    lines: list[str] = [
+        f"# {module_name} 外部入口分析草稿",
+        f"",
+        f"> 生成时间：{now}｜共 {len(merged)} 个外部入口｜包含完整 R2 分析数据",
+        f"",
+        f"## 概要统计",
+        f"",
+        f"| 入口角色 | 数量 | 典型入口 |",
+        f"| --- | --- | --- |",
+    ]
+    for role, group_entries in groups:
+        label = _ROLE_DISPLAY.get(role, role or "未分类")
+        sample = ", ".join(e["function"] for e in group_entries[:3])
+        lines.append(f"| {label} | {len(group_entries)} | {sample}... |")
+    lines.append("")
+
+    # 分组详细
+    for role, group_entries in groups:
+        label = _ROLE_DISPLAY.get(role, role or "未分类")
+        desc = _ROLE_DESC.get(role, "")
+        lines += [
+            f"## {label}",
+            f"",
+            f"> {desc}" if desc else "",
+            f"",
+        ]
+        for e in group_entries:
+            fh = e["func_hash"]
+            conf = e.get("entry_confidence")
+            tag_label = "主动型(A)" if e["tag"] == "A" else "被动型(P)"
+            lines += [
+                f"### `{e['function']}`",
+                f"",
+                f"- **文件**：`{e['file']}`（第 {e['line']} 行，共 {e['body_lines']} 行）",
+                f"- **类型**：{tag_label}｜函数哈希：`{fh}`",
+                f"- **置信度**：{_format_confidence(conf)}",
+                f"- **函数签名**：`{e['signature']}`",
+                f"",
+                f"**职责说明**：{e['function_description'] or '（待补充）'}",
+                f"",
+                f"**入口判定理由**：{e['entry_reason'] or '（待补充）'}",
+                f"",
+                f"**污点参数**：",
+            ]
+            taints = e.get("taints") or []
+            details = {d.get("name"): d.get("description", "") for d in (e.get("taint_details") or [])}
+            for t in taints:
+                desc_t = details.get(t, "")
+                lines.append(f"  - `{t}`{'\uff1a' + desc_t if desc_t else ''}")
+            src_lines = e.get("entry_source_lines") or []
+            if src_lines:
+                lines.append("")
+                lines.append("**入口代码行**：")
+                lines.append("```c")
+                for sl in src_lines[:5]:
+                    lines.append(f"L{sl.get('line','?')}: {sl.get('code','')}")
+                lines.append("```")
+            lines.append("")
+
+    lines += [
+        "---",
+        f"",
+        f"*草稿由 SecFlow 引擎从函数数据库直接提取，生成时间 {now}。将由 W+J 对进行进一步丰富化。*",
+        f"",
+    ]
+    return "\n".join(lines)

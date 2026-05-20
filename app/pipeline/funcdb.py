@@ -37,6 +37,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS file_meta (
     file_hash     TEXT PRIMARY KEY,
     original_path TEXT NOT NULL,
+    rel_path      TEXT NOT NULL DEFAULT '',
     basename      TEXT NOT NULL,
     total_funcs   INTEGER DEFAULT 0,
     created_at    REAL
@@ -108,6 +109,11 @@ class FunctionDB:
                 conn.execute("ALTER TABLE functions ADD COLUMN entry_confidence REAL DEFAULT NULL")
             except Exception:
                 pass  # 列已存在，忽略
+            # 向前兼容迁移：老 DB 可能没有 rel_path 列
+            try:
+                conn.execute("ALTER TABLE file_meta ADD COLUMN rel_path TEXT NOT NULL DEFAULT ''")
+            except Exception:
+                pass  # 列已存在，忽略
 
     # ── 写方法 ─────────────────────────────────────────────────────────────────
 
@@ -117,15 +123,17 @@ class FunctionDB:
         original_path: str,
         funcs: list["FunctionExtract"],
         func_hashes: list[str],
+        rel_path: str = "",
     ) -> None:
         """
         R1-W 初次批量写入。使用 INSERT OR IGNORE 避免覆盖已有记录。
 
         Args:
             file_hash:     文件 hash（12位 hex）
-            original_path: 源文件绝对路径
+            original_path: 源文件绝对路径（供 agent sed/grep 命令使用）
             funcs:         FunctionExtract 列表（来自 extractor）
             func_hashes:   与 funcs 一一对应的 12位 hex hash 列表
+            rel_path:      相对于 source_dir 的相对路径（供 functions.list file 字段使用）
         """
         basename = Path(original_path).name
         rows = []
@@ -143,9 +151,9 @@ class FunctionDB:
         with self._get_conn() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO file_meta
-                       (file_hash, original_path, basename, total_funcs, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (file_hash, original_path, basename, len(funcs), time.time()),
+                       (file_hash, original_path, rel_path, basename, total_funcs, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (file_hash, original_path, rel_path, basename, len(funcs), time.time()),
             )
             conn.executemany(
                 """INSERT OR IGNORE INTO functions
@@ -264,9 +272,10 @@ class FunctionDB:
             if file_hash:
                 conn.execute(
                     """INSERT OR REPLACE INTO file_meta
-                           (file_hash, original_path, basename, total_funcs, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                           (file_hash, original_path, rel_path, basename, total_funcs, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
                     (file_hash, original_path,
+                     data.get("rel_path", ""),
                      Path(original_path).name if original_path else "",
                      len(funcs_list), time.time()),
                 )
@@ -331,33 +340,51 @@ class FunctionDB:
 
         Returns:
             按 start_line 升序的 list，每项含
-            func_hash/name/signature/start_line/end_line/body_lines/has_external_input。
+            func_hash/name/signature/start_line/end_line/body_lines/has_external_input
+            /analysis(dict)/file_path(str)。
         """
         with self._get_conn() as conn:
             rows = conn.execute(
-                """SELECT func_hash, file_hash, name, signature,
-                          start_line, end_line, body_lines, has_external_input, updated_at
-                   FROM functions ORDER BY start_line"""
+                """SELECT f.func_hash, f.file_hash, f.name, f.signature,
+                          f.start_line, f.end_line, f.body_lines,
+                          f.has_external_input, f.analysis, f.entry_role,
+                          f.entry_confidence, f.updated_at,
+                          fm.rel_path AS file_path
+                   FROM functions f
+                   LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
+                   ORDER BY f.start_line"""
             ).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get("analysis"):
+                try:
+                    d["analysis"] = json.loads(d["analysis"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            result.append(d)
+        return result
 
     def get_entries(self) -> list[dict]:
         """
-        查询 has_external_input=1 的函数（含 analysis 和 entry_role，不含 body）。
+        查询 has_external_input=1 的函数（含 analysis、entry_role、file_path，不含 body）。
 
         供 R2-J/R3-W/R3-J/R4-W Agent 获取已确认外部入口列表。
 
         Returns:
             按 start_line 升序的 list，每项含
-            func_hash/name/signature/start_line/end_line/body_lines/entry_role/analysis（dict）。
+            func_hash/name/signature/start_line/end_line/body_lines/entry_role/analysis（dict）/file_path。
         """
         with self._get_conn() as conn:
             rows = conn.execute(
-                """SELECT func_hash, name, signature,
-                          start_line, end_line, body_lines, entry_role, entry_confidence, analysis
-                   FROM functions
-                   WHERE has_external_input = 1
-                   ORDER BY start_line"""
+                """SELECT f.func_hash, f.name, f.signature,
+                          f.start_line, f.end_line, f.body_lines,
+                          f.entry_role, f.entry_confidence, f.analysis,
+                          fm.rel_path AS file_path
+                   FROM functions f
+                   LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
+                   WHERE f.has_external_input = 1
+                   ORDER BY f.start_line"""
             ).fetchall()
         result = []
         for r in rows:

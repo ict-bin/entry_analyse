@@ -164,6 +164,7 @@ class PipelineEngine:
         self.task_id = task_id
         self._on_event = on_event or (lambda e: None)
         self._cancel = cancel_event or asyncio.Event()
+        self._source_dir: str = ""   # 由 run() 写入，供 R1-W 计算 rel_path
         # 全局信号量：限制同时存在的 pi 进程总数
         parallelism = (
             getattr(cfg, "pipeline_parallelism", None)
@@ -192,6 +193,9 @@ class PipelineEngine:
         """
         dirs = PipelineDirs(run=run_dir)
         dirs.setup()
+
+        # 保存 source_dir 供内部使用（rel_path 计算、prompt 生成等）
+        self._source_dir = str(Path(source_dir).resolve())
 
         # 建立 source/ 软链接
         from ..module_loader import ModuleInfo, prepare_workspace
@@ -284,6 +288,7 @@ class PipelineEngine:
                     task_id=self.task_id,
                     on_event=self._on_event,
                     cancel_event=self._cancel,
+                    source_dir=self._source_dir,
                     is_retry=(fs.r1_w_attempts > 1),
                     system_prompt=self._stage_sys_prompt('r1_worker'),
                 )
@@ -604,10 +609,33 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
 
+            # Engine 硬校验： has_external_input=true 但 taints 为空 → 强制 FAIL
+            # 这保证即使 J 防护失手，引擎也不放过空污点的分析结果
+            if passed:
+                try:
+                    from .funcdb import FunctionDB as _FDB
+                    _fn_data = _FDB.open(dirs.r1, file_hash).get_function(func_hash)
+                    if _fn_data:
+                        _a = _fn_data.get("analysis") or {}
+                        if isinstance(_a, str):
+                            import json as _json
+                            _a = _json.loads(_a)
+                        if _a.get("has_external_input") and not _a.get("taints"):
+                            passed = False
+                            feedback = (
+                                f"Engine 硬校验失败：{func_state.name}() 的分析结果 "
+                                f"has_external_input=true 但 taints 为空数组。"
+                                f"必须在 taints 中列出至少一个承载外部数据的参数/变量名。"
+                            )
+                except Exception:
+                    pass  # DB 读取失败不阻塞流程
 
             # parse "摘要:" line from judge output
             _sm = re.search(r"摘要[：:]\s*(.+)", ar.output)
             summary = _sm.group(1).strip()[:60] if _sm else feedback[:60]
+            # 如果 engine 硬校验覆盖了 passed/feedback，用我们的描述替换 summary
+            if not passed and "Engine 硬校验失败" in feedback:
+                summary = "taints 为空，必须列出至少一个承载外部数据的参数名"[:60]
             func_state.r2_j_state = NodeState.PASSED if passed else NodeState.FAILED
             func_state.r2_j_feedback_summary = summary
 
@@ -750,6 +778,10 @@ class PipelineEngine:
                 "signature":  func_st.signature or meta.get("signature", ""),
                 "start_line": meta.get("start_line", 0),
                 "end_line":   meta.get("end_line", 0),
+                # 以下字段供 _make_r3_entry 构建完整条目使用
+                "analysis":   meta.get("analysis"),      # dict 或 None
+                "file_path":  meta.get("file_path", ""), # rel_path，已经是相对路径
+                "body_lines": meta.get("body_lines", 0),
             })
 
         tasks = [
@@ -779,12 +811,34 @@ class PipelineEngine:
 
     @staticmethod
     def _make_r3_entry(func_info: dict, entry_role: str, reason: str) -> dict:
+        """从 funcdb 元数据构建 R3 层出口条目（已平铺，_flatten_r4_entries 直接透传）。"""
+        # analysis 字段已在 get_all_meta() 中被解析为 dict
+        a: dict = func_info.get("analysis") or {}
+        if not isinstance(a, dict):
+            try:
+                import json as _json
+                a = _json.loads(a)
+            except Exception:
+                a = {}
+        taints = a.get("taints") or []
+        tag    = a.get("tag") or "P"
         return {
-            "func_hash":    func_info["func_hash"],
-            "function":     func_info.get("name", ""),
-            "signature":    func_info.get("signature", ""),
-            "entry_role":   entry_role,
-            "entry_reason": reason,
+            # 字段顺序与 functions.list 规范一致
+            "tag":                  tag,
+            "file":                 func_info.get("file_path") or "",
+            "line":                 func_info.get("start_line") or 0,
+            "function":             func_info.get("name") or "",
+            "taints":               taints,
+            "entry_role":           entry_role,
+            "function_description": a.get("function_description") or "",
+            "entry_reason":         reason or a.get("entry_reason") or "",
+            "taint_details":        a.get("taint_details") or [],
+            # 保留原始字段供下游扩展
+            "func_hash":            func_info.get("func_hash") or "",
+            "signature":            func_info.get("signature") or "",
+            "start_line":           func_info.get("start_line") or 0,
+            "end_line":             func_info.get("end_line") or 0,
+            "body_lines":           func_info.get("body_lines") or 0,
         }
 
 
@@ -1237,3 +1291,102 @@ class PipelineEngine:
         return (self.cfg.judges.agents[0]
                 if self.cfg.judges.agents
                 else self.cfg.workers.agents[0])
+
+    # ── 公共接口：报告 W+J ────────────────────────────────────────────────────────────
+
+    async def generate_final_report(
+        self,
+        run_dir: Path,
+        fl_entries: list[dict],
+        out_dir: Path,
+        module_name: str,
+        stats: dict | None = None,
+    ) -> str:
+        """
+        从 funcDB 提取草稿 → Report-W 丰富化 → Report-J 验证。
+        返回最终报告 Markdown 文本。
+        """
+        from .report_generator import generate_draft_from_db
+        import app.pipeline.prompts as P
+
+        report_dir = run_dir / "workspace" / "report"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        draft_path  = report_dir / "draft.md"
+        report_path = out_dir / "final_report.md"
+        session_w   = str(report_dir / "report_w.jsonl")
+
+        # Step1： Python 从 funcDB 生成完整草稿
+        draft_text = generate_draft_from_db(run_dir, fl_entries, module_name, stats)
+        draft_path.write_text(draft_text, encoding="utf-8")
+        self._emit("report_draft_done", entry_count=len(fl_entries))
+
+        # Step2： Report-W + Report-J W+J 循环
+        max_rounds = int(getattr(self.cfg, "report_max_rounds", 2))
+        feedback = ""
+        acfg = self.cfg.workers.agents[0]
+        j_acfg = self._judge_acfg()
+        sys_w = self._stage_sys_prompt("report_worker")
+        sys_j = self._stage_sys_prompt("report_judge")
+
+        for attempt in range(1, max_rounds + 1):
+            if self._cancel.is_set():
+                break
+            is_retry = attempt > 1
+            self._emit("report_w_start", attempt=attempt)
+            w_prompt = P.build_report_w_prompt(
+                draft_path=draft_path,
+                report_out_path=report_path,
+                module_name=module_name,
+                is_retry=is_retry,
+                feedback=feedback,
+            )
+            try:
+                await self._call_agent(
+                    prompt=w_prompt, system_prompt=sys_w,
+                    session_file=session_w, cwd=str(out_dir),
+                    context="report_w", acfg=acfg,
+                )
+            except Exception as exc:
+                logger.warning("Report-W attempt %d failed: %s", attempt, exc)
+                break
+
+            if not report_path.exists():
+                feedback = "report文件未写出，请确认使用 write 工具将内容写入指定路径"
+                continue
+
+            # Report-J 验证
+            j_session = str(report_dir / f"report_j_a{attempt}.jsonl")
+            self._emit("report_j_start", attempt=attempt)
+            j_prompt = P.build_report_j_prompt(
+                report_path=report_path,
+                module_name=module_name,
+            )
+            try:
+                j_ar = await self._call_agent(
+                    prompt=j_prompt, system_prompt=sys_j,
+                    session_file=j_session, cwd=str(out_dir),
+                    context="report_j", acfg=j_acfg,
+                )
+                j_text = (j_ar.result or "").strip()
+                passed = j_text.startswith("通过: 是") or "通过: 是" in j_text
+                if passed:
+                    self._emit("report_j_done", passed=True, attempt=attempt)
+                    break
+                # 提取 J 反馈用于下一轮
+                for line in j_text.splitlines():
+                    if line.startswith("反馈:"):
+                        feedback = line[3:].strip()
+                        break
+                else:
+                    feedback = j_text[:200]
+                self._emit("report_j_done", passed=False, attempt=attempt, feedback=feedback)
+            except Exception as exc:
+                logger.warning("Report-J attempt %d failed: %s", attempt, exc)
+                break
+
+        # 如果 W 未写出文件，回落到草稿
+        if not report_path.exists():
+            report_path.write_text(draft_text, encoding="utf-8")
+            logger.warning("Report-W did not produce output, using draft")
+
+        return report_path.read_text(encoding="utf-8")

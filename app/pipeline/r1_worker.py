@@ -308,6 +308,7 @@ async def run_r1_worker(
     task_id: str,
     on_event: Callable,
     cancel_event,
+    source_dir: str = "",
     is_retry: bool = False,
     failed_funcs: list[dict] | None = None,
     system_prompt: str = "",
@@ -347,8 +348,14 @@ async def run_r1_worker(
         )
         # 同步写入 SQLite（Agent 可按 func_hash 精确查询，无 50KB 截断问题）
         from .funcdb import FunctionDB as _FDB
+        _rel = (
+            os.path.relpath(os.path.abspath(file_path), source_dir)
+            if source_dir
+            else os.path.basename(file_path)
+        )
         _FDB.open(dirs.r1, file_hash).write_functions(
-            file_hash, file_path, static_funcs, func_hashes_static
+            file_hash, file_path, static_funcs, func_hashes_static,
+            rel_path=_rel,
         )
 
         _safe_emit(on_event, "r1_static_done", task_id,

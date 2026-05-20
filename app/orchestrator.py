@@ -289,6 +289,31 @@ class Orchestrator:
         func_list_path = str(out_dir / "functions.list")
         _fl: list[dict] = _flatten_r4_entries(entries) if isinstance(entries, list) else []
 
+        # 补充空白的 file 字段：从 funcDB 构建 12位 func_hash -> 相对路径映射
+        # （funcdb.get_all_meta() 已返回 rel_path，_make_r3_entry 应该已填充，此处仅兑底）
+        if _fl:
+            _func_to_file: dict[str, str] = {}
+            _funcs_db_dir = run_dir / "workspace" / "r1-functions"
+            if _funcs_db_dir.exists():
+                import sqlite3 as _sqlite3
+                for _db_file in _funcs_db_dir.glob("*_functions.db"):
+                    try:
+                        _conn = _sqlite3.connect(str(_db_file))
+                        # rel_path 是相对路径，直接用。如果为空则兑底到 basename
+                        _fmap = {r[0]: r[1] or r[2]
+                                 for r in _conn.execute(
+                                     "SELECT file_hash, rel_path, basename FROM file_meta")}
+                        for _fhash, _fileh in _conn.execute(
+                                "SELECT func_hash, file_hash FROM functions"):
+                            _func_to_file[_fhash] = _fmap.get(_fileh, "")
+                        _conn.close()
+                    except Exception:
+                        pass
+            for _entry in _fl:
+                if not _entry.get("file"):
+                    _entry["file"] = _func_to_file.get(
+                        (_entry.get("func_hash") or "")[:12], "")
+
         if _fl:
             _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl)
             if _fl_fix_log:
@@ -313,9 +338,8 @@ class Orchestrator:
             json.dumps(_fl, ensure_ascii=False, indent=2),
             encoding="utf-8")
 
-        # final_report.md — 人类可读的 Markdown 报告
+        # final_report.md — 先由 Python 从 funcDB 提取完整草稿，再由 W+J 丰富化
         try:
-            from .pipeline.report_generator import generate_report as _gen_report
             _stats = {
                 "module_name":       cfg.module_name,
                 "file_count":        len(resolved_files) if resolved_files else 0,
@@ -324,8 +348,13 @@ class Orchestrator:
                                      if hasattr(result, "total_tokens") and result.total_tokens
                                      else {},
             }
-            _report_md = _gen_report(_fl, cfg.module_name, _stats)
-            (out_dir / "final_report.md").write_text(_report_md, encoding="utf-8")
+            await engine.generate_final_report(
+                run_dir=run_dir,
+                fl_entries=_fl,
+                out_dir=out_dir,
+                module_name=cfg.module_name,
+                stats=_stats,
+            )
         except Exception as _rep_exc:
             import logging as _log
             _log.getLogger("ea.orchestrator").warning(

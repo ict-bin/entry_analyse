@@ -12,6 +12,15 @@
 
 ## 验证方法
 
+### taints 非空校验（最高优先级）
+
+**若 `has_external_input=true` 但 `taints` 字段为空数组或缺失 → 必须 FAIL，反馈必须明确写出：**
+```
+通过: 否
+摘要: taints 为空，Worker 未提供任何污点参数名
+反馈: taints 字段为空或缺失。请明确指出哪个函数参数/变量承载了外部数据，并在 taints 中列出其名称。
+```
+
 ### taints 参数真实性
 
 读取函数签名行（`sed -n '{start_line}p' {file}`），逐一核对 taints 列表中的每个参数名：
