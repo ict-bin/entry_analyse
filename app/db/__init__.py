@@ -40,6 +40,8 @@ _MIGRATIONS = [
     "CREATE INDEX ix_ea_tasks_project_created_id ON secflow_app_ea_tasks (project_id, created_at, id)",
     "CREATE INDEX ix_ea_tasks_project_deleted_status_created_id ON secflow_app_ea_tasks (project_id, is_deleted, status, created_at, id)",
     "CREATE INDEX ix_ea_tasks_project_deleted_status_lease_id ON secflow_app_ea_tasks (project_id, is_deleted, status, lease_expires_at, id)",
+    "CREATE INDEX ix_ea_tasks_parent_stage_item_id_lookup ON secflow_app_ea_tasks (project_id, is_deleted, parent_task_id, parent_stage_name, parent_stage_item_id, created_at, id)",
+    "CREATE INDEX ix_ea_tasks_parent_stage_item_key_lookup ON secflow_app_ea_tasks (project_id, is_deleted, parent_task_id, parent_stage_name, parent_stage_item_key, created_at, id)",
 ]
 
 

@@ -26,6 +26,8 @@ from app.time_utils import add_seconds_local, isoformat_local, now_local
 
 logger = logging.getLogger("ea.task_service")
 
+_PARENT_REUSABLE_TASK_STATUSES = {"pending", "running", "passed", "success"}
+
 
 def _positive_int_env(name: str, default: int) -> int:
     try:
@@ -1075,6 +1077,39 @@ class TaskService:
     ) -> dict:
         # Auto-generate prompt from module_name (never use user-supplied prompt)
         effective_prompt = generate_prompt_from_module(module_name) if module_name else generate_prompt_from_path(input_path)
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        normalized_parent_stage_name = str(parent_stage_name or "").strip()
+        normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
+        normalized_parent_stage_item_key = str(parent_stage_item_key or "").strip()
+        if normalized_parent_task_id and normalized_parent_stage_name and (
+            normalized_parent_stage_item_id or normalized_parent_stage_item_key
+        ):
+            reusable_query = db.query(AppEaTask).filter(
+                AppEaTask.project_id == project_id,
+                AppEaTask.is_deleted.is_(False),
+                AppEaTask.parent_task_id == normalized_parent_task_id,
+                AppEaTask.parent_stage_name == normalized_parent_stage_name,
+                AppEaTask.status.in_(list(_PARENT_REUSABLE_TASK_STATUSES)),
+            )
+            if normalized_parent_stage_item_id:
+                reusable_query = reusable_query.filter(AppEaTask.parent_stage_item_id == normalized_parent_stage_item_id)
+            else:
+                reusable_query = reusable_query.filter(AppEaTask.parent_stage_item_key == normalized_parent_stage_item_key)
+            reusable = reusable_query.order_by(AppEaTask.created_at.desc(), AppEaTask.id.desc()).first()
+            if reusable is not None:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "task create deduplicated",
+                    event="task_create_deduplicated",
+                    task_id=reusable.task_id,
+                    project_id=project_id,
+                    parent_task_id=normalized_parent_task_id,
+                    parent_stage_name=normalized_parent_stage_name,
+                    parent_stage_item_id=normalized_parent_stage_item_id or None,
+                    parent_stage_item_key=normalized_parent_stage_item_key or None,
+                )
+                return self._row_to_dict(reusable)
         task_id = f"eat_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-entry-analyse"
