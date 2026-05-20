@@ -816,6 +816,7 @@ class PipelineEngine:
         state.cc_state = NodeState.RUNNING
         state.cc_attempts += 1
         state.save(dirs.state_file)
+        self._emit("callchain_start", attempt=state.cc_attempts)
 
         try:
             from .callchain_extractor import collect_known_funcs_from_dbs, extract_call_edges
@@ -902,6 +903,7 @@ class PipelineEngine:
             logger.warning("CC analysis failed (non-fatal): %s", exc)
             state.cc_state = NodeState.FAILED
             state.save(dirs.state_file)
+            self._emit("callchain_failed", error=str(exc)[:200])
 
 
     async def _run_r4_pipeline(
