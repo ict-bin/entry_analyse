@@ -1313,7 +1313,10 @@ class PipelineEngine:
         report_dir.mkdir(parents=True, exist_ok=True)
         draft_path  = report_dir / "draft.md"
         report_path = out_dir / "final_report.md"
-        session_w   = str(report_dir / "report_w.jsonl")
+        # Session 文件存到 run/sessions/ 下，供 session_index.py 扫描可见
+        _sess_dir = run_dir / "sessions"
+        _sess_dir.mkdir(parents=True, exist_ok=True)
+        session_w   = str(_sess_dir / "report_w.jsonl")
 
         # Step1： Python 从 funcDB 生成完整草稿
         draft_text = generate_draft_from_db(run_dir, fl_entries, module_name, stats)
@@ -1355,7 +1358,7 @@ class PipelineEngine:
                 continue
 
             # Report-J 验证
-            j_session = str(report_dir / f"report_j_a{attempt}.jsonl")
+            j_session = str(_sess_dir / f"report_j_a{attempt}.jsonl")
             self._emit("report_j_start", attempt=attempt)
             j_prompt = P.build_report_j_prompt(
                 report_path=report_path,

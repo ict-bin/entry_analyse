@@ -350,13 +350,22 @@ def _extract_functions_regex(file_path: str, lines: list[str]) -> list[dict]:
 
 # ─── 宏函数扫描 ────────────────────────────────────────────────────────────────
 
-def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
+def _scan_macro_functions(
+    file_path: str,
+    lines: list[str],
+    func_ranges: list[tuple[int, int]] | None = None,
+) -> list[dict]:
     """
     扫描文件中通过宏定义的函数。
 
     两种模式：
     1. 有 ## 的宏 → 扫调用位置（每次调用展开为不同函数名）
     2. 无 ## 但有 {} 的宏 → 用宏定义行本身（固定代码块）
+
+    Args:
+        func_ranges: ctags 已提取的函数体區间列表 [(start_line, end_line), ...]。
+                     用于过滤「函数体内的宏调用」（调用点而非定义点）。
+                     为 None 时跳过此过滤（向后兼容）。
     """
     entries = []
     macro_with_paste: dict[str, int] = {}
@@ -389,7 +398,8 @@ def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
             r'^\s*(' + '|'.join(re.escape(n) for n in macro_with_paste)
             + r')\s*\(([^)]+)\)\s*;?\s*$'
         )
-        seen: set[int] = set()
+        seen: set[int] = set()       # 一级去重：按行号（防正同一行被匹配两次）
+        seen_hints: set[str] = set() # 二级去重：按函数名（防止同名宏函数在文件层出现多次）
         for li, line in enumerate(lines):
             m = _CALL_RE.match(line)
             if not m:
@@ -397,10 +407,22 @@ def _scan_macro_functions(file_path: str, lines: list[str]) -> list[dict]:
             macro_name = m.group(1)
             args = [a.strip() for a in m.group(2).split(',')]
             call_line = li + 1
+
             if call_line in seen:
                 continue
-            seen.add(call_line)
+
+            # 过滤函数体内的宏调用：位于已知函数体内 → 是调用点而非定义点，跳过
+            if func_ranges and any(s < call_line <= e for s, e in func_ranges):
+                continue
+
             func_hint = f"{macro_name}({args[0]})"
+
+            # 按函数名去重：同一宏函数只保留首次出现（第二次出现就是 compile error，分析时容错）
+            if func_hint in seen_hints:
+                continue
+
+            seen.add(call_line)
+            seen_hints.add(func_hint)
             entries.append({
                 "name":            func_hint,
                 "scope":           "",
@@ -453,14 +475,24 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
         raw_entries = _extract_functions_regex(file_path, lines)
         logger.debug("ctags not available, using regex for %s", Path(file_path).name)
 
-    macro_entries = _scan_macro_functions(file_path, lines)
+    # 步骤 1.5：为 ctags/regex 提取到的常规函数计算函数体行号区间
+    # 用于将宏扫描器过滤掉「函数体内的宏调用」（调用点而非定义点）
+    func_ranges: list[tuple[int, int]] = []
+    for _entry in raw_entries:
+        _sl = _entry.get("line", 0)
+        if _sl > 0:
+            _el = _find_function_end(lines, _sl)
+            if _el > _sl:
+                func_ranges.append((_sl, _el))
+
+    macro_entries = _scan_macro_functions(file_path, lines, func_ranges=func_ranges)
     if macro_entries:
         existing_lines = {e.get("line", 0) for e in raw_entries}
         for me in macro_entries:
             if me["line"] not in existing_lines:
                 raw_entries.append(me)
                 existing_lines.add(me["line"])
-        logger.info("%s: found %d macro-defined functions",
+        logger.info("%s: found %d macro-defined functions (after in-body filtering)",
                     Path(file_path).name, len(macro_entries))
 
     results: list[FunctionExtract] = []

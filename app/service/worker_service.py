@@ -291,6 +291,28 @@ class WorkerService:
                 source_path=task_snapshot.source_path or "",
                 resume_task_id=tcfg.get("resume_task_id", ""),
             )
+
+            # 新鲜启动检测： stages_json 为空表示 DB 已被重置（手动重置 / restart_task API）
+            # 若磁盘上还有旧的 pipeline_state.json，将其删除以强制全量重分析
+            # （旧状态的 r4_state=PASSED 会导致新 run 跳过所有阶段直接进报告生成）
+            is_fresh_start = not task_snapshot.stages_json  # None 或 {}
+            if is_fresh_start and task_snapshot.output_path:
+                import pathlib as _pl
+                _state_file = (
+                    _pl.Path(task_snapshot.output_path)
+                    / task_snapshot.task_id / "run" / "pipeline_state.json"
+                )
+                if _state_file.exists():
+                    try:
+                        _state_file.unlink()
+                        logger.info(
+                            "Fresh start: deleted stale pipeline_state.json for %s",
+                            task_id)
+                    except Exception as _e:
+                        logger.warning(
+                            "Failed to delete pipeline_state.json for %s: %s",
+                            task_id, _e)
+
             orch = Orchestrator(config=cfg, on_event=on_event)
             lease_task = asyncio.create_task(self._renew_task_lease(task_id, lease_stop_event), name=f"ea_lease_{task_id}")
             control_task = asyncio.create_task(

@@ -9,14 +9,16 @@ from typing import Callable
 
 _STAGE_ORDER = {
     "analyse": 10,
-    "merge": 20,
-    "judge": 30,
+    "merge":   20,
+    "judge":   30,
+    "report":  40,
 }
 
 _STAGE_LABEL = {
     "analyse": "入口分析",
-    "merge": "合并结果",
-    "judge": "裁判评审",
+    "merge":   "合并结果",
+    "judge":   "裁判评审",
+    "report":  "报告生成",
 }
 
 
@@ -130,6 +132,32 @@ def _infer_path_descriptor(relative_path: str) -> dict:
             "parallel_group": f"judge::r{judge_match.group(3)}",
             "parent_relative_path": "master-worker.jsonl" if Path("master-worker.jsonl") else "worker.jsonl",
             "family_key": f"judge::r{judge_match.group(3)}",
+            "flow_kind": "parallel",
+        })
+        return desc
+    # Report-W
+    if normalized == "report_w.jsonl":
+        desc.update({
+            "role": "worker",
+            "role_label": "Worker",
+            "stage_key": "report",
+            "stage_label": _STAGE_LABEL["report"],
+            "stage_order": _STAGE_ORDER["report"],
+            "family_key": "report",
+        })
+        return desc
+    # Report-J
+    report_j_match = re.fullmatch(r"report_j_a(\d+)\.jsonl", normalized)
+    if report_j_match:
+        desc.update({
+            "role": "judge",
+            "role_label": "Judge",
+            "stage_key": "report",
+            "stage_label": _STAGE_LABEL["report"],
+            "stage_order": _STAGE_ORDER["report"],
+            "attempt": _safe_int(report_j_match.group(1)),
+            "parent_relative_path": "report_w.jsonl",
+            "family_key": "report",
             "flow_kind": "parallel",
         })
         return desc
