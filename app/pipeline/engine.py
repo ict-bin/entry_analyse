@@ -170,6 +170,8 @@ class PipelineEngine:
             or getattr(cfg, "worker_parallelism", 64)
         )
         self._sem = asyncio.Semaphore(int(parallelism))
+        # R4 Judge 至少 passed 一次时为 True，代表分析结果已被验证（即使入口列表为空）
+        self._r4_j_confirmed: bool = False
         # SQLite WAL 天然支持并发读写，删除应用层 asyncio.Lock
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
@@ -888,6 +890,8 @@ class PipelineEngine:
                 fb_file.write_text(feedback, encoding="utf-8")
                 state.r4_feedback = str(fb_file)  # 转存文件路径，供 retry 引用
             self._emit("r4_j_done", passed=passed, feedback=feedback[:200])
+            if passed:
+                self._r4_j_confirmed = True
             return passed
         except Exception as exc:
             logger.error("R4 J failed: %s", exc)

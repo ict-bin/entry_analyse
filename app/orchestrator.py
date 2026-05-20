@@ -197,6 +197,9 @@ class Orchestrator:
                 result.error = "任务已被取消"
             elif entries:
                 result.status = TaskStatus.PASSED
+            elif engine._r4_j_confirmed:
+                # R4 Judge 确认过（即使入口列表为空）：该模块本身就没有外部入口
+                result.status = TaskStatus.PASSED
             else:
                 result.status = TaskStatus.FAILED
                 result.error = "流水线未产生任何外部入口结果"
