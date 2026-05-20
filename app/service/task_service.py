@@ -111,6 +111,8 @@ def _task_abnormal_reason(row: AppEaTask) -> dict | None:
         code, category, title = "runtime_interrupted", "runtime", "运行时中断"
     elif "dispatch" in message.lower() or "调度" in message:
         code, category, title = "dispatch_failed", "runtime", "调度失败"
+    elif "找不到模块" in message or "files.list" in message.lower():
+        code, category, title = "module_descriptor_missing", "input", "模块描述文件缺失"
     else:
         code, category, title = ("unknown_abnormal" if status == "error" else "orchestration_failed"), "orchestration", "任务异常结束"
     return {

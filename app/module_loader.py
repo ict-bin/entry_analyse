@@ -151,6 +151,16 @@ def load_module(module_name: str, target_dir: str) -> ModuleInfo:
     # ─── 全部未命中 ──────────────────────────────────────────────────
     available = list_modules(target_dir)
     avail_msg = f"\n可用模块: {', '.join(available)}" if available else ""
+    direct_sources = sorted(
+        str(path.relative_to(target)).replace("\\", "/")
+        for path in target.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh"}
+    )[:20]
+    direct_msg = (
+        "\n当前目录存在源码文件，但未发现模块描述文件；请提供 files.list/module_map.json/modules.json 等模块索引。"
+        if direct_sources else ""
+    )
+    source_preview = f"\n源码文件示例: {', '.join(direct_sources)}" if direct_sources else ""
     raise FileNotFoundError(
         f"找不到模块 '{module_name}' 的分析文件。\n"
         f"请在 {target_dir} 中提供以下任一格式：\n"
@@ -159,6 +169,8 @@ def load_module(module_name: str, target_dir: str) -> ModuleInfo:
         f"  - modules/{module_name}.json\n"
         f"  - modules/{module_name}.txt"
         + avail_msg
+        + direct_msg
+        + source_preview
     )
 
 
