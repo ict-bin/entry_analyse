@@ -272,6 +272,14 @@ class Orchestrator:
         result.total_duration_ms = (time.time() - start) * 1000
 
         # ── 3. 产物写出 ──────────────────────────────────────────────────────
+        # cancel 后跳过产物写出，避免浪费时间写无效文件
+        if self._cancel_event and self._cancel_event.is_set():
+            self._emit("task_end", task_id,
+                       status=result.status.value,
+                       run_dir=str(run_dir),
+                       output_dir=str(out_dir))
+            self._cancel_event = None
+            return result
 
         # result.json（中间过程归档）
         (run_dir / "result.json").write_text(

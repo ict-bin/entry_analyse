@@ -231,6 +231,11 @@ class WorkerService:
                 "shard_merge_done",
                 "shard_master_start",
                 "shard_master_done",
+                # Fix: task 结束事件立即刷入，缩小 stages_json 更新和 status 更新之间的时间窗
+                "task_end",
+                "functions_list_synced",
+                "functions_list_error",
+                "callchain_done",
             }
             if n == 1 or n % 3 == 0 or event.type in immediate_events:
                 task_mod._flush_stages(task_id, event_buffer)
@@ -306,6 +311,9 @@ class WorkerService:
                     .first()
                 )
                 if not row:
+                    logger.warning(
+                        "task %s final DB update: row not found (owner_pod mismatch or deleted)",
+                        task_id)
                     return
                 cancel_requested = cancel_requested or row.cancel_requested or row.status == "cancelled"
                 row.status = "cancelled" if cancel_requested else (result.status.value if result else "error")
@@ -334,6 +342,26 @@ class WorkerService:
                     pass
         except asyncio.CancelledError:
             cancel_requested = True
+            # Fix: CancelledError 也需要更新 DB 状态，否则 task 永远停在 running
+            try:
+                _gen2 = get_db(); _db2 = next(_gen2)
+                try:
+                    _row = (_db2.query(AppEaTask)
+                            .filter_by(task_id=task_id)
+                            .first())
+                    if _row and _row.status == "running":
+                        _row.status = "cancelled"
+                        _row.error = "任务已取消"
+                        _row.finished_at = now_local()
+                        _row.owner_pod = None
+                        _row.lease_expires_at = None
+                        _row.cancel_requested = False
+                        _db2.commit()
+                finally:
+                    try: next(_gen2)
+                    except StopIteration: pass
+            except Exception as _ce_db_exc:
+                logger.warning("CancelledError DB update failed: %s", _ce_db_exc)
         except Exception as exc:
             log_event(logger, logging.ERROR, "task execution failed", event="task_error", task_id=task_id, error=str(exc))
             try:

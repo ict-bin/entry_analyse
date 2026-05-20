@@ -737,7 +737,8 @@ class PipelineEngine:
         """并行运行文件内所有候选函数的 R3-W session，聚合 keep 结果。"""
         from .funcdb import FunctionDB
         func_db = FunctionDB.open(dirs.r1, file_hash)
-        all_meta = func_db.get_all_meta()
+        # get_all_meta() 返回 list[dict]，转成 {func_hash: meta} 方便查找
+        all_meta = {m["func_hash"]: m for m in func_db.get_all_meta()}
 
         keep_info = []
         for fh in keep_hashes:
@@ -883,6 +884,45 @@ class PipelineEngine:
         return self._make_r3_entry(func_info, "boundary", "keep (max retries, conservative)")
 
 
+
+    async def _run_r3_j(
+        self,
+        file_hash: str,
+        file_path: str,
+        dirs: PipelineDirs,
+        state: PipelineState,
+        session_file: str,
+    ) -> bool:
+        """R3 Judge（每次新 session）。返回 passed。"""
+        fs = state.files[file_hash]
+        self._emit("r3_j_start", file_hash=file_hash, file=Path(file_path).name)
+        try:
+            acfg = self._judge_acfg()
+            sys_prompt = self._stage_sys_prompt('r3_judge')
+            prompt = P.build_r3_j_prompt(
+                file_path=file_path,
+                r3_entries_path=dirs.r3_file_path(file_hash),
+                db_path=dirs.r1_functions_db(file_hash),
+            )
+            ar = await self._call_agent(
+                prompt=prompt, system_prompt=sys_prompt,
+                session_file=session_file, cwd=str(dirs.source),
+                context=f"r3_j:{file_hash}", acfg=acfg,
+            )
+            passed, feedback = _parse_j_result(ar.output)
+            fs.r3_feedback = feedback
+            if not passed and feedback:
+                fb_file = dirs.r3_j_feedback_file(file_hash, fs.r3_attempts)
+                fb_file.parent.mkdir(parents=True, exist_ok=True)
+                fb_file.write_text(feedback, encoding="utf-8")
+                fs.r3_feedback = str(fb_file)
+            self._emit("r3_j_done",
+                       file_hash=file_hash, file=Path(file_path).name,
+                       passed=passed, feedback=feedback[:200])
+            return passed
+        except Exception as exc:
+            logger.error("R3 J failed for %s: %s", file_hash, exc)
+            return False
 
     # ── CC（调用链静态分析）─────────────────────────────────────────────────────────────
 

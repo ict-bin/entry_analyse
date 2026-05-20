@@ -831,9 +831,9 @@ async def _run_with_api_retry(
                         os.killpg(pgid, signal.SIGTERM)
                     except (ProcessLookupError, OSError):
                         pass
-                # Step2：等待 pi 进程退出（最多 3 秒）
+                # Step2：等待 pi 进程退出（最多 0.3 秒，原 3s 太长导致取消感知慢）
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=3)
+                    await asyncio.wait_for(proc.wait(), timeout=0.3)
                 except asyncio.TimeoutError:
                     pass
                 # Step3：无论 pi 是否已退出，对整个 group 强制 SIGKILL
