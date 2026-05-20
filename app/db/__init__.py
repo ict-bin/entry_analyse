@@ -18,6 +18,7 @@ _SessionLocal = None
 _MIGRATIONS = [
     # Add stages_json for real-time stage event tracking (added 2026-05)
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN stages_json JSON NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN latest_abnormal_reason_json JSON NULL",
     # Add task_config_json for per-task overrides and resume params (added 2026-05)
     "ALTER TABLE secflow_app_ea_tasks ADD COLUMN task_config_json JSON NULL",
     # Add source_path for separate source code root directory (added 2026-05)

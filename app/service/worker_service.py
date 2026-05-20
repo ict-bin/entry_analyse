@@ -324,6 +324,8 @@ class WorkerService:
                         row.error = result.error
                 elif cancel_requested:
                     row.error = "任务已取消"
+                reason, changed = task_mod._sync_task_abnormal_reason(row)
+                task_mod._record_abnormal_reason(row, reason, changed=changed)
                 db.commit()
             finally:
                 try:
@@ -359,6 +361,8 @@ class WorkerService:
                         prev = row.stages_json
                         prev_events = prev["events"] if isinstance(prev, dict) and isinstance(prev.get("events"), list) else []
                         row.stages_json = {"events": prev_events + event_buffer, "final": True}
+                        reason, changed = task_mod._sync_task_abnormal_reason(row)
+                        task_mod._record_abnormal_reason(row, reason, changed=changed)
                         db.commit()
                 finally:
                     try:

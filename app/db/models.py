@@ -50,6 +50,7 @@ class AppEaTask(Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    latest_abnormal_reason_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)

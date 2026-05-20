@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
 from app.db.models import AppEaTask
@@ -75,6 +76,126 @@ _SESSION_THINKING_LEVEL_MAP: dict[str, str] = {
     "high": "high",
     "x-high": "xhigh",
 }
+
+
+def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return {"key": key, "label": label, "value": text}
+
+
+def _task_abnormal_reason(row: AppEaTask) -> dict | None:
+    status = str(row.status or "")
+    if status not in {"failed", "error", "cancelled"}:
+        return None
+    if isinstance(row.latest_abnormal_reason_json, dict):
+        return dict(row.latest_abnormal_reason_json)
+    result_json = _load_task_result_json(row) or {}
+    stages_json = row.stages_json if isinstance(row.stages_json, dict) else {}
+    events = stages_json.get("events") if isinstance(stages_json.get("events"), list) else []
+    latest_event = next((event for event in reversed(events) if isinstance(event, dict) and (event.get("error") or event.get("event"))), None)
+    message = str(
+        row.error
+        or result_json.get("error")
+        or result_json.get("completion_reason")
+        or (latest_event or {}).get("error")
+        or (latest_event or {}).get("message")
+        or ""
+    ).strip()
+    if status == "cancelled" or row.cancel_requested:
+        code, category, title = "user_cancelled", "cancel", "任务已取消"
+    elif "lease" in message.lower() or "租约" in message:
+        code, category, title = "lease_lost", "runtime", "任务租约丢失"
+    elif "cancel" in message.lower() or "取消" in message:
+        code, category, title = "runtime_interrupted", "runtime", "运行时中断"
+    elif "dispatch" in message.lower() or "调度" in message:
+        code, category, title = "dispatch_failed", "runtime", "调度失败"
+    else:
+        code, category, title = ("unknown_abnormal" if status == "error" else "orchestration_failed"), "orchestration", "任务异常结束"
+    return {
+        "is_abnormal": True,
+        "category": category,
+        "code": code,
+        "title": title,
+        "message": message or "任务以非正常状态结束。",
+        "terminal": True,
+        "source_layer": "task",
+        "status": status,
+        "service": "entry-analysis",
+        "stage_name": str((latest_event or {}).get("stage") or (latest_event or {}).get("stage_name") or "").strip() or None,
+        "item_key": row.module_name,
+        "downstream_task_id": None,
+        "downstream_service": None,
+        "first_seen_at": isoformat_local(row.started_at),
+        "last_seen_at": isoformat_local(row.finished_at or row.updated_at),
+        "evidence": [
+            item for item in [
+                _abnormal_evidence("status", "状态", row.status),
+                _abnormal_evidence("module_name", "模块", row.module_name),
+                _abnormal_evidence("error", "原始错误", row.error),
+            ] if item is not None
+        ],
+        "recommended_action": "查看结果文件、stages_json 和会话索引，确认失败首先发生在哪一轮或哪一步。",
+        "related_event_ids": [],
+    }
+
+
+def _abnormal_reason_event(reason: dict, *, event_id: str | None = None) -> dict:
+    timestamp = str(reason.get("last_seen_at") or isoformat_local(now_local()) or "")
+    return {
+        "ts": _time.time(),
+        "timestamp": timestamp,
+        "event": "abnormal_reason_recorded",
+        "type": "abnormal_reason_recorded",
+        "event_id": event_id or f"abn-{uuid.uuid4().hex[:12]}",
+        "message": str(reason.get("title") or "任务异常结束"),
+        "level": "warning" if str(reason.get("status") or "") == "cancelled" else "error",
+        "data": {"reason": dict(reason)},
+    }
+
+
+def _abnormal_reason_history(row: AppEaTask) -> list[dict]:
+    stages_json = row.stages_json if isinstance(row.stages_json, dict) else {}
+    events = stages_json.get("events") if isinstance(stages_json.get("events"), list) else []
+    history: list[dict] = []
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("event") != "abnormal_reason_recorded":
+            continue
+        payload = event.get("data") if isinstance(event.get("data"), dict) else {}
+        reason = payload.get("reason") if isinstance(payload.get("reason"), dict) else None
+        if not isinstance(reason, dict):
+            continue
+        history.append(
+            {
+                "event_id": event.get("event_id"),
+                "created_at": event.get("timestamp") or event.get("ts"),
+                "reason": reason,
+            }
+        )
+        if len(history) >= 10:
+            break
+    return history
+
+
+def _sync_task_abnormal_reason(row: AppEaTask) -> tuple[dict | None, bool]:
+    reason = _task_abnormal_reason(row)
+    next_payload = dict(reason) if isinstance(reason, dict) else None
+    changed = row.latest_abnormal_reason_json != next_payload
+    if changed:
+        row.latest_abnormal_reason_json = next_payload
+        flag_modified(row, "latest_abnormal_reason_json")
+    return next_payload, changed
+
+
+def _record_abnormal_reason(row: AppEaTask, reason: dict | None, *, changed: bool) -> None:
+    if not changed or not isinstance(reason, dict):
+        return
+    payload = row.stages_json if isinstance(row.stages_json, dict) else {}
+    events = list(payload.get("events") or [])
+    events.append(_abnormal_reason_event(reason))
+    row.stages_json = {**payload, "events": events, "final": bool(payload.get("final", False))}
+    flag_modified(row, "stages_json")
 
 
 def _lease_deadline() -> datetime:
@@ -1154,7 +1275,9 @@ class TaskService:
         row.stages_json = None
         row.result_json = None
         row.error = None
+        row.latest_abnormal_reason_json = None
         flag_modified(row, "task_config_json")
+        flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
         if row.output_path:
             import shutil as _shutil
@@ -1189,7 +1312,9 @@ class TaskService:
         row.cancel_requested = False
         row.result_json = None
         row.error = None
+        row.latest_abnormal_reason_json = None
         flag_modified(row, "task_config_json")
+        flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
@@ -1208,6 +1333,8 @@ class TaskService:
             row.owner_pod = None
             row.owner_pod_ip = None
             row.lease_expires_at = None
+        reason, changed = _sync_task_abnormal_reason(row)
+        _record_abnormal_reason(row, reason, changed=changed)
         db.commit(); db.refresh(row)
         # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
         if owner_pod_ip and row.status == "running":
@@ -1296,6 +1423,7 @@ class TaskService:
     def _row_to_dict(row: AppEaTask, *, include_heavy: bool = True) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
+        abnormal_reason = _task_abnormal_reason(row)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),
@@ -1314,6 +1442,11 @@ class TaskService:
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
+            "abnormal_reason": abnormal_reason,
+            "abnormal_reason_history": _abnormal_reason_history(row) if include_heavy else [],
+            "abnormal_reason_title": (abnormal_reason or {}).get("title"),
+            "abnormal_reason_code": (abnormal_reason or {}).get("code"),
+            "abnormal_reason_category": (abnormal_reason or {}).get("category"),
         }
 
 
