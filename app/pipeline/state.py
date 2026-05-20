@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -221,14 +222,29 @@ class PipelineState:
         }
 
     def save(self, path: Path) -> None:
-        """原子写：先写 .tmp 再 rename，防止写一半时崩溃导致文件损坏。"""
+        """
+        原子写：用 mkstemp 产生唯一临时文件名，再 rename 到目标路径。
+
+        与固定名 `.tmp` 方案不同，即使多个 Worker Pod / 协程同时调用
+        save() 也不会产生 TOCTOU 竞争（各自持有独立临时文件）。
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix('.tmp')
-        tmp.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-            encoding='utf-8',
+        fd, tmp_str = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix='.ps_',
+            suffix='.tmp',
         )
-        os.replace(str(tmp), str(path))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+            os.replace(tmp_str, str(path))
+        except Exception:
+            # 常规临时文件废弃，避免腔留废弃 .tmp
+            try:
+                os.unlink(tmp_str)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def from_dict(cls, data: dict) -> "PipelineState":
