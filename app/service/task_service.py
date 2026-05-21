@@ -799,6 +799,22 @@ class TaskService:
             return None
         if row.status == "running" and row.owner_pod and row.owner_pod != POD_NAME and row.lease_expires_at and row.lease_expires_at >= now_local():
             return None
+        # pod 重启接管（lease 到期的 running 任务）→ 强制 restart，清空 stages_json
+        # 理由：resume 逻辑未完整实现，带旧 stages_json 的接管会走 resume 分支导致状态混乱；
+        #       清空后 worker_service.py 的 is_fresh_start=True 分支会清理磁盘残留文件后重新执行。
+        is_lease_takeover = (
+            row.status == "running"
+            and row.owner_pod is not None
+            and row.owner_pod != POD_NAME
+        )
+        if is_lease_takeover:
+            row.stages_json = None  # 触发 worker_service.py 中的 is_fresh_start=True
+            row.error = None
+            row.result_json = None
+            row.latest_abnormal_reason_json = None
+            row.started_at = None   # 重新记录本次开始时间
+            logger.info("Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",
+                        row.task_id, row.owner_pod)
         row.status = "running"
         row.owner_pod = POD_NAME
         row.lease_expires_at = _lease_deadline()
