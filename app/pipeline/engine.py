@@ -252,7 +252,7 @@ class PipelineEngine:
             if self._cancel.is_set():
                 return
             fs = state.files.get(file_hash)
-            if fs is None or fs.r1_w_state != NodeState.PASSED:
+            if fs is None or fs.r1_j_state != NodeState.PASSED:
                 return
             func_state = fs.functions.get(func_hash)
             if func_state is None:
@@ -320,8 +320,7 @@ class PipelineEngine:
         fs = state.files[file_hash]
         if fs.r1_j_state != NodeState.PASSED:
             await self._run_r1a(file_hash, file_path, dirs, state)
-        # R1-W 未通过才阻断；R1-J 失败属于覆盖率警告，不阻断后续函数处理
-        if self._cancel.is_set() or fs.r1_w_state != NodeState.PASSED:
+        if self._cancel.is_set() or fs.r1_j_state != NodeState.PASSED:
             return
         if fs.functions:
             await asyncio.gather(*[
@@ -577,24 +576,9 @@ class PipelineEngine:
         """R1a：文件级覆盖率 W+J 循环。"""
         fs = state.files[file_hash]
         r1a_max = int(getattr(self.cfg, "r1a_max_rounds", -1))
-        # R1-J 单独上限：限制 J 失败后重执行 W 的次数
-        # 防止头文件/0函数文件等情况导致 R1-J 广死循环阻断整个流水线
-        r1_j_max = int(getattr(self.cfg, "r1_j_max_rounds", 3))
-        j_fail_count = 0  # R1-J 连续失败次数
 
         while _should_continue(fs.r1_attempts, r1a_max, self._cancel):
             if fs.r1_j_state == NodeState.PASSED:
-                break
-            # R1-J 失败次数达到上限：强制通过，不再重距 R1-W
-            # （常见于头文件、0函数文件、0字节文件等结构性失败）
-            if j_fail_count >= r1_j_max and fs.r1_w_state == NodeState.PASSED:
-                logger.warning(
-                    "R1-J exceeded max retries (%d) for %s, force-passing with %d funcs found",
-                    r1_j_max, Path(file_path).name, len(fs.functions),
-                )
-                fs.r1_j_state = NodeState.PASSED
-                fs.r1_feedback = f"[force-pass after {j_fail_count} R1-J failures]"
-                state.save(dirs.state_file)
                 break
 
             # R1a-W
@@ -678,7 +662,6 @@ class PipelineEngine:
                            feedback=j_feedback[:200])
                 if j_passed:
                     break
-                j_fail_count += 1  # J 失败计数
             except Exception as exc:
                 logger.error("R1a J failed for %s: %s", file_hash, exc)
                 # J 异常保守通过
