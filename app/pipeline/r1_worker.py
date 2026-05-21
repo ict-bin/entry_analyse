@@ -295,17 +295,6 @@ async def run_r1a_worker(
     session_f = str(dirs.r1a_w_session(file_hash))
     workspace = str(dirs.source)
 
-    # fresh start 时清空旧 session 文件，避免旧对话占满上下文导致模型混乱
-    # 重试（is_retry=True）保留 session 继续对话，首次运行清空
-    if not is_retry:
-        _session_path = Path(session_f)
-        if _session_path.exists():
-            try:
-                _session_path.unlink()
-                logger.debug("R1a-W: cleared stale session for fresh start: %s", file_hash)
-            except OSError:
-                pass
-
     static_funcs:       list[FunctionExtract] = []
     func_hashes_static: list[str] = []
 

@@ -293,24 +293,37 @@ class WorkerService:
             )
 
             # 新鲜启动检测： stages_json 为空表示 DB 已被重置（手动重置 / restart_task API）
-            # 若磁盘上还有旧的 pipeline_state.json，将其删除以强制全量重分析
-            # （旧状态的 r4_state=PASSED 会导致新 run 跳过所有阶段直接进报告生成）
+            # 清除磁盘上的旧运行中间文件，确保新 run 不继承旧状态
             is_fresh_start = not task_snapshot.stages_json  # None 或 {}
             if is_fresh_start and task_snapshot.output_path:
                 import pathlib as _pl
-                _state_file = (
+                import shutil as _shutil
+                _run_dir = (
                     _pl.Path(task_snapshot.output_path)
-                    / task_snapshot.task_id / "run" / "pipeline_state.json"
+                    / task_snapshot.task_id / "run"
                 )
+                # 删除 pipeline_state.json（计数器归零，避免跳过已完成阶段）
+                _state_file = _run_dir / "pipeline_state.json"
                 if _state_file.exists():
                     try:
                         _state_file.unlink()
                         logger.info(
-                            "Fresh start: deleted stale pipeline_state.json for %s",
-                            task_id)
+                            "Fresh start: deleted pipeline_state.json for %s", task_id)
                     except Exception as _e:
                         logger.warning(
                             "Failed to delete pipeline_state.json for %s: %s",
+                            task_id, _e)
+                # 删除 sessions/ 目录（避免旧对话追加到新 run，导致 session 中出现多次初始化 prompt）
+                _sessions_dir = _run_dir / "sessions"
+                if _sessions_dir.exists():
+                    try:
+                        _shutil.rmtree(str(_sessions_dir))
+                        _sessions_dir.mkdir(parents=True, exist_ok=True)
+                        logger.info(
+                            "Fresh start: cleared sessions/ for %s", task_id)
+                    except Exception as _e:
+                        logger.warning(
+                            "Failed to clear sessions/ for %s: %s",
                             task_id, _e)
 
             orch = Orchestrator(config=cfg, on_event=on_event)
