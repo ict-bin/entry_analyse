@@ -597,6 +597,43 @@ class CallchainDB:
             """, (func_hash,)).fetchall()
         return [dict(r) for r in rows]
 
+    def update_node_r3_entry(self, func_hash: str, is_entry: bool) -> None:
+        """R3 决策后实时更新节点的 is_r3_entry 标记（用于 R3 完成后实时反馈）。"""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE nodes SET is_r3_entry=? WHERE func_hash=?",
+                (1 if is_entry else 0, func_hash),
+            )
+
+    def get_caller_context(self, func_hash: str) -> dict:
+        """
+        返回 R3 决策所需的完整 caller 上下文（专为 R3-W prompt 设计）。
+
+        Returns dict with:
+          direct_callers: [{caller_hash, name, call_type, is_r3_entry}]
+          ancestors:      [{ancestor_hash, name, depth}]  (depth 2-3)
+          has_any_caller: bool
+        """
+        direct = self.get_callers(func_hash)
+        ancestors: list[dict] = []
+        try:
+            with self._get_conn() as conn:
+                rows = conn.execute("""
+                    SELECT c.ancestor as ancestor_hash, n.name, c.depth
+                    FROM closure c
+                    LEFT JOIN nodes n ON n.func_hash = c.ancestor
+                    WHERE c.descendant = ? AND c.depth BETWEEN 2 AND 3
+                    ORDER BY c.depth, c.ancestor
+                """, (func_hash,)).fetchall()
+            ancestors = [dict(r) for r in rows]
+        except Exception:
+            pass
+        return {
+            "direct_callers": direct,
+            "ancestors": ancestors,
+            "has_any_caller": len(direct) > 0,
+        }
+
     def get_callchain_role(self, func_hash: str) -> dict:
         """
         综合调用链角色分析，供 R4-W Agent 通过 ea_db.py 调用。

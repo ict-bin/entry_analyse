@@ -299,19 +299,97 @@ def build_r3_w_func_prompt(
     end_line: int,
     file_path: str,
     r3_func_out_path: "Path",
-    other_candidates: "list[dict]",
+    caller_ctx: "dict | None" = None,
+    other_candidates: "list[dict] | None" = None,  # 已废弃，保留居兼容
     is_retry: bool = False,
     feedback: str = "",
 ) -> str:
     """
     R3 Worker（函数级并行）：对单个候选函数判断是否为模块外部入口。
 
-    设计原则：
-    - 每个函数独立决策，不再单 session 串行处理整个文件
-    - pre-filter 在 engine 侧静默执行，此处不列出被排除的函数
-    - 只给「本函数」+ 「同文件其他候选函数名列表」（供 caller 检查）
-    - 输出：一个 JSON 对象，decision=keep|filter + entry_role + reason
+    v4 变化：
+      - 移除 other_candidates（CC 岛子对单文件内调用关系已建全图）
+      - 新增 caller_ctx：包含模块级完整调用链（direct_callers + ancestors）
+      - 判断逻辑均基于 caller_ctx。不再要求 LLM grep 同文件其他候选
     """
+    if caller_ctx is None:
+        caller_ctx = {}
+    basename = os.path.basename(file_path)
+    abs_path = os.path.abspath(file_path)
+    retry = _retry_section(feedback) if is_retry else ""
+
+    # 构建 caller 上下文展示表
+    direct_callers = caller_ctx.get("direct_callers", [])
+    ancestors      = caller_ctx.get("ancestors", [])
+    has_any_caller = caller_ctx.get("has_any_caller", bool(direct_callers))
+
+    if not direct_callers:
+        caller_block = (
+            "> 无模块内调用者（CC 静态建图未发现任何调用关系），强烈建议 `keep`（直接外部边界）。"
+        )
+    else:
+        rows = ["| caller 名称 | call_type | 调用者是否有外部输入 |",
+                "|-----------|-----------|---------------------|"
+                ]
+        for c in direct_callers[:8]:
+            name   = (c.get("name") or "?")[:40]
+            ctype  = c.get("call_type", "?")
+            r2ok   = "是✔" if c.get("is_r2_passed") else "否"
+            rows.append(f"| `{name}` | `{ctype}` | {r2ok} |")
+        caller_block = "\n".join(rows)
+        if ancestors:
+            anc_names = ", ".join(
+                f"`{a.get('name','?')}` (depth={a.get('depth','?')})"
+                for a in ancestors[:4]
+            )
+            caller_block += f"\n\n上游祖先：{anc_names}"
+
+    sed_body = f"sed -n '{start_line},{end_line}p' {abs_path}"
+    grep_cb  = (
+        f"grep -n '{func_name}' {abs_path} | "
+        f"grep -i 'register" + r"\|hook\|bind\|RegFunc\|SubIf\|MsgBind\|callback'" + "'"
+    )
+
+    return (
+        f"# R3 Worker \u2014 单函数入口判断\n\n"
+        f"{retry}"
+        f"| 字段 | 値 |\n"
+        f"|------|-------|\n"
+        f"| func_hash | `{func_hash}` |\n"
+        f"| name | `{func_name}` |\n"
+        f"| 行范围 | {start_line}~{end_line} |\n"
+        f"| 文件 | `{basename}` |\n\n"
+        f"## 调用链上下文（来自静态建图，全模块覆盖）\n\n"
+        f"{caller_block}\n\n"
+        f"## 决策规则\n\n"
+        f"基于上方调用链信息，结合函数体内容，判断是否是模块外部入口：\n\n"
+        f"- **无 caller**：直接模块边界，强烈 keep\n"
+        f"- **call_type=`ptr`**：本函数被函数指针/回调注册调用 \u2192 `dispatch_target`/`callback`，保留\n"
+        f"- **有 caller 且 R2=是，且 call_type=`direct`**：数据可能来自 caller → 需读函数体确认\n"
+        f"- **有 caller 且 R2=否**： caller 是纯内部函数，不传递外部数据 \u2192 保留\n"
+        f"- **不确定时**：保守保留（宁可误报不漏报）\n\n"
+        f"## 分析步骤\n\n"
+        f"### 步骤 1：读取函数体\n\n"
+        f"```bash\n{sed_body}\n```\n\n"
+        f"判断：\n"
+        f"- 有没有主动获取外部数据的调用（网络/IPC/消息队列等）\n"
+        f"- 根据**代码语义**判断，不依赖特定函数名模式\n\n"
+        f"### 步骤 2：检查回调注册（若 caller_ctx 显示有 ptr 调用者，可跳过）\n\n"
+        f"```bash\n{grep_cb}\n```\n\n"
+        f"### 步骤 3：写出判断结果\n\n"
+        f"使用 `write` 工具写到：`{r3_func_out_path}`\n\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "decision": "keep",\n'
+        f'  "entry_type": "A",\n'
+        f'  "entry_role": "boundary",\n'
+        f'  "reason": "具体判断依据（≤80字）"\n'
+        f"}}\n"
+        f"```\n\n"
+        f"- `decision`: `keep` 或 `filter`\n"
+        f"- `entry_type`: `A`（主动）/ `P`（被动/回调/dispatch_target）/ `-`（filter）\n"
+        f"- `entry_role`: `boundary`/`dispatch_target`/`callback`/`ipc_handler`（filter 时留空）\n"
+    )
     basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
 

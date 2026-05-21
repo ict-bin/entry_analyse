@@ -37,7 +37,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r1b_max_rounds": -1,
     "r2_max_rounds": -1,
     "r3_max_rounds": -1,
-    "r4_func_max_rounds": -1,
+    "r4_func_max_rounds": 0,
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,

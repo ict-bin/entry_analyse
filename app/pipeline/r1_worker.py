@@ -42,6 +42,71 @@ from .extractor import (
 logger = logging.getLogger("ea.pipeline.r1_worker")
 
 
+# ─── Gap 计算（R1a 轻量化）────────────────────────────────────────────────────
+
+def _compute_gaps(
+    funcs: list["FunctionExtract"],
+    file_path: str,
+    min_gap: int = 8,
+) -> list[tuple[int, int, str]]:
+    """
+    计算源文件中不被任何已知函数覆盖的行区间（gap）。
+
+    Args:
+        funcs:     已提取的函数列表，含 start_line / end_line
+        file_path: 源文件路径（用于读取总行数和内容）
+        min_gap:   最小 gap 行数（小于此值忽略，通常是注释/空行）
+
+    Returns:
+        [(start, end, content_preview), ...]  1-indexed，闭区间
+        content_preview：前 120 个字符的代码内容（用于 prompt 展示）
+    """
+    try:
+        lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    total = len(lines)
+    if total == 0:
+        return []
+
+    # 合并函数覆盖区间
+    covered: list[tuple[int, int]] = sorted(
+        (
+            (max(1, f.start_line), min(total, f.end_line or f.start_line))
+            for f in funcs
+            if f.start_line and f.start_line > 0
+        ),
+        key=lambda x: x[0],
+    )
+    # 合并重叠区间
+    merged: list[tuple[int, int]] = []
+    for s, e in covered:
+        if merged and s <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    gaps: list[tuple[int, int, str]] = []
+    prev_end = 0
+    for seg_start, seg_end in merged + [(total + 1, total + 1)]:
+        gap_start = prev_end + 1
+        gap_end   = seg_start - 1
+        if gap_end >= gap_start and (gap_end - gap_start + 1) >= min_gap:
+            # 读取 gap 内容预览（最多 30 行，120 chars/行）
+            snippet_lines = lines[gap_start - 1: min(gap_start + 29, gap_end)]
+            # 跳过纯空行/纯注释行
+            code_lines = [
+                l for l in snippet_lines
+                if l.strip() and not l.strip().startswith(('//', '*', '#'))
+            ]
+            if code_lines:  # 只保留含实质代码的 gap
+                preview = "\n".join(snippet_lines)[:600]
+                gaps.append((gap_start, gap_end, preview))
+        prev_end = seg_end
+
+    return gaps
+
+
 # ─── 修正解析（共用）─────────────────────────────────────────────────────────
 
 def _parse_r1_corrections(output: str) -> list[dict] | None:
@@ -74,15 +139,68 @@ def build_r1a_w_initial_prompt(
     file_path: str,
     func_count: int,
     file_hash: str,
-    dirs: PipelineDirs,
+    dirs: "PipelineDirs",
+    gaps: "list[tuple[int,int,str]] | None" = None,
 ) -> str:
     """
-    R1a-W 首次 prompt：文件级覆盖率检查。
+    R1a-W 首次 prompt：文件级覆盖率检查（Gap 模式）。
 
-    LLM 职责：检查 funcdb 函数列表是否有遗漏或明显错误的额外条目。
-    只输出新增（func_hash="new"）和删除（delete:true）修正。
-    不做行号精确校正（R1b 的职责）。
+    直接展示 ctags 未覆盖的 gap 区间代码，让 LLM 判断是否有遗漏的函数定义。
+    不再让 LLM grep -c '{' 估算全文（误报率高且慢）。
     """
+    basename = os.path.basename(file_path)
+    abs_path = os.path.abspath(file_path)
+    db_path  = dirs.r1_functions_db(file_hash)
+
+    if func_count > 0:
+        status_text = f"ctags 已预提取 **{func_count}** 个函数，结果存于 `{db_path}`。"
+    else:
+        status_text = (
+            f"ctags 未提取到函数，`{db_path}` 当前为空（或只有完函数），需检查 gap 区间是否有遗漏函数。"
+        )
+
+    # 构建 gap 展示段
+    if not gaps:
+        gap_section = (
+            f"> ctags 覆盖该文件全部可识别内容，没有可视 gap。\n"
+            f"> 用 `python3 /app/scripts/ea_db.py list-meta {db_path}` 确认列表，"
+            f"若看起来完整则输出 `NO_CORRECTIONS`。"
+        )
+    else:
+        shown = gaps[:12]
+        parts = []
+        for i, (gs, ge, preview) in enumerate(shown, 1):
+            parts.append(
+                f"### Gap {i}\uff1a第 {gs}\u2013{ge} 行（{ge-gs+1} 行）\n"
+                f"```c\n{preview}\n```"
+            )
+        if len(gaps) > 12:
+            parts.append(f"\n（还有 {len(gaps)-12} 个 gap，可用 `sed -n 'N,Mp' {abs_path}` 手动查看）")
+        gap_section = "\n\n".join(parts)
+
+    return (
+        f"# Round 1a \u2014 函数覆盖率检查：`{basename}`\n\n"
+        f"## 当前状态\n\n{status_text}\n\n"
+        f"## 任务\n\n"
+        f"**只检查覆盖率（全不全），不检查行号精确性（准不准）。**\n\n"
+        f"行号精确性由 R1b 阶段单独处理。\n\n"
+        f"## Gap 区间（ctags 未覆盖的代码段）\n\n"
+        f"{gap_section}\n\n"
+        f"## 检查步骤\n\n"
+        f"1. 阅读上方 gap 片段，判断是否有遗漏的函数定义\n"
+        f"2. 若有未展示的 gap，用 `sed -n 'N,Mp' {abs_path}` 查看\n"
+        f"3. 确认遗漏函数名（完整限定名，如 `ClassName::method`）\n"
+        f"4. 在 `<result>` 中输出修正（**只允许 new 和 delete，不允许行号修正**）：\n\n"
+        f"   ```json\n"
+        f"   [\n"
+        f"     {{\"func_hash\": \"new\", \"name\": \"<完整限定名>\", "
+        f"\"signature\": \"<完整签名>\", \"start_line\": <起始行>, \"end_line\": 0}},\n"
+        f"     {{\"func_hash\": \"<已有hash>\", \"delete\": true}}\n"
+        f"   ]\n"
+        f"   ```\n\n"
+        f"   **无需修正时**：`<result>NO_CORRECTIONS</result>`\n\n"
+        f"   ⚠️ 不要修正行号，不要包含 body 字段。\n"
+    )
     basename = os.path.basename(file_path)
     abs_path = os.path.abspath(file_path)
     db_path  = dirs.r1_functions_db(file_hash)
@@ -255,7 +373,9 @@ async def run_r1a_worker(
                    count=len(static_funcs))
 
         prompt = build_r1a_w_initial_prompt(
-            file_path, len(static_funcs), file_hash, dirs)
+            file_path, len(static_funcs), file_hash, dirs,
+            gaps=_compute_gaps(static_funcs, file_path),
+        )
     else:
         current_count = db.stats().get("total", 0)
         prompt = build_r1a_w_retry_prompt(file_path, file_hash, dirs, feedback)

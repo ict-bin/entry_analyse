@@ -77,8 +77,12 @@ class FunctionState:
     # ── R4 per-func：跨文件分析（新架构）──────────────────────────────────────
     r4_state:    NodeState = NodeState.PENDING
     r4_attempts: int = 0
-    r4_decision: str = ""   # "keep" | "remove" | ""
+    r4_decision: str = ""   # "keep" | "remove" | "" — deprecated, kept for compat
     r4_reason:   str = ""
+
+    # R3 完整决策（包含内置了原 R4-per-func 的跨文件判断）
+    r3_decision:        str = ""    # "keep" | "filter"
+    r3_cross_file_note: str = ""    # 跨文件判断备注
 
     # ── Report per-func（新架构）──────────────────────────────────────────────
     report_state:    NodeState = NodeState.PENDING
@@ -110,6 +114,8 @@ class FunctionState:
         data.setdefault('r4_decision', '')
         data.setdefault('r4_reason', '')
         data.setdefault('report_path', '')
+        data.setdefault('r3_decision', '')
+        data.setdefault('r3_cross_file_note', '')
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
