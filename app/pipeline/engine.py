@@ -232,6 +232,10 @@ class PipelineEngine:
         cc_done_event:     asyncio.Event = asyncio.Event()
         r2_done_count = 0
 
+        # 修复B：无函数可处理时直接解锁（防止 _cc_phase 永久挂起）
+        if total_funcs == 0:
+            all_r2_done_event.set()
+
         # 断点续跑：CC 已建好，直接触发
         if (dirs.callchain / 'callchain.db').exists():
             cc_done_event.set()
@@ -253,9 +257,17 @@ class PipelineEngine:
                 return
             fs = state.files.get(file_hash)
             if fs is None or fs.r1_j_state != NodeState.PASSED:
+                # 修复A：跳过的函数也必须计入 r2_done_count
+                # 否则 all_r2_done_event 永远不会 set，_cc_phase 死锁
+                r2_done_count += 1
+                if r2_done_count >= total_funcs:
+                    all_r2_done_event.set()
                 return
             func_state = fs.functions.get(func_hash)
             if func_state is None:
+                r2_done_count += 1
+                if r2_done_count >= total_funcs:
+                    all_r2_done_event.set()
                 return
 
             # R2: 准确性验证（不需要 CC）
