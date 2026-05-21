@@ -1,34 +1,25 @@
 """
-entry_analyse — Pipeline 目录结构管理
-
-所有阶段的产物和 session 文件都通过 PipelineDirs 统一管理：
+entry_analyse — Pipeline 目录结构管理（v5）
 
   run/
   ├── workspace/
-  │   ├── source/                   ← 源文件软链接（symlinks）
-  │   │   └── {rel_path} -> /original/source/...
-  │   ├── r1-functions/             ← R1+R2 产物：每源文件一个 JSON
-  │   │   └── {file_hash}_functions.json  ← 含函数体(R1) + analysis字段(R2)
-  │   ├── r3-entries/               ← R3 产物：文件级过滤结果
-  │   │   └── {file_hash}.json
-  │   └── r4-module/                ← R4 产物：模块级最终入口
-  │       └── entries.json
-  ├── sessions/                     ← 所有阶段的 pi session 文件
-  │   ├── r1-w-{file_hash}.jsonl
-  │   ├── r1-j-{func_hash}-a{n}.jsonl
-  │   ├── r2-w-{file_hash}-{func_hash}.jsonl
-  │   ├── r2-j-{file_hash}-a{n}.jsonl
-  │   ├── r3-w-{file_hash}.jsonl
-  │   ├── r3-j-{file_hash}-a{n}.jsonl
-  │   ├── r4-w.jsonl
-  │   └── r4-j-a{n}.jsonl
-  ├── pipeline_state.json
-  └── result.json
-
-IO 设计：
-  R1 静态提取写 {file_hash}_functions.json（1次/文件，替代原来 N+1 次）
-  R2 Worker 分析结果写回同一 JSON 的 analysis 字段（引擎加锁保护并发）
-  R3/R4 不变
+  │   ├── source/               ← 源文件软链接
+  │   ├── r1-functions/         ← R1+R2 产物（funcdb SQLite）
+  │   ├── r3-entries/           ← R3/R4 产物（per-func 决策 JSON）
+  │   ├── r4-module/            ← R6 产物（最终入口 entries.json）
+  │   └── callchain/            ← CC 产物（callchain.db）
+  ├── sessions/
+  │   ├── r1-w-{fh}.jsonl            R1 coverage Worker（文件级，跨重试共享）
+  │   ├── r1-j-{fh}-a{n}.jsonl       R1 coverage Judge（每次新建）
+  │   ├── r2-j-{fh}-a{n}.jsonl       R2 accuracy Judge（函数级，每次新建）
+  │   ├── r3-w-{fh}-{func}.jsonl     R3 entry analysis Worker
+  │   ├── r3-j-{func}-a{n}.jsonl     R3 entry analysis Judge
+  │   ├── r4-w-{func}.jsonl          R4 callchain Worker
+  │   ├── r5-w-{func}.jsonl          R5 per-func report Worker
+  │   ├── r5-j-{func}-a{n}.jsonl     R5 per-func report Judge
+  │   ├── r6-w-a{n}.jsonl            R6 final report Worker
+  │   └── r6-j-a{n}.jsonl            R6 final report / quality Judge
+  └── pipeline_state.json
 """
 
 from __future__ import annotations
@@ -39,13 +30,6 @@ from pathlib import Path
 
 @dataclass
 class PipelineDirs:
-    """
-    所有 pipeline 路径的单一事实来源。
-
-    通过传入 run_dir（即 {output_dir}/{task_id}/run/）初始化，
-    其余路径全部从 run_dir 派生。
-    """
-
     run: Path
 
     # ─── 工作目录 ─────────────────────────────────────────────────────────────
@@ -56,27 +40,25 @@ class PipelineDirs:
 
     @property
     def source(self) -> Path:
-        """源文件软链接目录（由 module_loader.prepare_workspace 填充）。"""
         return self.run / "workspace" / "source"
 
     @property
     def r1(self) -> Path:
-        """R1+R2 产物根目录：每源文件一个 {file_hash}_functions.json。"""
+        """R1/R2 产物：{file_hash}_functions.db"""
         return self.run / "workspace" / "r1-functions"
 
     @property
     def r3(self) -> Path:
-        """R3 产物根目录：每文件一个 {file_hash}.json（文件级过滤结果）。"""
+        """R3/R4 产物：per-func 决策 JSON"""
         return self.run / "workspace" / "r3-entries"
 
     @property
     def r4(self) -> Path:
-        """R4 产物目录：模块级最终入口 entries.json。"""
+        """R6 产物：最终入口 entries.json"""
         return self.run / "workspace" / "r4-module"
 
     @property
     def callchain(self) -> Path:
-        """CC 调用链产物目录。"""
         return self.run / "workspace" / "callchain"
 
     @property
@@ -89,153 +71,134 @@ class PipelineDirs:
 
     @property
     def module_db(self) -> Path:
-        """R1通过后同步的模块级中心数据库（不含 body）。"""
         return self.workspace / "module_functions.db"
 
-    # ─── 核心产物路径 ─────────────────────────────────────────────────────────
-
-    def r1_functions_file(self, file_hash: str) -> Path:
-        """
-        R1+R2 核心数据文件：{r1}/{file_hash}_functions.json
-
-        包含：
-          - R1 静态提取写入的函数体（name/signature/start_line/end_line/body）
-          - R2 Worker 写回的 analysis 字段（has_external_input/taints/...）
-        """
-        return self.r1 / f"{file_hash}_functions.json"
+    # ─── 核心产物 ─────────────────────────────────────────────────────────────
 
     def r1_functions_db(self, file_hash: str) -> Path:
-        """
-        R1+R2 SQLite 数据库：{r1}/{file_hash}_functions.db
-
-        替代 functions.json 供 Agent 查询：
-          - `ea_db.py get <db> <func_hash>` 找单个函数（没有 50KB 截断）
-          - `ea_db.py list-entries <db>` 获取外部入口列表（R3/R4 用）
-          - set_analysis() 不需 asyncio.Lock（SQLite WAL 天然并发安全）
-        """
         return self.r1 / f"{file_hash}_functions.db"
 
-    def r1a_gaps_file(self, file_hash: str) -> Path:
-        """R1a Gap 文件：{r1}/{file_hash}_gaps.json"""
+    def r1_gaps_file(self, file_hash: str) -> Path:
         return self.r1 / f"{file_hash}_gaps.json"
 
+    # backward compat alias
+    def r1a_gaps_file(self, file_hash: str) -> Path:
+        return self.r1_gaps_file(file_hash)
+
     def r3_file_path(self, file_hash: str) -> Path:
-        """R3 某文件的入口列表文件：{r3}/{file_hash}.json"""
         return self.r3 / f"{file_hash}.json"
 
     def r4_entries_path(self) -> Path:
-        """R4 模块级最终入口文件：{r4}/entries.json"""
         return self.r4 / "entries.json"
 
     def callchain_db_path(self) -> Path:
-        """CC 调用链 SQLite 数据库：{callchain}/callchain.db"""
         return self.callchain / "callchain.db"
 
-    # ─── Feedback 文件路径 ────────────────────────────────────────────────────
+    # ─── Feedback 文件 ────────────────────────────────────────────────────────
 
-    def r1_j_feedback_file(self, file_hash: str, func_hash: str, attempt: int) -> Path:
-        """R1 Judge 反馈文件：{r1}/{file_hash}_r1j_{func_hash}_a{n}.txt"""
-        return self.r1 / f"{file_hash}_r1j_{func_hash}_a{attempt}.txt"
-
-    def r2_j_feedback_file(self, file_hash: str, attempt: int) -> Path:
-        """R2 Judge 文件级反馈文件（已废弃，保留干点续跳兼容）。"""
-        return self.r1 / f"{file_hash}_r2j_a{attempt}.txt"
-
-    def r2_j_feedback_file_func(self, func_hash: str, attempt: int) -> Path:
-        """R2 Judge 函数级详细反馈文件（供 retry 时 Agent read）。"""
+    def r2_j_feedback_file(self, func_hash: str, attempt: int) -> Path:
+        """R2 accuracy Judge 反馈（函数级）"""
         return self.r1 / f"{func_hash}_r2j_a{attempt}.txt"
 
-    def r3_j_feedback_file(self, file_hash: str, attempt: int) -> Path:
-        """R3 Judge 反馈文件：{r3}/{file_hash}_r3j_a{n}.txt"""
-        return self.r3 / f"{file_hash}_r3j_a{attempt}.txt"
+    def r3_j_feedback_file(self, func_hash: str, attempt: int) -> Path:
+        """R3 entry Judge 反馈（函数级）"""
+        return self.r1 / f"{func_hash}_r3j_a{attempt}.txt"
 
+    def r6_j_feedback_file(self, attempt: int) -> Path:
+        """R6 final Judge 反馈"""
+        return self.r4 / f"r6j_a{attempt}.txt"
+
+    # backward compat
     def r4_j_feedback_file(self, attempt: int) -> Path:
-        """R4 Judge 反馈文件：{r4}/r4j_a{n}.txt"""
-        return self.r4 / f"r4j_a{attempt}.txt"
+        return self.r6_j_feedback_file(attempt)
 
-    def r4_func_feedback_file(self, func_hash: str, attempt: int) -> Path:
-        """R4 per-func 反馈文件（新架构）"""
-        return self.r4 / f"{func_hash}_r4_a{attempt}.txt"
+    def r1_j_feedback_file(self, file_hash: str, func_hash: str, attempt: int) -> Path:
+        """R1 coverage Judge 函数级反馈（R2 retry 时读取）"""
+        return self.r1 / f"{file_hash}_r1j_{func_hash}_a{attempt}.txt"
 
-    def r4_func_result_file(self, func_hash: str) -> Path:
-        """R4 per-func 决策结果：{r4}/{func_hash}.json"""
-        return self.r4 / f"{func_hash}.json"
+    # ─── Session 文件 ─────────────────────────────────────────────────────────
 
-    # ─── Session 文件路径 ─────────────────────────────────────────────────────
+    # R1 Coverage（文件级）
+    def r1_w_session(self, file_hash: str) -> Path:
+        return self.sessions / f"r1-w-{file_hash}.jsonl"
 
-    # R1a（新架构）
+    def r1_j_session(self, file_hash: str, attempt: int) -> Path:
+        return self.sessions / f"r1-j-{file_hash}-a{attempt}.jsonl"
+
+    # backward compat aliases
     def r1a_w_session(self, file_hash: str) -> Path:
-        """R1a Worker session：文件级覆盖率，跨重试共享。"""
-        return self.sessions / f"r1a-w-{file_hash}.jsonl"
+        return self.r1_w_session(file_hash)
 
     def r1a_j_session(self, file_hash: str, attempt: int) -> Path:
-        """R1a Judge session：文件级覆盖率，每次新建。"""
-        return self.sessions / f"r1a-j-{file_hash}-a{attempt}.jsonl"
+        return self.r1_j_session(file_hash, attempt)
 
-    # R1b（新架构）
-    def r1b_w_session(self, func_hash: str) -> Path:
-        """R1b Worker session：函数级准确性，跨重试共享。"""
-        return self.sessions / f"r1b-w-{func_hash}.jsonl"
-
-    def r1b_j_session(self, func_hash: str, attempt: int) -> Path:
-        """R1b Judge session：函数级准确性，每次新建。"""
-        return self.sessions / f"r1b-j-{func_hash}-a{attempt}.jsonl"
-
-    # R1 旧接口（向后兼容）
-    def r1_w_session(self, file_hash: str) -> Path:
-        """R1 Worker session（已废弃，指向 r1a-w）。"""
-        return self.sessions / f"r1a-w-{file_hash}.jsonl"
-
-    def r1_j_session(self, func_hash: str, attempt: int) -> Path:
-        """R1 Judge session（已废弃，指向 r1b-j）。"""
-        return self.sessions / f"r1b-j-{func_hash}-a{attempt}.jsonl"
-
-    def r2_w_session(self, file_hash: str, func_hash: str) -> Path:
-        return self.sessions / f"r2-w-{file_hash}-{func_hash}.jsonl"
-
-    def r2_j_session(self, file_hash: str, attempt: int) -> Path:
-        return self.sessions / f"r2-j-{file_hash}-a{attempt}.jsonl"
-
-    def r2_j_session_func(self, func_hash: str, attempt: int) -> Path:
+    # R2 Accuracy（函数级，只有 J，无独立 W session）
+    def r2_j_session(self, func_hash: str, attempt: int) -> Path:
         return self.sessions / f"r2-j-{func_hash}-a{attempt}.jsonl"
 
-    def r3_w_session(self, file_hash: str) -> Path:
+    # backward compat aliases
+    def r1b_j_session(self, func_hash: str, attempt: int) -> Path:
+        return self.r2_j_session(func_hash, attempt)
+
+    def r1b_w_session(self, func_hash: str) -> Path:
+        return self.sessions / f"r2-w-{func_hash}.jsonl"
+
+    # R3 Entry Analysis（函数级）
+    def r3_w_session(self, file_hash: str, func_hash: str) -> Path:
+        return self.sessions / f"r3-w-{file_hash}-{func_hash}.jsonl"
+
+    def r3_j_session(self, func_hash: str, attempt: int) -> Path:
+        return self.sessions / f"r3-j-{func_hash}-a{attempt}.jsonl"
+
+    # backward compat: old r2_w/j sessions
+    def r2_w_session(self, file_hash: str, func_hash: str) -> Path:
+        return self.r3_w_session(file_hash, func_hash)
+
+    def r2_j_session_func(self, func_hash: str, attempt: int) -> Path:
+        return self.r3_j_session(func_hash, attempt)
+
+    # R4 Callchain（函数级）
+    def r4_w_session(self, func_hash: str) -> Path:
+        return self.sessions / f"r4-w-{func_hash}.jsonl"
+
+    # backward compat
+    def r3_w_session_file(self, file_hash: str) -> Path:
+        """旧 R3 文件级 W session（已废弃）"""
         return self.sessions / f"r3-w-{file_hash}.jsonl"
 
-    def r3_j_session(self, file_hash: str, attempt: int) -> Path:
-        return self.sessions / f"r3-j-{file_hash}-a{attempt}.jsonl"
+    # R5 Per-func Report
+    def r5_w_session(self, func_hash: str) -> Path:
+        return self.sessions / f"r5-w-{func_hash}.jsonl"
 
-    # R4 per-func（新架构）
-    def r4_func_w_session(self, func_hash: str) -> Path:
-        """R4 per-func Worker session：跨重试共享。"""
-        return self.sessions / f"r4-func-w-{func_hash}.jsonl"
+    def r5_j_session(self, func_hash: str, attempt: int) -> Path:
+        return self.sessions / f"r5-j-{func_hash}-a{attempt}.jsonl"
 
-    # R4 旧接口（向后兼容）
-    def r4_w_session(self) -> Path:
-        return self.sessions / "r4-w.jsonl"
-
-    def r4_j_session(self, attempt: int) -> Path:
-        return self.sessions / f"r4-j-a{attempt}.jsonl"
-
-    # R4 final Judge（新架构）
-    def r4_final_j_session(self, attempt: int) -> Path:
-        return self.sessions / f"r4-final-j-a{attempt}.jsonl"
-
-    # Report per-func（新架构）
+    # backward compat
     def report_func_w_session(self, func_hash: str) -> Path:
-        return self.sessions / f"report-func-w-{func_hash}.jsonl"
+        return self.r5_w_session(func_hash)
 
     def report_func_j_session(self, func_hash: str, attempt: int) -> Path:
-        return self.sessions / f"report-func-j-{func_hash}-a{attempt}.jsonl"
+        return self.r5_j_session(func_hash, attempt)
+
+    # R6 Final Report + Quality Judge
+    def r6_w_session(self, attempt: int) -> Path:
+        return self.sessions / f"r6-w-a{attempt}.jsonl"
+
+    def r6_j_session(self, attempt: int) -> Path:
+        return self.sessions / f"r6-j-a{attempt}.jsonl"
+
+    # backward compat
+    def r4_final_j_session(self, attempt: int) -> Path:
+        return self.r6_j_session(attempt)
+
+    def r4_func_w_session(self, func_hash: str) -> Path:
+        return self.r4_w_session(func_hash)
 
     # ─── 初始化 ───────────────────────────────────────────────────────────────
 
     def setup(self) -> None:
-        """预创建所有必要目录。"""
         for d in (self.source, self.r1, self.r3, self.r4, self.callchain, self.sessions):
             d.mkdir(parents=True, exist_ok=True)
-
-    # ─── 工厂方法 ─────────────────────────────────────────────────────────────
 
     @classmethod
     def from_task(cls, output_dir: str, task_id: str) -> "PipelineDirs":

@@ -3,12 +3,12 @@ entry_analyse — Round 1 Workers（v3）
 
 拆分为两步，各司其职：
 
-  run_r1a_worker（文件级覆盖率）：
+  run_r1_worker（文件级覆盖率）：
     1. 静态提取（ctags/宏扫描/regex）→ 直接写 funcdb（不经 JSON）
     2. LLM 检查覆盖率 → 输出新增/删除修正 → apply_corrections 直写 DB
     3. 同步到 ModuleDB
 
-  run_r1b_worker（函数级准确性）：
+  run_r2_worker（函数级准确性）：
     1. 读 funcdb 中单函数当前记录
     2. LLM 用 bash sed 验证行号/签名准确性 → 输出修正
     3. apply_corrections 直写 DB
@@ -126,7 +126,7 @@ def _parse_r1_corrections(output: str) -> list[dict] | None:
 
 # ─── R1a Prompt 构建 ──────────────────────────────────────────────────────────
 
-def build_r1a_w_initial_prompt(
+def build_r1_w_initial_prompt(
     file_path: str,
     func_count: int,
     file_hash: str,
@@ -197,7 +197,7 @@ def build_r1a_w_initial_prompt(
     )
 
 
-def build_r1a_w_retry_prompt(
+def build_r1_w_retry_prompt(
     file_path: str,
     file_hash: str,
     dirs: PipelineDirs,
@@ -216,7 +216,7 @@ def build_r1a_w_retry_prompt(
 
 # ─── R1b Prompt 构建 ──────────────────────────────────────────────────────────
 
-def build_r1b_w_prompt(
+def build_r2_w_prompt(
     func_hash: str,
     func_name: str,
     start_line: int,
@@ -262,9 +262,9 @@ def build_r1b_w_prompt(
     )
 
 
-# ─── run_r1a_worker ──────────────────────────────────────────────────────────
+# ─── run_r1_worker ──────────────────────────────────────────────────────────
 
-async def run_r1a_worker(
+async def run_r1_worker(
     *,
     file_path: str,
     dirs: PipelineDirs,
@@ -292,7 +292,7 @@ async def run_r1a_worker(
 
     basename  = os.path.basename(file_path)
     file_hash = compute_file_hash(file_path)
-    session_f = str(dirs.r1a_w_session(file_hash))
+    session_f = str(dirs.r1_w_session(file_hash))
     workspace = str(dirs.source)
 
     static_funcs:       list[FunctionExtract] = []
@@ -324,7 +324,7 @@ async def run_r1a_worker(
                    count=len(static_funcs))
 
         # 计算 gaps 并写入文件（不嵌入 prompt，避免大文件时 prompt 超大）
-        gaps_file = dirs.r1a_gaps_file(file_hash)
+        gaps_file = dirs.r1_gaps_file(file_hash)
         gaps_list = _compute_gaps(static_funcs, file_path)
         if gaps_list:
             import json as _json
@@ -335,7 +335,7 @@ async def run_r1a_worker(
         elif gaps_file.exists():
             gaps_file.unlink()  # 无 gap 时删除旧文件
 
-        prompt = build_r1a_w_initial_prompt(
+        prompt = build_r1_w_initial_prompt(
             file_path, len(static_funcs), file_hash, dirs,
             gaps_file_path=gaps_file if gaps_list else None,
         )
@@ -356,17 +356,17 @@ async def run_r1a_worker(
                 if source_dir else os.path.basename(file_path)
             )
             db.write_functions(file_hash, file_path, static_funcs, func_hashes_static, rel_path=rel)
-            gaps_file  = dirs.r1a_gaps_file(file_hash)
+            gaps_file  = dirs.r1_gaps_file(file_hash)
             gaps_list2 = _compute_gaps(static_funcs, file_path)
             if gaps_list2:
                 import json as _json2
                 gaps_file.write_text(_json2.dumps(gaps_list2, ensure_ascii=False, indent=2), encoding="utf-8")
-            prompt = build_r1a_w_initial_prompt(
+            prompt = build_r1_w_initial_prompt(
                 file_path, len(static_funcs), file_hash, dirs,
                 gaps_file_path=gaps_file if gaps_list2 else None,
             )
         else:
-            prompt = build_r1a_w_retry_prompt(file_path, file_hash, dirs, feedback)
+            prompt = build_r1_w_retry_prompt(file_path, file_hash, dirs, feedback)
 
     _safe_emit(on_event, "r1_w_start", task_id,
                file=basename, file_hash=file_hash, is_retry=is_retry)
@@ -453,9 +453,9 @@ async def run_r1a_worker(
     return ar.token_usage, funcs_out, hashes_out
 
 
-# ─── run_r1b_worker ──────────────────────────────────────────────────────────
+# ─── run_r2_worker ──────────────────────────────────────────────────────────
 
-async def run_r1b_worker(
+async def run_r2_worker(
     *,
     file_path: str,
     func_hash: str,
@@ -488,7 +488,7 @@ async def run_r1b_worker(
     session_f = str(dirs.r1b_w_session(func_hash))
     workspace = str(dirs.source)
 
-    prompt = build_r1b_w_prompt(
+    prompt = build_r2_w_prompt(
         func_hash=func_hash,
         func_name=func_name,
         start_line=start_line,

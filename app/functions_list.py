@@ -13,7 +13,8 @@ functions.list 固定输出格式（JSON 数组，不可变更）
         "file":             "announce_begin_server.cpp", // 必须: 源文件名，非空字符串
         "line":             45,                          // 必须: 整数行号（未知时为 0）
         "function":         "HandleRequest()",           // 必须: 完整函数签名，非空字符串
-        "taints":           ["aMessage", "aMessageInfo"] // 必须: 外部可控参数，非空数组
+        "taints":           ["aMessage", "aMessageInfo"], // 必须: 外部可控污点（P型=参数名,A型=局部变量名）
+        "entry_source_lines": [{"line": 42, "code": "buf = recv(...)"}], // 可选: 污点来源行（P型=签名行,A型=I/O调用行）
         "entry_role":       "boundary",                 // 可选: 入口在模块中的角色（见下）
         "entry_confidence": 0.87                        // 可选: 入口置信度（0.0-1.0，越高越可信）
       },
@@ -312,6 +313,10 @@ def generate_functions_list(entry_json: str) -> str:
                 "line": line if isinstance(line, int) else 0,
                 "function": item.get("function", ""),
                 "taints": taints,
+                "entry_source_lines": [
+                    s for s in (item.get("entry_source_lines") or [])
+                    if isinstance(s, dict) and s.get("line")
+                ],
                 "function_description": str(item.get("function_description") or "").strip(),
                 "function_description_source": _derive_description_source(item.get("function_description")),
                 "entry_reason": str(item.get("entry_reason") or "").strip(),
