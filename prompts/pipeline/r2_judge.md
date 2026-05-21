@@ -12,21 +12,21 @@
 
 ## 验证方法
 
-### taints 非空校验（最高优先级）
+### taints 校验规则
 
-**若 `has_external_input=true` 但 `taints` 字段为空数组或缺失 → 必须 FAIL，反馈必须明确写出：**
-```
-通过: 否
-摘要: taints 为空，Worker 未提供任何污点参数名
-反馈: taints 字段为空或缺失。请明确指出哪个函数参数/变量承载了外部数据，并在 taints 中列出其名称。
-```
+**第一步：判断函数是否有参数**（读取签名行 `sed -n '{start_line}p' {file}`）
 
-### taints 参数真实性
+**情形 A：函数有参数**
+- 若 `has_external_input=true` 但 `taints` 为空 → **FAIL**（必须从参数中指出携带外部数据的参数名）
+- 逐一核对 taints 中每个名称在签名中真实存在：
+  - ❌ `output` / `out_` / `result` / `rsp` / `response` 等 → 输出参数，不是外部输入 taint
+  - ❌ 名称不在签名中出现 → taints 字段错误（**局部变量不算参数**）
+  - ✅ `buf` / `data` / `msg` / `packet` / `request` / `context` / `pkt` → 合理的输入 taint
 
-读取函数签名行（`sed -n '{start_line}p' {file}`），逐一核对 taints 列表中的每个参数名：
-- ❌ `output` / `out_` / `result` / `rsp` / `response` 等 → **输出参数**，不是外部输入 taint
-- ❌ 参数名不在签名中出现 → taints 字段错误
-- ✅ `buf` / `data` / `msg` / `packet` / `request` / `context` / `pkt` → 合理的输入 taint
+**情形 B：函数无参数（签名形如 `type func()` 或 `type func(void)`）**
+- 外部输入只能来自系统调用 / 全局变量 / 文件/socket 句柄，**taints=[] 合法**
+- 若 `has_external_input=true` 且 `taints=[]`，**不得因此 FAIL**
+- 若 taints 中列出了局部变量名 → **FAIL**（局部变量不是参数）
 
 ### P/A 分类正确性（直接读代码分析）
 

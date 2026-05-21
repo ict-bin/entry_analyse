@@ -221,24 +221,11 @@ class PipelineEngine:
             return []
 
         # ── Phase 3: 所有函数 R2+R3（并行，带 CC caller 上下文）─────────────
-        all_func_triples = [
-            (func_hash, file_hash, file_path)
-            for file_hash, file_path in file_hash_paths
-            for func_hash in list(state.files[file_hash].functions.keys())
-        ]
+        # 以文件为单元并行：每个文件内部所有函数 R2+R3-W 完成后立刻进 R3-J
+        # 不等其他文件，与 R1 的每文件 R1a→R1b 流水线完全对称
         await asyncio.gather(*[
-            self._run_func_r2_r3(fh, fhash, fpath, dirs, state)
-            for fh, fhash, fpath in all_func_triples
-        ])
-
-        if self._cancel.is_set():
-            return []
-
-        # ── Phase 4: R3 Judge（文件级，各文件并行）──────────────────────────
-        await asyncio.gather(*[
-            self._run_r3_j_for_file(fhash, fpath, dirs, state)
+            self._run_file_r2_r3_r3j(fhash, fpath, dirs, state)
             for fhash, fpath in file_hash_paths
-            if state.files[fhash].r3_state != NodeState.PASSED
         ])
 
         if self._cancel.is_set():
@@ -252,6 +239,39 @@ class PipelineEngine:
                 final_entries, dirs, out_dir, self.cfg.module_name, state)
 
         return final_entries
+
+    # ── Phase 3+4 文件单元：该文件所有函数 R2+R3-W 完成 → 立刻 R3-J ────────────
+
+    async def _run_file_r2_r3_r3j(
+        self,
+        file_hash: str,
+        file_path: str,
+        dirs: PipelineDirs,
+        state: PipelineState,
+    ) -> None:
+        """R1 完成后的文件单元流水线：
+        1. 该文件所有函数并行跑 R2+R3-W
+        2. 该文件所有函数完成后立刻跑 R3-J
+        不等其他文件，与 _run_file_r1 对称。
+        """
+        if self._cancel.is_set():
+            return
+        fs = state.files.get(file_hash)
+        if fs is None or fs.r1a_j_state != NodeState.PASSED:
+            return
+
+        func_hashes = list(fs.functions.keys())
+        if func_hashes:
+            await asyncio.gather(*[
+                self._run_func_r2_r3(fh, file_hash, file_path, dirs, state)
+                for fh in func_hashes
+            ])
+
+        if self._cancel.is_set():
+            return
+
+        if fs.r3_state != NodeState.PASSED:
+            await self._run_r3_j_for_file(file_hash, file_path, dirs, state)
 
     # ── Phase 1 文件单元：仅 R1a + R1b ────────────────────────────────────────
 
@@ -931,7 +951,7 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
 
-            # Engine 硬校验：taints 非空
+            # Engine 硬校验：taints 非空（仅对有参数的函数）
             if passed:
                 try:
                     from .funcdb import FunctionDB as _FDB
@@ -940,7 +960,13 @@ class PipelineEngine:
                         _a = _fn_data.get("analysis") or {}
                         if isinstance(_a, str):
                             _a = json.loads(_a)
-                        if _a.get("has_external_input") and not _a.get("taints"):
+                        # 无参数函数（如 func()、func(void)）的外部输入来自系统调用，taints=[]合法
+                        _sig = _fn_data.get("signature", "") or ""
+                        _has_params = bool(
+                            _sig and
+                            not re.search(r'\(\s*(void\s*)?\)', _sig)
+                        )
+                        if _a.get("has_external_input") and not _a.get("taints") and _has_params:
                             passed = False
                             feedback = (
                                 f"Engine 硬校验失败：{func_state.name}() 的分析结果 "
