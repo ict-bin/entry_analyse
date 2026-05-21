@@ -368,7 +368,7 @@ async def run_r1a_worker(
         else:
             prompt = build_r1a_w_retry_prompt(file_path, file_hash, dirs, feedback)
 
-    _safe_emit(on_event, "r1_w_agent_start", task_id,
+    _safe_emit(on_event, "r1_w_start", task_id,
                file=basename, file_hash=file_hash, is_retry=is_retry)
 
     async with model_capacity_slot(
@@ -394,7 +394,7 @@ async def run_r1a_worker(
             pi_retry_delay=cfg.pi_retry_delay,
         )
 
-    _safe_emit(on_event, "r1_w_agent_done", task_id,
+    _safe_emit(on_event, "r1_w_done", task_id,
                file=basename, file_hash=file_hash,
                tokens_in=ar.token_usage.input,
                tokens_out=ar.token_usage.output,

@@ -456,7 +456,7 @@ class PipelineEngine:
         dirs.r3.mkdir(parents=True, exist_ok=True)
         r3_out = dirs.r3_file_path(file_hash)
         r3_out.write_text(json.dumps(keep_entries, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._emit("r3_w_done", file_hash=file_hash, file=Path(file_path).name,
+        self._emit("r4_w_done", file_hash=file_hash, file=Path(file_path).name,
                    entry_count=len(keep_entries))
         if not keep_entries:
             fs.r3_state = NodeState.PASSED
@@ -764,7 +764,7 @@ class PipelineEngine:
         attempt = func_state.r1b_j_attempts
         session_file = str(dirs.r1b_j_session(func_hash, attempt))
 
-        self._emit("r1_j_start",
+        self._emit("r2_j_start",
                    func_hash=func_hash, function=func_state.name,
                    file=Path(file_path).name)
         try:
@@ -791,7 +791,7 @@ class PipelineEngine:
                 fb_file.write_text(feedback, encoding="utf-8")
                 func_state.r1b_j_feedback_path = str(fb_file)
             state.save(dirs.state_file)
-            self._emit("r1_j_done",
+            self._emit("r2_j_done",
                        func_hash=func_hash, function=func_state.name,
                        passed=passed, feedback=feedback[:200], attempt=attempt)
             return passed
@@ -825,7 +825,7 @@ class PipelineEngine:
             func_state.r2_w_attempts += 1
             state.save(dirs.state_file)
 
-            self._emit("r2_w_start",
+            self._emit("r3_w_start",
                        func_hash=func_hash, function=func_state.name)
             try:
                 acfg = self.cfg.workers.agents[0]
@@ -878,7 +878,7 @@ class PipelineEngine:
 
                 func_state.r2_w_state = NodeState.PASSED
                 state.save(dirs.state_file)
-                self._emit("r2_w_done",
+                self._emit("r3_w_done",
                            func_hash=func_hash, function=func_state.name,
                            has_external_input=func_state.has_external_input,
                            entry_role=func_state.entry_role or None)
@@ -909,7 +909,7 @@ class PipelineEngine:
         db_path = dirs.r1_functions_db(file_hash)
         body_lines = max(0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1)
 
-        self._emit("r2_j_func_start",
+        self._emit("r3_j_start",
                    func_hash=func_hash, function=func_state.name)
         try:
             acfg = self._judge_acfg()
@@ -964,7 +964,7 @@ class PipelineEngine:
                 func_state.r2_j_feedback_path = str(fb_path)
 
             state.save(dirs.state_file)
-            self._emit("r2_j_func_done",
+            self._emit("r3_j_done",
                        func_hash=func_hash, function=func_state.name,
                        passed=passed, summary=summary)
             return passed, summary
@@ -1032,7 +1032,7 @@ class PipelineEngine:
         state.save(dirs.state_file)
         dirs.r3.mkdir(parents=True, exist_ok=True)
 
-        self._emit("r3_w_start", file_hash=file_hash, file=Path(file_path).name)
+        self._emit("r4_w_start", file_hash=file_hash, file=Path(file_path).name)
         try:
             r3_keep_entries = await self._run_r3_funcs_parallel(
                 file_hash, file_path, dirs, state, _keep_hashes, funcs_with_input
@@ -1054,7 +1054,7 @@ class PipelineEngine:
             except Exception:
                 pass
 
-            self._emit("r3_w_done",
+            self._emit("r4_w_done",
                        file_hash=file_hash, file=Path(file_path).name,
                        entry_count=len(r3_keep_entries))
 
@@ -1658,7 +1658,7 @@ class PipelineEngine:
                 encoding="utf-8"
             )
 
-            self._emit("r4_j_start", attempt=state.r4_final_j_attempts)
+            self._emit("r6_j_start", attempt=state.r4_final_j_attempts)
             try:
                 acfg = self._judge_acfg()
                 sys_prompt = self._stage_sys_prompt('r4_judge')
@@ -1680,7 +1680,7 @@ class PipelineEngine:
                     fb_file.write_text(feedback, encoding="utf-8")
                     state.r4_final_j_feedback = str(fb_file)
 
-                self._emit("r4_j_done", passed=passed, feedback=feedback[:200],
+                self._emit("r6_j_done", passed=passed, feedback=feedback[:200],
                            attempt=state.r4_final_j_attempts)
                 if passed:
                     state.r4_final_j_state = NodeState.PASSED
@@ -1754,7 +1754,7 @@ class PipelineEngine:
                 func_state.report_state = NodeState.RUNNING
 
             session_w = str(dirs.report_func_w_session(func_hash))
-            self._emit("report_w_start",
+            self._emit("r5_w_start",
                        func_hash=func_hash, function=func_name, attempt=attempts)
 
             # 从 ModuleDB 补充完整分析数据
@@ -1905,7 +1905,7 @@ class PipelineEngine:
             draft_text = generate_draft_from_db(run_dir, fl_entries, module_name, stats)
 
         draft_path.write_text(draft_text, encoding="utf-8")
-        self._emit("report_draft_done", entry_count=len(fl_entries))
+        self._emit("r5_done", entry_count=len(fl_entries))
 
         # Step2: Report-W + Report-J W+J 循环
         max_rounds = int(getattr(self.cfg, "report_final_max_rounds", -1))
@@ -1919,7 +1919,7 @@ class PipelineEngine:
         while _should_continue(attempts, max_rounds, self._cancel):
             attempts += 1
             is_retry = attempts > 1
-            self._emit("report_w_start", attempt=attempts)
+            self._emit("r5_w_start", attempt=attempts)
             w_prompt = P.build_report_w_prompt(
                 draft_path=draft_path,
                 report_out_path=report_path,
@@ -1942,7 +1942,7 @@ class PipelineEngine:
                 continue
 
             j_session = str(_sess_dir / f"report_j_a{attempts}.jsonl")
-            self._emit("report_j_start", attempt=attempts)
+            self._emit("r5_j_start", attempt=attempts)
             j_prompt = P.build_report_j_prompt(
                 report_path=report_path,
                 module_name=module_name,
@@ -1956,7 +1956,7 @@ class PipelineEngine:
                 j_text = (j_ar.result or j_ar.output or "").strip()
                 passed = "通过: 是" in j_text
                 if passed:
-                    self._emit("report_j_done", passed=True, attempt=attempts)
+                    self._emit("r5_j_done", passed=True, attempt=attempts)
                     break
                 for line in j_text.splitlines():
                     if line.startswith("反馈:"):
@@ -1964,7 +1964,7 @@ class PipelineEngine:
                         break
                 else:
                     feedback = j_text[:200]
-                self._emit("report_j_done", passed=False, attempt=attempts, feedback=feedback)
+                self._emit("r5_j_done", passed=False, attempt=attempts, feedback=feedback)
             except Exception as exc:
                 logger.warning("Report-J attempt %d failed: %s", attempts, exc)
                 break
