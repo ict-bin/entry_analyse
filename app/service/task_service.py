@@ -1302,33 +1302,8 @@ class TaskService:
         return self._row_to_dict(row)
 
     def resume_task(self, db: Session, task_id: str) -> dict:
-        """从断点续跑：保留同一任务ID，跳过前序 stage 直接从断点继续。"""
-        row = self._get_or_404(db, task_id)
-        if row.status in ("pending", "running"):
-            from fastapi import HTTPException
-            raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
-        if row.status == "passed":
-            from fastapi import HTTPException
-            raise HTTPException(400, "任务已完成，无需续跑")
-        from sqlalchemy.orm.attributes import flag_modified
-        tcfg = dict(row.task_config_json or {})
-        tcfg["resume_task_id"] = task_id
-        row.task_config_json = tcfg
-        row.status = "pending"
-        row.finished_at = None
-        row.owner_pod = None
-        row.lease_expires_at = None
-        row.cancel_requested = False
-        row.result_json = None
-        row.error = None
-        row.latest_abnormal_reason_json = None
-        flag_modified(row, "task_config_json")
-        flag_modified(row, "latest_abnormal_reason_json")
-        db.commit(); db.refresh(row)
-        self.schedule_dispatch(row.project_id)
-        log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
-                  task_id=task_id, project_id=row.project_id)
-        return self._row_to_dict(row)
+        """续跑（暂时禁用断点续跑，直接调用 restart_task）。"""
+        return self.restart_task(db, task_id)
 
     async def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
