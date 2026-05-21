@@ -336,19 +336,17 @@ class WorkerService:
                     / task_snapshot.task_id
                 )
                 # restart 时清空整个任务目录（run/ + output/）下的所有中间文件
-                # 确保新 run 不继承任何旧状态：session文件/funcdb/callchain/pipeline_state 等全部清除
                 # 保留 input/ 目录（任务元数据）不删除
+                # 注意：必须使用 ignore_errors=True 连同 强制重建空目录
+                # 防止 rmtree 因竞争条件（ENOENT）抛异常中止导致旧 session 文件残留
+                # （旧 session 残留会让 pi SDK resume 老会话→工作目录不存在→ fatal error）
                 for _subdir in ("run", "output"):
                     _d = _task_dir / _subdir
                     if _d.exists():
-                        try:
-                            _shutil.rmtree(str(_d))
-                            logger.info(
-                                "Fresh start: cleared %s/ for %s", _subdir, task_id)
-                        except Exception as _e:
-                            logger.warning(
-                                "Failed to clear %s/ for %s: %s",
-                                _subdir, task_id, _e)
+                        _shutil.rmtree(str(_d), ignore_errors=True)
+                    # 强制重建空目录：就算 rmtree 有部分文件删除失败，也能确保新 run 从干净目录开始
+                    _d.mkdir(parents=True, exist_ok=True)
+                    logger.info("Fresh start: reset %s/ for %s", _subdir, task_id)
 
             orch = Orchestrator(config=cfg, on_event=on_event)
             lease_task = asyncio.create_task(self._renew_task_lease(task_id, lease_stop_event), name=f"ea_lease_{task_id}")
