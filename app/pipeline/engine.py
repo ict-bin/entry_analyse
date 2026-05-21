@@ -574,20 +574,23 @@ class PipelineEngine:
             self._emit("r1_j_start", file_hash=file_hash,
                        file=Path(file_path).name, attempt=fs.r1a_attempts)
             try:
-                from .funcdb import FunctionDB as _FDB
-                db_path = dirs.r1_functions_db(file_hash)
-                func_list_str = ", ".join(
-                    m.get("name", "?") for m in _FDB.open(dirs.r1, file_hash).get_all_meta()[:20]
-                )
+                db_path   = dirs.r1_functions_db(file_hash)
+                gaps_file = dirs.r1a_gaps_file(file_hash)
+                if gaps_file.exists():
+                    gap_hint = (
+                        f"请读取 gap 文件 `{gaps_file}` 并用 sed 核查各区间内容，"
+                        f"确认 Worker 的修正是否正确。"
+                    )
+                else:
+                    gap_hint = (
+                        f"无 gap 文件（ctags 已完整覆盖），直接用 "
+                        f"`python3 /app/scripts/ea_db.py list-meta {db_path}` 确认列表。"
+                    )
                 j_prompt = (
-                    f"# Round 1a Judge — 覆盖率验证：`{Path(file_path).name}`\n\n"
-                    f"funcdb 中有 {len(fs.functions)} 个函数：{func_list_str}{'...' if len(fs.functions)>20 else ''}\n\n"
-                    f"验证步骤：\n"
-                    f"1. `grep -c '{{' {os.path.abspath(file_path)}` 估算函数体数量\n"
-                    f"2. `python3 /app/scripts/ea_db.py list-meta {db_path}` 查看函数名列表\n"
-                    f"3. 判断覆盖率是否合理（差距 >20% 需 FAIL）\n\n"
-                    f"输出格式：\n```\n通过: 是\n反馈: 覆盖率验证通过，N 个函数合理\n```\n"
-                    f"或：\n```\n通过: 否\n反馈: 发现 X 个遗漏函数：funcA, funcB...\n```"
+                    f"# Round 1a Judge \u2014 覆盖率验证：`{Path(file_path).name}`\n\n"
+                    f"funcdb 共 {len(fs.functions)} 个函数。\n\n"
+                    f"{gap_hint}\n\n"
+                    f"输出格式：\n```\n通过: 是\n反馈: <验证结论>\n```"
                 )
                 acfg_j = self._judge_acfg()
                 ar_j = await self._call_agent(

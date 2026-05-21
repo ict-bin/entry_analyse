@@ -115,6 +115,10 @@ class PipelineDirs:
         """
         return self.r1 / f"{file_hash}_functions.db"
 
+    def r1a_gaps_file(self, file_hash: str) -> Path:
+        """R1a Gap 文件：{r1}/{file_hash}_gaps.json"""
+        return self.r1 / f"{file_hash}_gaps.json"
+
     def r3_file_path(self, file_hash: str) -> Path:
         """R3 某文件的入口列表文件：{r3}/{file_hash}.json"""
         return self.r3 / f"{file_hash}.json"
