@@ -13,11 +13,10 @@ import asyncio
 import uvicorn
 from dotenv import load_dotenv
 
-from app.db import init_db
+from app.service.runtime_bootstrap import get_runtime_bootstrap
 from app.service.runtime_role import get_runtime_role, role_enabled
 from app.service.scheduler_service import get_scheduler_service
 from app.service.worker_service import get_worker_service, trigger_instant_cancel
-from app.service.svc_config import get_service_yaml
 
 load_dotenv()
 
@@ -53,12 +52,7 @@ async def _handle_cancel_request(
 
 
 async def _run_background_runtime() -> None:
-    svc_yaml = get_service_yaml()
-    init_db(
-        svc_yaml.database.url,
-        pool_size=svc_yaml.database.pool_size,
-        max_overflow=svc_yaml.database.max_overflow,
-    )
+    bootstrap = get_runtime_bootstrap()
     scheduler_service = get_scheduler_service() if role_enabled("scheduler") else None
     worker_service = get_worker_service() if role_enabled("worker") else None
 
@@ -70,13 +64,11 @@ async def _run_background_runtime() -> None:
         )
 
     try:
-        if scheduler_service is not None:
-            scheduler_service.start()
-        if worker_service is not None:
-            worker_service.start()
+        await bootstrap.start()
         while True:
             await asyncio.sleep(3600)
     finally:
+        await bootstrap.stop()
         if cancel_server is not None:
             cancel_server.close()
             await cancel_server.wait_closed()

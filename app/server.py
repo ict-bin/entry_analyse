@@ -44,6 +44,7 @@ from .metrics import observe_request as observe_metrics_request, render_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .module_loader import list_modules
 from .orchestrator import Orchestrator
+from .service.runtime_bootstrap import get_runtime_bootstrap
 from .service.runtime_role import get_runtime_role, role_enabled
 
 load_dotenv()
@@ -61,23 +62,9 @@ CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
-    _db_ready = False
     try:
         from .service.svc_config import get_service_yaml
         svc_yaml = get_service_yaml()
-        db_url = svc_yaml.database.url
-        try:
-            from .db import init_db
-            init_db(
-                db_url,
-                pool_size=svc_yaml.database.pool_size,
-                max_overflow=svc_yaml.database.max_overflow,
-            )
-            _db_ready = True
-        except Exception as exc:
-            import logging
-            logging.getLogger("ea.server").warning("DB init failed (management APIs unavailable): %s", exc)
-
         try:
             from .service.registry_service import get_registry_service
             registry = get_registry_service(svc_yaml.registry)
@@ -91,29 +78,12 @@ async def lifespan(app: FastAPI):
         import logging
         logging.getLogger("ea.server").warning("Startup error: %s", exc)
 
-    if _db_ready and role_enabled("api"):
-        from .api import router as mgmt_router
-        app.include_router(mgmt_router)
-
-    if _db_ready and role_enabled("scheduler"):
-        try:
-            from .service.scheduler_service import get_scheduler_service
-            get_scheduler_service().start()
-        except Exception as exc:
-            import logging
-            logging.getLogger("ea.server").warning("Scheduler startup failed: %s", exc)
-
-    if _db_ready and role_enabled("worker"):
-        try:
-            from .service.worker_service import get_worker_service
-            get_worker_service().start()
-        except Exception as exc:
-            import logging
-            logging.getLogger("ea.server").warning("Worker startup failed: %s", exc)
+    await get_runtime_bootstrap().start(app)
 
     yield
 
     # --- shutdown ---
+    await get_runtime_bootstrap().stop()
     try:
         from .service.registry_service import get_registry_service
         get_registry_service().stop()
@@ -198,6 +168,7 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/entry-analyse/health")
 async def health():
+    bootstrap = get_runtime_bootstrap().status()
     scheduler_running = False
     worker_running = False
     try:
@@ -211,13 +182,26 @@ async def health():
     except Exception:
         worker_running = False
     return {
-        "status": "ok",
+        "status": "ok" if bootstrap["db_ready"] else "degraded",
         "role": get_runtime_role(),
+        "db_ready": bootstrap["db_ready"],
+        "management_api_ready": bootstrap["management_api_ready"],
+        "bootstrap_attempts": bootstrap["attempts"],
+        "bootstrap_error": bootstrap["last_error"],
         "scheduler_running": scheduler_running,
         "worker_running": worker_running,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
     }
+
+
+@app.get("/ready")
+@app.get("/api/app/entry-analyse/ready")
+async def ready():
+    bootstrap = get_runtime_bootstrap()
+    if bootstrap.management_ready():
+        return {"status": "ready", **bootstrap.status()}
+    raise HTTPException(status_code=503, detail=bootstrap.status())
 
 
 @app.get("/metrics")
