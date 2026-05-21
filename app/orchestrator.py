@@ -243,6 +243,7 @@ class Orchestrator:
                 module_files=resolved_files,
                 run_dir=run_dir,
                 source_dir=source_dir,
+                out_dir=out_dir,
             )
 
             if self._cancel_event.is_set():

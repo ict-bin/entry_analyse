@@ -76,18 +76,21 @@ class PipelineDirs:
 
     @property
     def callchain(self) -> Path:
-        """CC 调用链产物目录：模块级调用关系数据库。"""
+        """CC 调用链产物目录。"""
         return self.run / "workspace" / "callchain"
 
     @property
     def sessions(self) -> Path:
-        """所有阶段的 pi session 文件目录。"""
         return self.run / "sessions"
 
     @property
     def state_file(self) -> Path:
-        """流水线执行状态 JSON（断点续跑用）。"""
         return self.run / "pipeline_state.json"
+
+    @property
+    def module_db(self) -> Path:
+        """R1通过后同步的模块级中心数据库（不含 body）。"""
+        return self.workspace / "module_functions.db"
 
     # ─── 核心产物路径 ─────────────────────────────────────────────────────────
 
@@ -146,43 +149,80 @@ class PipelineDirs:
         """R4 Judge 反馈文件：{r4}/r4j_a{n}.txt"""
         return self.r4 / f"r4j_a{attempt}.txt"
 
+    def r4_func_feedback_file(self, func_hash: str, attempt: int) -> Path:
+        """R4 per-func 反馈文件（新架构）"""
+        return self.r4 / f"{func_hash}_r4_a{attempt}.txt"
+
+    def r4_func_result_file(self, func_hash: str) -> Path:
+        """R4 per-func 决策结果：{r4}/{func_hash}.json"""
+        return self.r4 / f"{func_hash}.json"
+
     # ─── Session 文件路径 ─────────────────────────────────────────────────────
 
+    # R1a（新架构）
+    def r1a_w_session(self, file_hash: str) -> Path:
+        """R1a Worker session：文件级覆盖率，跨重试共享。"""
+        return self.sessions / f"r1a-w-{file_hash}.jsonl"
+
+    def r1a_j_session(self, file_hash: str, attempt: int) -> Path:
+        """R1a Judge session：文件级覆盖率，每次新建。"""
+        return self.sessions / f"r1a-j-{file_hash}-a{attempt}.jsonl"
+
+    # R1b（新架构）
+    def r1b_w_session(self, func_hash: str) -> Path:
+        """R1b Worker session：函数级准确性，跨重试共享。"""
+        return self.sessions / f"r1b-w-{func_hash}.jsonl"
+
+    def r1b_j_session(self, func_hash: str, attempt: int) -> Path:
+        """R1b Judge session：函数级准确性，每次新建。"""
+        return self.sessions / f"r1b-j-{func_hash}-a{attempt}.jsonl"
+
+    # R1 旧接口（向后兼容）
     def r1_w_session(self, file_hash: str) -> Path:
-        """R1 Worker session：跨重试共享。"""
-        return self.sessions / f"r1-w-{file_hash}.jsonl"
+        """R1 Worker session（已废弃，指向 r1a-w）。"""
+        return self.sessions / f"r1a-w-{file_hash}.jsonl"
 
     def r1_j_session(self, func_hash: str, attempt: int) -> Path:
-        """R1 Judge session：每次评审新建。"""
-        return self.sessions / f"r1-j-{func_hash}-a{attempt}.jsonl"
+        """R1 Judge session（已废弃，指向 r1b-j）。"""
+        return self.sessions / f"r1b-j-{func_hash}-a{attempt}.jsonl"
 
     def r2_w_session(self, file_hash: str, func_hash: str) -> Path:
-        """R2 Worker session：每函数独立，跨重试共享。"""
         return self.sessions / f"r2-w-{file_hash}-{func_hash}.jsonl"
 
     def r2_j_session(self, file_hash: str, attempt: int) -> Path:
-        """R2 Judge session（文件级，已废弃，保留干点续跳兼容）。"""
         return self.sessions / f"r2-j-{file_hash}-a{attempt}.jsonl"
 
     def r2_j_session_func(self, func_hash: str, attempt: int) -> Path:
-        """R2 Judge 函数级 session（每函数独立，每次新建）。"""
         return self.sessions / f"r2-j-{func_hash}-a{attempt}.jsonl"
 
     def r3_w_session(self, file_hash: str) -> Path:
-        """R3 Worker session：跨重试共享。"""
         return self.sessions / f"r3-w-{file_hash}.jsonl"
 
     def r3_j_session(self, file_hash: str, attempt: int) -> Path:
-        """R3 Judge session：每次新建。"""
         return self.sessions / f"r3-j-{file_hash}-a{attempt}.jsonl"
 
+    # R4 per-func（新架构）
+    def r4_func_w_session(self, func_hash: str) -> Path:
+        """R4 per-func Worker session：跨重试共享。"""
+        return self.sessions / f"r4-func-w-{func_hash}.jsonl"
+
+    # R4 旧接口（向后兼容）
     def r4_w_session(self) -> Path:
-        """R4 Worker session：跨重试共享。"""
         return self.sessions / "r4-w.jsonl"
 
     def r4_j_session(self, attempt: int) -> Path:
-        """R4 Judge session：每次新建。"""
         return self.sessions / f"r4-j-a{attempt}.jsonl"
+
+    # R4 final Judge（新架构）
+    def r4_final_j_session(self, attempt: int) -> Path:
+        return self.sessions / f"r4-final-j-a{attempt}.jsonl"
+
+    # Report per-func（新架构）
+    def report_func_w_session(self, func_hash: str) -> Path:
+        return self.sessions / f"report-func-w-{func_hash}.jsonl"
+
+    def report_func_j_session(self, func_hash: str, attempt: int) -> Path:
+        return self.sessions / f"report-func-j-{func_hash}-a{attempt}.jsonl"
 
     # ─── 初始化 ───────────────────────────────────────────────────────────────
 

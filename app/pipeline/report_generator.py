@@ -499,3 +499,97 @@ def generate_draft_from_db(
         f"",
     ]
     return "\n".join(lines)
+
+
+# ─── 从 per-func 报告聚合草稿 ──────────────────────────────────────────────────
+
+def generate_draft_from_func_reports(
+    reports_dir: "Path",
+    fl_entries: list[dict],
+    module_name: str,
+    stats: dict | None = None,
+) -> str:
+    """
+    从 per-func 报告目录（output/reports/*.md）聚合生成最终草稿。
+
+    当 R4 per-func Report 已经生成了每个函数的独立报告时，
+    此函数将这些报告按 entry_role 排序后拼接，再加上汇总表头。
+
+    如果某函数没有对应的报告文件，则降级到 funcdb 数据填充。
+    """
+    from pathlib import Path as _Path
+    stats = stats or {}
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 建立 func_hash -> report_file 映射
+    report_map: dict[str, _Path] = {}
+    for md_file in sorted(reports_dir.glob("*.md")):
+        fh = md_file.stem
+        if len(fh) == 12:  # 12位 func_hash
+            report_map[fh] = md_file
+
+    total_entries = len(fl_entries)
+    groups = _group_entries(fl_entries)
+
+    lines = [
+        f"# {module_name} 外部入口分析报告草稿",
+        f"",
+        f"> 生成时间：{now} ｜ 共 {total_entries} 个外部入口",
+        f"> per-func 报告：{len(report_map)} 个",
+        f"",
+        f"## 概要统计",
+        f"",
+        f"| 入口角色 | 数量 |",
+        f"| --- | --- |",
+    ]
+    for role, group_entries in groups:
+        label = _ROLE_DISPLAY.get(role, role or "未分类")
+        lines.append(f"| {label} | {len(group_entries)} |")
+    lines.append("")
+
+    # 按角色顺序聚合 per-func 报告
+    for role, group_entries in groups:
+        label = _ROLE_DISPLAY.get(role, role or "未分类")
+        desc  = _ROLE_DESC.get(role, "")
+        lines += [f"## {label}", ""]
+        if desc:
+            lines += [f"> {desc}", ""]
+
+        for entry in group_entries:
+            fh = entry.get("func_hash", "")
+            report_file = report_map.get(fh)
+            if report_file and report_file.exists():
+                try:
+                    lines.append(report_file.read_text(encoding="utf-8"))
+                    lines.append("")
+                    continue
+                except Exception:
+                    pass
+            # 降级：从 entry 数据生成简单段落
+            func_name = entry.get("function", fh[:8])
+            conf = entry.get("entry_confidence")
+            lines += [
+                f"## `{func_name}`",
+                f"",
+                f"**文件**：`{entry.get('file', '')}:{entry.get('line', 0)}`  ",
+                f"**类型**：{'A（主动型）' if entry.get('tag')=='A' else 'P（被动型）'}",
+                f"**置信度**：{_format_confidence(conf)}",
+                f"",
+                f"**功能描述**：{entry.get('function_description') or '（待补充）'}",
+                f"",
+                f"**入口判定理由**：{entry.get('entry_reason') or '（待补充）'}",
+                f"",
+                f"**污点参数**：{', '.join(f'`{t}`' for t in (entry.get('taints') or []))}",
+                f"",
+                f"---",
+                f"",
+            ]
+
+    lines += [
+        "---",
+        f"",
+        f"*草稿由 SecFlow 引擎聚合 per-func 报告生成，时间 {now}*",
+        f"",
+    ]
+    return chr(10).join(lines)
+

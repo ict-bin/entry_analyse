@@ -1,21 +1,18 @@
 """
 entry_analyse — Pipeline 状态机
 
-跟踪每个文件和函数在四轮流水线中的执行状态，
+跟踪每个文件和函数在流水线中的执行状态，
 持久化到 pipeline_state.json，支持断点续跑。
 
-状态转移：
-  函数级（R1 J + R2 W）：
-    PENDING → RUNNING → PASSED
-                      ↘ FAILED(n) → RUNNING → ...
+新架构（v3）状态层级：
+  文件级：
+    R1a（覆盖率 W+J）→ R1b+R2（函数级并行）→ R3（函数级并行 + 文件级J）
+  函数级：
+    R1b（准确性 W+J）→ R2（外部输入 W+J）→ R3-per-func → R4-per-func → Report-per-func
+  模块级：
+    CC（调用链静态） → R4-final-J → Report-final W+J
 
-  文件级（R1 W / R2 J / R3）：
-    PENDING → RUNNING → PASSED
-                      ↘ FAILED(n) → RUNNING → ...
-
-  模块级（R4）：
-    PENDING → RUNNING → PASSED
-                      ↘ FAILED(n) → RUNNING → ...
+状态转移：PENDING → RUNNING → PASSED | FAILED(retry) → ...
 """
 
 from __future__ import annotations
@@ -41,54 +38,78 @@ class NodeState(str, Enum):
 
 @dataclass
 class FunctionState:
-    """单个函数在流水线中的状态。"""
+    """单个函数在流水线中的状态（v3：含 R1b / R4-per-func / Report-per-func）。"""
 
     func_hash:  str
-    name:       str          # qualified name（如 ClassName::Method）
+    name:       str
     start_line: int
     end_line:   int = 0
-    signature:  str = ""    # 函数完整签名（R1-W 写入，R2-W prompt 中配置策略用）
+    signature:  str = ""
 
-    # R1 J：函数提取质量评审
+    # ── R1b W+J：函数级准确性（新架构）────────────────────────────────────────
+    r1b_w_state:    NodeState = NodeState.PENDING
+    r1b_w_attempts: int = 0
+    r1b_j_state:    NodeState = NodeState.PENDING
+    r1b_j_attempts: int = 0
+    r1b_j_feedback: str = ""
+    r1b_j_feedback_path: str = ""
+
+    # ── 已废弃字段（向前兼容旧 pipeline_state.json）────────────────────────────
+    # r1_j_* → 在 from_dict 中映射到 r1b_j_*
     r1_j_state:    NodeState = NodeState.PENDING
     r1_j_attempts: int = 0
-    r1_j_feedback: str = ""       # 最后一次 J 反馈文本（fallback）
-    r1_j_feedback_path: str = ""  # Judge 反馈写入的文件路径（优先引用）
+    r1_j_feedback: str = ""
+    r1_j_feedback_path: str = ""
 
-    # R2 W：外部输入分析
+    # ── R2 W+J：外部输入分析 ──────────────────────────────────────────────────
     r2_w_state:    NodeState = NodeState.PENDING
     r2_w_attempts: int = 0
-    r2_w_feedback: str = ""     # R2 J 反馈（格式：「摘要」+ 详细文件路径）
-    has_external_input: Optional[bool] = None   # None=尚未分析
+    r2_w_feedback: str = ""
+    has_external_input: Optional[bool] = None
 
-    # R2 J：函数级评审（每函数独立，每次新 session）
     r2_j_state:    NodeState = NodeState.PENDING
     r2_j_attempts: int = 0
-    r2_j_feedback_path:    str = ""   # 详细反馈文件路径（供 retry 时 Agent read）
-    r2_j_feedback_summary: str = ""   # 摘要（≤60字，嵌入 retry prompt 标题）
+    r2_j_feedback_path:    str = ""
+    r2_j_feedback_summary: str = ""
 
-    # R2-W 得出的入口角色（boundary/dispatch_target/callback/ipc_handler）
-    # None = 尚未分析；"" = 已分析但没有外部输入
     entry_role: str = ""
 
-    # 时间戳（秒级 unix，仅供调试）
+    # ── R4 per-func：跨文件分析（新架构）──────────────────────────────────────
+    r4_state:    NodeState = NodeState.PENDING
+    r4_attempts: int = 0
+    r4_decision: str = ""   # "keep" | "remove" | ""
+    r4_reason:   str = ""
+
+    # ── Report per-func（新架构）──────────────────────────────────────────────
+    report_state:    NodeState = NodeState.PENDING
+    report_attempts: int = 0
+    report_path:     str = ""   # output/reports/{func_hash}.md
+
     updated_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d['r1_j_state'] = self.r1_j_state.value
-        d['r2_w_state'] = self.r2_w_state.value
-        d['r2_j_state'] = self.r2_j_state.value
+        for _f in ('r1b_w_state', 'r1b_j_state', 'r1_j_state',
+                   'r2_w_state', 'r2_j_state', 'r4_state', 'report_state'):
+            d[_f] = getattr(self, _f).value
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "FunctionState":
         data = dict(data)
-        data['r1_j_state'] = NodeState(data.get('r1_j_state', 'pending'))
-        data['r2_w_state'] = NodeState(data.get('r2_w_state', 'pending'))
-        data['r2_j_state'] = NodeState(data.get('r2_j_state', 'pending'))
-        # entry_role 字段向前兼容：旧状态文件中没有此字段时保持空字符串
+        # 向前兼容：r1_j_* → r1b_j_*（旧 pipeline_state.json 没有 r1b_* 字段）
+        if 'r1_j_state' in data and 'r1b_j_state' not in data:
+            data['r1b_j_state']         = data.get('r1_j_state', 'pending')
+            data['r1b_j_attempts']      = data.get('r1_j_attempts', 0)
+            data['r1b_j_feedback']      = data.get('r1_j_feedback', '')
+            data['r1b_j_feedback_path'] = data.get('r1_j_feedback_path', '')
+        for _f in ('r1b_w_state', 'r1b_j_state', 'r1_j_state',
+                   'r2_w_state', 'r2_j_state', 'r4_state', 'report_state'):
+            data[_f] = NodeState(data.get(_f, 'pending'))
         data.setdefault('entry_role', '')
+        data.setdefault('r4_decision', '')
+        data.setdefault('r4_reason', '')
+        data.setdefault('report_path', '')
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -96,28 +117,34 @@ class FunctionState:
 
 @dataclass
 class FileState:
-    """单个源文件在流水线中的状态。"""
+    """单个源文件在流水线中的状态（v3：R1a 覆盖率 + R1b 准确性分离）。"""
 
     file_hash:     str
-    original_path: str       # 源文件绝对路径
+    original_path: str
 
-    # R1 W：函数提取（静态 + LLM 验证）
+    # ── R1a W+J：文件级覆盖率（新架构）──────────────────────────────────────
+    r1a_w_state:  NodeState = NodeState.PENDING
+    r1a_j_state:  NodeState = NodeState.PENDING
+    r1a_attempts: int = 0
+    r1a_feedback: str = ""
+
+    # ── 已废弃字段（向前兼容）────────────────────────────────────────────────
+    # r1_w_* → 在 from_dict 中映射到 r1a_*
     r1_w_state:    NodeState = NodeState.PENDING
     r1_w_attempts: int = 0
 
-    # R2 J：文件所有函数分析完成后的一次性评审
+    # ── R2 J 文件级（已不再使用，保留兼容）────────────────────────────────────
     r2_j_state:    NodeState = NodeState.PENDING
     r2_j_attempts: int = 0
     r2_j_feedback: str = ""
 
-    # R3：文件级入口过滤
+    # ── R3 文件级过滤 ────────────────────────────────────────────────────────
     r3_state:    NodeState = NodeState.PENDING
     r3_attempts: int = 0
     r3_feedback: str = ""
-    # R3 函数级并行状态：func_hash → NodeState.value（向后兼容：旧状态文件没有此字段）
     r3_func_state: dict = field(default_factory=dict)
 
-    # 函数级状态（func_hash → FunctionState）
+    # ── 函数级状态 ───────────────────────────────────────────────────────────
     functions: dict[str, FunctionState] = field(default_factory=dict)
 
     updated_at: float = field(default_factory=time.time)
@@ -125,14 +152,18 @@ class FileState:
     # ── 便捷查询 ──────────────────────────────────────────────────────────────
 
     @property
-    def all_r1_j_passed(self) -> bool:
+    def r1_passed(self) -> bool:
+        """R1a 覆盖率 J 已通过。"""
+        return self.r1a_j_state == NodeState.PASSED
+
+    @property
+    def all_r1b_j_passed(self) -> bool:
         return bool(self.functions) and all(
-            f.r1_j_state == NodeState.PASSED for f in self.functions.values()
+            f.r1b_j_state == NodeState.PASSED for f in self.functions.values()
         )
 
     @property
     def all_r2_w_done(self) -> bool:
-        """所有函数 R2 W 已完成（passed 或 has_external_input=False）。"""
         return bool(self.functions) and all(
             f.r2_w_state == NodeState.PASSED or f.has_external_input is False
             for f in self.functions.values()
@@ -142,16 +173,14 @@ class FileState:
     def functions_with_external_input(self) -> list[FunctionState]:
         return [f for f in self.functions.values() if f.has_external_input is True]
 
-    @property
-    def r2_j_failed_funcs(self) -> list[FunctionState]:
-        """R2 J 失败时需要重跑的函数（仅标记为有问题的那些）。"""
-        # 实际使用时由 engine 在解析 J 反馈后填入 failed_func_hashes
-        return []
-
     def to_dict(self) -> dict:
         return {
             'file_hash':     self.file_hash,
             'original_path': self.original_path,
+            'r1a_w_state':   self.r1a_w_state.value,
+            'r1a_j_state':   self.r1a_j_state.value,
+            'r1a_attempts':  self.r1a_attempts,
+            'r1a_feedback':  self.r1a_feedback,
             'r1_w_state':    self.r1_w_state.value,
             'r1_w_attempts': self.r1_w_attempts,
             'r2_j_state':    self.r2_j_state.value,
@@ -162,17 +191,22 @@ class FileState:
             'r3_feedback':   self.r3_feedback,
             'r3_func_state': self.r3_func_state,
             'updated_at':    self.updated_at,
-            'functions': {
-                fh: fs.to_dict() for fh, fs in self.functions.items()
-            },
+            'functions': {fh: fs.to_dict() for fh, fs in self.functions.items()},
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileState":
         funcs_raw = data.pop('functions', {})
-        data['r1_w_state'] = NodeState(data.get('r1_w_state', 'pending'))
-        data['r2_j_state'] = NodeState(data.get('r2_j_state', 'pending'))
-        data['r3_state']   = NodeState(data.get('r3_state',   'pending'))
+        data = dict(data)
+        # 向前兼容：r1_w_state=PASSED → r1a_w_state=PASSED + r1a_j_state=PASSED
+        if 'r1_w_state' in data and 'r1a_w_state' not in data:
+            _old = data.get('r1_w_state', 'pending')
+            data['r1a_w_state'] = _old
+            data['r1a_j_state'] = _old   # 旧架构 W 通过即认为 J 通过
+            data['r1a_attempts'] = data.get('r1_w_attempts', 0)
+        for _f in ('r1a_w_state', 'r1a_j_state', 'r1_w_state',
+                   'r2_j_state', 'r3_state'):
+            data[_f] = NodeState(data.get(_f, 'pending'))
         data.setdefault('r3_func_state', {})
         obj = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         obj.functions = {
@@ -185,20 +219,30 @@ class FileState:
 
 @dataclass
 class PipelineState:
-    """整个任务的流水线状态。"""
+    """整个任务的流水线状态（v3：R4-final-J 独立字段）。"""
 
     task_id: str
 
-    # R4：模块级过滤
+    # ── R4 final Judge：模块级最终验证（新架构）──────────────────────────────
+    r4_final_j_state:    NodeState = NodeState.PENDING
+    r4_final_j_attempts: int = 0
+    r4_final_j_feedback: str = ""
+
+    # ── 已废弃字段（向前兼容旧 pipeline_state.json）──────────────────────────
+    # 旧的 r4_state（模块级 W+J）→ 映射到 r4_final_j_state
     r4_state:    NodeState = NodeState.PENDING
     r4_attempts: int = 0
     r4_feedback: str = ""
 
-    # CC：调用链静态分析（R3 完成后、R4 之前）
+    # ── CC：调用链静态分析 ────────────────────────────────────────────────────
     cc_state:    NodeState = NodeState.PENDING
     cc_attempts: int = 0
 
-    # 文件级状态（file_hash → FileState）
+    # ── Report final W+J ─────────────────────────────────────────────────────
+    report_final_state:    NodeState = NodeState.PENDING
+    report_final_attempts: int = 0
+
+    # ── 文件级状态 ───────────────────────────────────────────────────────────
     files: dict[str, FileState] = field(default_factory=dict)
 
     updated_at: float = field(default_factory=time.time)
@@ -211,27 +255,33 @@ class PipelineState:
             fs.r3_state == NodeState.PASSED for fs in self.files.values()
         )
 
+    @property
+    def all_r1a_passed(self) -> bool:
+        return bool(self.files) and all(
+            fs.r1a_j_state == NodeState.PASSED for fs in self.files.values()
+        )
+
     # ── 持久化 ────────────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
         return {
-            'task_id':     self.task_id,
-            'r4_state':    self.r4_state.value,
-            'r4_attempts': self.r4_attempts,
-            'r4_feedback': self.r4_feedback,
-            'cc_state':    self.cc_state.value,
-            'cc_attempts': self.cc_attempts,
-            'updated_at':  self.updated_at,
+            'task_id':               self.task_id,
+            'r4_final_j_state':      self.r4_final_j_state.value,
+            'r4_final_j_attempts':   self.r4_final_j_attempts,
+            'r4_final_j_feedback':   self.r4_final_j_feedback,
+            'r4_state':              self.r4_state.value,
+            'r4_attempts':           self.r4_attempts,
+            'r4_feedback':           self.r4_feedback,
+            'cc_state':              self.cc_state.value,
+            'cc_attempts':           self.cc_attempts,
+            'report_final_state':    self.report_final_state.value,
+            'report_final_attempts': self.report_final_attempts,
+            'updated_at':            self.updated_at,
             'files': {fh: fs.to_dict() for fh, fs in self.files.items()},
         }
 
     def save(self, path: Path) -> None:
-        """
-        原子写：用 mkstemp 产生唯一临时文件名，再 rename 到目标路径。
-
-        与固定名 `.tmp` 方案不同，即使多个 Worker Pod / 协程同时调用
-        save() 也不会产生 TOCTOU 竞争（各自持有独立临时文件）。
-        """
+        """原子写：用 mkstemp 产生唯一临时文件，再 rename 到目标路径。"""
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_str = tempfile.mkstemp(
             dir=str(path.parent),
@@ -243,7 +293,6 @@ class PipelineState:
                 fh.write(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
             os.replace(tmp_str, str(path))
         except Exception:
-            # 常规临时文件废弃，避免腔留废弃 .tmp
             try:
                 os.unlink(tmp_str)
             except OSError:
@@ -253,10 +302,17 @@ class PipelineState:
     @classmethod
     def from_dict(cls, data: dict) -> "PipelineState":
         files_raw = data.pop('files', {})
-        data['r4_state'] = NodeState(data.get('r4_state', 'pending'))
-        # cc_state 向前兼容：旧状态文件没有此字段时默认 pending
-        data['cc_state'] = NodeState(data.get('cc_state', 'pending'))
+        data = dict(data)
+        # 向前兼容：旧的 r4_state=PASSED → r4_final_j_state=PASSED
+        if 'r4_state' in data and 'r4_final_j_state' not in data:
+            data['r4_final_j_state']    = data.get('r4_state', 'pending')
+            data['r4_final_j_attempts'] = data.get('r4_attempts', 0)
+            data['r4_final_j_feedback'] = data.get('r4_feedback', '')
+        for _f in ('r4_final_j_state', 'r4_state', 'cc_state', 'report_final_state'):
+            data[_f] = NodeState(data.get(_f, 'pending'))
         data.setdefault('cc_attempts', 0)
+        data.setdefault('report_final_state', NodeState.PENDING)
+        data.setdefault('report_final_attempts', 0)
         obj = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         obj.files = {
             fh: FileState.from_dict(fd) for fh, fd in files_raw.items()
@@ -265,20 +321,15 @@ class PipelineState:
 
     @classmethod
     def load_or_create(cls, path: Path, task_id: str) -> "PipelineState":
-        """
-        从 pipeline_state.json 加载状态；文件不存在时创建空状态。
-
-        断点续跑的核心：engine 每次启动都调用此方法，
-        未完成的节点继续推进，已完成的节点直接跳过。
-        """
+        """从 pipeline_state.json 加载状态；不存在时创建空状态。"""
+        import logging as _log
+        _logger = _log.getLogger('ea.pipeline.state')
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding='utf-8'))
                 state = cls.from_dict(data)
-                # task_id 一致性检查
                 if state.task_id != task_id:
-                    import logging
-                    logging.getLogger('ea.pipeline.state').warning(
+                    _logger.warning(
                         'pipeline_state.json task_id mismatch: '
                         'file=%r expected=%r, creating fresh state',
                         state.task_id, task_id,
@@ -286,47 +337,34 @@ class PipelineState:
                     return cls(task_id=task_id)
                 return state
             except Exception as exc:
-                import logging
-                logging.getLogger('ea.pipeline.state').warning(
+                _logger.warning(
                     'Failed to load pipeline_state.json (%s), creating fresh state', exc
                 )
         return cls(task_id=task_id)
 
     def register_files(self, file_hash_paths: list[tuple[str, str]]) -> None:
-        """
-        将模块文件列表注册到 state（仅注册尚未存在的文件）。
-
-        Args:
-            file_hash_paths: [(file_hash, original_path), ...]
-        """
-        for fh, original_path in file_hash_paths:
-            if fh not in self.files:
-                self.files[fh] = FileState(
-                    file_hash=fh,
+        for file_hash, original_path in file_hash_paths:
+            if file_hash not in self.files:
+                self.files[file_hash] = FileState(
+                    file_hash=file_hash,
                     original_path=original_path,
                 )
 
     def register_functions(
         self,
         file_hash: str,
-        func_hash_names: list[tuple[str, str, str, int, int]],
+        funcs: list[tuple[str, str, str, int, int]],
     ) -> None:
-        """
-        将 R1 W 提取的函数列表注册到对应文件的 state（仅注册尚未存在的）。
-
-        Args:
-            file_hash:       文件 hash
-            func_hash_names: [(func_hash, name, signature, start_line, end_line), ...]
-        """
-        if file_hash not in self.files:
+        """注册函数列表到文件状态（R1a 完成后调用）。"""
+        fs = self.files.get(file_hash)
+        if fs is None:
             return
-        fs = self.files[file_hash]
-        for fh, name, signature, start_line, end_line in func_hash_names:
+        for fh, name, sig, start, end in funcs:
             if fh not in fs.functions:
                 fs.functions[fh] = FunctionState(
                     func_hash=fh,
                     name=name,
-                    signature=signature,
-                    start_line=start_line,
-                    end_line=end_line,
+                    signature=sig,
+                    start_line=start,
+                    end_line=end,
                 )

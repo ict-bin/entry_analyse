@@ -413,6 +413,164 @@ class FunctionDB:
 
     # ── 工厂方法 ───────────────────────────────────────────────────────────────
 
+    def apply_corrections(
+        self,
+        corrections: list[dict],
+        source_file: str,
+    ) -> None:
+        """
+        直接在 DB 内应用 R1a/R1b Worker 输出的修正列表。
+
+        取代旧的 _apply_r1_corrections(data, ...) + sync_from_json(data) 两步，
+        所有 body 从源文件重提取（不信任 LLM）。
+
+        corrections 格式同 r1_worker._apply_r1_corrections：
+          [{"func_hash": "...", "start_line": N, "end_line": M, "name": "...", "delete": True}, ...]
+        """
+        from .extractor import compute_func_hash, _find_function_end
+        try:
+            source_lines = Path(source_file).read_text(
+                encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            source_lines = []
+
+        with self._get_conn() as conn:
+            file_hash_row = conn.execute(
+                "SELECT file_hash FROM file_meta LIMIT 1").fetchone()
+            file_hash = file_hash_row[0] if file_hash_row else ""
+
+        for corr in corrections:
+            fh = corr.get("func_hash", "")
+            if not fh:
+                continue
+
+            if corr.get("delete"):
+                self.delete_function(fh)
+                continue
+
+            if fh == "new":
+                # 新增函数
+                name      = corr.get("name", "")
+                start     = int(corr.get("start_line") or 0)
+                if not name or not start:
+                    continue
+                end = int(corr.get("end_line") or 0)
+                if end <= 0 and source_lines:
+                    from .extractor import _find_function_end
+                    end = _find_function_end(source_lines, start)
+                body = ""
+                if source_lines and start > 0:
+                    if end >= start:
+                        body = chr(10).join(source_lines[start - 1: end])
+                    else:
+                        body = chr(10).join(source_lines[start - 1: start - 1 + 150])
+                new_fh = compute_func_hash(source_file, name, start)
+                sig = corr.get("signature", name)
+                body_lines = body.count(chr(10)) + 1 if body.strip() else 0
+                with self._get_conn() as conn:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO functions
+                               (func_hash, file_hash, name, signature,
+                                start_line, end_line, body, body_lines, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (new_fh, file_hash, name, sig,
+                         start, end, body, body_lines, time.time()),
+                    )
+                continue
+
+            # 更新已有函数
+            updates: dict = {}
+            for field_name in ("name", "signature"):
+                if corr.get(field_name):
+                    updates[field_name] = corr[field_name]
+            new_start = int(corr.get("start_line") or 0)
+            new_end   = int(corr.get("end_line")   or 0)
+            if new_start > 0:
+                updates["start_line"] = new_start
+            if new_end > 0:
+                updates["end_line"] = new_end
+
+            # 总是重提取 body
+            cur_start = updates.get("start_line", 0)
+            cur_end   = updates.get("end_line",   0)
+            if not cur_start:
+                row = self.get_function(fh)
+                if row:
+                    cur_start = row.get("start_line", 0)
+                    cur_end   = row.get("end_line",   0)
+            if cur_start > 0 and source_lines:
+                if cur_end <= 0:
+                    from .extractor import _find_function_end
+                    cur_end = _find_function_end(source_lines, cur_start)
+                    updates["end_line"] = cur_end
+                if cur_end >= cur_start:
+                    body = chr(10).join(source_lines[cur_start - 1: cur_end])
+                else:
+                    body = chr(10).join(source_lines[cur_start - 1: cur_start - 1 + 150])
+                updates["body"] = body
+                updates["body_lines"] = body.count(chr(10)) + 1 if body.strip() else 0
+
+            if updates:
+                self.update_function(fh, **updates)
+
+    def upsert_function(
+        self,
+        func_hash: str,
+        file_hash: str,
+        name: str,
+        signature: str,
+        start_line: int,
+        end_line: int,
+        body: str,
+    ) -> None:
+        """INSERT OR REPLACE 单个函数记录（用于新增遗漏函数）。"""
+        body_lines = body.count(chr(10)) + 1 if body.strip() else 0
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO functions
+                       (func_hash, file_hash, name, signature,
+                        start_line, end_line, body, body_lines, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (func_hash, file_hash, name, signature,
+                 start_line, end_line, body, body_lines, time.time()),
+            )
+
+    def get_functions_for_r1b(self) -> list[dict]:
+        """
+        返回全量函数元数据（不含 body），供 R1b-W/J 使用。
+
+        与 get_all_meta() 相同，但语义更明确（R1b 准确性验证专用）。
+        """
+        return self.get_all_meta()
+
+    def get_all_entries_light(self) -> list[dict]:
+        """
+        返回所有 has_external_input=1 函数的轻量信息（供 ModuleDB 同步）。
+        """
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT f.func_hash, f.file_hash, f.name, f.signature,
+                          f.start_line, f.end_line, f.body_lines,
+                          f.has_external_input, f.analysis, f.entry_role,
+                          f.entry_confidence,
+                          fm.rel_path AS file_path, fm.original_path
+                   FROM functions f
+                   LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
+                   WHERE f.has_external_input = 1
+                   ORDER BY f.start_line"""
+            ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get("analysis"):
+                try:
+                    d["analysis"] = json.loads(d["analysis"])
+                except Exception:
+                    pass
+            result.append(d)
+        return result
+
+
     @classmethod
     def open(cls, out_dir: Path, file_hash: str) -> "FunctionDB":
         """

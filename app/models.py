@@ -153,6 +153,28 @@ class TaskConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
+    # ── 并发控制 ───────────────────────────────────────────────────────────────
+    pipeline_parallelism: int = Field(default=64,
+        description="全局并行信号量大小（同时存在的 pi 进程上限）")
+
+    # ── 每阶段最大重试轮次（-1=无限重试，0=跳过，正整数=上限）─────────────────────
+    r1a_max_rounds: int = Field(default=-1,
+        description="R1a 覆盖率 W+J 最大轮次（-1=无限）")
+    r1b_max_rounds: int = Field(default=-1,
+        description="R1b 准确性 W+J 最大轮次（-1=无限）")
+    r2_max_rounds: int = Field(default=-1,
+        description="R2 外部输入分析 W+J 最大轮次（-1=无限）")
+    r3_max_rounds: int = Field(default=-1,
+        description="R3 入口过滤 W+J 最大轮次（-1=无限）")
+    r4_func_max_rounds: int = Field(default=-1,
+        description="R4 per-func 跨文件分析最大轮次（-1=无限）")
+    r4_final_max_rounds: int = Field(default=-1,
+        description="R4 汇总 Judge 最大轮次（-1=无限）")
+    report_func_max_rounds: int = Field(default=-1,
+        description="Report per-func W+J 最大轮次（-1=无限）")
+    report_final_max_rounds: int = Field(default=-1,
+        description="Report final W+J 最大轮次（-1=无限）")
+
     # 断点续跑：填入已有任务 ID，自动检测上次完成的轮次并从下一轮继续
     resume_task_id: str = Field(default="", description="断点续跑：已有任务 ID，从中断处继续")
 
