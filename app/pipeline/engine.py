@@ -525,7 +525,7 @@ class PipelineEngine:
             state.save(dirs.state_file)
             return
         fs.r3_attempts += 1
-        j_session = str(dirs.r4_j_session(file_hash, fs.r3_attempts))
+        j_session = str(dirs.r3_j_file_session(file_hash, fs.r3_attempts))
         await self._run_r3_j(file_hash, file_path, dirs, state, j_session)
         fs.r3_state = NodeState.PASSED
         state.save(dirs.state_file)
@@ -819,7 +819,7 @@ class PipelineEngine:
         state.save(dirs.state_file)
 
         attempt = func_state.r2_j_attempts
-        session_file = str(dirs.r4_j_session(func_hash, attempt))
+        session_file = str(dirs.r2_j_session(func_hash, attempt))
 
         self._emit("r2_j_start",
                    func_hash=func_hash, function=func_state.name,
@@ -962,7 +962,7 @@ class PipelineEngine:
         func_state.r3_j_attempts += 1
         state.save(dirs.state_file)
 
-        session_file = str(dirs.r4_j_session(func_hash, func_state.r3_j_attempts))
+        session_file = str(dirs.r3_j_session(func_hash, func_state.r3_j_attempts))
         db_path = dirs.r1_functions_db(file_hash)
         body_lines = max(0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1)
 
@@ -1126,7 +1126,7 @@ class PipelineEngine:
 
             # R3-J（文件级）
             if r3_max != 0:
-                j_session = str(dirs.r4_j_session(file_hash, fs.r3_attempts))
+                j_session = str(dirs.r3_j_file_session(file_hash, fs.r3_attempts))
                 j_passed = await self._run_r3_j(
                     file_hash, file_path, dirs, state, j_session)
                 if j_passed:
@@ -1233,6 +1233,9 @@ class PipelineEngine:
 
         existing = fs.r3_func_state.get(func_hash, "pending")
         if existing == "passed_keep":
+            # 同步 r4_decision（断点续跑时 state 可能未持久化决策）
+            if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
+                fs.functions[func_hash].r4_decision = "keep"
             r3_func_dir = dirs.r3.parent / "r3_func"
             out_path = r3_func_dir / f"{func_hash}.json"
             if out_path.exists():
@@ -1241,6 +1244,8 @@ class PipelineEngine:
                 except Exception:
                     pass
         elif existing == "passed_filter":
+            if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
+                fs.functions[func_hash].r4_decision = "filter"
             return None
 
         session_dir = dirs.r4_w_session(file_hash).parent
@@ -1278,11 +1283,15 @@ class PipelineEngine:
             except Exception as exc:
                 logger.warning("R3-W-func agent error for %s: %s", func_name, exc)
                 if attempt >= max_attempts:
+                    if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
+                        fs.functions[func_hash].r4_decision = "keep"
                     return self._make_r3_entry(func_info, "boundary", "keep (agent error, conservative)")
                 continue
 
             if not r3_func_out.exists():
                 if attempt >= max_attempts:
+                    if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
+                        fs.functions[func_hash].r4_decision = "keep"
                     return self._make_r3_entry(func_info, "boundary", "keep (no output, conservative)")
                 continue
 
@@ -1290,6 +1299,8 @@ class PipelineEngine:
                 decision_data = json.loads(r3_func_out.read_text(encoding="utf-8"))
             except Exception:
                 if attempt >= max_attempts:
+                    if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
+                        fs.functions[func_hash].r4_decision = "keep"
                     return self._make_r3_entry(func_info, "boundary", "keep (parse error, conservative)")
                 continue
 
@@ -1299,15 +1310,28 @@ class PipelineEngine:
 
             if decision == "filter":
                 fs.r3_func_state[func_hash] = "passed_filter"
+                if func_hash in fs.functions:
+                    fs.functions[func_hash].r4_decision = "filter"
                 state.save(dirs.state_file)
                 return None
             else:
                 entry = self._make_r3_entry(func_info, entry_role, reason)
                 r3_func_out.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
                 fs.r3_func_state[func_hash] = "passed_keep"
+                if func_hash in fs.functions:
+                    fs.functions[func_hash].r4_decision = "keep"
+                # 同步到 CallchainDB is_r3_entry
+                try:
+                    from .callchain_db import CallchainDB
+                    CallchainDB.open(dirs.callchain).update_node_r3_entry(func_hash, True)
+                except Exception:
+                    pass
                 state.save(dirs.state_file)
                 return entry
 
+        # 所有保守返回路径同步 r4_decision = "keep"
+        if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
+            fs.functions[func_hash].r4_decision = "keep"
         return self._make_r3_entry(func_info, "boundary", "keep (max retries, conservative)")
 
     async def _run_r3_j(

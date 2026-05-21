@@ -70,6 +70,7 @@ class FunctionState:
     # ── R4：调用链分析（原 R3-per-func）──────────────────────────────────────
     r4_decision:  str = ""    # "keep" | "filter"
     r4_note:      str = ""    # 跨文件/调用链判断备注
+    r4_reason:    str = ""    # 跨文件分析理由（旧加载兼容）
     r4_state:     NodeState = NodeState.PENDING
     r4_attempts:  int = 0
 
@@ -161,6 +162,11 @@ class FileState:
     r1_j_state:  NodeState = NodeState.PENDING
     r1_attempts: int = 0
     r1_feedback: str = ""
+
+    # ── R3：文件级汇总状态（旧加载工下防崩溃字段）──────────────────────
+    r3_state:    NodeState = NodeState.PENDING
+    r3_attempts: int = 0
+    r3_feedback: str = ""
 
     # ── 函数级状态 ───────────────────────────────────────────────────────────
     # R3 per-func decision cache: {func_hash: "passed_keep"|"passed_filter"}

@@ -204,3 +204,23 @@ class PipelineDirs:
     def from_task(cls, output_dir: str, task_id: str) -> "PipelineDirs":
         run = Path(output_dir) / task_id / "run"
         return cls(run=run)
+
+    # ─── 补丁：旧命名向前兼容 ────────────────────────────────────────────────
+
+    def r3_j_file_session(self, file_hash: str, attempt: int) -> Path:
+        """R3 文件级 Judge session（_run_r3_j_for_file / _run_r3 使用）"""
+        return self.sessions / f"r3-j-file-{file_hash}-a{attempt}.jsonl"
+
+    def r2_j_feedback_file_func(self, func_hash: str, attempt: int) -> Path:
+        """R3 entry analysis Judge 反馈文件（函数级）— 语义同 r3_j_feedback_file"""
+        return self.r3_j_feedback_file(func_hash, attempt)
+
+    def r4_j_session(self, hash_: str, attempt: int) -> Path:
+        """backward compat：旧 r4_j_session 对应 r3-j session 文件。
+        调用方应迁移至语义明确的 r2_j_session / r3_j_session / r3_j_file_session。
+        """
+        return self.sessions / f"r4-j-{hash_}-a{attempt}.jsonl"
+
+    def r4_func_result_file(self, func_hash: str) -> Path:
+        """R4 per-func 决策结果 JSON（旧路径，dead code 兼容保留）"""
+        return self.r4 / f"r4-func-{func_hash}.json"
