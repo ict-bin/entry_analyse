@@ -983,7 +983,8 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
 
-            # Engine 硬校验：taints 校验（区分 P/A 类型和有参/无参）
+            # Engine 硬校验：仅针对有参函数校验 taints 非空
+            # 无参函数（A 型）taints=[] 合法；entry_source_lines 由 Judge 语义验证
             if passed:
                 try:
                     from .funcdb import FunctionDB as _FDB
@@ -994,25 +995,17 @@ class PipelineEngine:
                             _a = json.loads(_a)
                         if _a.get("has_external_input") and not _a.get("taints"):
                             _sig = _fn_data.get("signature", "") or ""
-                            # 无参函数（func() / func(void)）：A 型 taints=[] 合法
+                            # 无参函数（func() / func(void)）：A 型 taints=[] 合法，跳过
                             _no_params = bool(
                                 _sig and re.search(r'\(\s*(void\s*)?\)', _sig)
                             )
                             if not _no_params:
-                                # 有参函数：P 型必须指出参数
+                                # 有参函数：P 型必须指出承载外部数据的参数名
                                 passed = False
                                 feedback = (
                                     f"Engine 硬校验失败：{func_state.name}() "
                                     f"has_external_input=true 但 taints 为空。"
                                     f"有参函数必须指出哪个参数承载外部数据。"
-                                )
-                            elif not _a.get("entry_source_lines"):
-                                # 无参函数：需要 entry_source_lines 说明 I/O 调用行
-                                passed = False
-                                feedback = (
-                                    f"Engine 硬校验失败：{func_state.name}() "
-                                    f"无参 A 型函数缺少 entry_source_lines，"
-                                    f"请指出具体的 I/O 调用行。"
                                 )
                 except Exception:
                     pass
