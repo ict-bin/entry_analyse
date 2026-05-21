@@ -298,33 +298,24 @@ class WorkerService:
             if is_fresh_start and task_snapshot.output_path:
                 import pathlib as _pl
                 import shutil as _shutil
-                _run_dir = (
+                _task_dir = (
                     _pl.Path(task_snapshot.output_path)
-                    / task_snapshot.task_id / "run"
+                    / task_snapshot.task_id
                 )
-                # 删除 pipeline_state.json（计数器归零，避免跳过已完成阶段）
-                _state_file = _run_dir / "pipeline_state.json"
-                if _state_file.exists():
-                    try:
-                        _state_file.unlink()
-                        logger.info(
-                            "Fresh start: deleted pipeline_state.json for %s", task_id)
-                    except Exception as _e:
-                        logger.warning(
-                            "Failed to delete pipeline_state.json for %s: %s",
-                            task_id, _e)
-                # 删除 sessions/ 目录（避免旧对话追加到新 run，导致 session 中出现多次初始化 prompt）
-                _sessions_dir = _run_dir / "sessions"
-                if _sessions_dir.exists():
-                    try:
-                        _shutil.rmtree(str(_sessions_dir))
-                        _sessions_dir.mkdir(parents=True, exist_ok=True)
-                        logger.info(
-                            "Fresh start: cleared sessions/ for %s", task_id)
-                    except Exception as _e:
-                        logger.warning(
-                            "Failed to clear sessions/ for %s: %s",
-                            task_id, _e)
+                # restart 时清空整个任务目录（run/ + output/）下的所有中间文件
+                # 确保新 run 不继承任何旧状态：session文件/funcdb/callchain/pipeline_state 等全部清除
+                # 保留 input/ 目录（任务元数据）不删除
+                for _subdir in ("run", "output"):
+                    _d = _task_dir / _subdir
+                    if _d.exists():
+                        try:
+                            _shutil.rmtree(str(_d))
+                            logger.info(
+                                "Fresh start: cleared %s/ for %s", _subdir, task_id)
+                        except Exception as _e:
+                            logger.warning(
+                                "Failed to clear %s/ for %s: %s",
+                                _subdir, task_id, _e)
 
             orch = Orchestrator(config=cfg, on_event=on_event)
             lease_task = asyncio.create_task(self._renew_task_lease(task_id, lease_stop_event), name=f"ea_lease_{task_id}")
