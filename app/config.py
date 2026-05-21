@@ -83,6 +83,16 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,
         resume_task_id=resume_task_id,
+        # 各阶段轮次配置（v3）
+        pipeline_parallelism=int(getattr(svc, 'pipeline_parallelism', 64) or 64),
+        r1a_max_rounds=int(getattr(svc, 'r1a_max_rounds', -1)),
+        r1b_max_rounds=int(getattr(svc, 'r1b_max_rounds', -1)),
+        r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
+        r3_max_rounds=int(getattr(svc, 'r3_max_rounds', -1)),
+        r4_func_max_rounds=int(getattr(svc, 'r4_func_max_rounds', -1)),
+        r4_final_max_rounds=int(getattr(svc, 'r4_final_max_rounds', -1)),
+        report_func_max_rounds=int(getattr(svc, 'report_func_max_rounds', -1)),
+        report_final_max_rounds=int(getattr(svc, 'report_final_max_rounds', -1)),
     )
 
     _backfill_role(cfg.workers)
