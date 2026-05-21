@@ -121,6 +121,20 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
+    # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
+    lean_mode: bool = Field(
+        default=False,
+        description="精简模式：跳过 R1b/CC/per-func R2-R3，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
+    )
+    lean_file_max_rounds: int = Field(
+        default=-1,
+        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）"
+    )
+    lean_module_max_rounds: int = Field(
+        default=-1,
+        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
+    )
+
 
 # ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
 
@@ -185,6 +199,20 @@ class TaskConfig(BaseModel):
         description="Report per-func W+J 最大轮次（-1=无限）")
     report_final_max_rounds: int = Field(default=-1,
         description="Report final W+J 最大轮次（-1=无限）")
+
+    # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
+    lean_mode: bool = Field(
+        default=False,
+        description="精简模式：跳过 R1b/CC/per-func R2-R3，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
+    )
+    lean_file_max_rounds: int = Field(
+        default=-1,
+        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）"
+    )
+    lean_module_max_rounds: int = Field(
+        default=-1,
+        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
+    )
 
     # 断点续跑：填入已有任务 ID，自动检测上次完成的轮次并从下一轮继续
     resume_task_id: str = Field(default="", description="断点续跑：已有任务 ID，从中断处继续")

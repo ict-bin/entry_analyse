@@ -41,6 +41,10 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,
+    # 精简模式（与完整模式配置并列，互不影响）
+    "lean_mode": False,
+    "lean_file_max_rounds": -1,
+    "lean_module_max_rounds": -1,
     "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
@@ -130,6 +134,7 @@ class ConfigService:
         except (TypeError, ValueError):
             normalized["model_max_concurrency"] = 32
         normalized["model_capacity_enabled"] = bool(normalized.get("model_capacity_enabled", True))
+        normalized["lean_mode"] = bool(normalized.get("lean_mode", False))
         return normalized
 
     def get_config(self, db: Session, project_id: str) -> dict:

@@ -93,6 +93,10 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         r4_final_max_rounds=int(getattr(svc, 'r4_final_max_rounds', -1)),
         report_func_max_rounds=int(getattr(svc, 'report_func_max_rounds', -1)),
         report_final_max_rounds=int(getattr(svc, 'report_final_max_rounds', -1)),
+        # 精简模式字段透传（与完整模式字段并列，互不影响）
+        lean_mode=bool(getattr(svc, 'lean_mode', False)),
+        lean_file_max_rounds=int(getattr(svc, 'lean_file_max_rounds', -1)),
+        lean_module_max_rounds=int(getattr(svc, 'lean_module_max_rounds', -1)),
     )
 
     _backfill_role(cfg.workers)
