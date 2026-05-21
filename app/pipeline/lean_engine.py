@@ -292,10 +292,18 @@ class LeanPipelineEngine:
             if fs.j_state == NodeState.PASSED:
                 break
 
-            # ── W 阶段 ────────────────────────────────────────────────────────
-            fs.w_state = NodeState.RUNNING
-            fs.w_attempts += 1
-            state.save(dirs.lean_state_file)
+            # ── 断点续跑：W 已完成则跳过，直接执行 J ─────────────────────────
+            # 场景：pod 重启后 w_state=passed/j_state=pending，不应重跑 W
+            _w_already_done = (
+                fs.w_state == NodeState.PASSED
+                and fs.w_attempts > 0
+                and script_path.exists()
+            )
+            if not _w_already_done:
+                # ── W 阶段 ──────────────────────────────────────────────────
+                fs.w_state = NodeState.RUNNING
+                fs.w_attempts += 1
+                state.save(dirs.lean_state_file)
 
             is_retry = fs.w_attempts > 1
             self._emit("lean_w_start", file=basename, file_hash=file_hash,

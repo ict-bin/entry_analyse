@@ -1,13 +1,18 @@
 """
-entry_analyse — 精简模式（Lean Mode）Prompt 构建器
+entry_analyse — 精简模式（Lean Mode）Prompt 构建器 v2
 
 与完整模式 prompts.py 完全独立，不 import prompts.py 中任何函数。
 
-设计理念：
-  Worker 编写 Python 分析脚本 → 执行脚本批量产出结果（1-2 次 LLM 调用替代 N 次）
-  Judge 两阶段验证：Phase 1 先审脚本逻辑，Phase 2 再审输出结果
+设计理念（v2）：
+  Worker：内嵌完整脚本模板，只需填入 CUSTOM_API_PATTERN 和调整正则
+  Judge：只查误报，不读源文件，不查漏报
 
-脚本路径参数的传递路径：
+主动型（A 型）改进（来自 5c83c35/26b2fc7 提交）：
+  - A 型外部数据来源不再限于 syscall，任何封装 API 均支持
+  - A 型 taints = 局部变量名，精简模式允许填 []
+  - FAIL 条件收紧：只在函数体完全无调用时 FAIL
+
+脚本路径传递：
   lean_engine → lean_dirs.lean_file_script(file_hash) → prompt → Worker 写脚本
   → state.files[fh].script_path 保存 → Judge prompt 引用同一路径
 """
@@ -21,19 +26,128 @@ from pathlib import Path
 # ─── 内部工具函数 ─────────────────────────────────────────────────────────────
 
 def _retry_section(feedback: str) -> str:
-    """生成重试时的 Judge 反馈引用片段（与 feedback 是文本还是文件路径均兼容）。"""
+    """生成重试时的 Judge 反馈引用片段。"""
     if not feedback:
         return ""
     feedback = feedback.strip()
     if os.path.isfile(feedback):
         return (
-            f"\n**上次 Judge 评审意见（详见文件）**：\n"
+            "\n**上次 Judge 评审意见（详见文件）**：\n"
             f"```bash\ncat {feedback}\n```\n\n"
             "请根据评审意见修正脚本后重新执行。\n\n"
         )
     return (
         f"\n**上次 Judge 评审意见**：\n{feedback[:800]}\n\n"
         "请根据评审意见修正脚本后重新执行。\n\n"
+    )
+
+
+# ─── 脚本模板（嵌入 W prompt，Worker 只需改 3 处）────────────────────────────
+#
+# 占位符：{basename} {db_path} {r3_out_path} {rel_file_path} {CUSTOM_API_PATTERN}
+#   {CUSTOM_API_PATTERN} 默认填 PLACEHOLDER_NEVER_MATCH（Worker 根据浏览结果替换）
+#
+# A 型改进（5c83c35/26b2fc7）：
+#   - ACTIVE_BODY 支持任意封装 API（SNMP_MsgGet/NetlinkRecv/BusRecv 等）
+#   - A 型 taints=[] 合法（局部变量名，精简模式不强制）
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SCRIPT_TMPL = """\
+#!/usr/bin/env python3
+\"\"\"Lean entry analysis for %(basename)s\"\"\"
+import json, re, sqlite3
+from pathlib import Path
+
+DB_PATH  = "%(db_path)s"
+OUT_PATH = "%(r3_out_path)s"
+
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+# body 字段必须查询（主动型检测依赖函数体）
+cur.execute("SELECT func_hash, name, signature, start_line, end_line, body, body_lines FROM functions")
+funcs = cur.fetchall()
+conn.close()
+
+# ── 定制区（根据浏览结果修改这 3 个正则） ─────────────────────────────────────
+# 被动型：函数名特征（加上此文件特有的前缀/后缀，如 deal_、On、ProcXxx）
+PASSIVE_NAME = re.compile(
+    r"(handle|handler|proc|process|dispatch|on_|_cb|recv|receive|input_|deal_)", re.I
+)
+# 被动型：参数名特征（加上此文件特有的外部数据参数关键词，如 pMsg、stReq）
+PASSIVE_SIG = re.compile(
+    r"\\b(msg|buf|data|frame|packet|request|req|payload|input|pkt|hdr)\\b", re.I
+)
+# 主动型：函数体内调用特征（在 %(CUSTOM_API_PATTERN)s 位置填封装 API，如 NetlinkRecv|SNMP_MsgGet）
+# 如无特殊 API，保留 PLACEHOLDER_NEVER_MATCH 即可
+ACTIVE_BODY = re.compile(
+    r"\\b(recv|recvfrom|recvmsg|accept|fread|fgets|getline|ioctl"
+    r"|MsgReceive|MsgReceivePulse|MsgRead"
+    r"|%(CUSTOM_API_PATTERN)s)\\s*\\(",
+    re.I
+)
+# ────────────────────────────────────────────────────────────────────────────
+
+REL_FILE = "%(rel_file_path)s"
+
+def infer_role(name: str, body: str) -> str:
+    if re.search(r"dispatch|oper_|msg_proc|proc_msg|cmd_", name, re.I): return "dispatch_target"
+    if re.search(r"register|hook|subscribe|add_cb|set_cb", name, re.I): return "callback"
+    if re.search(r"\\b(mq_|msgrcv|msgsnd|pipe|ipc_)", body, re.I): return "ipc_handler"
+    return "boundary"
+
+def extract_taints_p(sig: str) -> list:
+    params = re.findall(r"[*&,( ]([a-zA-Z_]\\w*)\\s*[,)]", sig)
+    return [p for p in params if PASSIVE_SIG.search(p)][:4]
+
+entries = []
+for f in funcs:
+    name = f["name"] or ""
+    sig  = f["signature"] or ""
+    body = f["body"] or ""
+    fh   = f["func_hash"]
+    sl   = f["start_line"]
+    el   = f["end_line"]
+    bl   = f["body_lines"]
+
+    tag = None; taints = []; src_lines = []; reason = ""
+
+    # A 型优先：函数体内主动拉取外部数据（syscall + 封装 API）
+    m = ACTIVE_BODY.search(body)
+    if m:
+        tag = "A"; reason = "主动拉取: " + m.group(0).strip()
+        src_lines = [{"line": sl, "code": m.group(0).strip()}]
+    # P 型：函数名或参数名含外部数据特征
+    elif PASSIVE_NAME.search(name) or PASSIVE_SIG.search(sig):
+        tag = "P"; taints = extract_taints_p(sig); reason = "被动接收外部数据"
+
+    if tag is None:
+        continue
+
+    entries.append({
+        "tag": tag, "file": REL_FILE, "line": sl, "function": name,
+        "taints": taints, "entry_role": infer_role(name, body),
+        "function_description": name + ": " + sig[:80],
+        "entry_reason": reason,
+        "taint_details": [{"name": t, "description": "外部输入"} for t in taints],
+        "func_hash": fh, "signature": sig, "start_line": sl, "end_line": el, "body_lines": bl,
+    })
+
+Path(OUT_PATH).parent.mkdir(parents=True, exist_ok=True)
+Path(OUT_PATH).write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"OK: {len(entries)} entries -> {OUT_PATH}")
+"""
+
+
+def _render_script(basename: str, db_path: Path, r3_out_path: Path,
+                   rel_file_path: str) -> str:
+    """渲染脚本模板（CUSTOM_API_PATTERN 留占位符，Worker 替换）。"""
+    return _SCRIPT_TMPL % dict(
+        basename=basename,
+        db_path=str(db_path),
+        r3_out_path=str(r3_out_path),
+        rel_file_path=rel_file_path,
+        CUSTOM_API_PATTERN="PLACEHOLDER_NEVER_MATCH",
     )
 
 
@@ -50,125 +164,82 @@ def build_lean_file_w_prompt(
     feedback: str = "",
 ) -> str:
     """
-    文件级 Worker Prompt：指示 Agent 编写并执行 Python 分析脚本。
+    文件级 Worker Prompt v2：浏览 → 填模板 → 执行（最多 3 bash + 1 write）。
 
-    工作流（速度优先）：
-      1. 浏览函数签名（ea_db.py list-meta，1 次 bash，< 1 秒）
-      2. 抽样 3-5 个函数体建立正则模式（sed 按需读取）
-      3. 编写 Python 脚本（1 次 write 调用）
-      4. 执行脚本（< 1 秒，不管函数数量多少）
-      5. validate_entry_list.py 验证格式
+    v2 改进（应用来自 5c83c35/26b2fc7 的 A 型改进）：
+    - 内嵌完整脚本模板，Worker 只需改 CUSTOM_API_PATTERN 和正则
+    - ACTIVE_BODY 支持任意封装 API（SNMP_MsgGet/NetlinkRecv/BusRecv 等）
+    - A 型 taints=[] 合法（精简模式不强制填局部变量名）
+    - 明确：无参函数有拉取调用即为 A 型
     """
     basename = os.path.basename(file_path)
+    try:
+        rel_file = os.path.relpath(os.path.abspath(file_path))
+    except ValueError:
+        rel_file = basename
     retry_block = _retry_section(feedback) if is_retry else ""
+    script_body = _render_script(basename, db_path, r3_out_path, rel_file)
 
-    return (
-        f"# Lean Mode 文件级入口分析 — `{basename}`\n\n"
-        f"{retry_block}"
-        f"## 目标\n\n"
-        f"编写并执行 Python 分析脚本，识别 `{basename}` 中的外部入口函数，"
-        f"输出到 `{r3_out_path}`。\n\n"
-        f"**速度优先**：脚本批量处理，无论文件有多少函数只需一次执行。\n\n"
-        f"## 步骤\n\n"
-        f"### Step 1：浏览函数列表（必须先做）\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}\n"
-        f"```\n\n"
-        f"快速浏览函数名和签名，识别此文件的命名风格（如 `ProcMsg_`/`Handle`/`Recv` 前缀）。\n\n"
-        f"### Step 2：抽样查看函数体（3-5 个典型函数）\n\n"
-        f"选取签名中有外部输入迹象的函数，用 sed 查看其函数体：\n\n"
-        f"```bash\n"
-        f"# 用 ea_db.py get 查单个函数完整数据（含 body）\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py get {db_path} <func_hash>\n"
-        f"```\n\n"
-        f"目的：确认此文件实际的 I/O 调用模式，让脚本的正则更准确。\n\n"
-        f"### Step 3：编写分析脚本\n\n"
-        f"将脚本写入 `{script_path}`，脚本模板如下（**根据 Step 1/2 的观察修改模式**）：\n\n"
-        f"```python\n"
-        f"#!/usr/bin/env python3\n"
-        f'"""Lean entry analysis for {basename}"""\n'
-        f"import json, re, sqlite3\n"
-        f"from pathlib import Path\n\n"
-        f'DB_PATH  = "{db_path}"\n'
-        f'OUT_PATH = "{r3_out_path}"\n\n'
-        f"# ── 根据 Step 1/2 观察结果定制正则模式 ──────────────────\n"
-        f"# 被动型：签名中出现以下参数/函数名模式\n"
-        f"PASSIVE_SIG = re.compile(\n"
-        f"    r'\\b(msg|request|req|buf|data|frame|packet|header|payload|'\n"
-        f"    r'handle|handler|proc|process|dispatch|on_|cb_)\\b', re.I)\n\n"
-        f"# 主动型：函数体中出现以下 I/O 调用\n"
-        f"ACTIVE_BODY = re.compile(\n"
-        f"    r'\\b(recv|recvfrom|recvmsg|read|fread|accept|ioctl|'\n"
-        f"    r'MsgReceive|MsgReceivePulse|MsgRead|getmsg)\\b')\n\n"
-        f"conn = sqlite3.connect(DB_PATH)\n"
-        f"conn.row_factory = sqlite3.Row\n"
-        f"funcs = conn.execute(\"\"\"\n"
-        f"    SELECT f.func_hash, f.name, f.signature,\n"
-        f"           f.start_line, f.end_line, f.body, f.body_lines,\n"
-        f"           fm.rel_path AS file_path, fm.original_path\n"
-        f"    FROM functions f\n"
-        f"    LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash\n"
-        f'""").fetchall()\n'
-        f"conn.close()\n\n"
-        f"def infer_taints(sig: str) -> list[str]:\n"
-        f"    \"\"\"从函数签名提取参数变量名作为 taint 列表。\"\"\"\n"
-        f"    params = re.findall(r'\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?:[,)])\\s*$|'\n"
-        f"                        r'(?:^|,)\\s*[^,)]*?\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?:,|\\))', sig)\n"
-        f"    flat = [p for pair in params for p in pair if p and not p[0].isupper()]\n"
-        f"    return flat[:3] if flat else ['param']\n\n"
-        f"entries = []\n"
-        f"for func in funcs:\n"
-        f"    sig  = str(func['signature'] or func['name'] or '')\n"
-        f"    body = str(func['body'] or '')\n"
-        f"    name = str(func['name'] or '')\n"
-        f"    fp   = str(func['file_path'] or func['original_path'] or '{basename}')\n\n"
-        f"    tag = None\n"
-        f"    if ACTIVE_BODY.search(body):\n"
-        f"        tag = 'A'\n"
-        f"    elif PASSIVE_SIG.search(sig) or PASSIVE_SIG.search(name):\n"
-        f"        tag = 'P'\n\n"
-        f"    if tag:\n"
-        f"        taints = infer_taints(sig)\n"
-        f"        entries.append({{\n"
-        f'            "tag":                  tag,\n'
-        f'            "file":                 Path(fp).name,\n'
-        f'            "line":                 int(func["start_line"] or 0),\n'
-        f'            "function":             name,\n'
-        f'            "taints":               taints,\n'
-        f'            "entry_role":           "boundary",\n'
-        f'            "function_description": f"{{name}} 处理外部输入数据",\n'
-        f'            "entry_reason":         f"函数签名/函数体存在外部输入模式",\n'
-        f'            "taint_details":        [{{"name": t, "description": "外部可控参数"}} for t in taints],\n'
-        f'            "func_hash":            str(func["func_hash"]),\n'
-        f'            "signature":            sig,\n'
-        f'            "start_line":           int(func["start_line"] or 0),\n'
-        f'            "end_line":             int(func["end_line"] or 0),\n'
-        f'            "body_lines":           int(func["body_lines"] or 0),\n'
-        f"        }})\n\n"
-        f"Path(OUT_PATH).parent.mkdir(parents=True, exist_ok=True)\n"
-        f"Path(OUT_PATH).write_text(\n"
-        f"    json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')\n"
-        f"print(f'Done: {{len(entries)}} entries -> {{OUT_PATH}}')\n"
-        f"```\n\n"
-        f"### Step 4：执行脚本\n\n"
-        f"```bash\n"
-        f"python3 {script_path} 2>&1 | tee {log_path}\n"
-        f"```\n\n"
-        f"### Step 5：验证输出格式\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/"
-        f"validate_entry_list.py {r3_out_path}\n"
-        f"```\n\n"
-        f"验证通过即完成。若失败，根据错误信息修改脚本后重跑 Step 4。\n\n"
-        f"## 注意事项\n\n"
-        f"- 模式要根据 Step 1/2 实际观察结果定制，不要照搬模板\n"
-        f"- 如果文件无外部 I/O 接口（纯内部工具函数），输出空数组 `[]` 是合理的\n"
-        f"- taints 只填参数变量名（如 `aMsg`），不填中文、空格或括号\n"
-        f"- 任务完成越快越好\n"
-    )
+    lines = [
+        f"# Lean Mode 文件级入口分析 — `{basename}`",
+        "",
+        retry_block,
+        "## 目标",
+        "",
+        f"分析 `{basename}` 的入口函数，脚本写入 `{script_path}`，结果写入 `{r3_out_path}`。",
+        "",
+        "**速度优先**：浏览 → 填模板 → 执行，最多 3 次 bash + 1 次 write。",
+        "",
+        "---",
+        "",
+        "## Step 1：浏览函数列表（必须先做）",
+        "",
+        "```bash",
+        f"python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}",
+        "```",
+        "",
+        "关注：**函数命名前缀/后缀**规律、是否有封装的外部数据接收 API（如 `XxxRecv`/`GetMsg`/`BusRead`/`SNMP_MsgGet`）。",
+        "",
+        "---",
+        "",
+        "## Step 2：修改并写入脚本",
+        "",
+        f"将下方模板写入 `{script_path}`，**只需修改 3 处**（其余保持不变）：",
+        "",
+        "| 位置 | 修改内容 |",
+        "|------|---------|",
+        "| `CUSTOM_API_PATTERN` | 浏览时发现的封装外部 API 名称（如 `NetlinkRecv\\|SNMP_MsgGet`）；无则填 `PLACEHOLDER_NEVER_MATCH` |",
+        "| `PASSIVE_NAME` | 加上此文件特有的函数名前缀/后缀 |",
+        "| `PASSIVE_SIG` | 加上此文件特有的外部数据参数关键词 |",
+        "",
+        "```python",
+        script_body,
+        "```",
+        "",
+        "---",
+        "",
+        "## Step 3：执行 + 验证",
+        "",
+        "```bash",
+        f"python3 {script_path} 2>&1 | tee {log_path} && \\",
+        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_entry_list.py {r3_out_path}",
+        "```",
+        "",
+        "验证通过即完成。若失败，根据错误信息修正脚本后重跑。",
+        "",
+        "---",
+        "",
+        "## A 型（主动拉取）注意事项",
+        "",
+        "- `CUSTOM_API_PATTERN` 接受任何从外部拉取数据的封装 API（不限于 syscall）",
+        "- A 型 `taints=[]` 合法（精简模式不强制填局部变量名）",
+        "- 无参函数只要函数体内有拉取调用即为 A 型",
+        "- 纯内部工具模块输出 `[]` 是正确的",
+    ]
+    return "\n".join(lines)
 
 
-# ─── 文件级 Judge Prompt（两阶段验证）────────────────────────────────────────
+# ─── 文件级 Judge Prompt（只查误报，不读源文件）─────────────────────────────────
 
 def build_lean_file_j_prompt(
     *,
@@ -178,85 +249,124 @@ def build_lean_file_j_prompt(
     db_path: Path,
 ) -> str:
     """
-    文件级 Judge Prompt：两阶段验证（先脚本后结果）。
+    文件级 Judge Prompt v2：只查误报，不读源文件，不查漏报。
 
-    Phase 1（先做）：验证脚本语法和逻辑
-    Phase 2（脚本通过后）：验证 r3 JSON 格式和结果合理性
-
-    关键设计：脚本逻辑有缺陷直接 FAIL，无需看结果。
-    精简模式宽松标准：边界模糊案例通过，不追究字段完整性细节。
+    v2 改进（应用来自 5c83c35/26b2fc7 的 A 型改进）：
+    - 不使用 sed/grep 读源文件（节省 1-2 次 bash，加速 30-50%）
+    - A 型 taints=[] 合法（不因此 FAIL）
+    - A 型调用非标准 API（SNMP_MsgGet 等）→ 信任 Worker 判断，不 FAIL
+    - FAIL 条件严格收紧：只在明确误报时 FAIL
     """
     basename = os.path.basename(file_path)
-    return (
-        f"# Lean Mode 文件级入口结果评审 — `{basename}`\n\n"
-        f"## Phase 1：脚本验证（先做，必须通过才继续 Phase 2）\n\n"
-        f"### 1.1 读取脚本\n\n"
-        f"```bash\n"
-        f"cat {script_path}\n"
-        f"```\n\n"
-        f"### 1.2 语法检查\n\n"
-        f"```bash\n"
-        f"python3 -m py_compile {script_path} && echo 'SYNTAX_OK'\n"
-        f"```\n\n"
-        f"### 1.3 逻辑检查要点\n\n"
-        f"- `DB_PATH` 是否指向正确的 funcdb（`{db_path}`）？\n"
-        f"- 从 funcdb 查询时是否包含了 `body` 字段（主动型检测必需）？\n"
-        f"- `PASSIVE_SIG` 和 `ACTIVE_BODY` 正则是否合理（不过于宽泛或严格）？\n"
-        f"- 输出是否写到 `{r3_entries_path}`？\n"
-        f"- entry_role / taints / function_description 等字段是否有填充逻辑？\n\n"
-        f"**Phase 1 失败条件**（任一即 FAIL，无需继续 Phase 2）：\n"
-        f"- 语法错误\n"
-        f"- DB_PATH 路径错误\n"
-        f"- 查询未包含 body 字段（导致主动型漏判）\n"
-        f"- 输出路径错误（产物写到了错误位置）\n\n"
-        f"---\n\n"
-        f"## Phase 2：结果验证（Phase 1 通过后执行）\n\n"
-        f"### 2.1 格式验证\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/"
-        f"validate_entry_list.py {r3_entries_path}\n"
-        f"```\n\n"
-        f"### 2.2 合理性抽查（抽取 3-5 个条目）\n\n"
-        f"对 `{r3_entries_path}` 中的条目，随机抽取 3-5 个核验：\n\n"
-        f"```bash\n"
-        f"# 查看函数原始数据（签名+body 片段）\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py get {db_path} <func_hash>\n"
-        f"```\n\n"
-        f"确认：\n"
-        f"- tag=A 的函数体中确实有 recv/read/ioctl 等主动 I/O 调用\n"
-        f"- tag=P 的函数签名确实有外部数据参数名（msg/buf/request 等）\n\n"
-        f"### 2.3 覆盖率评估\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py stats {db_path}\n"
-        f"```\n\n"
-        f"结合函数总数判断命中率：\n"
-        f"- 命中率 < 1%：检查正则模式是否过于严格（可能大量漏报）\n"
-        f"- 命中率 > 40%：检查正则是否过于宽泛（可能大量误报）\n"
-        f"- 空文件（0 个函数）输出 `[]` 是合理的，正常通过\n\n"
-        f"## 输出格式\n\n"
-        f"```\n"
-        f"通过: 是\n"
-        f"反馈: Phase 1 脚本逻辑正确，Phase 2 格式验证通过，命中率合理\n"
-        f"```\n\n"
-        f"或：\n\n"
-        f"```\n"
-        f"通过: 否\n"
-        f"反馈:\n"
-        f"- [Phase 1] 第 N 行：PASSIVE_SIG 未包含此文件常见的 handler_ 前缀\n"
-        f"- [Phase 1] DB_PATH 路径写死为绝对路径但文件不存在\n"
-        f"```\n\n"
-        f"## 精简模式宽松标准\n\n"
-        f"- 字段描述内容粗略但非空即通过（精简模式允许一定误报）\n"
-        f"- 边界模糊的函数保留（宁可误报不漏报）\n"
-        f"- 不要求 taint_details 内容精确，只要格式合法即可\n"
-    )
+    lines = [
+        f"# Lean Mode 文件级入口结果评审 — `{basename}`",
+        "",
+        "## 核心原则：只查误报，不读源码，不查漏报",
+        "",
+        "**4 步检查，全部命令行完成，不使用 sed/grep 读源文件。**",
+        "",
+        "---",
+        "",
+        "## Step 1：脚本语法检查",
+        "",
+        "```bash",
+        f"python3 -m py_compile {script_path} && echo SYNTAX_OK",
+        "```",
+        "",
+        "失败 → 直接输出 FAIL。",
+        "",
+        "---",
+        "",
+        "## Step 2：脚本结构检查（只读脚本，不读源代码）",
+        "",
+        "```bash",
+        f"cat {script_path}",
+        "```",
+        "",
+        "检查以下 3 项（任一明确违反则 FAIL）：",
+        "",
+        "| 条件 | 违反时 |",
+        "|------|-------|",
+        "| SQL 查询包含 `body` 字段 | FAIL（漏所有 A 型） |",
+        f"| DB_PATH 指向 funcdb（含 `r1-functions` 或 `_functions.db`） | FAIL |",
+        f"| OUT_PATH 为 `{r3_entries_path}` | FAIL |",
+        "",
+        "---",
+        "",
+        "## Step 3：格式验证",
+        "",
+        "```bash",
+        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_entry_list.py {r3_entries_path}",
+        "```",
+        "",
+        "失败 → FAIL，附 validate 输出中的具体错误行。",
+        "",
+        "---",
+        "",
+        "## Step 4：误报快检（读 JSON，不读源文件）",
+        "",
+        "```bash",
+        "python3 - << 'PY'",
+        "import json",
+        f"es = json.load(open('{r3_entries_path}'))",
+        "print(f'total={len(es)}')",
+        "for e in es[:5]:",
+        "    print(e.get('tag'), e.get('function'), e.get('taints'), e.get('entry_reason','')[:50])",
+        "PY",
+        "```",
+        "",
+        "只 FAIL 以下**明显误报**（有证据才 FAIL）：",
+        "",
+        "| 误报类型 | 判断依据 | 处理 |",
+        "|---------|---------|------|",
+        "| 输出/释放函数 | 函数名含 send/print/log/free/destroy/dump/write | FAIL |",
+        "| taints 格式非法 | 含中文、空格、括号、`.`、`->` | FAIL |",
+        "| tag 非 P/A | tag 字段不是 `\"P\"` 或 `\"A\"` | FAIL |",
+        "",
+        "**以下情况不 FAIL**（来自 5c83c35 A 型放宽规则）：",
+        "",
+        "- A 型 `taints=[]` → **合法**（精简模式允许，A 型 taints 是局部变量名）",
+        "- A 型调用不认识的 API（如 `SNMP_MsgGet`/`NetlinkRecv`）→ **信任 Worker 判断**",
+        "- 无参函数标注 A 型 → **合法**",
+        "- 命中率偏高（> 40%）→ 警告但不 FAIL",
+        "- `entry_role` 统一为 `boundary` → 可接受",
+        "",
+        "---",
+        "",
+        "## 输出格式",
+        "",
+        "通过时：",
+        "```",
+        "通过: 是",
+        "反馈: 格式验证通过，共 N 条，无明显误报",
+        "```",
+        "",
+        "失败时：",
+        "```",
+        "通过: 否",
+        "反馈:",
+        "- [Step X] 具体问题（字段名/实际值）",
+        "```",
+        "",
+        "---",
+        "",
+        "## 快速通过条件",
+        "",
+        "满足以下全部条件时，**无需逐条检查，直接通过**：",
+        "1. 语法检查通过",
+        "2. 脚本含 `body` 字段查询",
+        "3. validate_entry_list.py 输出 OK",
+        "4. 条目数 > 0（或函数总数 < 5）",
+        "5. 前 3 条函数名不含明显输出/释放操作前缀",
+    ]
+    return "\n".join(lines)
 
 
-# ─── 模块级 Worker Prompt ─────────────────────────────────────────────────────
+# ─── 模块级 Worker Prompt ──────────────────────────────────────────────────────
 
 def build_lean_module_w_prompt(
     *,
-    r3_files: list[Path],
+    r3_files: list,
     module_script_path: Path,
     r4_out_path: Path,
     log_path: Path,
@@ -265,84 +375,72 @@ def build_lean_module_w_prompt(
     feedback: str = "",
 ) -> str:
     """
-    模块级 Worker Prompt：编写并执行跨文件整合脚本。
-
-    脚本读取所有 r3/{file_hash}.json → 跨文件去重 → 写出 r4/entries.json。
-    与完整模式 R4 Worker 语义相同，但采用脚本方式以加速。
+    模块级 Worker Prompt：读取所有 r3 结果 → 编写去重整合脚本 → 执行 → 产出 r4/entries.json。
     """
     retry_block = _retry_section(feedback) if is_retry else ""
-    r3_list = "\n".join(f"  - `{f}`" for f in sorted(r3_files)) if r3_files else "  (暂无 R3 结果)"
+    r3_list = "\n".join(f"  - {p}" for p in r3_files[:20])
+    if len(r3_files) > 20:
+        r3_list += f"\n  - ...（共 {len(r3_files)} 个文件）"
 
-    return (
-        f"# Lean Mode 模块级入口整合 — `{module_name}`\n\n"
-        f"{retry_block}"
-        f"## 目标\n\n"
-        f"编写并执行 Python 整合脚本，将各文件的入口结果汇总，"
-        f"完成跨文件去重后写出到 `{r4_out_path}`。\n\n"
-        f"## 文件级分析结果（R3 输出）\n\n"
-        f"{r3_list}\n\n"
-        f"## 步骤\n\n"
-        f"### Step 1：快速读取所有 R3 结果\n\n"
-        f"```bash\n"
-        f"cat {' '.join(str(f) for f in sorted(r3_files)[:5])}  # 先看前几个\n"
-        f"```\n\n"
-        f"了解各文件的入口分布情况。\n\n"
-        f"### Step 2：编写整合脚本\n\n"
-        f"将脚本写入 `{module_script_path}`：\n\n"
-        f"```python\n"
-        f"#!/usr/bin/env python3\n"
-        f'"""Lean module consolidation for {module_name}"""\n'
-        f"import json\n"
-        f"from pathlib import Path\n\n"
-        f"R3_FILES = [\n"
-        + "".join(f'    "{f}",\n' for f in sorted(r3_files))
-        + f"]\n"
-        f'OUT_PATH = "{r4_out_path}"\n\n'
-        f"# 读取所有文件级结果\n"
-        f"all_entries = []\n"
-        f"for r3_path in R3_FILES:\n"
-        f"    p = Path(r3_path)\n"
-        f"    if not p.exists():\n"
-        f"        continue\n"
-        f"    try:\n"
-        f"        data = json.loads(p.read_text(encoding='utf-8'))\n"
-        f"        if isinstance(data, list):\n"
-        f"            all_entries.extend(data)\n"
-        f"    except Exception as e:\n"
-        f"        print(f'Warning: skip {{r3_path}}: {{e}}')\n\n"
-        f"# 去重：同一 func_hash 只保留首次出现\n"
-        f"seen = set()\n"
-        f"unique_entries = []\n"
-        f"for e in all_entries:\n"
-        f"    fh = e.get('func_hash', '') or e.get('function', '')\n"
-        f"    if fh and fh not in seen:\n"
-        f"        seen.add(fh)\n"
-        f"        unique_entries.append(e)\n\n"
-        f"# 注意：精简模式不做跨文件调用链分析（允许一定误报）\n"
-        f"# 如需精确跨文件分析请使用完整模式\n\n"
-        f"Path(OUT_PATH).parent.mkdir(parents=True, exist_ok=True)\n"
-        f"Path(OUT_PATH).write_text(\n"
-        f"    json.dumps(unique_entries, ensure_ascii=False, indent=2),\n"
-        f"    encoding='utf-8')\n"
-        f"print(f'Done: {{len(unique_entries)}} entries -> {{OUT_PATH}}')\n"
-        f"```\n\n"
-        f"### Step 3：执行脚本\n\n"
-        f"```bash\n"
-        f"python3 {module_script_path} 2>&1 | tee {log_path}\n"
-        f"```\n\n"
-        f"### Step 4：验证\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/"
-        f"validate_entry_list.py {r4_out_path}\n"
-        f"```\n\n"
-        f"## 注意事项\n\n"
-        f"- dispatch_target 角色的函数即使有上层 dispatcher 调用也**保留**（污点追踪起点）\n"
-        f"- 去重以 func_hash 为准，确保同一函数不重复出现\n"
-        f"- 精简模式不做深度跨文件调用链分析，直接去重即可\n"
-    )
+    lines = [
+        f"# Lean Mode 模块级入口整合 — `{module_name}`",
+        "",
+        retry_block,
+        "## 目标",
+        "",
+        f"将所有文件级分析结果（r3）合并去重，产出模块最终入口列表 `{r4_out_path}`。",
+        "",
+        "## r3 结果文件列表",
+        "",
+        r3_list,
+        "",
+        "## 整合脚本要求",
+        "",
+        f"将脚本写入 `{module_script_path}`，脚本逻辑：",
+        "",
+        "1. 读取所有 r3 JSON 文件，合并所有 entries 列表",
+        "2. 按 `func_hash` 去重（保留第一次出现的条目）",
+        "3. 排序（按 file + line）",
+        f'4. 写出到 `{r4_out_path}`',
+        "",
+        "**模板**：",
+        "",
+        "```python",
+        "#!/usr/bin/env python3",
+        f'"""Lean module consolidation for {module_name}"""',
+        "import json",
+        "from pathlib import Path",
+        "",
+        f'R3_FILES = {[str(p) for p in r3_files]}',
+        f'OUT_PATH = "{r4_out_path}"',
+        "",
+        "seen, entries = set(), []",
+        "for r3_path in R3_FILES:",
+        "    try:",
+        "        for e in json.loads(Path(r3_path).read_text(encoding='utf-8')):",
+        "            key = e.get('func_hash') or e.get('function', '')",
+        "            if key and key not in seen:",
+        "                seen.add(key); entries.append(e)",
+        "    except Exception as ex:",
+        "        print(f'skip {r3_path}: {ex}')",
+        "",
+        "entries.sort(key=lambda e: (e.get('file',''), e.get('line', 0)))",
+        "Path(OUT_PATH).parent.mkdir(parents=True, exist_ok=True)",
+        "Path(OUT_PATH).write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')",
+        f'print(f"OK: {{len(entries)}} entries -> {{OUT_PATH}}")',
+        "```",
+        "",
+        "## 执行",
+        "",
+        "```bash",
+        f"python3 {module_script_path} 2>&1 | tee {log_path} && \\",
+        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_entry_list.py {r4_out_path}",
+        "```",
+    ]
+    return "\n".join(lines)
 
 
-# ─── 模块级 Judge Prompt（两阶段验证）────────────────────────────────────────
+# ─── 模块级 Judge Prompt ──────────────────────────────────────────────────────
 
 def build_lean_module_j_prompt(
     *,
@@ -351,37 +449,55 @@ def build_lean_module_j_prompt(
     module_name: str,
 ) -> str:
     """
-    模块级 Judge Prompt：两阶段验证（先脚本后最终结果）。
+    模块级 Judge Prompt：验证模块级整合脚本和产物。
+    与文件级 Judge 相同策略：只查误报，不读源文件。
     """
-    return (
-        f"# Lean Mode 模块级入口结果评审 — `{module_name}`\n\n"
-        f"## Phase 1：脚本验证\n\n"
-        f"```bash\n"
-        f"cat {module_script_path}\n"
-        f"python3 -m py_compile {module_script_path} && echo 'SYNTAX_OK'\n"
-        f"```\n\n"
-        f"检查要点：\n"
-        f"- R3_FILES 列表是否包含所有文件\n"
-        f"- 去重逻辑是否正确（以 func_hash 为 key）\n"
-        f"- 输出路径是否为 `{r4_entries_path}`\n\n"
-        f"---\n\n"
-        f"## Phase 2：最终结果验证\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/"
-        f"validate_entry_list.py {r4_entries_path}\n"
-        f"```\n\n"
-        f"读取并抽查结果：\n"
-        f"```bash\n"
-        f"cat {r4_entries_path} | python3 -c \"\n"
-        f"import json,sys\n"
-        f"d=json.load(sys.stdin)\n"
-        f"print(f'总数: {{len(d)}}')\n"
-        f"for e in d[:3]: print(e.get('function'), e.get('tag'), e.get('entry_role'))\n"
-        f"\"\n"
-        f"```\n\n"
-        f"## 输出格式\n\n"
-        f"```\n"
-        f"通过: 是\n"
-        f"反馈: 脚本逻辑正确，去重有效，结果格式合法，共 N 个模块级入口\n"
-        f"```\n"
-    )
+    lines = [
+        f"# Lean Mode 模块级入口结果评审 — `{module_name}`",
+        "",
+        "## 验证步骤",
+        "",
+        "### Step 1：语法检查",
+        "",
+        "```bash",
+        f"python3 -m py_compile {module_script_path} && echo SYNTAX_OK",
+        "```",
+        "",
+        "### Step 2：格式验证",
+        "",
+        "```bash",
+        f"python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_entry_list.py {r4_entries_path}",
+        "```",
+        "",
+        "### Step 3：基本检查",
+        "",
+        "```bash",
+        "python3 - << 'PY'",
+        "import json",
+        f"es = json.load(open('{r4_entries_path}'))",
+        "print(f'total={len(es)}')",
+        "tags = [e.get('tag') for e in es]",
+        "print('P:', tags.count('P'), 'A:', tags.count('A'))",
+        "PY",
+        "```",
+        "",
+        "检查：",
+        "- 格式验证通过",
+        "- 条目数合理（0 条是合理的，如果模块确实无外部入口）",
+        "- tag 只含 P/A",
+        "",
+        "## 输出格式",
+        "",
+        "通过时：",
+        "```",
+        "通过: 是",
+        "反馈: 格式验证通过，共 N 条（P: X，A: Y）",
+        "```",
+        "",
+        "失败时：",
+        "```",
+        "通过: 否",
+        "反馈: <具体问题>",
+        "```",
+    ]
+    return "\n".join(lines)
