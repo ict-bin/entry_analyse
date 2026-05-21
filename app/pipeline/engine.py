@@ -205,66 +205,31 @@ class PipelineEngine:
 
         self._emit("pipeline_start", file_count=len(module_files))
 
-        # ── Phase 1: 所有文件 R1a（并行，仅覆盖率验证，不含 R1b）────────────
-        # 只等 R1a（静态提取 + 文件级 LLM），R1b 放到 Phase 2 与 CC 并行
+        # ── Phase 1: 所有文件 R1（并行）──────────────────────────────────────
         await asyncio.gather(*[
-            self._run_r1a(fh, fp, dirs, state)
+            self._run_file_r1(fh, fp, dirs, state)
             for fh, fp in file_hash_paths
-            if state.files[fh].r1a_j_state != NodeState.PASSED
         ])
 
         if self._cancel.is_set():
             return []
 
-        # ── Phase 2: CC + R1b + R2+R3 三者最大并行 ───────────────────────────
-        # CC 只需 R1a funcdb（静态函数列表），无需等待 R1b
-        # R1b 每个函数独立并行；函数在 R1b 完成且 cc_done 触发后立刻进入 R2→R3
-        cc_done_event: asyncio.Event = asyncio.Event()
+        # ── Phase 2: CC 静态建图（全量函数，R1 完成后立即建）────────────────
+        await self._run_callchain_analysis(dirs, state, module_files, file_hash_paths)
 
-        # 若 CC 已建好（断点续跑），直接触发 event
-        _cc_db = dirs.workspace / "callchain" / "callchain.db"
-        if _cc_db.exists():
-            cc_done_event.set()
+        if self._cancel.is_set():
+            return []
 
-        async def _cc_phase() -> None:
-            if not cc_done_event.is_set():
-                await self._run_callchain_analysis(
-                    dirs, state, module_files, file_hash_paths)
-            cc_done_event.set()
-
-        async def _r1b_then_r2r3(
-            file_hash: str, func_hash: str, file_path: str
-        ) -> None:
-            fs = state.files.get(file_hash)
-            if fs is None or fs.r1a_j_state != NodeState.PASSED:
-                return
-            if fs.functions.get(func_hash) is None:
-                return
-            # R1b：校正函数边界（与 CC 并行）
-            if fs.functions[func_hash].r1b_j_state != NodeState.PASSED:
-                await self._run_r1b_only(
-                    file_hash, func_hash, file_path, dirs, state)
-            if self._cancel.is_set():
-                return
-            # 等 CC 建完再进 R2→R3
-            await cc_done_event.wait()
-            if self._cancel.is_set():
-                return
-            await self._run_func_r2_r3(
-                func_hash, file_hash, file_path, dirs, state)
-
+        # ── Phase 3: 所有函数 R2+R3（并行，带 CC caller 上下文）─────────────
         all_func_triples = [
             (func_hash, file_hash, file_path)
             for file_hash, file_path in file_hash_paths
             for func_hash in list(state.files[file_hash].functions.keys())
         ]
-        await asyncio.gather(
-            _cc_phase(),
-            *[
-                _r1b_then_r2r3(file_hash, func_hash, file_path)
-                for func_hash, file_hash, file_path in all_func_triples
-            ],
-        )
+        await asyncio.gather(*[
+            self._run_func_r2_r3(fh, fhash, fpath, dirs, state)
+            for fh, fhash, fpath in all_func_triples
+        ])
 
         if self._cancel.is_set():
             return []
