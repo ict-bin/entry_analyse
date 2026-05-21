@@ -305,9 +305,8 @@ class PipelineEngine:
         func_name  = func_meta.get("name", func_state.name or func_hash[:8])
         start_line = func_meta.get("start_line", 0)
         end_line   = func_meta.get("end_line", 0)
-        await self._run_r1b_j_loop(
-            file_hash, func_hash, func_name, start_line, end_line,
-            file_path, dirs, state)
+        await self._run_r1b_j(
+            file_hash, func_hash, file_path, dirs, state)
 
     # ── Phase 3 函数单元：R2 + R3-W(带 CC caller 上下文) ───────────────────
 
@@ -342,7 +341,8 @@ class PipelineEngine:
             while _should_continue(func_state.r2_j_attempts, r2_j_max, self._cancel):
                 if func_state.r2_j_state == NodeState.PASSED:
                     break
-                passed, _ = await self._run_r2_j(file_hash, func_hash, dirs, state)
+                passed, _ = await self._run_r2_j_for_func(
+                    file_hash, func_hash, file_path, dirs, state)
                 if passed:
                     break
                 func_state.r2_w_state = NodeState.PENDING
