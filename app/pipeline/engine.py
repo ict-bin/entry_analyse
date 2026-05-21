@@ -289,9 +289,33 @@ class PipelineEngine:
             if self._cancel.is_set():
                 return
 
-            # R4: 调用链分析（需要 CC）
-            await self._run_r3_w_for_func(
-                file_hash, func_hash, file_path, dirs, state)
+            # R4: per-func 入口决策（需要 CC，用 caller_ctx 增强）
+            if not func_state.r4_decision:
+                _func_meta: dict = {}
+                try:
+                    from .funcdb import FunctionDB as _FDB2
+                    _func_meta = _FDB2.open(dirs.r1, file_hash).get_function(func_hash) or {}
+                except Exception:
+                    pass
+                _func_info = {
+                    "func_hash":  func_hash,
+                    "name":       func_state.name or _func_meta.get("name", ""),
+                    "signature":  func_state.signature or _func_meta.get("signature", ""),
+                    "start_line": _func_meta.get("start_line", func_state.start_line),
+                    "end_line":   _func_meta.get("end_line", func_state.end_line),
+                    "analysis":   _func_meta.get("analysis"),
+                    "file_path":  file_path,
+                    "body_lines": _func_meta.get("body_lines", 0),
+                }
+                _caller_ctx = self._build_caller_context_for_r3(func_hash, dirs, state)
+                await self._run_r3_w_for_func(
+                    file_hash=file_hash,
+                    file_path=file_path,
+                    func_info=_func_info,
+                    caller_ctx=_caller_ctx,
+                    dirs=dirs,
+                    state=state,
+                )
             if self._cancel.is_set():
                 return
 
@@ -300,9 +324,27 @@ class PipelineEngine:
             if (out_dir and func_state and
                     func_state.r4_decision == 'keep' and
                     func_state.r5_state != NodeState.PASSED):
+                _r3_func_dir = dirs.r3.parent / "r3_func"
+                _entry_path  = _r3_func_dir / f"{func_hash}.json"
+                try:
+                    _entry = json.loads(_entry_path.read_text(encoding="utf-8"))
+                except Exception:
+                    _entry = {
+                        "func_hash": func_hash,
+                        "function":  func_state.name or "",
+                        "file":      file_path,
+                    }
+                _reports_dir = out_dir / "reports"
+                _reports_dir.mkdir(parents=True, exist_ok=True)
                 await self._run_report_for_func(
-                    func_hash, file_hash, file_path,
-                    dirs, out_dir, self.cfg.module_name, state)
+                    entry=_entry,
+                    dirs=dirs,
+                    out_dir=out_dir,
+                    reports_dir=_reports_dir,
+                    module_name=self.cfg.module_name,
+                    state=state,
+                )
+
 
         await asyncio.gather(
             _cc_phase(),
@@ -354,10 +396,10 @@ class PipelineEngine:
         if func_state is None:
             return
         r1b_max = int(getattr(self.cfg, "r1b_max_rounds", -1))
-        if func_state.r3_j_state == NodeState.PASSED:
+        if func_state.r2_j_state == NodeState.PASSED:
             return
-        if not _should_continue(func_state.r3_j_attempts, r1b_max, self._cancel):
-            func_state.r3_j_state = NodeState.PASSED
+        if not _should_continue(func_state.r2_j_attempts, r1b_max, self._cancel):
+            func_state.r2_j_state = NodeState.PASSED
             state.save(dirs.state_file)
             return
         func_meta: dict = {}
@@ -374,6 +416,7 @@ class PipelineEngine:
 
     # ── Phase 3 函数单元：R2 + R3-W(带 CC caller 上下文) ───────────────────
 
+
     async def _run_func_r2_r3(
         self,
         func_hash: str,
@@ -384,9 +427,11 @@ class PipelineEngine:
     ) -> None:
         """
         Phase 3 函数单元：
-          1. R2-W+J
-          2. Step 1: 检查 has_external_input，否则跳过 R3
-          3. Step 2: R3-W 带 CC caller 上下文
+          1. R2-W（外部输入分析）+ R2-J（验证）
+          2. 检查 has_external_input，否则跳过后续
+
+        注意：per-func 入口决策 (_run_r3_w_for_func) 由 _func_pipeline 在
+        CC 完成后调用（R4 步骤），确保能获得完整的 caller_ctx。
         """
         if self._cancel.is_set():
             return
@@ -395,9 +440,10 @@ class PipelineEngine:
             return
         func_state = fs.functions[func_hash]
 
-        # R2-W+J
+        # R2-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
         if func_state.r3_w_state != NodeState.PASSED:
             await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
+
         if self._cancel.is_set():
             return
         if func_state.r3_w_state == NodeState.PASSED:
@@ -417,65 +463,12 @@ class PipelineEngine:
         if self._cancel.is_set():
             return
 
-        # Step 1: 检查 has_external_input，否则跳过 R3
+        # 检查 has_external_input，否则直接过滤
         if not func_state.has_external_input:
             func_state.r4_decision = "filter"
             logger.debug("R3 skip (no external input): %s", func_state.name)
-            return
+            state.save(dirs.state_file)
 
-        # Step 2: R3-W(带 CC caller 上下文)
-        r3_max = int(getattr(self.cfg, "r3_max_rounds", -1))
-        if r3_max == 0:
-            func_state.r4_decision = "keep"
-            return
-
-        caller_ctx = self._build_caller_context_for_r3(func_hash, dirs, state)
-        func_meta: dict = {}
-        try:
-            from .funcdb import FunctionDB
-            func_meta = FunctionDB.open(dirs.r1, file_hash).get_function(func_hash) or {}
-        except Exception:
-            pass
-        func_info = {
-            "func_hash":  func_hash,
-            "name":       func_state.name or func_meta.get("name", ""),
-            "signature":  func_state.signature or func_meta.get("signature", ""),
-            "start_line": func_meta.get("start_line", 0),
-            "end_line":   func_meta.get("end_line", 0),
-            "analysis":   func_meta.get("analysis"),
-            "file_path":  file_path,
-            "body_lines": func_meta.get("body_lines", 0),
-        }
-        dirs.r3.mkdir(parents=True, exist_ok=True)
-        r3_func_dir = dirs.r3.parent / "r3_func"
-        r3_func_dir.mkdir(parents=True, exist_ok=True)
-        result = await self._run_r3_w_for_func(
-            file_hash=file_hash, file_path=file_path,
-            func_info=func_info, caller_ctx=caller_ctx,
-            dirs=dirs, state=state,
-        )
-        if result is not None:
-            r3_func_out = r3_func_dir / f"{func_hash}.json"
-            r3_func_out.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-            func_state.r4_decision = "keep"
-            try:
-                from .callchain_db import CallchainDB
-                CallchainDB.open(dirs.callchain).update_node_r3_entry(func_hash, True)
-            except Exception:
-                pass
-            try:
-                from .module_db import ModuleDB
-                ModuleDB.open(dirs.workspace).update_r3_decision(func_hash, "keep")
-            except Exception:
-                pass
-        else:
-            func_state.r4_decision = "filter"
-            try:
-                from .module_db import ModuleDB
-                ModuleDB.open(dirs.workspace).update_r3_decision(func_hash, "filter")
-            except Exception:
-                pass
-        state.save(dirs.state_file)
 
     def _build_caller_context_for_r3(
         self, func_hash: str, dirs: PipelineDirs, state: PipelineState
@@ -705,7 +698,7 @@ class PipelineEngine:
         if len(fs.functions) > R1B_J_SKIP_THRESHOLD:
             func_state = fs.functions.get(func_hash)
             if func_state and func_state.r3_j_state != NodeState.PASSED:
-                func_state.r3_j_state = NodeState.PASSED
+                func_state.r2_j_state = NodeState.PASSED
                 func_state.r3_w_state = NodeState.PASSED
                 state.save(dirs.state_file)
         else:
@@ -714,15 +707,15 @@ class PipelineEngine:
                 func_state = state.files[file_hash].functions.get(func_hash)
                 if func_state is None:
                     return
-                if func_state.r3_j_state == NodeState.PASSED:
+                if func_state.r2_j_state == NodeState.PASSED:
                     break
-                if not _should_continue(func_state.r3_j_attempts, r1b_max, self._cancel):
-                    func_state.r3_j_state = NodeState.PASSED
+                if not _should_continue(func_state.r2_j_attempts, r1b_max, self._cancel):
+                    func_state.r2_j_state = NodeState.PASSED
                     state.save(dirs.state_file)
                     break
 
                 # R1b-W（首次或被 J 失败触发）
-                if func_state.r3_w_state != NodeState.PASSED:
+                if func_state.r2_w_state != NodeState.PASSED:
                     await self._run_r1b_w(file_hash, func_hash, file_path, dirs, state)
 
                 # R1b-J
@@ -732,7 +725,7 @@ class PipelineEngine:
                 # J 失败：重置 W
                 func_state = state.files[file_hash].functions.get(func_hash)
                 if func_state:
-                    func_state.r3_w_state = NodeState.PENDING
+                    func_state.r2_w_state = NodeState.PENDING
 
         # ── R2 W+J ──────────────────────────────────────────────────────────
         r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
@@ -778,13 +771,13 @@ class PipelineEngine:
     ) -> None:
         """R1b Worker：函数级准确性校正。"""
         func_state = state.files[file_hash].functions[func_hash]
-        func_state.r3_w_state = NodeState.RUNNING
-        func_state.r3_w_attempts += 1
+        func_state.r2_w_state = NodeState.RUNNING
+        func_state.r2_w_attempts += 1
         state.save(dirs.state_file)
 
         try:
             acfg = self.cfg.workers.agents[0]
-            is_retry = func_state.r3_w_attempts > 1
+            is_retry = func_state.r2_w_attempts > 1
             async with self._sem:
                 await run_r2_worker(
                     file_path=file_path,
@@ -802,11 +795,11 @@ class PipelineEngine:
                     feedback=func_state.r2_j_feedback if is_retry else "",
                     system_prompt=self._stage_sys_prompt('r2_worker'),
                 )
-            func_state.r3_w_state = NodeState.PASSED
+            func_state.r2_w_state = NodeState.PASSED
             state.save(dirs.state_file)
         except Exception as exc:
             logger.error("R1b W failed for %s: %s", func_hash, exc)
-            func_state.r3_w_state = NodeState.FAILED
+            func_state.r2_w_state = NodeState.FAILED
             state.save(dirs.state_file)
 
     # ── R1b J ──────────────────────────────────────────────────────────────────
@@ -821,11 +814,11 @@ class PipelineEngine:
     ) -> bool:
         """R1b Judge：函数级准确性验证。返回 passed。"""
         func_state = state.files[file_hash].functions[func_hash]
-        func_state.r3_j_state = NodeState.RUNNING
-        func_state.r3_j_attempts += 1
+        func_state.r2_j_state = NodeState.RUNNING
+        func_state.r2_j_attempts += 1
         state.save(dirs.state_file)
 
-        attempt = func_state.r3_j_attempts
+        attempt = func_state.r2_j_attempts
         session_file = str(dirs.r4_j_session(func_hash, attempt))
 
         self._emit("r2_j_start",
@@ -848,7 +841,7 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
             func_state.r2_j_feedback = feedback
-            func_state.r3_j_state = NodeState.PASSED if passed else NodeState.FAILED
+            func_state.r2_j_state = NodeState.PASSED if passed else NodeState.FAILED
             if not passed and feedback:
                 fb_file = dirs.r1_j_feedback_file(file_hash, func_hash, attempt)
                 fb_file.parent.mkdir(parents=True, exist_ok=True)
@@ -861,7 +854,7 @@ class PipelineEngine:
             return passed
         except Exception as exc:
             logger.error("R1b J failed for %s: %s", func_hash, exc)
-            func_state.r3_j_state = NodeState.PASSED   # 异常保守通过
+            func_state.r2_j_state = NodeState.PASSED   # 异常保守通过
             state.save(dirs.state_file)
             return True
 
@@ -1414,102 +1407,6 @@ class PipelineEngine:
             state.cc_state = NodeState.FAILED
             state.save(dirs.state_file)
             self._emit("callchain_failed", error=str(exc)[:200])
-        if state.cc_state == NodeState.PASSED:
-            logger.debug("CC already done, skipping")
-            return
-
-        state.cc_state = NodeState.RUNNING
-        state.cc_attempts += 1
-        state.save(dirs.state_file)
-        self._emit("callchain_start", attempt=state.cc_attempts)
-
-        try:
-            from .callchain_extractor import collect_known_funcs_from_dbs, extract_call_edges
-            from .callchain_db import CallchainDB
-            from .funcdb import FunctionDB
-            from .confidence import compute_confidence
-
-            known_funcs, file_hash_map = collect_known_funcs_from_dbs(
-                file_hash_paths, dirs.r1
-            )
-            edges = extract_call_edges(module_files, known_funcs, file_hash_map)
-
-            # 收集 R3 保留的候选入口
-            r3_entry_hashes: list[str] = []
-            for r3_file in sorted(dirs.r3.glob("*.json")):
-                try:
-                    entries = json.loads(r3_file.read_text(encoding="utf-8"))
-                    for e in (entries if isinstance(entries, list) else []):
-                        fh = e.get("func_hash")
-                        if fh:
-                            r3_entry_hashes.append(fh)
-                except Exception:
-                    pass
-
-            cc_db = CallchainDB.open(dirs.callchain)
-            nodes_list = [
-                {
-                    "func_hash":   fh,
-                    "name":        info.get("name", ""),
-                    "signature":   info.get("signature", ""),
-                    "file_hash":   info.get("file_hash", ""),
-                    "start_line":  info.get("start_line", 0),
-                    "is_r3_entry": 1 if fh in r3_entry_hashes else 0,
-                    "entry_role":  info.get("entry_role", ""),
-                }
-                for fh, info in known_funcs.items()
-            ]
-            cc_db.insert_nodes(nodes_list)
-            cc_db.insert_edges(edges)
-            cc_db.mark_r3_entries(r3_entry_hashes)
-            cc_db.build_closure(max_depth=10)
-            cc_db.build_entry_trees(r3_entry_hashes, max_depth=10)
-
-            # 置信度更新
-            for fh in r3_entry_hashes:
-                try:
-                    role_info = cc_db.get_callchain_role(fh)
-                    node = cc_db.get_node(fh)
-                    if node is None:
-                        continue
-                    f_hash = node.get("file_hash", "")
-                    if not f_hash:
-                        continue
-                    func_db = FunctionDB.open(dirs.r1, f_hash)
-                    func_info = func_db.get_function(fh)
-                    if not func_info or not func_info.get("analysis"):
-                        continue
-                    new_conf = compute_confidence(
-                        analysis=func_info["analysis"],
-                        callchain_role=role_info,
-                    )
-                    func_db.update_confidence(fh, new_conf)
-                    cc_db.update_entry_confidence(fh, new_conf)
-                    # 同步到 ModuleDB
-                    try:
-                        from .module_db import ModuleDB
-                        ModuleDB.open(dirs.workspace).update_confidence(fh, new_conf)
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.debug("confidence update failed for %s: %s", fh, exc)
-
-            cc_db.mark_build_done()
-            cc_stats = cc_db.stats()
-            state.cc_state = NodeState.PASSED
-            state.save(dirs.state_file)
-            self._emit("callchain_done",
-                       nodes=cc_stats["nodes"],
-                       edges=cc_stats["edges"],
-                       r3_entries=len(r3_entry_hashes))
-
-        except Exception as exc:
-            logger.warning("CC analysis failed (non-fatal): %s", exc)
-            state.cc_state = NodeState.FAILED
-            state.save(dirs.state_file)
-            self._emit("callchain_failed", error=str(exc)[:200])
-
-    # ── R4 pipeline (v4: 删除 per-func, 只保留 final-J) ───────────────────────────
 
     async def _run_r4_pipeline(
         self, dirs: PipelineDirs, state: PipelineState

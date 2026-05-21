@@ -163,6 +163,10 @@ class FileState:
     r1_feedback: str = ""
 
     # ── 函数级状态 ───────────────────────────────────────────────────────────
+    # R3 per-func decision cache: {func_hash: "passed_keep"|"passed_filter"}
+    # Persisted to pipeline_state.json for resume support
+    r3_func_state: dict = field(default_factory=dict)
+
     functions: dict[str, FunctionState] = field(default_factory=dict)
 
     updated_at: float = field(default_factory=time.time)
@@ -200,6 +204,7 @@ class FileState:
             'r1_attempts':   self.r1_attempts,
             'r1_feedback':   self.r1_feedback,
             'updated_at':    self.updated_at,
+            'r3_func_state': self.r3_func_state,
             'functions': {fh: fs.to_dict() for fh, fs in self.functions.items()},
         }
 
@@ -225,6 +230,8 @@ class FileState:
         obj.functions = {
             fh: FunctionState.from_dict(fd) for fh, fd in funcs_raw.items()
         }
+        obj.r3_func_state = {k: v for k, v in data.get('r3_func_state', {}).items()
+                             if isinstance(v, str)}
         return obj
 
 
