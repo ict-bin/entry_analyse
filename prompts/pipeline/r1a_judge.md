@@ -25,7 +25,7 @@ sed -n '<start>,<end>p' {source_file}
 ### 2. 验证 Worker 新增的函数
 
 ```bash
-python3 /app/scripts/ea_db.py list-meta {db_path}
+python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}
 ```
 
 检查是否有明显不合理的函数名（如数据结构、宏定义被误识别为函数）。

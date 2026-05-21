@@ -584,7 +584,7 @@ class PipelineEngine:
                 else:
                     gap_hint = (
                         f"无 gap 文件（ctags 已完整覆盖），直接用 "
-                        f"`python3 /app/scripts/ea_db.py list-meta {db_path}` 确认列表。"
+                        f"`python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表。"
                     )
                 j_prompt = (
                     f"# Round 1a Judge \u2014 覆盖率验证：`{Path(file_path).name}`\n\n"

@@ -170,7 +170,7 @@ def build_r1a_w_initial_prompt(
         gap_instruction = (
             f"## Gap 检查\n\n"
             f"无可视 gap（ctags 已覆盖全部内容）。"
-            f"用 `python3 /app/scripts/ea_db.py list-meta {db_path}` 确认列表，"
+            f"用 `python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表，"
             f"若看起来完整则输出 `NO_CORRECTIONS`。"
         )
 
@@ -295,6 +295,17 @@ async def run_r1a_worker(
     session_f = str(dirs.r1a_w_session(file_hash))
     workspace = str(dirs.source)
 
+    # fresh start 时清空旧 session 文件，避免旧对话占满上下文导致模型混乱
+    # 重试（is_retry=True）保留 session 继续对话，首次运行清空
+    if not is_retry:
+        _session_path = Path(session_f)
+        if _session_path.exists():
+            try:
+                _session_path.unlink()
+                logger.debug("R1a-W: cleared stale session for fresh start: %s", file_hash)
+            except OSError:
+                pass
+
     static_funcs:       list[FunctionExtract] = []
     func_hashes_static: list[str] = []
 
@@ -341,7 +352,32 @@ async def run_r1a_worker(
         )
     else:
         current_count = db.stats().get("total", 0)
-        prompt = build_r1a_w_retry_prompt(file_path, file_hash, dirs, feedback)
+        if current_count == 0:
+            # funcdb 为空（可能 pod kill 导致 WAL 丢失）—降级为 fresh start
+            logger.warning("R1a-W: funcdb empty on retry for %s, falling back to fresh start", basename)
+            _safe_emit(on_event, "r1_static_extract", task_id,
+                       file=basename, file_hash=file_hash)
+            static_funcs = extract_functions_static(file_path)
+            func_hashes_static = [
+                compute_func_hash(file_path, fe.name, fe.start_line)
+                for fe in static_funcs
+            ]
+            rel = (
+                os.path.relpath(os.path.abspath(file_path), source_dir)
+                if source_dir else os.path.basename(file_path)
+            )
+            db.write_functions(file_hash, file_path, static_funcs, func_hashes_static, rel_path=rel)
+            gaps_file  = dirs.r1a_gaps_file(file_hash)
+            gaps_list2 = _compute_gaps(static_funcs, file_path)
+            if gaps_list2:
+                import json as _json2
+                gaps_file.write_text(_json2.dumps(gaps_list2, ensure_ascii=False, indent=2), encoding="utf-8")
+            prompt = build_r1a_w_initial_prompt(
+                file_path, len(static_funcs), file_hash, dirs,
+                gaps_file_path=gaps_file if gaps_list2 else None,
+            )
+        else:
+            prompt = build_r1a_w_retry_prompt(file_path, file_hash, dirs, feedback)
 
     _safe_emit(on_event, "r1_w_agent_start", task_id,
                file=basename, file_hash=file_hash, is_retry=is_retry)
