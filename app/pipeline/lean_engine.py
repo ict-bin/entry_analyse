@@ -298,53 +298,58 @@ class LeanPipelineEngine:
                 fs.w_state == NodeState.PASSED
                 and fs.w_attempts > 0
                 and script_path.exists()
+                and r3_out.exists()
             )
             if not _w_already_done:
-                # ── W 阶段 ──────────────────────────────────────────────────
+                # ── W 阶段（完整包含 agent 调用，resume 时整块跳过）─────────
                 fs.w_state = NodeState.RUNNING
                 fs.w_attempts += 1
                 state.save(dirs.lean_state_file)
-
-            is_retry = fs.w_attempts > 1
-            self._emit("lean_w_start", file=basename, file_hash=file_hash,
-                       attempt=fs.w_attempts, is_retry=is_retry)
-            try:
-                w_prompt = P.build_lean_file_w_prompt(
-                    file_path=file_path,
-                    db_path=db_path,
-                    script_path=script_path,
-                    r3_out_path=r3_out,
-                    log_path=log_path,
-                    is_retry=is_retry,
-                    feedback=fs.feedback if is_retry else "",
-                )
-                await self._call_agent(
-                    prompt=w_prompt,
-                    system_prompt=self._stage_sys_prompt("lean_file_worker"),
-                    session_file=w_session,
-                    cwd=str(dirs.source),
-                    context=f"lean_w:{file_hash}",
-                    acfg=self.cfg.workers.agents[0],
-                    # Worker 需要 write（写脚本）+ bash（执行脚本）+ read/grep（浏览函数）
-                    tools=["read", "bash", "write", "grep"],
-                )
-                fs.w_state = NodeState.PASSED
-                # 记录脚本路径到 state（供 Judge session 引用）
-                if script_path.exists():
-                    fs.script_path = str(script_path)
-                state.save(dirs.lean_state_file)
-                self._emit("lean_w_done", file=basename, file_hash=file_hash,
-                           script_exists=script_path.exists(),
-                           r3_exists=r3_out.exists())
-            except Exception as exc:
-                logger.error("Lean W 失败 %s: %s", file_path, exc)
-                fs.w_state = NodeState.FAILED
-                state.save(dirs.lean_state_file)
-                # W 执行异常时跳过该文件，写空 r3 作为兜底
-                if not r3_out.exists():
-                    r3_out.parent.mkdir(parents=True, exist_ok=True)
-                    r3_out.write_text("[]", encoding="utf-8")
-                break
+                is_retry = fs.w_attempts > 1
+                self._emit("lean_w_start", file=basename, file_hash=file_hash,
+                           attempt=fs.w_attempts, is_retry=is_retry)
+                try:
+                    w_prompt = P.build_lean_file_w_prompt(
+                        file_path=file_path,
+                        db_path=db_path,
+                        script_path=script_path,
+                        r3_out_path=r3_out,
+                        log_path=log_path,
+                        is_retry=is_retry,
+                        feedback=fs.feedback if is_retry else "",
+                    )
+                    await self._call_agent(
+                        prompt=w_prompt,
+                        system_prompt=self._stage_sys_prompt("lean_file_worker"),
+                        session_file=w_session,
+                        cwd=str(dirs.source),
+                        context=f"lean_w:{file_hash}",
+                        acfg=self.cfg.workers.agents[0],
+                        # Worker 需要 write（写脚本）+ bash（执行脚本）+ read/grep（浏览函数）
+                        tools=["read", "bash", "write", "grep"],
+                    )
+                    fs.w_state = NodeState.PASSED
+                    # 记录脚本路径到 state（供 Judge session 引用）
+                    if script_path.exists():
+                        fs.script_path = str(script_path)
+                    state.save(dirs.lean_state_file)
+                    self._emit("lean_w_done", file=basename, file_hash=file_hash,
+                               script_exists=script_path.exists(),
+                               r3_exists=r3_out.exists())
+                except Exception as exc:
+                    logger.error("Lean W 失败 %s: %s", file_path, exc)
+                    fs.w_state = NodeState.FAILED
+                    state.save(dirs.lean_state_file)
+                    # W 执行异常时跳过该文件，写空 r3 作为兜底
+                    if not r3_out.exists():
+                        r3_out.parent.mkdir(parents=True, exist_ok=True)
+                        r3_out.write_text("[]", encoding="utf-8")
+                    break
+            else:
+                # W 已完成：更新 emit 用的 is_retry 标志，跳过 agent 调用
+                is_retry = fs.w_attempts > 1
+                self._emit("lean_w_skip", file=basename, file_hash=file_hash,
+                           attempt=fs.w_attempts, reason="already_done")
 
             if self._cancel.is_set():
                 break
@@ -737,3 +742,9 @@ class LeanPipelineEngine:
             if self.cfg.judges.agents
             else self.cfg.workers.agents[0]
         )
+
+    # ── duck-typing 兼容 orchestrator.py / worker_service.py ─────────────────
+
+    def generate_final_report(self, *args, **kwargs) -> None:
+        """兼容 PipelineEngine 接口的空实现：精简模式在 run() 内部已处理报告。"""
+        pass
