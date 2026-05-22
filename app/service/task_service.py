@@ -220,6 +220,63 @@ def _task_run_root(row: AppEaTask) -> Path | None:
     return root / "run" if root else None
 
 
+def _build_function_catalog(row: AppEaTask) -> list[dict]:
+    run_root = _task_run_root(row)
+    if not run_root:
+        return []
+    state_path = run_root / "pipeline_state.json"
+    if not state_path.is_file():
+        return []
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    files_raw = payload.get("files") if isinstance(payload, dict) else {}
+    if not isinstance(files_raw, dict):
+        return []
+
+    items: list[dict] = []
+    for file_hash, fs in files_raw.items():
+        if not isinstance(fs, dict):
+            continue
+        original_path = str(fs.get("original_path") or "")
+        file_name = Path(original_path).name if original_path else ""
+        funcs = fs.get("functions") if isinstance(fs.get("functions"), dict) else {}
+        for func_hash, f in funcs.items():
+            if not isinstance(f, dict):
+                continue
+            has_input = f.get("has_external_input")
+            r4_decision = str(f.get("r4_decision") or "").lower()
+            r3_state = "pending"
+            if has_input is False:
+                r3_state = "skip"
+            elif r4_decision in ("keep", "filter", "remove"):
+                r3_state = "passed"
+            items.append({
+                "func_hash": str(func_hash),
+                "file_hash": str(file_hash),
+                "file": file_name,
+                "original_path": original_path,
+                "name": str(f.get("name") or func_hash),
+                "signature": str(f.get("signature") or ""),
+                "start_line": int(f.get("start_line") or 0),
+                "end_line": int(f.get("end_line") or 0),
+                "r1b_state": str(f.get("r2_j_state") or "pending"),
+                "r2_state": str(f.get("r3_w_state") or "pending"),
+                "r2j_state": str(f.get("r3_j_state") or "pending"),
+                "r3_state": r3_state,
+                "r4_state": str(f.get("r4_state") or "pending"),
+                "rep_state": str(f.get("r5_state") or "pending"),
+                "has_external_input": has_input,
+                "entry_role": str(f.get("entry_role") or ""),
+                "r4_decision": r4_decision,
+                "is_entry": r4_decision == "keep",
+            })
+    items.sort(key=lambda x: (x.get("file") or "", int(x.get("start_line") or 0), x.get("name") or ""))
+    return items
+
+
 def _task_result_path(row: AppEaTask) -> Path | None:
     run_root = _task_run_root(row)
     return run_root / "result.json" if run_root else None
@@ -1439,6 +1496,7 @@ class TaskService:
             "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
             "stages_json": row.stages_json if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
+            "function_catalog": _build_function_catalog(row) if include_heavy else [],
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
