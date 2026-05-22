@@ -86,6 +86,17 @@ ACTIVE_BODY = re.compile(
     r"|%(CUSTOM_API_PATTERN)s)\\s*\\(",
     re.I
 )
+# 默认排除：明显不是入口的内部 helper / 输出 / 清理函数
+EXCLUDE_NAME = re.compile(
+    r"(fill|build|parse|convert|copy|clone|validate|check|set|get|cleanup|clean|free|destroy|release"
+    r"|reply|resp|response|write|print|log|dump|encode|decode|format|marshal|unmarshal)",
+    re.I
+)
+# 默认保留：明显边界语义的入口名称
+BOUNDARY_NAME = re.compile(
+    r"(handle|handler|dispatch|recv|receive|serve|process.*msg|on_|callback|hook|accept|request)",
+    re.I
+)
 # ────────────────────────────────────────────────────────────────────────────
 
 REL_FILE = "%(rel_file_path)s"
@@ -100,6 +111,28 @@ def extract_taints_p(sig: str) -> list:
     params = re.findall(r"[*&,( ]([a-zA-Z_]\\w*)\\s*[,)]", sig)
     return [p for p in params if PASSIVE_SIG.search(p)][:4]
 
+def looks_like_boundary(name: str, sig: str, body: str) -> bool:
+    name_l = name.lower()
+    sig_l = sig.lower()
+    body_l = body.lower()
+    # 明显输出/内部 helper 默认排除；除非同时带很强的边界语义
+    if EXCLUDE_NAME.search(name) and not BOUNDARY_NAME.search(name):
+        return False
+    # 名称本身有边界语义
+    if BOUNDARY_NAME.search(name):
+        return True
+    # 角色推断为回调/分发/IPC 入口
+    role = infer_role(name, body)
+    if role in ("dispatch_target", "callback", "ipc_handler"):
+        return True
+    # 签名里出现典型外部请求对象，且不是明显 helper
+    if PASSIVE_SIG.search(sig) and not EXCLUDE_NAME.search(name):
+        return True
+    # 函数体里有明确外部接收调用
+    if ACTIVE_BODY.search(body):
+        return True
+    return False
+
 entries = []
 for f in funcs:
     name = f["name"] or ""
@@ -112,12 +145,16 @@ for f in funcs:
 
     tag = None; taints = []; src_lines = []; reason = ""
 
+    # 先做边界过滤：不是边界入口的函数直接跳过
+    if not looks_like_boundary(name, sig, body):
+        continue
+
     # A 型优先：函数体内主动拉取外部数据（syscall + 封装 API）
     m = ACTIVE_BODY.search(body)
     if m:
         tag = "A"; reason = "主动拉取: " + m.group(0).strip()
         src_lines = [{"line": sl, "code": m.group(0).strip()}]
-    # P 型：函数名或参数名含外部数据特征
+    # P 型：函数名或参数名含外部数据特征，但必须已经通过边界过滤
     elif PASSIVE_NAME.search(name) or PASSIVE_SIG.search(sig):
         tag = "P"; taints = extract_taints_p(sig); reason = "被动接收外部数据"
 

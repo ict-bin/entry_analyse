@@ -95,6 +95,17 @@ ACTIVE_BODY = re.compile(
     r'|{CUSTOM_API_PATTERN})\s*\(',
     re.I
 )
+# 默认排除：明显不是入口的内部 helper / 输出 / 清理函数
+EXCLUDE_NAME = re.compile(
+    r'(fill|build|parse|convert|copy|clone|validate|check|set|get|cleanup|clean|free|destroy|release'
+    r'|reply|resp|response|write|print|log|dump|encode|decode|format|marshal|unmarshal)',
+    re.I
+)
+# 默认保留：明显边界语义的入口名称
+BOUNDARY_NAME = re.compile(
+    r'(handle|handler|dispatch|recv|receive|serve|process.*msg|on_|callback|hook|accept|request)',
+    re.I
+)
 # ─────────────────────────────────────────────────────────────────────────
 
 REL_FILE = "{rel_file_path}"  # 相对路径，用于 file 字段
@@ -113,6 +124,21 @@ def extract_taints_p(sig: str) -> list:
     params = re.findall(r'[\s,*&(]([a-zA-Z_]\w*)\s*(?:[,)]|$)', sig)
     return [p for p in params if PASSIVE_SIG.search(p)][:4]
 
+def looks_like_boundary(name: str, sig: str, body: str) -> bool:
+    # 明显输出/内部 helper 默认排除；除非名字同时带很强边界语义
+    if EXCLUDE_NAME.search(name) and not BOUNDARY_NAME.search(name):
+        return False
+    if BOUNDARY_NAME.search(name):
+        return True
+    role = infer_role(name, body)
+    if role in ('dispatch_target', 'callback', 'ipc_handler'):
+        return True
+    if PASSIVE_SIG.search(sig) and not EXCLUDE_NAME.search(name):
+        return True
+    if ACTIVE_BODY.search(body):
+        return True
+    return False
+
 entries = []
 for f in funcs:
     name = f['name'] or ''
@@ -129,6 +155,10 @@ for f in funcs:
     src_lines = []
     reason    = ''
 
+    # 先做边界过滤：不是边界入口的函数直接跳过
+    if not looks_like_boundary(name, sig, body):
+        continue
+
     # A 型优先检测（函数体内主动拉取）
     m = ACTIVE_BODY.search(body)
     if m:
@@ -138,7 +168,7 @@ for f in funcs:
         src_lines = [{"line": sl, "code": m.group(0).strip()}]
         reason = f"主动拉取: {m.group(0).strip()}"
 
-    # P 型检测（函数名或参数名含外部数据特征）
+    # P 型检测（函数名或参数名含外部数据特征，但必须已通过边界过滤）
     elif PASSIVE_NAME.search(name) or PASSIVE_SIG.search(sig):
         tag    = 'P'
         taints = extract_taints_p(sig)
