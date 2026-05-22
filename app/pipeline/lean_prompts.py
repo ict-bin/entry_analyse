@@ -198,7 +198,7 @@ def build_lean_file_w_prompt(
         f"python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}",
         "```",
         "",
-        "关注：**函数命名前缀/后缀**规律、是否有封装的外部数据接收 API（如 `XxxRecv`/`GetMsg`/`BusRead`/`SNMP_MsgGet`）。",
+        "关注：**真正的边界入口命名**（如 handle/dispatch/on/recv/serve/process_msg）以及封装的外部数据接收 API（如 `XxxRecv`/`GetMsg`/`BusRead`/`SNMP_MsgGet`）；不要把 fill/build/parse/convert/validate 之类内部 helper 当入口。"
         "",
         "---",
         "",
@@ -235,8 +235,10 @@ def build_lean_file_w_prompt(
         "- A 型 `taints=[]` 合法（精简模式不强制填局部变量名）",
         "- 无参函数只要函数体内有拉取调用即为 A 型",
         "- 纯内部工具模块输出 `[]` 是正确的",
+        "- **只保留真正边界入口**：通常一个文件只有最外层 1~3 个函数是入口，普通 helper/parse/fill/build/convert/validate 不算入口",
+        "- 对同文件多个相似函数，优先保留最外层 `handle_*` / `dispatch_*` / `on_*` / `recv_*` / `serve_*` / `process_*_msg`",
         "- **`sqlite3` CLI 不可用**（命令不存在），必须用 Python `sqlite3` 模块（模板已内置）",
-        "- **funcdb 为空时（0 函数）输出 `[]` 即可**，不要尝试手动解析源文件",
+        "- **funcdb 为空时（0 函数）输出 `[]` 即可**，不要尝试手动解析源文件"
     ]
     return "\n".join(lines)
 
@@ -321,7 +323,8 @@ def build_lean_file_j_prompt(
         "",
         "| 误报类型 | 判断依据 | 处理 |",
         "|---------|---------|------|",
-        "| 输出/释放函数 | 函数名含 send/print/log/free/destroy/dump/write | FAIL |",
+        "| 输出/释放函数 | 函数名含 send/reply/resp/response/print/log/free/destroy/dump/write | FAIL |",
+        "| 内部 helper 误报 | 函数名含 fill/build/convert/copy/validate/set/get/cleanup，且无 handle/dispatch/on/recv 边界语义 | FAIL |",
         "| taints 格式非法 | 含中文、空格、括号、`.`、`->` | FAIL |",
         "| tag 非 P/A | tag 字段不是 `\"P\"` 或 `\"A\"` | FAIL |",
         "",
@@ -331,7 +334,7 @@ def build_lean_file_j_prompt(
         "- `taints=[]`（P 型或 A 型）→ **合法**（函数签名无可解析外部参数 / 精简模式允许）",
         "- A 型调用不认识的 API（如 `SNMP_MsgGet`/`NetlinkRecv`）→ **信任 Worker 判断**",
         "- 无参函数标注 A 型 → **合法**",
-        "- 命中率偏高（> 40%）→ 警告但不 FAIL",
+        "- 命中率偏高（> 60%）或同文件出现大量 fill/build/parse/convert/helper 条目 → FAIL，要求只保留真正边界入口",
         "- `entry_role` 统一为 `boundary` → 可接受",
         "- validate_entry_list.py 输出 `数组为空` 或 `至少 1 个入口` → **直接通过**（这是 0 条目的合法情形）",
         "",
@@ -361,7 +364,7 @@ def build_lean_file_j_prompt(
         "2. 脚本含 `body` 字段查询",
         "3. validate_entry_list.py 输出 OK",
         "4. 条目数 > 0（或函数总数 < 5）",
-        "5. 前 3 条函数名不含明显输出/释放操作前缀",
+        "5. 前 3 条函数名具备明显边界语义（handle/dispatch/on/recv/serve/process_msg），且不含 helper/output 语义"
     ]
     return "\n".join(lines)
 

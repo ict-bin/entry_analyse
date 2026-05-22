@@ -15,11 +15,27 @@
 
 ## 外部入口分类（必须理解）
 
-**被动型（P, Passive）**：外部数据通过**函数参数**传入
+## 第一原则：**只保留真正的边界入口，不要把普通业务函数/工具函数算进来**
+
+一个函数只有在**满足“外部边界 + 首次接收/拉取外部数据”**时，才算入口。
+
+### 真正入口的典型场景
+- 对外暴露的协议/接口处理函数：HTTP、RPC、gRPC、REST、CLI、MQ、IPC、Netlink、SNMP、回调入口
+- 明确从外部读数据的第一层函数：socket recv、消息队列收包、设备/ioctl 取输入、框架回调分发入口
+- dispatcher/router/callback target 中，**真正接住外部消息对象**的那一层
+
+### 不是入口的常见误报
+- 只是把参数继续传下去的普通 helper / util / convert / validate / fill / build / copy / parse 子函数
+- 输出/回包/日志/释放/清理函数：`send`/`reply`/`response`/`write`/`print`/`log`/`free`/`destroy`/`cleanup`
+- 普通 setter/getter、构造/析构、状态查询、内部对象方法
+- 仅因为参数名像 `data`/`buf` 就误判，但该函数本质是内部处理链中的中间层
+
+**被动型（P, Passive）**：外部数据通过**函数参数**传入，且该函数本身处在外部边界/分发边界
 - 参数名含：`msg`、`buf`、`data`、`frame`、`packet`、`request`、`req`、`payload`、`input`
 - 函数名含：`handle`、`handler`、`proc`、`process`、`dispatch`、`on_`、`_cb`、`recv`、`receive`
+- **但仅名字/参数命中还不够，必须像入口函数**
 
-**主动型（A, Active）**：函数体内**主动调用某个函数**拉取外部数据
+**主动型（A, Active）**：函数体内**主动调用某个函数**拉取外部数据，且这是该文件中靠前的接收边界
 - 系统调用：`recv`、`recvfrom`、`recvmsg`、`accept`、`read`（socket fd）
 - 文件/设备：`fread`、`fgets`、`getline`、`ioctl`、`mmap`
 - RTOS 消息：`MsgReceive`、`MsgReceivePulse`、`MsgRead`
@@ -178,6 +194,9 @@ python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_ent
 ## 原则
 
 - 纯内部工具模块（无外部 I/O）输出 `[]` 是正确的，不必强行找入口
-- 宁可多报不漏报（精简模式允许一定误报）
+- **宁可少报，也不要把内部函数误报成入口**
+- 如果一个文件里很多函数都带 `request/data/buf` 参数，通常**只有最外层 1~3 个**是真入口
+- 优先选择：`handle_xxx_request` / `dispatch_xxx` / `on_xxx_msg` / `recv_xxx` / `serve_xxx` / `process_xxx_msg`
+- 谨慎排除：`fill_*` / `build_*` / `parse_*` / `convert_*` / `validate_*` / `set_*` / `get_*` / `clean_*` / `free_*`
 - A 型 taints 填空 `[]` 合法（A 型用局部变量名，精简模式不强制）
 - **任务越快完成越好**：浏览 → 改模板 → 执行，不要反复迭代
