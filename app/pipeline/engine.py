@@ -647,24 +647,16 @@ class PipelineEngine:
                 except ValueError:
                     _rel = Path(file_path).name
                 ws_file_path = dirs.source / _rel
-                if gaps_file.exists():
-                    gap_hint = (
-                        f"源文件路径：`{ws_file_path}`\n\n"
-                        f"请读取 gap 文件 `{gaps_file}` 并用 sed 核查各区间内容，"
-                        f"确认 Worker 的修正是否正确。\n\n"
-                        f"查看 gap 区间示例：`sed -n '<start>,<end>p' {ws_file_path}`"
-                    )
-                else:
-                    gap_hint = (
-                        f"源文件路径：`{ws_file_path}`\n\n"
-                        f"无 gap 文件（ctags 已完整覆盖），直接用 "
-                        f"`python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表。"
-                    )
-                j_prompt = (
-                    f"# Round 1a Judge \u2014 覆盖率验证：`{Path(file_path).name}`\n\n"
-                    f"funcdb 共 {len(fs.functions)} 个函数。\n\n"
-                    f"{gap_hint}\n\n"
-                    f"输出格式：\n```\n通过: 是\n反馈: <验证结论>\n```"
+                worker_result_file = dirs.stage_result_file("r1_w", "worker", file_hash, fs.r1_attempts)
+                worker_raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, fs.r1_attempts)
+                j_prompt = P.build_r1a_j_prompt(
+                    file_name=Path(file_path).name,
+                    func_count=len(fs.functions),
+                    ws_file_path=str(ws_file_path),
+                    gaps_file=str(gaps_file) if gaps_file.exists() else "",
+                    db_path=str(db_path),
+                    worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
+                    worker_raw_file=str(worker_raw_file) if worker_raw_file.exists() else "",
                 )
                 acfg_j = self._judge_acfg()
                 ar_j = await self._call_agent(
@@ -936,6 +928,7 @@ class PipelineEngine:
                 body_lines = max(
                     0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
                 )
+                prev_j_result = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, func_state.r3_w_attempts - 1)) if is_retry else None
                 prompt = P.build_r2_w_prompt(
                     func_hash=func_hash,
                     func_name=func_state.name,
@@ -947,6 +940,7 @@ class PipelineEngine:
                     db_path=db_path,
                     is_retry=is_retry,
                     feedback=r2_feedback,
+                    judge_result_file=str(prev_j_result) if prev_j_result and prev_j_result.exists() else "",
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
@@ -1655,25 +1649,17 @@ class PipelineEngine:
         entry_role  = entry.get("entry_role", "boundary")
         file_path   = entry.get("file", "")
 
-        prompt = (
-            f"# R4 跨文件分析：`{func_name}`\n\n"
-            f"**文件**：`{file_path}`\n"
-            f"**角色**：`{entry_role}`\n"
-            f"**调用关系**：{callers_info}\n\n"
-            f"## 判断规则\n\n"
-            f"若满足以下**全部**条件，则 `decision=remove`：\n"
-            f"1. 存在本模块内调用者\n"
-            f"2. 该函数的 taint 来自调用者参数（非自主读取）\n"
-            f"3. `entry_role` **不是** `dispatch_target`\n\n"
-            f"否则 `decision=keep`（保守保留）。\n\n"
-            f"## 验证步骤\n\n"
-            f"1. 若有调用者，检查调用者是否也是 R3 候选入口（其他外部入口）\n"
-            f"2. 查看函数签名，判断 taint 是参数来源还是函数体内主动读取\n\n"
-            f"## 输出格式\n\n"
-            f"```json\n"
-            f"{{\"decision\": \"keep\", \"reason\": \"直接外部边界，无模块内调用者\"}}\n"
-            f"```\n"
-            f"将 JSON 写入：`{result_file}`\n"
+        is_retry = bool(getattr(func_state, 'r4_attempts', 1) and getattr(func_state, 'r4_attempts', 1) > 1)
+        prev_result = result_file if is_retry and result_file.exists() else None
+        prompt = P.build_r4_func_w_prompt(
+            func_name=func_name,
+            file_path=file_path,
+            entry_role=entry_role,
+            callers_info=callers_info,
+            result_file=result_file,
+            is_retry=is_retry,
+            feedback=getattr(func_state, 'r4_reason', '') if is_retry else '',
+            judge_result_file=str(prev_result) if prev_result else "",
         )
 
         self._emit("r4_w_start", func_hash=func_hash,
@@ -1911,26 +1897,19 @@ class PipelineEngine:
             except Exception:
                 pass
 
-            w_prompt = (
-                f"# 生成入口函数报告：`{func_name}`\n\n"
-                f"将以下入口函数的分析结果写成 Markdown 报告段落。\n\n"
-                f"**函数信息**：\n"
-                f"```json\n{json.dumps(entry_rich, ensure_ascii=False, indent=2)[:2000]}\n```\n\n"
-                f"**调用关系**：\n{callers_str}\n\n"
-                f"{'**修改意见**：' + feedback + chr(10) + chr(10) if feedback else ''}"
-                f"## 输出格式\n\n"
-                f"写入文件：`{report_out}`\n\n"
-                f"格式：\n"
-                f"```markdown\n"
-                f"## `{func_name}` — {entry.get('entry_role','boundary')}\n\n"
-                f"**文件**：`{entry.get('file','')}:{entry.get('line',0)}`  \n"
-                f"**类型**：{'A（主动型）' if entry.get('tag')=='A' else 'P（被动型）'}  \n"
-                f"**置信度**：{{score}}\n\n"
-                f"### 功能描述\n{{description}}\n\n"
-                f"### 入口判定理由\n{{reason}}\n\n"
-                f"### 污点参数\n{{taints}}\n\n"
-                f"### 安全测试建议\n{{fuzzing tips}}\n"
-                f"```\n"
+            prev_r5_j = dirs.stage_result_file("r5_j", "judge", func_hash, max(1, attempts - 1)) if attempts > 1 else None
+            w_prompt = P.build_report_func_w_prompt(
+                func_name=func_name,
+                entry_role=entry.get('entry_role','boundary'),
+                entry_file=entry.get('file',''),
+                entry_line=entry.get('line',0),
+                entry_tag=entry.get('tag'),
+                entry_json=json.dumps(entry_rich, ensure_ascii=False, indent=2)[:2000],
+                callers_str=callers_str,
+                report_out_path=report_out,
+                is_retry=attempts > 1,
+                feedback=feedback,
+                judge_result_file=str(prev_r5_j) if prev_r5_j and prev_r5_j.exists() else "",
             )
 
             try:
@@ -1964,14 +1943,11 @@ class PipelineEngine:
 
             # Report-func-J
             j_session = str(dirs.r5_j_session(func_hash, attempts))
-            j_prompt = (
-                f"# 验证入口函数报告：`{func_name}`\n\n"
-                f"读取 `{report_out}`，验证：\n"
-                f"1. 功能描述是否有实质内容（非占位符）\n"
-                f"2. 入口判定理由是否具体\n"
-                f"3. 污点参数是否列出\n"
-                f"4. 安全测试建议是否具体\n\n"
-                f"输出：`通过: 是` 或 `通过: 否\n反馈: <具体问题>`"
+            j_prompt = P.build_report_func_j_prompt(
+                func_name=func_name,
+                report_path=report_out,
+                worker_result_file=str(worker_result_file),
+                worker_raw_file=str(worker_raw_file),
             )
             try:
                 acfg_j = self._judge_acfg()

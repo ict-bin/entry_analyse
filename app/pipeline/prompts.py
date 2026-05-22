@@ -38,7 +38,41 @@ def _retry_section(feedback: str, label: str = "Judge 评审意见") -> str:
     return f"\n## 上次结果有问题，请修正\n\n{feedback}\n"
 
 
-# ─── R1 Judge ─────────────────────────────────────────────────────────────────
+# ─── R1a Judge / R1 Judge ─────────────────────────────────────────────────────
+
+def build_r1a_j_prompt(
+    file_name: str,
+    func_count: int,
+    ws_file_path: str,
+    gaps_file: str,
+    db_path: str,
+    worker_result_file: str = "",
+    worker_raw_file: str = "",
+) -> str:
+    """R1a Judge：文件级覆盖率验证，必须先审阅本轮 Worker 结果文件。"""
+    if gaps_file:
+        gap_hint = (
+            f"源文件路径：`{ws_file_path}`\n\n"
+            f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n"
+            f"Worker 原始输出：`{worker_raw_file}`（若提供，可辅助理解 Worker 推理过程）\n\n"
+            f"请先读取 Worker 结果文件，再读取 gap 文件 `{gaps_file}` 并用 sed 核查各区间内容，确认 Worker 的修正是否正确。\n\n"
+            f"查看 gap 区间示例：`sed -n '<start>,<end>p' {ws_file_path}`"
+        )
+    else:
+        gap_hint = (
+            f"源文件路径：`{ws_file_path}`\n\n"
+            f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n"
+            f"Worker 原始输出：`{worker_raw_file}`（若提供，可辅助理解 Worker 推理过程）\n\n"
+            f"无 gap 文件（ctags 已完整覆盖），请先读取 Worker 结果文件，再用 "
+            f"`python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表。"
+        )
+    return (
+        f"# Round 1a Judge — 覆盖率验证：`{file_name}`\n\n"
+        f"funcdb 共 {func_count} 个函数。\n\n"
+        f"{gap_hint}\n\n"
+        f"输出格式：\n```\n通过: 是\n反馈: <验证结论>\n```"
+    )
+
 
 def build_r1_j_prompt(
     func_hash: str,
@@ -98,6 +132,7 @@ def build_r2_w_prompt(
     db_path: Path,
     is_retry: bool = False,
     feedback: str = "",
+    judge_result_file: str = "",
 ) -> str:
     """
     R2 Worker：分析单个函数是否有外部输入。
@@ -108,6 +143,8 @@ def build_r2_w_prompt(
     """
     basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
+    if is_retry and judge_result_file:
+        retry += f"\n上一轮 Judge 结果文件：`{judge_result_file}`（请先读取再改进）\n"
 
     _AWK_REGEX = r"recv|recvfrom|recvmsg|mmap|ioctl|fgets|fread|getline|MsgReceive|Receive|accept"
     _PATTERNS = "recv,recvfrom,recvmsg,mmap,ioctl,fgets,fread,getline,MsgReceive,Receive,accept"
@@ -522,6 +559,43 @@ def build_r3_j_prompt(
 
 # ─── R4 Worker ────────────────────────────────────────────────────────────────
 
+def build_r4_func_w_prompt(
+    func_name: str,
+    file_path: str,
+    entry_role: str,
+    callers_info: str,
+    result_file: Path,
+    is_retry: bool = False,
+    feedback: str = "",
+    judge_result_file: str = "",
+) -> str:
+    """R4 函数级 Worker：跨文件去重判断，retry 时显式读取上一轮结果文件。"""
+    retry = _retry_section(feedback) if is_retry else ""
+    if is_retry and judge_result_file:
+        retry += f"\n上一轮结果文件：`{judge_result_file}`（请先读取再改进）\n"
+    return (
+        f"# R4 跨文件分析：`{func_name}`\n\n"
+        f"{retry}"
+        f"**文件**：`{file_path}`\n"
+        f"**角色**：`{entry_role}`\n"
+        f"**调用关系**：{callers_info}\n\n"
+        f"## 判断规则\n\n"
+        f"若满足以下**全部**条件，则 `decision=remove`：\n"
+        f"1. 存在本模块内调用者\n"
+        f"2. 该函数的 taint 来自调用者参数（非自主读取）\n"
+        f"3. `entry_role` **不是** `dispatch_target`\n\n"
+        f"否则 `decision=keep`（保守保留）。\n\n"
+        f"## 验证步骤\n\n"
+        f"1. 若有调用者，检查调用者是否也是 R3 候选入口（其他外部入口）\n"
+        f"2. 查看函数签名，判断 taint 是参数来源还是函数体内主动读取\n\n"
+        f"## 输出格式\n\n"
+        f"```json\n"
+        f"{{\"decision\": \"keep\", \"reason\": \"直接外部边界，无模块内调用者\"}}\n"
+        f"```\n"
+        f"将 JSON 写入：`{result_file}`\n"
+    )
+
+
 def build_r4_w_prompt(
     r3_entries_files: list[Path],
     r4_out_path: Path,
@@ -597,7 +671,160 @@ def build_r4_j_prompt(
     )
 
 
+def build_r4_func_w_prompt(
+    func_name: str,
+    file_path: str,
+    entry_role: str,
+    callers_info: str,
+    result_file: str,
+    is_retry: bool = False,
+    feedback: str = "",
+    previous_result_file: str = "",
+) -> str:
+    """R4 函数级 Worker：跨文件入口保留/删除判断。"""
+    retry = _retry_section(feedback) if is_retry else ""
+    if is_retry and previous_result_file:
+        retry += f"\n上一轮结果文件：`{previous_result_file}`（请先读取再修正）\n"
+    return (
+        f"# R4 跨文件分析：`{func_name}`\n\n"
+        f"{retry}"
+        f"**文件**：`{file_path}`\n"
+        f"**角色**：`{entry_role}`\n"
+        f"**调用关系**：{callers_info}\n\n"
+        f"## 判断规则\n\n"
+        f"若满足以下**全部**条件，则 `decision=remove`：\n"
+        f"1. 存在本模块内调用者\n"
+        f"2. 该函数的 taint 来自调用者参数（非自主读取）\n"
+        f"3. `entry_role` **不是** `dispatch_target`\n\n"
+        f"否则 `decision=keep`（保守保留）。\n\n"
+        f"## 验证步骤\n\n"
+        f"1. 若有调用者，检查调用者是否也是 R3 候选入口（其他外部入口）\n"
+        f"2. 查看函数签名，判断 taint 是参数来源还是函数体内主动读取\n\n"
+        f"## 输出格式\n\n"
+        f"```json\n"
+        f"{{\"decision\": \"keep\", \"reason\": \"直接外部边界，无模块内调用者\"}}\n"
+        f"```\n"
+        f"将 JSON 写入：`{result_file}`\n"
+    )
+
+
+def build_r5_func_w_prompt(
+    func_name: str,
+    entry_rich_json: str,
+    callers_str: str,
+    report_out_path: str,
+    is_retry: bool = False,
+    feedback: str = "",
+    judge_result_file: str = "",
+) -> str:
+    """R5 函数报告 Worker。"""
+    retry = _retry_section(feedback, label="Judge 修改意见") if is_retry and feedback else ""
+    if is_retry and judge_result_file:
+        retry += f"\n上一轮 Judge 结果文件：`{judge_result_file}`（请先读取再改进）\n"
+    return (
+        f"# 生成入口函数报告：`{func_name}`\n\n"
+        f"将以下入口函数的分析结果写成 Markdown 报告段落。\n\n"
+        f"{retry}"
+        f"**函数信息**：\n"
+        f"```json\n{entry_rich_json}\n```\n\n"
+        f"**调用关系**：\n{callers_str}\n\n"
+        f"## 输出格式\n\n"
+        f"写入文件：`{report_out_path}`\n\n"
+        f"格式：\n"
+        f"```markdown\n"
+        f"## `{func_name}` — {{entry_role}}\n\n"
+        f"**文件**：{{file_line}}  \n"
+        f"**类型**：{{entry_type}}  \n"
+        f"**置信度**：{{score}}\n\n"
+        f"### 功能描述\n{{description}}\n\n"
+        f"### 入口判定理由\n{{reason}}\n\n"
+        f"### 污点参数\n{{taints}}\n\n"
+        f"### 安全测试建议\n{{fuzzing tips}}\n"
+        f"```\n"
+    )
+
+
+def build_r5_func_j_prompt(
+    func_name: str,
+    report_out_path: str,
+    worker_result_file: str = "",
+    worker_raw_file: str = "",
+) -> str:
+    """R5 函数报告 Judge。"""
+    return (
+        f"# 验证入口函数报告：`{func_name}`\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n"
+        f"Worker 原始输出：`{worker_raw_file}`（若提供，可辅助理解 Worker 推理过程）\n\n"
+        f"读取 `{report_out_path}`，验证：\n"
+        f"1. 功能描述是否有实质内容（非占位符）\n"
+        f"2. 入口判定理由是否具体\n"
+        f"3. 污点参数是否列出\n"
+        f"4. 安全测试建议是否具体\n\n"
+        f"输出：`通过: 是` 或 `通过: 否\n反馈: <具体问题>`"
+    )
+
+
 # ─── Report Worker / Judge ───────────────────────────────────────────────────────────────
+
+def build_report_func_w_prompt(
+    func_name: str,
+    entry_role: str,
+    entry_file: str,
+    entry_line: int,
+    entry_tag: str,
+    entry_json: str,
+    callers_str: str,
+    report_out_path: "Path",
+    is_retry: bool = False,
+    feedback: str = "",
+    judge_result_file: str = "",
+) -> str:
+    """R5 Worker：生成单函数入口报告，retry 时必须先读上一轮 Judge 结果文件。"""
+    retry = _retry_section(feedback) if is_retry else ""
+    if is_retry and judge_result_file:
+        retry += f"\n上一轮 Judge 结果文件：`{judge_result_file}`（请先读取再改进）\n"
+    return (
+        f"# 生成入口函数报告：`{func_name}`\n\n"
+        f"将以下入口函数的分析结果写成 Markdown 报告段落。\n\n"
+        f"{retry}"
+        f"**函数信息**：\n"
+        f"```json\n{entry_json}\n```\n\n"
+        f"**调用关系**：\n{callers_str}\n\n"
+        f"## 输出格式\n\n"
+        f"写入文件：`{report_out_path}`\n\n"
+        f"格式：\n"
+        f"```markdown\n"
+        f"## `{func_name}` — {entry_role}\n\n"
+        f"**文件**：`{entry_file}:{entry_line}`  \n"
+        f"**类型**：{'A（主动型）' if entry_tag=='A' else 'P（被动型）'}  \n"
+        f"**置信度**：{{score}}\n\n"
+        f"### 功能描述\n{{description}}\n\n"
+        f"### 入口判定理由\n{{reason}}\n\n"
+        f"### 污点参数\n{{taints}}\n\n"
+        f"### 安全测试建议\n{{fuzzing tips}}\n"
+        f"```\n"
+    )
+
+
+def build_report_func_j_prompt(
+    func_name: str,
+    report_path: "Path",
+    worker_result_file: str = "",
+    worker_raw_file: str = "",
+) -> str:
+    """R5 Judge：验证单函数入口报告，必须先审阅本轮 Worker 结果文件。"""
+    return (
+        f"# 验证入口函数报告：`{func_name}`\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n"
+        f"Worker 原始输出：`{worker_raw_file}`（若提供，可辅助理解 Worker 推理过程）\n\n"
+        f"读取 `{report_path}`，验证：\n"
+        f"1. 功能描述是否有实质内容（非占位符）\n"
+        f"2. 入口判定理由是否具体\n"
+        f"3. 污点参数是否列出\n"
+        f"4. 安全测试建议是否具体\n\n"
+        f"输出：`通过: 是` 或 `通过: 否\n反馈: <具体问题>`"
+    )
+
 
 def build_report_w_prompt(
     draft_path: "Path",
