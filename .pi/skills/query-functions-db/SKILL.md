@@ -71,8 +71,34 @@ python3 /opt/entry_analyse/scripts/ea_db.py list-entries <db_path>
 
 ```bash
 python3 /opt/entry_analyse/scripts/ea_db.py stats <db_path>
-# → {"total": 415, "analysed": 13, "with_input": 2}
 ```
+
+### 5. 按函数名查找（推荐，替代 sqlite3/grep）
+
+```bash
+python3 /opt/entry_analyse/scripts/ea_db.py find-name <db_path> <func_name>
+```
+
+**特点**：
+- 查到时：`found=true` + `rows=[...]`
+- 查不到时：**也有正常输出**，`found=false` + `rows=[]`
+- 不要把 `rows=[]` 误判为工具失败
+
+### 6. 按行区间查函数（推荐，用于 gap 核查）
+
+```bash
+python3 /opt/entry_analyse/scripts/ea_db.py between-lines <db_path> <start_line> <end_line>
+```
+
+适合判断某个 gap 区间内/相邻区间内，funcdb 已有哪些函数。
+
+### 7. 按某行附近查函数（推荐，用于边界判断）
+
+```bash
+python3 /opt/entry_analyse/scripts/ea_db.py around-line <db_path> <line_no> [window]
+```
+
+适合判断 `line_no` 前后已有函数覆盖情况。
 
 ---
 
@@ -140,7 +166,7 @@ sed -n '{start_line}p' {source_file}
 
 ---
 
-### 5. 任意 SQL 查询（灵活搜索，`sqlite3` CLI 的替代）
+### 8. 任意 SQL 查询（灵活搜索，`sqlite3` CLI 的替代）
 
 ```bash
 python3 /opt/entry_analyse/scripts/ea_db.py query <db_path> '<SQL>'
@@ -163,8 +189,9 @@ python3 /opt/entry_analyse/scripts/ea_db.py query \
   {db_path} "SELECT count(*) as cnt FROM functions WHERE name = 'target_func'"
 ```
 
-> ⚠️ 虽然容器内已安装 `sqlite3` CLI，但**优先使用 `ea_db.py`** 保证输出格式统一；  
-> 在 `ea_db.py` 确实无法满足需求时，可以用 `sqlite3` CLI 作为逃生出口。
+> ⚠️ 虽然容器内已安装 `sqlite3` CLI，但**优先使用 `ea_db.py`** 保证输出格式统一。  
+> `ea_db.py` 的所有正常结果（包括“未找到”）都会输出结构化 JSON；不要优先使用 `sqlite3`/`grep` 直接查 `.db`。  
+> 只有在 `ea_db.py` 确实无法满足需求时，才可以用 `sqlite3` CLI 作为逃生出口。
 
 ---
 
@@ -174,3 +201,5 @@ python3 /opt/entry_analyse/scripts/ea_db.py query \
 - `body_lines` = `end_line - start_line + 1`（含首尾行）
 - 数据库使用 WAL 模式，多个 Agent 并发读写安全，**无需额外锁**
 - `analysis` 字段：`null` = 未分析；`{"has_external_input": false}` = 已分析，无外部输入
+- `ea_db.py` 正常空结果会输出 `rows: []` / `found: false` / `row_count: 0`，这是**成功查询**，不是错误
+- **默认禁止**：`grep` / `strings` 直接扫描 `.db` 文件内容

@@ -681,6 +681,12 @@ class PipelineEngine:
                 self._emit("r1_j_done", file_hash=file_hash,
                            file=Path(file_path).name, passed=j_passed,
                            feedback=j_feedback[:200])
+                if not j_passed:
+                    self._emit("r1_retry_scheduled", file_hash=file_hash,
+                               file=Path(file_path).name,
+                               attempt=fs.r1_attempts + 1,
+                               reason="judge_failed",
+                               feedback=j_feedback[:200])
                 if j_passed:
                     break
             except Exception as exc:

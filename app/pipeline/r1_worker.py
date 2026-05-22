@@ -209,14 +209,24 @@ def build_r1_w_initial_prompt(
             f"```bash\n"
             f"sed -n '<start>,<end>p' {abs_path}\n"
             f"```\n\n"
-            f"判断是否有完整函数定义（有函数体 `{{` ... `}}`）则输出新增修正。"
+            f"如需确认某函数是否已在 funcdb 中，优先使用：\n\n"
+            f"```bash\n"
+            f"python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>\n"
+            f"python3 /opt/entry_analyse/scripts/ea_db.py between-lines {db_path} <start> <end>\n"
+            f"```\n\n"
+            f"⚠️ 不要用 `grep` / `strings` 直接扫描 `.db` 文件。"
+            f" `ea_db.py` 若未命中也会返回结构化 JSON（如 `rows: []`），这表示查询成功。"
+            f" 判断是否有完整函数定义（有函数体 `{{` ... `}}`）则输出新增修正。"
         )
     else:
         gap_instruction = (
             f"## Gap 检查\n\n"
             f"无可视 gap（ctags 已覆盖全部内容）。"
-            f"用 `python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表，"
-            f"若看起来完整则输出 `NO_CORRECTIONS`。"
+            f"优先用以下命令确认列表：\n\n"
+            f"```bash\n"
+            f"python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}\n"
+            f"```\n\n"
+            f"不要用 `grep` / `strings` 直接扫描 `.db` 文件；若看起来完整则输出 `NO_CORRECTIONS`。"
         )
 
     return (
@@ -250,12 +260,40 @@ def build_r1_w_retry_prompt(
 ) -> str:
     """R1a-W 重试 prompt（文件级覆盖率 J 失败后）。"""
     db_path = dirs.r1_functions_db(file_hash)
+    gaps_file = dirs.r1_gaps_file(file_hash)
+    abs_path = os.path.abspath(file_path)
     return (
         f"# Round 1a — 覆盖率修正（重试）\n\n"
         f"Judge 评审意见：\n\n{feedback}\n\n"
-        f"请根据意见修正函数列表，仍只输出新增/删除修正。\n"
-        f"当前函数列表：`{db_path}`\n\n"
-        f"在 `<result>` 中输出修正列表（或 NO_CORRECTIONS）。"
+        f"## 当前输入\n\n"
+        f"- 源文件：`{abs_path}`\n"
+        f"- gap 文件：`{gaps_file}`\n"
+        f"- funcdb：`{db_path}`\n\n"
+        f"## 重要规则\n\n"
+        f"1. **优先核查 Judge 指出的 gap 区间，不要重新全文件漫游**。\n"
+        f"2. 数据库查询默认使用 `python3 /opt/entry_analyse/scripts/ea_db.py`。\n"
+        f"3. **禁止** 用 `grep` / `strings` 直接扫描 `.db` 文件。\n"
+        f"4. `ea_db.py` 的正常空结果会返回结构化 JSON（如 `rows: []`、`found: false`、`row_count: 0`），这表示**查询成功但未命中**，不是工具出错。\n"
+        f"5. `sqlite3` 只作为最后逃生出口，不是默认路径。\n\n"
+        f"## 推荐命令\n\n"
+        f"### 查看 Judge 指出的 gap 原文\n"
+        f"```bash\n"
+        f"cat {gaps_file}\n"
+        f"sed -n '<start>,<end>p' {abs_path}\n"
+        f"```\n\n"
+        f"### 检查某个函数是否已在 funcdb 中\n"
+        f"```bash\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>\n"
+        f"```\n\n"
+        f"### 检查某个 gap 区间附近已有函数\n"
+        f"```bash\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py between-lines {db_path} <start> <end>\n"
+        f"python3 /opt/entry_analyse/scripts/ea_db.py around-line {db_path} <line_no> 30\n"
+        f"```\n\n"
+        f"## 任务\n\n"
+        f"请根据 Judge 意见修正函数列表，仍只输出新增/删除修正。\n"
+        f"如果 Judge 指出的函数已在 funcdb 中，则不要重复新增；如果确实缺失，则输出 `new` 修正。\n\n"
+        f"在 `<result>` 中输出修正列表（或 `NO_CORRECTIONS`）。\n"
     )
 
 
@@ -414,7 +452,8 @@ async def run_r1_worker(
             prompt = build_r1_w_retry_prompt(file_path, file_hash, dirs, feedback)
 
     _safe_emit(on_event, "r1_w_start", task_id,
-               file=basename, file_hash=file_hash, is_retry=is_retry)
+               file=basename, file_hash=file_hash, is_retry=is_retry,
+               retry_reason="judge_failed" if is_retry else "")
 
     async with model_capacity_slot(
         acfg.model,

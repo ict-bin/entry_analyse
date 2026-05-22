@@ -50,6 +50,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 
 # ─── 连接辅助 ──────────────────────────────────────────────────────────────────
@@ -57,15 +58,21 @@ from pathlib import Path
 def _get_conn(db_path: Path) -> sqlite3.Connection:
     """获取 WAL 模式连接（只读场景不需要 WAL，但保持一致性）。"""
     if not db_path.exists():
-        _die(f"DB not found: {db_path}")
+        _die(f"DB not found: {db_path}", command="open-db", db_path=str(db_path))
     conn = sqlite3.connect(str(db_path), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _die(msg: str) -> None:
-    print(json.dumps({"error": msg}), file=sys.stderr)
+def _emit_ok(command: str, **data: Any) -> None:
+    payload = {"ok": True, "command": command, **data}
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _die(msg: str, *, command: str = "unknown", **data: Any) -> None:
+    payload = {"ok": False, "command": command, "error": msg, **data}
+    print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)
     sys.exit(1)
 
 
@@ -104,11 +111,16 @@ def cmd_get(db_path: Path, func_hash: str) -> None:
         ).fetchone()
 
     if row is None:
-        _die(f"func_hash '{func_hash}' not found in {db_path.name}")
+        _die(
+            f"func_hash '{func_hash}' not found in {db_path.name}",
+            command="get",
+            db_path=str(db_path),
+            func_hash=func_hash,
+        )
 
     d = dict(row)
     d["analysis"] = _parse_analysis(d.get("analysis"))
-    print(json.dumps(d, ensure_ascii=False, indent=2))
+    _emit_ok("get", db_path=str(db_path), func_hash=func_hash, found=True, row=d)
 
 
 def cmd_list_meta(db_path: Path) -> None:
@@ -137,7 +149,8 @@ def cmd_list_meta(db_path: Path) -> None:
                       start_line, end_line, body_lines, has_external_input
                FROM functions ORDER BY start_line"""
         ).fetchall()
-    print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+    result = [dict(r) for r in rows]
+    _emit_ok("list-meta", db_path=str(db_path), row_count=len(result), rows=result)
 
 
 def cmd_list_entries(db_path: Path) -> None:
@@ -177,14 +190,13 @@ def cmd_list_entries(db_path: Path) -> None:
     for r in rows:
         d = dict(r)
         d["analysis"] = _parse_analysis(d.get("analysis"))
-        # entry_role 写入 analysis 中（方便 Agent 看到角色信息）
         role = d.pop("entry_role", "") or ""
         if role and isinstance(d["analysis"], dict):
             d["analysis"].setdefault("entry_role", role)
         elif role:
             d["entry_role"] = role
         result.append(d)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    _emit_ok("list-entries", db_path=str(db_path), row_count=len(result), rows=result)
 
 
 def cmd_set_analysis(db_path: Path, func_hash: str, analysis_json: str) -> None:
@@ -199,7 +211,7 @@ def cmd_set_analysis(db_path: Path, func_hash: str, analysis_json: str) -> None:
     try:
         analysis = json.loads(analysis_json)
     except json.JSONDecodeError as e:
-        _die(f"Invalid JSON: {e}")
+        _die(f"Invalid JSON: {e}", command="set-analysis", db_path=str(db_path), func_hash=func_hash)
 
     has_input = 1 if analysis.get("has_external_input") else 0
     valid_roles = {"boundary", "dispatch_target", "callback", "ipc_handler"}
@@ -213,9 +225,9 @@ def cmd_set_analysis(db_path: Path, func_hash: str, analysis_json: str) -> None:
             (analysis_json, has_input, entry_role, time.time(), func_hash),
         )
         if cur.rowcount == 0:
-            _die(f"func_hash '{func_hash}' not found")
+            _die(f"func_hash '{func_hash}' not found", command="set-analysis", db_path=str(db_path), func_hash=func_hash)
 
-    print(json.dumps({"ok": True, "func_hash": func_hash}))
+    _emit_ok("set-analysis", db_path=str(db_path), func_hash=func_hash)
 
 
 def cmd_stats(db_path: Path) -> None:
@@ -233,7 +245,7 @@ def cmd_stats(db_path: Path) -> None:
         with_input = conn.execute(
             "SELECT COUNT(*) FROM functions WHERE has_external_input = 1"
         ).fetchone()[0]
-    print(json.dumps({"total": total, "analysed": analysed, "with_input": with_input}))
+    _emit_ok("stats", db_path=str(db_path), total=total, analysed=analysed, with_input=with_input)
 
 
 # ─── 调用链 DB 命令（callchain.db） ────────────────────────────────────────────────────
@@ -241,7 +253,7 @@ def cmd_stats(db_path: Path) -> None:
 def _get_cc_conn(cc_db_path: Path) -> sqlite3.Connection:
     """调用链 DB 连接（只读场景，无需 WAL）。"""
     if not cc_db_path.exists():
-        _die(f"Callchain DB not found: {cc_db_path}")
+        _die(f"Callchain DB not found: {cc_db_path}", command="open-callchain-db", db_path=str(cc_db_path))
     conn = sqlite3.connect(str(cc_db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
@@ -471,7 +483,62 @@ def cmd_callchain_stats(cc_db_path: Path) -> None:
         "tree_roots": tree_roots,
         "build_status": status,
     }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    _emit_ok("callchain-stats", db_path=str(cc_db_path), **result)
+
+
+def cmd_find_name(db_path: Path, func_name: str) -> None:
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT func_hash, name, signature, start_line, end_line, body_lines
+               FROM functions WHERE name = ? ORDER BY start_line""",
+            (func_name,),
+        ).fetchall()
+    result = [dict(r) for r in rows]
+    _emit_ok("find-name", db_path=str(db_path), name=func_name, found=bool(result), row_count=len(result), rows=result)
+
+
+def cmd_between_lines(db_path: Path, start_line: int, end_line: int) -> None:
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT func_hash, name, signature, start_line, end_line, body_lines
+               FROM functions
+               WHERE NOT (end_line < ? OR start_line > ?)
+               ORDER BY start_line""",
+            (start_line, end_line),
+        ).fetchall()
+    result = [dict(r) for r in rows]
+    _emit_ok(
+        "between-lines",
+        db_path=str(db_path),
+        start_line=start_line,
+        end_line=end_line,
+        row_count=len(result),
+        rows=result,
+    )
+
+
+def cmd_around_line(db_path: Path, line_no: int, window: int = 50) -> None:
+    start_line = max(1, line_no - max(1, window))
+    end_line = line_no + max(1, window)
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT func_hash, name, signature, start_line, end_line, body_lines
+               FROM functions
+               WHERE NOT (end_line < ? OR start_line > ?)
+               ORDER BY start_line""",
+            (start_line, end_line),
+        ).fetchall()
+    result = [dict(r) for r in rows]
+    _emit_ok(
+        "around-line",
+        db_path=str(db_path),
+        line_no=line_no,
+        window=window,
+        scan_start=start_line,
+        scan_end=end_line,
+        row_count=len(result),
+        rows=result,
+    )
 
 
 def cmd_query(db_path: Path, sql: str) -> None:
@@ -484,13 +551,14 @@ def cmd_query(db_path: Path, sql: str) -> None:
     sql_upper = sql.strip().upper()
     for kw in forbidden:
         if sql_upper.startswith(kw):
-            _die(f"Only SELECT queries allowed, got: {kw}")
+            _die(f"Only SELECT queries allowed, got: {kw}", command="query", db_path=str(db_path), sql=sql)
     with _get_conn(db_path) as conn:
         try:
             rows = conn.execute(sql).fetchall()
         except Exception as e:
-            _die(f"SQL error: {e}")
-    print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+            _die(f"SQL error: {e}", command="query", db_path=str(db_path), sql=sql)
+    result = [dict(r) for r in rows]
+    _emit_ok("query", db_path=str(db_path), sql=sql, row_count=len(result), rows=result)
 
 
 # ─── 入口 ──────────────────────────────────────────────────────────────────────
@@ -505,7 +573,7 @@ def main() -> None:
 
     if cmd == "get":
         if len(sys.argv) < 4:
-            _die("Usage: ea_db.py get <db_path> <func_hash>")
+            _die("Usage: ea_db.py get <db_path> <func_hash>", command="get", db_path=str(db_path))
         cmd_get(db_path, sys.argv[3])
 
     elif cmd == "list-meta":
@@ -516,7 +584,7 @@ def main() -> None:
 
     elif cmd == "set-analysis":
         if len(sys.argv) < 5:
-            _die("Usage: ea_db.py set-analysis <db_path> <func_hash> '<json>'")
+            _die("Usage: ea_db.py set-analysis <db_path> <func_hash> '<json>'", command="set-analysis", db_path=str(db_path))
         cmd_set_analysis(db_path, sys.argv[3], sys.argv[4])
 
     elif cmd == "stats":
@@ -528,32 +596,49 @@ def main() -> None:
         cc_db = db_path  # 复用第二个参数位置
         if cmd == "callchain-callers":
             if len(sys.argv) < 4:
-                _die("Usage: ea_db.py callchain-callers <cc_db_path> <func_hash>")
+                _die("Usage: ea_db.py callchain-callers <cc_db_path> <func_hash>", command="callchain-callers", db_path=str(cc_db))
             cmd_callchain_callers(cc_db, sys.argv[3])
         elif cmd == "callchain-callees":
             if len(sys.argv) < 4:
-                _die("Usage: ea_db.py callchain-callees <cc_db_path> <func_hash>")
+                _die("Usage: ea_db.py callchain-callees <cc_db_path> <func_hash>", command="callchain-callees", db_path=str(cc_db))
             cmd_callchain_callees(cc_db, sys.argv[3])
         elif cmd == "callchain-tree":
             if len(sys.argv) < 4:
-                _die("Usage: ea_db.py callchain-tree <cc_db_path> <root_hash>")
+                _die("Usage: ea_db.py callchain-tree <cc_db_path> <root_hash>", command="callchain-tree", db_path=str(cc_db))
             cmd_callchain_tree(cc_db, sys.argv[3])
         elif cmd == "callchain-role":
             if len(sys.argv) < 4:
-                _die("Usage: ea_db.py callchain-role <cc_db_path> <func_hash>")
+                _die("Usage: ea_db.py callchain-role <cc_db_path> <func_hash>", command="callchain-role", db_path=str(cc_db))
             cmd_callchain_role(cc_db, sys.argv[3])
         elif cmd == "callchain-stats":
             cmd_callchain_stats(cc_db)
 
+    elif cmd == "find-name":
+        if len(sys.argv) < 4:
+            _die("Usage: ea_db.py find-name <db_path> <func_name>", command="find-name", db_path=str(db_path))
+        cmd_find_name(db_path, sys.argv[3])
+
+    elif cmd == "between-lines":
+        if len(sys.argv) < 5:
+            _die("Usage: ea_db.py between-lines <db_path> <start_line> <end_line>", command="between-lines", db_path=str(db_path))
+        cmd_between_lines(db_path, int(sys.argv[3]), int(sys.argv[4]))
+
+    elif cmd == "around-line":
+        if len(sys.argv) < 4:
+            _die("Usage: ea_db.py around-line <db_path> <line_no> [window]", command="around-line", db_path=str(db_path))
+        window = int(sys.argv[4]) if len(sys.argv) >= 5 else 50
+        cmd_around_line(db_path, int(sys.argv[3]), window)
+
     elif cmd == "query":
         if len(sys.argv) < 4:
-            _die("Usage: ea_db.py query <db_path> '<SQL>'")
+            _die("Usage: ea_db.py query <db_path> '<SQL>'", command="query", db_path=str(db_path))
         cmd_query(db_path, sys.argv[3])
 
     else:
         _die(f"Unknown command: {cmd!r}. "
-             f"Valid commands: get, list-meta, list-entries, set-analysis, stats, query, "
-             f"callchain-callers, callchain-callees, callchain-tree, callchain-role, callchain-stats")
+             f"Valid commands: get, list-meta, list-entries, set-analysis, stats, find-name, between-lines, around-line, query, "
+             f"callchain-callers, callchain-callees, callchain-tree, callchain-role, callchain-stats",
+             command="unknown", db_path=str(db_path))
 
 
 if __name__ == "__main__":
