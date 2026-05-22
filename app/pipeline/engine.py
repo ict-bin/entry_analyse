@@ -37,6 +37,7 @@ from ..models import AgentInstanceConfig, SwarmEvent, TaskConfig, TokenUsage
 from ..runner import AgentResult, PiFatalError, run_agent
 from .dirs import PipelineDirs
 from .extractor import compute_file_hash, compute_func_hash
+from .result_index import write_stage_result_files, upsert_stage_result_index
 
 # Skills 目录：相对于本文件 (app/pipeline/engine.py) → app/pipeline/../../.pi/skills
 _EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
@@ -849,12 +850,14 @@ class PipelineEngine:
         try:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r2_judge')
+            worker_result_file = dirs.stage_result_file("r1b_w", "worker", func_hash, max(1, attempt))
             prompt = P.build_r1_j_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
                 start_line=func_state.start_line,
                 end_line=func_state.end_line,
                 file_path=file_path,
+                worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
@@ -862,6 +865,22 @@ class PipelineEngine:
                 context=f"r1b_j:{func_hash}", acfg=acfg,
             )
             passed, feedback = _parse_j_result(ar.output)
+            result_payload = {
+                "stage": "r1b_j",
+                "attempt": attempt,
+                "scope": "func",
+                "func_hash": func_hash,
+                "file_hash": file_hash,
+                "passed": passed,
+                "summary": feedback[:200],
+                "feedback": feedback,
+            }
+            result_file = dirs.stage_result_file("r1b_j", "judge", func_hash, attempt)
+            raw_file = dirs.stage_raw_file("r1b_j", "judge", func_hash, attempt)
+            write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r1b_j", role_kind="judge", scope_kind="func", attempt=attempt,
+                                      file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
+                                      summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
             func_state.r2_j_feedback = feedback
             func_state.r2_j_state = NodeState.PASSED if passed else NodeState.FAILED
             if not passed and feedback:
@@ -936,6 +955,23 @@ class PipelineEngine:
                 )
 
                 analysis = _parse_r2_analysis(ar.output)
+                result_payload = {
+                    "stage": "r2_w",
+                    "attempt": func_state.r3_w_attempts,
+                    "scope": "func",
+                    "func_hash": func_hash,
+                    "file_hash": file_hash,
+                    "source_file": os.path.abspath(file_path),
+                    "status": "ok" if analysis is not None or _parse_has_external_input(ar.output) is not None else "parse_failed",
+                    "result_type": "analysis",
+                    "result": analysis if analysis is not None else {"has_external_input": _parse_has_external_input(ar.output)},
+                }
+                result_file = dirs.stage_result_file("r2_w", "worker", func_hash, func_state.r3_w_attempts)
+                raw_file = dirs.stage_raw_file("r2_w", "worker", func_hash, func_state.r3_w_attempts)
+                write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+                upsert_stage_result_index(task_id=self.task_id, stage_key="r2_w", role_kind="worker", scope_kind="func", attempt=func_state.r3_w_attempts,
+                                          file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
+                                          summary=str(result_payload["result"])[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
                 if analysis is not None:
                     has_input = bool(analysis.get("has_external_input", True))
                     func_state.has_external_input = has_input
@@ -993,6 +1029,7 @@ class PipelineEngine:
         try:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r3_judge')
+            worker_result_file = dirs.stage_result_file("r2_w", "worker", func_hash, max(1, func_state.r3_w_attempts))
             prompt = P.build_r2_j_func_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
@@ -1002,6 +1039,7 @@ class PipelineEngine:
                 body_lines=body_lines,
                 file_path=file_path,
                 db_path=db_path,
+                worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
@@ -1041,6 +1079,23 @@ class PipelineEngine:
             summary = _sm.group(1).strip()[:60] if _sm else feedback[:60]
             if not passed and "Engine 硬校验失败" in feedback:
                 summary = "taints 为空，必须列出至少一个承载外部数据的参数名"[:60]
+
+            result_payload = {
+                "stage": "r2_j",
+                "attempt": func_state.r3_j_attempts,
+                "scope": "func",
+                "func_hash": func_hash,
+                "file_hash": file_hash,
+                "passed": passed,
+                "summary": summary,
+                "feedback": feedback,
+            }
+            result_file = dirs.stage_result_file("r2_j", "judge", func_hash, func_state.r3_j_attempts)
+            raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, func_state.r3_j_attempts)
+            write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=func_state.r3_j_attempts,
+                                      file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
+                                      summary=summary, result_file_path=str(result_file), raw_file_path=str(raw_file))
 
             func_state.r3_j_state = NodeState.PASSED if passed else NodeState.FAILED
             func_state.r3_j_feedback_summary = summary
@@ -1330,6 +1385,22 @@ class PipelineEngine:
             entry_role = str(decision_data.get("entry_role", "") or "boundary").strip()
             reason     = str(decision_data.get("reason", ""))[:200]
 
+            result_payload = {
+                "stage": "r3_w",
+                "attempt": attempt,
+                "scope": "func",
+                "func_hash": func_hash,
+                "file_hash": file_hash,
+                "decision": decision,
+                "entry_role": entry_role,
+                "reason": reason,
+            }
+            result_file = dirs.stage_result_file("r3_w", "worker", func_hash, attempt)
+            raw_file = dirs.stage_raw_file("r3_w", "worker", func_hash, attempt)
+            write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=json.dumps(decision_data, ensure_ascii=False))
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r3_w", role_kind="worker", scope_kind="func", attempt=attempt,
+                                      file_hash=file_hash, func_hash=func_hash, status=decision, summary=reason,
+                                      result_file_path=str(result_file), raw_file_path=str(raw_file))
             if decision == "filter":
                 fs.r3_func_state[func_hash] = "passed_filter"
                 if func_hash in fs.functions:
@@ -1365,10 +1436,12 @@ class PipelineEngine:
         try:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r6_judge')
+            worker_result_file = dirs.stage_result_file("r3_w", "worker", file_hash, max(1, fs.r3_attempts))
             prompt = P.build_r3_j_prompt(
                 file_path=file_path,
                 r3_entries_path=dirs.r3_file_path(file_hash),
                 db_path=dirs.r1_functions_db(file_hash),
+                worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
@@ -1376,6 +1449,21 @@ class PipelineEngine:
                 context=f"r3_j:{file_hash}", acfg=acfg,
             )
             passed, feedback = _parse_j_result(ar.output)
+            result_payload = {
+                "stage": "r3_j",
+                "attempt": fs.r3_attempts,
+                "scope": "file",
+                "file_hash": file_hash,
+                "passed": passed,
+                "summary": feedback[:200],
+                "feedback": feedback,
+            }
+            result_file = dirs.stage_result_file("r3_j", "judge", file_hash, fs.r3_attempts)
+            raw_file = dirs.stage_raw_file("r3_j", "judge", file_hash, fs.r3_attempts)
+            write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r3_j", role_kind="judge", scope_kind="file", attempt=fs.r3_attempts,
+                                      file_hash=file_hash, status="passed" if passed else "failed", passed=passed,
+                                      summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
             fs.r3_feedback = feedback
             if not passed and feedback:
                 fb_file = dirs.r3_j_feedback_file(file_hash, fs.r3_attempts)
@@ -1678,9 +1766,11 @@ class PipelineEngine:
             try:
                 acfg = self._judge_acfg()
                 sys_prompt = self._stage_sys_prompt('r6_judge')
+                worker_result_file = dirs.stage_result_file("r4_w", "worker", "module", max(1, state.r6_attempts))
                 prompt = P.build_r4_j_prompt(
                     r4_entries_path=tmp_path,
                     module_name=self.cfg.module_name,
+                    worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
@@ -1696,6 +1786,21 @@ class PipelineEngine:
                     fb_file.write_text(feedback, encoding="utf-8")
                     state.r6_feedback = str(fb_file)
 
+                result_payload = {
+                    "stage": "r4_j",
+                    "attempt": state.r6_attempts,
+                    "scope": "module",
+                    "passed": passed,
+                    "summary": feedback[:200],
+                    "feedback": feedback,
+                    "entry_count": len(final_entries),
+                }
+                result_file = dirs.stage_result_file("r4_j", "judge", "module", state.r6_attempts)
+                raw_file = dirs.stage_raw_file("r4_j", "judge", "module", state.r6_attempts)
+                write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+                upsert_stage_result_index(task_id=self.task_id, stage_key="r4_j", role_kind="judge", scope_kind="module", attempt=state.r6_attempts,
+                                          status="passed" if passed else "failed", passed=passed, summary=feedback[:200],
+                                          result_file_path=str(result_file), raw_file_path=str(raw_file))
                 self._emit("r6_j_done", passed=passed, feedback=feedback[:200],
                            attempt=state.r6_attempts,
                            entry_count=len(final_entries))
@@ -1846,6 +1951,17 @@ class PipelineEngine:
                 feedback = "报告文件未写出，请确认使用 write 工具将内容写入指定路径"
                 continue
 
+            worker_result_file = dirs.stage_result_file("r5_w", "worker", func_hash, attempts)
+            worker_raw_file = dirs.stage_raw_file("r5_w", "worker", func_hash, attempts)
+            write_stage_result_files(
+                result_file=worker_result_file,
+                raw_file=worker_raw_file,
+                payload={"stage": "r5_w", "attempt": attempts, "scope": "func", "func_hash": func_hash, "status": "ok", "report_file": str(report_out)},
+                raw_text=report_out.read_text(encoding="utf-8") if report_out.exists() else "",
+            )
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r5_w", role_kind="worker", scope_kind="func", attempt=attempts,
+                                      func_hash=func_hash, status="ok", summary=func_name[:200], result_file_path=str(worker_result_file), raw_file_path=str(worker_raw_file))
+
             # Report-func-J
             j_session = str(dirs.r5_j_session(func_hash, attempts))
             j_prompt = (
@@ -1868,6 +1984,17 @@ class PipelineEngine:
                     acfg=acfg_j,
                 )
                 j_passed, j_feedback = _parse_j_result(j_ar.output)
+                j_result_file = dirs.stage_result_file("r5_j", "judge", func_hash, attempts)
+                j_raw_file = dirs.stage_raw_file("r5_j", "judge", func_hash, attempts)
+                write_stage_result_files(
+                    result_file=j_result_file,
+                    raw_file=j_raw_file,
+                    payload={"stage": "r5_j", "attempt": attempts, "scope": "func", "func_hash": func_hash, "passed": j_passed, "summary": j_feedback[:200], "feedback": j_feedback},
+                    raw_text=j_ar.output or "",
+                )
+                upsert_stage_result_index(task_id=self.task_id, stage_key="r5_j", role_kind="judge", scope_kind="func", attempt=attempts,
+                                          func_hash=func_hash, status="passed" if j_passed else "failed", passed=j_passed, summary=j_feedback[:200],
+                                          result_file_path=str(j_result_file), raw_file_path=str(j_raw_file))
                 if j_passed:
                     if func_state:
                         func_state.r5_state = NodeState.PASSED
@@ -1937,12 +2064,14 @@ class PipelineEngine:
             attempts += 1
             is_retry = attempts > 1
             self._emit("r5_w_start", attempt=attempts)
+            prev_j_result = dirs.stage_result_file("r6_j", "judge", "module", max(1, attempts - 1)) if is_retry else None
             w_prompt = P.build_report_w_prompt(
                 draft_path=draft_path,
                 report_out_path=report_path,
                 module_name=module_name,
                 is_retry=is_retry,
                 feedback=feedback,
+                judge_result_file=str(prev_j_result) if prev_j_result and prev_j_result.exists() else "",
             )
             try:
                 await self._call_agent(
@@ -1958,11 +2087,23 @@ class PipelineEngine:
                 feedback = "report文件未写出，请确认使用 write 工具将内容写入指定路径"
                 continue
 
+            worker_result_file = dirs.stage_result_file("r6_w", "worker", "module", attempts)
+            worker_raw_file = dirs.stage_raw_file("r6_w", "worker", "module", attempts)
+            write_stage_result_files(
+                result_file=worker_result_file,
+                raw_file=worker_raw_file,
+                payload={"stage": "r6_w", "attempt": attempts, "scope": "module", "status": "ok", "report_file": str(report_path)},
+                raw_text=report_path.read_text(encoding="utf-8") if report_path.exists() else "",
+            )
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r6_w", role_kind="worker", scope_kind="module", attempt=attempts,
+                                      status="ok", summary=module_name[:200], result_file_path=str(worker_result_file), raw_file_path=str(worker_raw_file))
+
             j_session = str(_sess_dir / f"report_j_a{attempts}.jsonl")
             self._emit("r5_j_start", attempt=attempts)
             j_prompt = P.build_report_j_prompt(
                 report_path=report_path,
                 module_name=module_name,
+                worker_result_file=str(worker_result_file),
             )
             try:
                 j_ar = await self._call_agent(
@@ -1972,6 +2113,17 @@ class PipelineEngine:
                 )
                 j_text = (j_ar.result or j_ar.output or "").strip()
                 passed = "通过: 是" in j_text
+                j_result_file = dirs.stage_result_file("r6_j", "judge", "module", attempts)
+                j_raw_file = dirs.stage_raw_file("r6_j", "judge", "module", attempts)
+                write_stage_result_files(
+                    result_file=j_result_file,
+                    raw_file=j_raw_file,
+                    payload={"stage": "r6_j", "attempt": attempts, "scope": "module", "passed": passed, "summary": j_text[:200], "feedback": j_text},
+                    raw_text=j_ar.output or "",
+                )
+                upsert_stage_result_index(task_id=self.task_id, stage_key="r6_j", role_kind="judge", scope_kind="module", attempt=attempts,
+                                          status="passed" if passed else "failed", passed=passed, summary=j_text[:200],
+                                          result_file_path=str(j_result_file), raw_file_path=str(j_raw_file))
                 if passed:
                     self._emit("r5_j_done", passed=True, attempt=attempts)
                     break

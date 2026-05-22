@@ -103,3 +103,24 @@ class AppEaModelsConfig(Base):
     config_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True, default="global")
     config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+
+class AppEaStageResultIndex(Base):
+    """Stage result index: DB stores only metadata/index, full content remains on disk."""
+    __tablename__ = "secflow_app_ea_stage_result_index"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    stage_key: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    role_kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)   # worker/judge
+    scope_kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)  # file/func/module
+    file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    func_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1, index=True)
+    status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    result_file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    raw_file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)

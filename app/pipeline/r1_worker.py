@@ -32,6 +32,7 @@ from ..models import AgentInstanceConfig, TaskConfig, TokenUsage
 from ..runner import run_agent, AgentResult
 from ..agent_capacity import model_capacity_slot
 from .dirs import PipelineDirs
+from .result_index import write_stage_result_files, upsert_stage_result_index
 from .extractor import (
     FunctionExtract,
     compute_file_hash,
@@ -307,6 +308,7 @@ def build_r2_w_prompt(
     file_path: str,
     is_retry: bool = False,
     feedback: str = "",
+    judge_result_file: str = "",
 ) -> str:
     """
     R1b-W prompt：单函数行号/签名准确性校正。
@@ -319,6 +321,8 @@ def build_r2_w_prompt(
     retry_section = ""
     if is_retry and feedback:
         retry_section = f"\n**Judge 意见**：{feedback}\n"
+    if is_retry and judge_result_file:
+        retry_section += f"\n**上一轮 Judge 结果文件**：`{judge_result_file}`（请先读取该文件再修正）\n"
 
     return (
         f"# Round 1b — 函数准确性校正：`{func_name}` in `{basename}`\n\n"
@@ -455,6 +459,8 @@ async def run_r1_worker(
                file=basename, file_hash=file_hash, is_retry=is_retry,
                retry_reason="judge_failed" if is_retry else "")
 
+    attempt_no = 2 if is_retry else 1
+
     async with model_capacity_slot(
         acfg.model,
         enabled=cfg.model_capacity_enabled,
@@ -487,6 +493,25 @@ async def run_r1_worker(
 
     # 解析并应用修正（直接写 funcdb，不经 JSON）
     corrections = _parse_r1_corrections(ar.output)
+    result_payload = {
+        "stage": "r1_w",
+        "attempt": attempt_no,
+        "scope": "file",
+        "file_hash": file_hash,
+        "source_file": os.path.abspath(file_path),
+        "status": "ok" if (corrections is None or isinstance(corrections, list)) else "parse_failed",
+        "result_type": "corrections",
+        "result": [] if corrections is None else (corrections or []),
+    }
+    result_file = dirs.stage_result_file("r1_w", "worker", file_hash, attempt_no)
+    raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, attempt_no)
+    write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+    upsert_stage_result_index(
+        task_id=task_id, stage_key="r1_w", role_kind="worker", scope_kind="file",
+        attempt=attempt_no, file_hash=file_hash, status=result_payload["status"],
+        summary=f"corrections={len(result_payload['result'])}",
+        result_file_path=str(result_file), raw_file_path=str(raw_file),
+    )
     if corrections is None:
         logger.info("R1a W: no corrections needed for %s", basename)
     elif corrections:
@@ -573,6 +598,8 @@ async def run_r2_worker(
     session_f = str(dirs.r1b_w_session(func_hash))
     workspace = str(dirs.source)
 
+    attempt_no = 2 if is_retry else 1
+    judge_result_file = dirs.stage_result_file("r1b_j", "judge", func_hash, max(1, attempt_no - 1)) if is_retry else None
     prompt = build_r2_w_prompt(
         func_hash=func_hash,
         func_name=func_name,
@@ -581,6 +608,7 @@ async def run_r2_worker(
         file_path=file_path,
         is_retry=is_retry,
         feedback=feedback,
+        judge_result_file=str(judge_result_file) if judge_result_file and judge_result_file.exists() else "",
     )
 
     async with model_capacity_slot(
@@ -608,6 +636,26 @@ async def run_r2_worker(
         )
 
     corrections = _parse_r1_corrections(ar.output)
+    result_payload = {
+        "stage": "r1b_w",
+        "attempt": attempt_no,
+        "scope": "func",
+        "func_hash": func_hash,
+        "file_hash": file_hash,
+        "source_file": os.path.abspath(file_path),
+        "status": "ok" if (corrections is None or isinstance(corrections, list)) else "parse_failed",
+        "result_type": "corrections",
+        "result": [] if corrections is None else (corrections or []),
+    }
+    result_file = dirs.stage_result_file("r1b_w", "worker", func_hash, attempt_no)
+    raw_file = dirs.stage_raw_file("r1b_w", "worker", func_hash, attempt_no)
+    write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+    upsert_stage_result_index(
+        task_id=task_id, stage_key="r1b_w", role_kind="worker", scope_kind="func",
+        attempt=attempt_no, file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
+        summary=f"corrections={len(result_payload['result'])}",
+        result_file_path=str(result_file), raw_file_path=str(raw_file),
+    )
     if corrections is None:
         logger.debug("R1b W: no corrections needed for %s", func_hash)
     elif corrections:

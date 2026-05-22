@@ -46,6 +46,7 @@ def build_r1_j_prompt(
     start_line: int,
     end_line: int,
     file_path: str,
+    worker_result_file: str = "",
 ) -> str:
     """
     R1 Judge：验证 ctags 提取的函数行号是否正确。
@@ -61,6 +62,7 @@ def build_r1_j_prompt(
         f"| start_line | {start_line}      |\n"
         f"| end_line   | {end_line}        |\n"
         f"| 源文件     | `{basename}`      |\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
         f"## 验证步骤（必须用 bash，不要用 read 工具计数）\n\n"
         f"**步骤 1**：用 bash 精确读取 ctags 记录的行范围：\n"
         f"```bash\n"
@@ -227,6 +229,7 @@ def build_r2_j_func_prompt(
     body_lines: int,
     file_path: str,
     db_path: "Path",
+    worker_result_file: str = "",
 ) -> str:
     """
     R2 Judge（函数级）：验证单个函数的 R2 分析质量。
@@ -247,6 +250,7 @@ def build_r2_j_func_prompt(
         f"| name      | `{func_name}`            |\n"
         f"| \u884c\u8303\u56f4    | {start_line}~{end_line}\uff08\u5171 {body_lines} \u884c\uff09|\n"
         f"| \u6587\u4ef6      | `{basename}`             |\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
         f"## \u6b65\u9aa4 1\uff1a\u83b7\u53d6 R2 \u5206\u6790\u7ed3\u679c\n\n"
         f"```bash\n"
         f"python3 /opt/entry_analyse/scripts/ea_db.py get {db_path} {func_hash}\n"
@@ -463,6 +467,7 @@ def build_r3_j_prompt(
     file_path: str,
     r3_entries_path: Path,
     db_path: Path,
+    worker_result_file: str = "",
 ) -> str:
     """
     R3 Judge：评审文件级入口过滤结果。
@@ -477,6 +482,7 @@ def build_r3_j_prompt(
     return (
         f"# R3 Judge — 文件级入口过滤评审\n\n"
         f"文件：`{basename}`\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
         f"## 步骤 1：读取 R3 过滤结果\n\n"
         f"```bash\n"
         f"cat {r3_entries_path}\n"
@@ -570,11 +576,13 @@ def build_r4_w_prompt(
 def build_r4_j_prompt(
     r4_entries_path: Path,
     module_name: str,
+    worker_result_file: str = "",
 ) -> str:
     """R4 Judge：评审模块级最终入口列表。"""
     return (
         f"# R4 Judge — 模块级入口评审\n\n"
         f"模块：`{module_name}`\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
         f"## 步骤\n\n"
         f"1. 使用 `read` 工具读取 R4 最终入口列表：`{r4_entries_path}`\n"
         f"2. 评审：\n"
@@ -597,9 +605,12 @@ def build_report_w_prompt(
     module_name: str,
     is_retry: bool = False,
     feedback: str = "",
+    judge_result_file: str = "",
 ) -> str:
     """Report Worker：读取草稿 Markdown，丰富化内容，写出最终报告。"""
     retry = _retry_section(feedback) if is_retry else ""
+    if is_retry and judge_result_file:
+        retry += f"\n上一轮 Judge 结果文件：`{judge_result_file}`（请先读取再改进）\n"
     return (
         f"# Report Worker — 安全分析报告丰富化\n\n"
         f"模块：`{module_name}`\n"
@@ -618,11 +629,13 @@ def build_report_w_prompt(
 def build_report_j_prompt(
     report_path: "Path",
     module_name: str,
+    worker_result_file: str = "",
 ) -> str:
     """Report Judge：评审安全分析报告质量。"""
     return (
         f"# Report Judge — 安全分析报告质量审核\n\n"
         f"模块：`{module_name}`\n\n"
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
         f"## 步骤\n\n"
         f"1. 使用 `read` 工具读取报告文件：`{report_path}`\n"
         f"2. 按系统提示中的维度逐一检查\n\n"

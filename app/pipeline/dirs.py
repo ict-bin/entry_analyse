@@ -62,6 +62,10 @@ class PipelineDirs:
         return self.run / "workspace" / "callchain"
 
     @property
+    def stage_results(self) -> Path:
+        return self.run / "workspace" / "stage-results"
+
+    @property
     def sessions(self) -> Path:
         return self.run / "sessions"
 
@@ -196,8 +200,16 @@ class PipelineDirs:
 
     # ─── 初始化 ───────────────────────────────────────────────────────────────
 
+    def stage_result_file(self, stage_key: str, role_kind: str, scope_key: str, attempt: int) -> Path:
+        safe = str(scope_key or "module").replace("/", "_").replace("\\", "_")
+        return self.stage_results / f"{stage_key}-{role_kind}-{safe}-a{attempt}.json"
+
+    def stage_raw_file(self, stage_key: str, role_kind: str, scope_key: str, attempt: int) -> Path:
+        safe = str(scope_key or "module").replace("/", "_").replace("\\", "_")
+        return self.stage_results / f"{stage_key}-{role_kind}-{safe}-a{attempt}.txt"
+
     def setup(self) -> None:
-        for d in (self.source, self.r1, self.r3, self.r4, self.callchain, self.sessions):
+        for d in (self.source, self.r1, self.r3, self.r4, self.callchain, self.stage_results, self.sessions):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
