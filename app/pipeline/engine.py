@@ -635,13 +635,24 @@ class PipelineEngine:
             try:
                 db_path   = dirs.r1_functions_db(file_hash)
                 gaps_file = dirs.r1_gaps_file(file_hash)
+                # 计算源文件在 workspace/source 内的路径（保留子目录结构）
+                try:
+                    _rel = os.path.relpath(os.path.abspath(file_path), self._source_dir)
+                    if _rel.startswith(".."):
+                        _rel = Path(file_path).name
+                except ValueError:
+                    _rel = Path(file_path).name
+                ws_file_path = dirs.source / _rel
                 if gaps_file.exists():
                     gap_hint = (
+                        f"源文件路径：`{ws_file_path}`\n\n"
                         f"请读取 gap 文件 `{gaps_file}` 并用 sed 核查各区间内容，"
-                        f"确认 Worker 的修正是否正确。"
+                        f"确认 Worker 的修正是否正确。\n\n"
+                        f"查看 gap 区间示例：`sed -n '<start>,<end>p' {ws_file_path}`"
                     )
                 else:
                     gap_hint = (
+                        f"源文件路径：`{ws_file_path}`\n\n"
                         f"无 gap 文件（ctags 已完整覆盖），直接用 "
                         f"`python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表。"
                     )
@@ -1677,7 +1688,8 @@ class PipelineEngine:
                     state.r6_feedback = str(fb_file)
 
                 self._emit("r6_j_done", passed=passed, feedback=feedback[:200],
-                           attempt=state.r6_attempts)
+                           attempt=state.r6_attempts,
+                           entry_count=len(final_entries))
                 if passed:
                     state.r6_state = NodeState.PASSED
                     state.save(dirs.state_file)

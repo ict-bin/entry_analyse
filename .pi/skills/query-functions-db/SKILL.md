@@ -140,6 +140,34 @@ sed -n '{start_line}p' {source_file}
 
 ---
 
+### 5. 任意 SQL 查询（灵活搜索，`sqlite3` CLI 的替代）
+
+```bash
+python3 /opt/entry_analyse/scripts/ea_db.py query <db_path> '<SQL>'
+```
+
+只允许 SELECT，禁止修改操作（INSERT/UPDATE/DELETE/DROP 等）。
+
+**示例**：
+```bash
+# 按函数名前缀搜索
+python3 /opt/entry_analyse/scripts/ea_db.py query \
+  {db_path} "SELECT name, start_line FROM functions WHERE name LIKE 'ipsec_%'"
+
+# 查看未分析的函数
+python3 /opt/entry_analyse/scripts/ea_db.py query \
+  {db_path} "SELECT name FROM functions WHERE analysis IS NULL LIMIT 20"
+
+# 确认某函数是否已写入
+python3 /opt/entry_analyse/scripts/ea_db.py query \
+  {db_path} "SELECT count(*) as cnt FROM functions WHERE name = 'target_func'"
+```
+
+> ⚠️ 虽然容器内已安装 `sqlite3` CLI，但**优先使用 `ea_db.py`** 保证输出格式统一；  
+> 在 `ea_db.py` 确实无法满足需求时，可以用 `sqlite3` CLI 作为逃生出口。
+
+---
+
 ## 注意事项
 
 - `start_line`/`end_line` 均为 **1-indexed**，与 `sed -n 'N,Mp'` 一一对应

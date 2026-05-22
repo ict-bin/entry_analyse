@@ -812,7 +812,7 @@ class TaskService:
             row.error = None
             row.result_json = None
             row.latest_abnormal_reason_json = None
-            row.started_at = None   # 重新记录本次开始时间
+            # 注意：不重置 started_at，保留任务真实开始时间
             logger.info("Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",
                         row.task_id, row.owner_pod)
         row.status = "running"

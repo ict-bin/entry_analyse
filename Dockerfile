@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv \
     bubblewrap \
     universal-ctags \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # ═══ Node.js 22 ═══════════════════════════════════════════════════════════════

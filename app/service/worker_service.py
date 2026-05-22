@@ -292,6 +292,14 @@ class WorkerService:
                 resume_task_id=tcfg.get("resume_task_id", ""),
             )
 
+            # 在任务启动时保存本轮前的历史事件快照（用于最终写入，避免与 _flush_stages 叠加翻倍）
+            pre_run_events: list[dict] = (
+                task_snapshot.stages_json["events"]
+                if isinstance(task_snapshot.stages_json, dict)
+                   and isinstance(task_snapshot.stages_json.get("events"), list)
+                else []
+            )
+
             # 新鲜启动检测： stages_json 为空表示 DB 已被重置（手动重置 / restart_task API）
             # 清除磁盘上的旧运行中间文件，并同步清理 DB 残余字段，确保新 run 不继承旧状态
             is_fresh_start = not task_snapshot.stages_json  # None 或 {}
@@ -378,9 +386,7 @@ class WorkerService:
                 row.owner_pod = None
                 row.lease_expires_at = None
                 row.cancel_requested = False
-                prev = row.stages_json
-                prev_events = prev["events"] if isinstance(prev, dict) and isinstance(prev.get("events"), list) else []
-                row.stages_json = {"events": prev_events + event_buffer, "final": True}
+                row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
                 if result and not cancel_requested:
                     result_payload = result.model_dump(mode="json")
                     result_file = task_mod._write_task_result_json(task_snapshot, result_payload)
@@ -413,6 +419,8 @@ class WorkerService:
                         _row.owner_pod = None
                         _row.lease_expires_at = None
                         _row.cancel_requested = False
+                        # 补 flush：将本轮已收集的事件写入 stages_json（避免 pod kill 导致事件丢失）
+                        _row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
                         _db2.commit()
                 finally:
                     try: next(_gen2)
@@ -443,9 +451,7 @@ class WorkerService:
                         row.owner_pod = None
                         row.lease_expires_at = None
                         row.cancel_requested = False
-                        prev = row.stages_json
-                        prev_events = prev["events"] if isinstance(prev, dict) and isinstance(prev.get("events"), list) else []
-                        row.stages_json = {"events": prev_events + event_buffer, "final": True}
+                        row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
                         reason, changed = task_mod._sync_task_abnormal_reason(row)
                         task_mod._record_abnormal_reason(row, reason, changed=changed)
                         db.commit()

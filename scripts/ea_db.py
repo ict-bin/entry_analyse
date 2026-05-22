@@ -474,6 +474,25 @@ def cmd_callchain_stats(cc_db_path: Path) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def cmd_query(db_path: Path, sql: str) -> None:
+    """
+    执行任意只读 SQL，结果以 JSON 数组输出。
+
+    只允许 SELECT 查询，禁止修改操作。
+    """
+    forbidden = ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "REPLACE", "ATTACH")
+    sql_upper = sql.strip().upper()
+    for kw in forbidden:
+        if sql_upper.startswith(kw):
+            _die(f"Only SELECT queries allowed, got: {kw}")
+    with _get_conn(db_path) as conn:
+        try:
+            rows = conn.execute(sql).fetchall()
+        except Exception as e:
+            _die(f"SQL error: {e}")
+    print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+
+
 # ─── 入口 ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -526,9 +545,14 @@ def main() -> None:
         elif cmd == "callchain-stats":
             cmd_callchain_stats(cc_db)
 
+    elif cmd == "query":
+        if len(sys.argv) < 4:
+            _die("Usage: ea_db.py query <db_path> '<SQL>'")
+        cmd_query(db_path, sys.argv[3])
+
     else:
         _die(f"Unknown command: {cmd!r}. "
-             f"Valid commands: get, list-meta, list-entries, set-analysis, stats, "
+             f"Valid commands: get, list-meta, list-entries, set-analysis, stats, query, "
              f"callchain-callers, callchain-callees, callchain-tree, callchain-role, callchain-stats")
 
 
