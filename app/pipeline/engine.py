@@ -37,6 +37,9 @@ from ..models import AgentInstanceConfig, SwarmEvent, TaskConfig, TokenUsage
 from ..runner import AgentResult, PiFatalError, run_agent
 from .dirs import PipelineDirs
 from .extractor import compute_file_hash, compute_func_hash
+
+# Skills 目录：相对于本文件 (app/pipeline/engine.py) → app/pipeline/../../.pi/skills
+_EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
 from .r1_worker import run_r1_worker, run_r2_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
 from . import prompts as P
@@ -2010,6 +2013,7 @@ class PipelineEngine:
                     thinking_level=(
                         acfg.thinking_level or self.cfg.workers.default_thinking_level),
                     session_file=session_file,
+                    skill_paths=[str(_EA_SKILLS_DIR)] if _EA_SKILLS_DIR.is_dir() else None,
                     cancel_event=self._cancel,
                     max_retries=self.cfg.agent_max_retries,
                     retry_delay=self.cfg.agent_retry_delay,

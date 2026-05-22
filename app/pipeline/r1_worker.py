@@ -39,10 +39,54 @@ from .extractor import (
     extract_functions_static,
 )
 
+# Skills 目录（与 engine.py 保持一致）
+_EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
+
 logger = logging.getLogger("ea.pipeline.r1_worker")
 
 
 # ─── Gap 计算（R1a 轻量化）────────────────────────────────────────────────────
+
+# 单个 gap 超过此行数时按空行切分
+MAX_GAP_CHUNK = 80
+
+
+def _split_gap_at_blanks(
+    lines_data: list[str],
+    start: int,
+    end: int,
+    min_size: int = 8,
+) -> list[tuple[int, int]]:
+    """
+    将超大 gap 在空行处切分为小片段，每段不小于 min_size 行。
+
+    避免单一 gap 包含整个文件导致 agent 一次性处理过大范围。
+    """
+    if end - start + 1 <= MAX_GAP_CHUNK:
+        return [(start, end)]
+
+    chunks: list[tuple[int, int]] = []
+    chunk_start = start
+    for i in range(start, end + 1):
+        line = lines_data[i - 1]  # 1-indexed -> 0-indexed
+        is_blank = not line.strip()
+        chunk_len = i - chunk_start
+        if is_blank and chunk_len >= min_size:
+            # 切分点：当前空行之前的内容作为一个 chunk
+            if i - 1 >= chunk_start:
+                chunks.append((chunk_start, i - 1))
+            chunk_start = i + 1  # 跳过空行本身
+    # 最后一段
+    if chunk_start <= end:
+        last_len = end - chunk_start + 1
+        if last_len >= min_size:
+            chunks.append((chunk_start, end))
+        elif chunks:
+            # 最后一小段太短，合并到前一个 chunk
+            chunks[-1] = (chunks[-1][0], end)
+
+    return chunks if chunks else [(start, end)]
+
 
 def _compute_gaps(
     funcs: list["FunctionExtract"],
@@ -91,8 +135,9 @@ def _compute_gaps(
                 for l in snippet
             )
             if has_code:
-                gaps.append({"start": gap_start, "end": gap_end,
-                             "lines": gap_end - gap_start + 1})
+                # 超大 gap 按空行切分，避免 agent 一次性面对整个文件
+                for cs, ce in _split_gap_at_blanks(lines, gap_start, gap_end, min_size=min_gap):
+                    gaps.append({"start": cs, "end": ce, "lines": ce - cs + 1})
         prev_end = seg_end
 
     return gaps
@@ -384,6 +429,7 @@ async def run_r1_worker(
             cwd=workspace,
             thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
             session_file=session_f,
+            skill_paths=[str(_EA_SKILLS_DIR)] if _EA_SKILLS_DIR.is_dir() else None,
             cancel_event=cancel_event,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,
@@ -511,6 +557,7 @@ async def run_r2_worker(
             cwd=workspace,
             thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
             session_file=session_f,
+            skill_paths=[str(_EA_SKILLS_DIR)] if _EA_SKILLS_DIR.is_dir() else None,
             cancel_event=cancel_event,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,
