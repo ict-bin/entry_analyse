@@ -340,7 +340,7 @@ class WorkerService:
                 # 注意：必须使用 ignore_errors=True 连同 强制重建空目录
                 # 防止 rmtree 因竞争条件（ENOENT）抛异常中止导致旧 session 文件残留
                 # （旧 session 残留会让 pi SDK resume 老会话→工作目录不存在→ fatal error）
-                for _subdir in ("run", "output"):
+                for _subdir in ("run",):  # output/ preserved: user-visible results must survive restart
                     _d = _task_dir / _subdir
                     if _d.exists():
                         _shutil.rmtree(str(_d), ignore_errors=True)

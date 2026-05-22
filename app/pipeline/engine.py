@@ -129,10 +129,12 @@ def _count_json_array(path: Path) -> int:
 
 def _aggregate_r3_entries(dirs: PipelineDirs) -> list[dict]:
     result: list[dict] = []
-    for f in sorted(dirs.r3.glob("*.json")):
+    for f in sorted((dirs.r3.parent / "r3_func").glob("*.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            if isinstance(data, list):
+            if isinstance(data, dict):
+                result.append(data)
+            elif isinstance(data, list):
                 result.extend(data)
         except Exception:
             pass
@@ -871,7 +873,7 @@ class PipelineEngine:
         """R2 Worker：外部输入分析（函数级，session 跨重试共享）。"""
         func_state = state.files[file_hash].functions[func_hash]
         r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
-        session_file = str(dirs.r4_w_session(file_hash, func_hash))
+        session_file = str(dirs.r4_w_session(func_hash))
         db_path = dirs.r1_functions_db(file_hash)
 
         while _should_continue(func_state.r3_w_attempts, r2_max, self._cancel):
