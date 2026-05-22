@@ -413,6 +413,7 @@ def build_session_catalog(
         "task_id": task_id,
         "task_status": row_status,
         "sessions_root": str(sessions_root),
+        "items": items,
         "summary": {
             "session_count": len(nodes),
             "active_session_count": sum(1 for node in nodes if node.get("is_active")),

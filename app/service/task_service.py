@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time as _time
 import uuid
 from datetime import datetime
@@ -76,6 +77,7 @@ _SESSION_THINKING_LEVEL_MAP: dict[str, str] = {
     "high": "high",
     "x-high": "xhigh",
 }
+_SESSION_INDEX_REFRESH_SECONDS = _positive_int_env("EA_SESSION_INDEX_REFRESH_SECONDS", 5)
 
 
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
@@ -284,9 +286,57 @@ def _task_result_path(row: AppEaTask) -> Path | None:
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(tmp_name).replace(path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _load_cached_session_catalog(
+    *,
+    task_id: str,
+    row_status: str,
+    sessions_root: Path,
+    max_age_seconds: int,
+) -> dict | None:
+    index_path = sessions_root / "index.json"
+    if max_age_seconds < 0 or not index_path.is_file():
+        return None
+    try:
+        index_stat = index_path.stat()
+        age_seconds = max(0.0, _time.time() - index_stat.st_mtime)
+        if age_seconds > max_age_seconds:
+            return None
+        payload = _safe_load_json(index_path)
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        return {
+            "task_id": str(payload.get("task_id") or task_id),
+            "status": row_status,
+            "sessions_root": str(payload.get("sessions_root") or sessions_root),
+            "index_path": str(index_path),
+            "generated_at": payload.get("generated_at"),
+            "items": items,
+            "index": payload,
+            "warnings": payload.get("warnings") if isinstance(payload.get("warnings"), list) else [],
+        }
+    except Exception as exc:
+        logger.warning("failed to load cached session index %s: %s", index_path, exc)
+        return None
 
 
 def _load_task_result_json(row: AppEaTask) -> dict | None:
@@ -815,6 +865,14 @@ class TaskService:
                 },
                 "warnings": [],
             }
+        cached = _load_cached_session_catalog(
+            task_id=row.task_id,
+            row_status=row.status,
+            sessions_root=sessions_root,
+            max_age_seconds=_SESSION_INDEX_REFRESH_SECONDS,
+        )
+        if cached is not None:
+            return cached
         result_json = _load_task_result_json(row)
         return build_session_catalog(
             task_id=row.task_id,

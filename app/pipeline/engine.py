@@ -2087,7 +2087,7 @@ class PipelineEngine:
                     session_file=j_session, cwd=str(out_dir),
                     context="report_j", acfg=j_acfg,
                 )
-                j_text = (j_ar.result or j_ar.output or "").strip()
+                j_text = (j_ar.output or "").strip()
                 passed = "通过: 是" in j_text
                 j_result_file = dirs.stage_result_file("r6_j", "judge", "module", attempts)
                 j_raw_file = dirs.stage_raw_file("r6_j", "judge", "module", attempts)
