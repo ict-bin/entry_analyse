@@ -193,6 +193,7 @@ def _render_script(basename: str, db_path: Path, r3_out_path: Path,
 def build_lean_file_w_prompt(
     *,
     file_path: str,
+    source_dir: str,
     db_path: Path,
     script_path: Path,
     r3_out_path: Path,
@@ -211,7 +212,12 @@ def build_lean_file_w_prompt(
     """
     basename = os.path.basename(file_path)
     try:
-        rel_file = os.path.relpath(os.path.abspath(file_path))
+        rel_file = (
+            os.path.relpath(os.path.abspath(file_path), os.path.abspath(source_dir))
+            if source_dir else basename
+        )
+        if rel_file.startswith(".."):
+            rel_file = basename
     except ValueError:
         rel_file = basename
     retry_block = _retry_section(feedback) if is_retry else ""

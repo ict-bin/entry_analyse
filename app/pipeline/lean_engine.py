@@ -305,6 +305,7 @@ class LeanPipelineEngine:
             try:
                 w_prompt = P.build_lean_file_w_prompt(
                     file_path=file_path,
+                    source_dir=self._source_dir,
                     db_path=db_path,
                     script_path=script_path,
                     r3_out_path=r3_out,
