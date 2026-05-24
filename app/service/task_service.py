@@ -1539,12 +1539,27 @@ class TaskService:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         abnormal_reason = _task_abnormal_reason(row)
+        task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
+        run_root = str(Path(task_root) / "run") if task_root else None
+        workspace_root = str(Path(run_root) / "workspace") if run_root else None
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "source_path": row.source_path,
             "module_name": row.module_name, "output_path": row.output_path,
+            "task_root": task_root,
+            "run_root": run_root,
+            "workspace_root": workspace_root,
+            "input_summary": {
+                "files_list_path": str(Path(row.input_path) / "modules" / str(row.module_name or "") / "files.list") if row.input_path and row.module_name else None,
+            } if include_heavy else None,
+            "output_summary": {
+                "r1_functions_path": str(Path(workspace_root) / "r1-functions") if workspace_root else None,
+                "r3_entries_path": str(Path(workspace_root) / "r3-entries") if workspace_root else None,
+                "r4_module_path": str(Path(workspace_root) / "r4-module") if workspace_root else None,
+                "report_path": str(Path(workspace_root) / "report") if workspace_root else None,
+            } if include_heavy else None,
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
             "owner_pod": row.owner_pod,

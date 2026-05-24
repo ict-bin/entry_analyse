@@ -32,6 +32,7 @@ class FunctionsListMetadataTests(unittest.TestCase):
                 "taints": ["buf"],
                 "function_description": "处理外部请求缓冲区。",
                 "entry_reason": "由外部消息分发器直接回调。",
+                "body_lines": 0,
                 "taint_details": [
                     {
                         "name": "buf",
@@ -48,6 +49,8 @@ class FunctionsListMetadataTests(unittest.TestCase):
         self.assertEqual(result[0]["entry_reason_source"], "agent")
         self.assertEqual(result[0]["taint_details"][0]["description_source"], "agent")
         self.assertEqual(result[0]["taint_details"][0]["source_kind"], "network")
+        self.assertEqual(result[0]["definition_kind"], "declaration")
+        self.assertFalse(result[0]["is_definition_found"])
 
     def test_auto_fix_functions_list_fills_default_metadata_sources(self):
         fixed, log = auto_fix_functions_list(
@@ -69,6 +72,8 @@ class FunctionsListMetadataTests(unittest.TestCase):
         self.assertEqual(item["entry_reason_source"], "default")
         self.assertEqual(item["taint_details"][0]["description_source"], "default")
         self.assertIn("buf", item["taint_details"][0]["description"])
+        self.assertEqual(item["definition_kind"], "definition")
+        self.assertTrue(item["is_definition_found"])
 
 
 if __name__ == "__main__":

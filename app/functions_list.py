@@ -307,6 +307,13 @@ def generate_functions_list(entry_json: str) -> str:
             )
             line = item.get("line", 0)
             entry_role = str(item.get("entry_role") or "").strip()
+            raw_definition_kind = str(item.get("definition_kind") or "").strip().lower()
+            if raw_definition_kind not in {"definition", "declaration", "unknown"}:
+                body_lines = item.get("body_lines")
+                if isinstance(body_lines, int):
+                    raw_definition_kind = "definition" if body_lines > 0 else "declaration"
+                else:
+                    raw_definition_kind = "definition" if bool(item.get("is_definition_found", True)) else "unknown"
             flat: dict = {
                 "tag": tag,
                 "file": item.get("file", ""),
@@ -331,7 +338,8 @@ def generate_functions_list(entry_json: str) -> str:
                     if isinstance(item.get("definition_line"), int)
                     else (line if isinstance(line, int) else 0)
                 ),
-                "is_definition_found": bool(item.get("is_definition_found", True)),
+                "definition_kind": raw_definition_kind,
+                "is_definition_found": bool(item.get("is_definition_found", raw_definition_kind == "definition")),
                 "signature_params": item.get("signature_params") if isinstance(item.get("signature_params"), list) else [],
             }
             if entry_role:
@@ -469,6 +477,10 @@ def validate_functions_list(items: list) -> list[str]:
         if not isinstance(function_description, str) or not function_description.strip():
             errors.append(f"{prefix} function_description 为空或非字符串: {function_description!r}")
 
+        definition_kind = str(item.get("definition_kind") or "").strip()
+        if definition_kind and definition_kind not in {"definition", "declaration", "unknown"}:
+            errors.append(f"{prefix} definition_kind={definition_kind!r} 不合法")
+
         entry_reason = item.get("entry_reason")
         if not isinstance(entry_reason, str) or not entry_reason.strip():
             errors.append(f"{prefix} entry_reason 为空或非字符串: {entry_reason!r}")
@@ -572,6 +584,11 @@ def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
         # 如果字典中根本没有 entry_role/confidence 字段，不填充默认值（向后兼容）
         raw_function_description = str(item.get("function_description") or "").strip()
         raw_entry_reason = str(item.get("entry_reason") or "").strip()
+        raw_definition_kind = str(item.get("definition_kind") or "").strip().lower()
+        if raw_definition_kind not in {"definition", "declaration", "unknown"}:
+            raw_definition_kind = "definition" if bool(item.get("is_definition_found", True)) else "unknown"
+        item["definition_kind"] = raw_definition_kind
+        item["is_definition_found"] = bool(item.get("is_definition_found", raw_definition_kind == "definition"))
         item["function_description"] = raw_function_description or _default_function_description(str(item.get("function") or ""))
         item["function_description_source"] = "agent" if raw_function_description else "default"
         item["entry_reason"] = raw_entry_reason or _default_entry_reason(str(item.get("tag") or ""), str(item.get("function") or ""))

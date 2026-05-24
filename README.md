@@ -58,10 +58,22 @@ output/
 
 ### `functions.list` 格式
 
-每行一个污点入口：
+`functions.list` 与 `entry-details.json` 都是 JSON 数组，每个元素描述一个入口点，例如：
 
-```
-文件名:函数名:行号:污点变量
+```json
+[
+  {
+    "tag": "P",
+    "file": "libipsec.c",
+    "line": 26837,
+    "function": "IPSEC_SOCKI_PipeMsg",
+    "taints": ["pipe_id", "pipe_type", "msg_type"],
+    "definition_file": "libipsec.c",
+    "definition_line": 26837,
+    "definition_kind": "definition",
+    "is_definition_found": true
+  }
+]
 ```
 
 **行号语义**：
@@ -72,16 +84,23 @@ output/
 - 被动回调型 → 直接变量名：`pipe_id,msg_type`
 - 主动拉取型 → `调用名@变量名`：`recv@buf`，`fread@data`
 
-示例：
-```
-libipsec.c:IPSEC_SOCKI_PipeMsg:L26837:pipe_id,pipe_type,msg_type
-libipsec.c:IPSEC_MsgProc:L18347:message
-libipsec.c:IPSEC_RecvLoop:L505:recv@buf
-mle.cpp:Mle::HandleUdpReceive:L1891:aMessage,aMessageInfo
-mesh_forwarder.cpp:MeshForwarder::HandleReceivedFrame:L735:aFrame
-```
-
 无污点（如初始化函数）不输出行。
+
+当前 `functions.list` 与 `entry-details.json` 还会额外保留下游契约字段：
+
+- `definition_file`
+- `definition_line`
+- `definition_kind`
+  - `definition`：定位到真实函数体
+  - `declaration`：仅命中声明/override 签名
+  - `unknown`：无法确认
+- `is_definition_found`
+
+其中：
+
+- `definition_kind=definition` 才允许 Binary Security 编排进入 DFA
+- `definition_kind=declaration` 的 entry 仍可用于入口展示和人工排障，但默认不会触发数据流分析
+- 若 Agent 未显式提供 `definition_kind`，生成器会按 `body_lines` 自动补成 `definition` 或 `declaration`
 
 ### `flag` 文件
 
