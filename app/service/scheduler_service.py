@@ -25,6 +25,8 @@ class SchedulerService:
         self._task: Optional[asyncio.Task] = None
 
     async def _reconcile_cluster_state(self) -> int:
+        from app.service.worker_slot_service import get_worker_slot_service
+
         db_gen = get_db()
         db: Session = next(db_gen)
         try:
@@ -87,6 +89,7 @@ class SchedulerService:
                 row.lease_expires_at = None
                 changed += 1
 
+            changed += get_worker_slot_service().cleanup_retired_workers(db)
             if changed:
                 db.commit()
             return changed

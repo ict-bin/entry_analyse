@@ -23,6 +23,7 @@ _running_tasks: dict[str, asyncio.Task] = {}
 # task_id -> asyncio.Event: 外部信号立即唤醒 _watch_task_control，无需等待轮询间隔
 _cancel_wake: dict[str, asyncio.Event] = {}
 WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
+WORKER_SLOT_HEARTBEAT_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 
 
 def trigger_instant_cancel(task_id: str) -> bool:
@@ -38,6 +39,7 @@ class WorkerService:
     def __init__(self):
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     def has_local_task(self, task_id: str) -> bool:
         task = _running_tasks.get(task_id)
@@ -93,17 +95,52 @@ class WorkerService:
                 logger.warning("worker poll failed: %s", exc)
             await asyncio.sleep(WORKER_POLL_SECONDS)
 
+    async def _heartbeat_loop(self) -> None:
+        from app.service import task_service as task_mod
+        from app.service.worker_slot_service import get_worker_slot_service
+
+        while self._running:
+            try:
+                db_gen = get_db()
+                db: Session = next(db_gen)
+                try:
+                    project_ids = await self._discover_active_projects()
+                    project_id = project_ids[0] if project_ids else ""
+                    max_concurrent_tasks = getattr(task_mod._load_svc_config(), "max_concurrent_tasks", 1)
+                    if project_id:
+                        svc = task_mod._load_svc_config_from_db(db, project_id)
+                        max_concurrent_tasks = getattr(svc, "max_concurrent_tasks", 1)
+                    get_worker_slot_service().upsert_heartbeat(
+                        db,
+                        worker_id=task_mod.POD_NAME,
+                        pod_name=task_mod.POD_NAME,
+                        pod_ip=task_mod.POD_IP or None,
+                        max_concurrent_tasks=max_concurrent_tasks,
+                        status="running",
+                    )
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
+            except Exception as exc:
+                logger.warning("worker slot heartbeat failed: %s", exc)
+            await asyncio.sleep(WORKER_SLOT_HEARTBEAT_SECONDS)
+
     def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ea_worker_slot_heartbeat")
         logger.info("Entry-analysis worker started (poll=%ss)", WORKER_POLL_SECONDS)
 
     def stop(self) -> None:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
 
     def is_running(self) -> bool:
         return self._running

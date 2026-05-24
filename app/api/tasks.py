@@ -175,6 +175,46 @@ class TaskEvaluationResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class EntryAnalyseActiveTaskRefResponse(BaseModel):
+    task_id: str
+    entry_id: Optional[str] = None
+    status: str
+    lease_expires_at: Optional[str] = None
+
+
+class EntryAnalyseWorkerSlotResponse(BaseModel):
+    worker_id: str
+    url: Optional[str] = None
+    pod_name: str
+    pod_ip: Optional[str] = None
+    healthy: bool
+    max_concurrent_tasks: int
+    max_concurrent_jobs: int
+    running_tasks: int = 0
+    running_jobs: int = 0
+    queued_jobs: int = 0
+    available_slots: int = 0
+    last_heartbeat_at: Optional[str] = None
+    source: str = "worker_registry"
+    error: Optional[str] = None
+    active_tasks: list[EntryAnalyseActiveTaskRefResponse] = Field(default_factory=list)
+    active_jobs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EntryAnalyseSlotClusterResponse(BaseModel):
+    worker_count: int = 0
+    healthy_workers: int = 0
+    stale_workers: int = 0
+    total_capacity: int = 0
+    busy_slots: int = 0
+    running_jobs: int = 0
+    available_slots: int = 0
+    queued_tasks: int = 0
+    queued_jobs: int = 0
+    updated_at: Optional[str] = None
+    workers: list[EntryAnalyseWorkerSlotResponse] = Field(default_factory=list)
+
+
 @router.post("/tasks", status_code=201)
 async def create_task(
     body: TaskCreateRequest,
@@ -231,6 +271,19 @@ async def list_tasks(
         sort_by=sort_by,
         sort_order=sort_order,
     )
+
+
+@router.get("/projects/{project_id}/slot-cluster", response_model=EntryAnalyseSlotClusterResponse)
+async def get_slot_cluster(
+    project_id: str,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    from app.service.worker_slot_service import get_worker_slot_service
+
+    return get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
 
 
 @router.get("/tasks/{task_id}")

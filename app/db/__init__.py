@@ -46,6 +46,21 @@ _MIGRATIONS = [
     "CREATE INDEX ix_ea_stage_result_task_stage_role_attempt ON secflow_app_ea_stage_result_index (task_id, stage_key, role_kind, attempt)",
     "CREATE INDEX ix_ea_stage_result_task_func_stage ON secflow_app_ea_stage_result_index (task_id, func_hash, stage_key)",
     "CREATE INDEX ix_ea_stage_result_task_file_stage ON secflow_app_ea_stage_result_index (task_id, file_hash, stage_key)",
+    """
+    CREATE TABLE secflow_app_ea_worker_slots (
+        id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        worker_id VARCHAR(128) NOT NULL UNIQUE,
+        pod_name VARCHAR(128) NOT NULL,
+        pod_ip VARCHAR(64) NULL,
+        max_concurrent_tasks INTEGER NOT NULL DEFAULT 1,
+        last_seen_status VARCHAR(32) NOT NULL DEFAULT 'running',
+        last_heartbeat_at DATETIME NOT NULL,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL
+    )
+    """,
+    "CREATE INDEX ix_ea_worker_slots_pod_name ON secflow_app_ea_worker_slots (pod_name)",
+    "CREATE INDEX ix_ea_worker_slots_last_heartbeat ON secflow_app_ea_worker_slots (last_heartbeat_at)",
 ]
 
 
