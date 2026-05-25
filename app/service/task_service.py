@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from fastapi import HTTPException
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -778,6 +779,8 @@ def _preferred_files_list_path(row: AppEaTask) -> str | None:
         raw = str(value or "").strip()
         if raw:
             return raw
+    if _is_binary_security_origin_task(row.task_origin_type, row.parent_task_id, row.parent_stage_name):
+        return None
     input_path = str(row.input_path or "").strip()
     module_name = str(row.module_name or "").strip()
     if not input_path or not module_name:
@@ -790,6 +793,67 @@ def _preferred_files_list_path(row: AppEaTask) -> str | None:
         return str(direct_files_list)
     legacy_files_list = input_dir / "modules" / module_name / "files.list"
     return str(legacy_files_list)
+
+
+def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task_id: Optional[str], parent_stage_name: Optional[str]) -> bool:
+    return (
+        str(task_origin_type or "").strip() == "binary_security"
+        or (
+            str(parent_task_id or "").strip() != ""
+            and str(parent_stage_name or "").strip() != ""
+        )
+    )
+
+
+def _normalize_entry_input_contract(input_contract: Optional[dict[str, Any]]) -> dict[str, Any]:
+    return dict(input_contract) if isinstance(input_contract, dict) else {}
+
+
+def _validate_binary_security_input_contract(
+    *,
+    input_contract: dict[str, Any],
+    input_path: str,
+    source_path: Optional[str],
+) -> tuple[str, str, str]:
+    module_dir = str(
+        input_contract.get("module_dir")
+        or input_contract.get("source_dir")
+        or ""
+    ).strip()
+    files_list_path = str(
+        input_contract.get("files_list_path")
+        or input_contract.get("entry_files_list")
+        or input_contract.get("files_list")
+        or ""
+    ).strip()
+    source_root = str(
+        input_contract.get("source_root")
+        or input_contract.get("source_root_path")
+        or input_contract.get("source_dir")
+        or ""
+    ).strip()
+    missing_fields = [
+        field
+        for field, value in (
+            ("module_dir", module_dir),
+            ("files_list_path", files_list_path),
+            ("source_root", source_root),
+        )
+        if not value
+    ]
+    if missing_fields:
+        raise HTTPException(
+            400,
+            "binary_security 编排来源任务缺少显式 input_contract 字段: "
+            + ", ".join(missing_fields),
+        )
+    normalized_input_path = str(input_path or "").strip()
+    normalized_source_path = str(source_path or "").strip()
+    if normalized_input_path and normalized_input_path != module_dir:
+        raise HTTPException(400, "input_path 必须与 input_contract.module_dir 保持一致")
+    if normalized_source_path and normalized_source_path != source_root:
+        raise HTTPException(400, "source_path 必须与 input_contract.source_root 保持一致")
+    return module_dir, source_root, files_list_path
 
 
 def _load_svc_config():
@@ -1367,8 +1431,19 @@ class TaskService:
         parent_stage_item_id: Optional[str] = None,
         parent_stage_item_key: Optional[str] = None,
     ) -> dict:
+        normalized_input_contract = _normalize_entry_input_contract(input_contract)
+        normalized_input_path = str(input_path or "").strip()
+        normalized_source_path = str(source_path or "").strip() or None
+        if _is_binary_security_origin_task(task_origin_type, parent_task_id, parent_stage_name):
+            validated_input_path, validated_source_path, _validated_files_list_path = _validate_binary_security_input_contract(
+                input_contract=normalized_input_contract,
+                input_path=normalized_input_path,
+                source_path=normalized_source_path,
+            )
+            normalized_input_path = validated_input_path
+            normalized_source_path = validated_source_path
         # Auto-generate prompt from module_name (never use user-supplied prompt)
-        effective_prompt = generate_prompt_from_module(module_name) if module_name else generate_prompt_from_path(input_path)
+        effective_prompt = generate_prompt_from_module(module_name) if module_name else generate_prompt_from_path(normalized_input_path)
         normalized_parent_task_id = str(parent_task_id or "").strip()
         normalized_parent_stage_name = str(parent_stage_name or "").strip()
         normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
@@ -1406,12 +1481,12 @@ class TaskService:
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-entry-analyse"
         merged_task_config = dict(task_config_json or {})
-        if isinstance(input_contract, dict) and input_contract:
-            merged_task_config["input_contract"] = dict(input_contract)
+        if normalized_input_contract:
+            merged_task_config["input_contract"] = normalized_input_contract
         row = AppEaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
-            task_description=task_description, input_path=input_path,
-            source_path=source_path or None, module_name=module_name or None,
+            task_description=task_description, input_path=normalized_input_path,
+            source_path=normalized_source_path, module_name=module_name or None,
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=effective_prompt, status="pending", created_by=created_by,
             owner_pod=None, lease_expires_at=None, cancel_requested=False,
