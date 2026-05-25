@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from app.agent_process import AgentProcessHandle
 from app import runner
 
 
@@ -24,6 +25,31 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentPromptFileTests(unittest.TestCase):
+    def test_agent_process_terminate_tree_force_cleans_group_after_exit(self):
+        logs: list[str] = []
+
+        class FakeProc:
+            pid = 123
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        async def scenario():
+            with patch("app.agent_process.process_group_exists", return_value=True):
+                with patch("app.agent_process.os.killpg") as killpg:
+                    handle = AgentProcessHandle(
+                        proc=FakeProc(),
+                        label="test",
+                        logger=logs.append,
+                        pgid=456,
+                    )
+                    await handle.terminate_tree(reason="cleanup")
+                    killpg.assert_called_once()
+
+        asyncio.run(scenario())
+        self.assertTrue(any("cleaning leaked pi process group" in msg for msg in logs))
+
     def test_run_agent_uses_prompt_file_instead_of_raw_argv(self):
         captured = {}
 

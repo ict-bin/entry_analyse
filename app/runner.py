@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from .agent_process import AgentProcessHandle, find_pi_command, process_group_id
 from .models import TokenUsage
 
 logger = logging.getLogger("ea.runner")
@@ -271,17 +272,7 @@ def _format_context_overflow_failure(
 
 def _find_pi_command() -> list[str]:
     """找到 pi 可执行文件。"""
-    pi_bin = os.environ.get("PI_BIN")
-    if pi_bin and os.path.isfile(pi_bin):
-        return [pi_bin]
-    pi_path = shutil.which("pi")
-    if pi_path:
-        return [pi_path]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "pi"]
-    raise FileNotFoundError(
-        "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent")
+    return find_pi_command()
 
 
 def _pi_config_dir() -> Path:
@@ -828,13 +819,16 @@ async def _run_with_api_retry(
         # 避免将大 prompt 拼入命令行参数超出 Linux ARG_MAX 限制。
         # 根据 WORKER_ISOLATION_MODE 可选包裹文件系统隔离层。
         _spawn_args = _build_isolated_args(args, cwd)
-        proc = await asyncio.create_subprocess_exec(
-            *_spawn_args, cwd=cwd,
+        handle = await AgentProcessHandle.spawn(
+            *_spawn_args,
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,
-            start_new_session=True,   # 独立 process group，cancel 时可 killpg 杀全组
+            logger=_log_warn,
+            label="entry-agent",
         )
+        proc = handle.proc
 
         # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
         if stdin_data and proc.stdin:
@@ -853,7 +847,7 @@ async def _run_with_api_retry(
                 # 在 kill 前先记录 pgid，防止 pi 退出后无法获取
                 pgid: int | None = None
                 try:
-                    pgid = os.getpgid(proc.pid)
+                    pgid = process_group_id(proc)
                 except (ProcessLookupError, OSError):
                     pass
                 # Step1：向整个 process group 发 SIGTERM（杀 pi 及其工具子进程）
@@ -910,28 +904,14 @@ async def _run_with_api_retry(
             result.exit_code = proc.returncode or 0
 
         except asyncio.CancelledError:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await handle.terminate_tree(reason="task_cancelled")
             raise
         except Exception as e:
             # 管道断裂、进程被杀等
             _log_warn(f"pi 进程读取异常: {e}")
             result.error = f"pi process read error: {e}"
             result.exit_code = -1
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
 
         finally:
             if cancel_task:
@@ -940,6 +920,11 @@ async def _run_with_api_retry(
                     await cancel_task
                 except asyncio.CancelledError:
                     pass
+            await handle.terminate_tree(
+                reason="finally_cleanup",
+                term_timeout=2.0,
+                kill_timeout=2.0,
+            )
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
