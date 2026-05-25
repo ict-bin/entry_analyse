@@ -1859,7 +1859,11 @@ class TaskService:
             "stages_json": _stages_json_summary(row.stages_json) if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
             "function_catalog": _build_function_catalog(row) if include_heavy else [],
-            "lean_mode": bool(((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False)),
+            "lean_mode": bool(
+                (row.task_config_json or {}).get("lean_mode",
+                    ((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False)
+                )
+            ),
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
