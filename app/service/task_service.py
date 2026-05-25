@@ -759,7 +759,37 @@ def _origin_payload(row: AppEaTask) -> dict:
         "parent_stage_item_key": row.parent_stage_item_key,
         "origin_label": origin_label,
         "parent_task_display": row.parent_task_id,
+        "input_contract": (
+            dict((row.task_config_json or {}).get("input_contract") or {})
+            if isinstance((row.task_config_json or {}).get("input_contract"), dict)
+            else None
+        ),
     }
+
+
+def _preferred_files_list_path(row: AppEaTask) -> str | None:
+    task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
+    input_contract = task_config.get("input_contract") if isinstance(task_config.get("input_contract"), dict) else {}
+    candidates = [
+        input_contract.get("files_list_path"),
+        input_contract.get("entry_files_list"),
+    ]
+    for value in candidates:
+        raw = str(value or "").strip()
+        if raw:
+            return raw
+    input_path = str(row.input_path or "").strip()
+    module_name = str(row.module_name or "").strip()
+    if not input_path or not module_name:
+        return None
+    input_dir = Path(input_path)
+    direct_files_list = input_dir / "files.list"
+    if direct_files_list.is_file():
+        return str(direct_files_list)
+    if input_dir.name == module_name and direct_files_list.exists():
+        return str(direct_files_list)
+    legacy_files_list = input_dir / "modules" / module_name / "files.list"
+    return str(legacy_files_list)
 
 
 def _load_svc_config():
@@ -1322,6 +1352,7 @@ class TaskService:
         input_path: str,
         module_name: str = "",
         source_path: Optional[str] = None,
+        input_contract: Optional[dict[str, Any]] = None,
         output_path: Optional[str] = None,
         task_description: Optional[str] = None,
         prompt_template_id: Optional[str] = None,
@@ -1374,6 +1405,9 @@ class TaskService:
         task_id = f"eat_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-entry-analyse"
+        merged_task_config = dict(task_config_json or {})
+        if isinstance(input_contract, dict) and input_contract:
+            merged_task_config["input_contract"] = dict(input_contract)
         row = AppEaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=input_path,
@@ -1381,7 +1415,7 @@ class TaskService:
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=effective_prompt, status="pending", created_by=created_by,
             owner_pod=None, lease_expires_at=None, cancel_requested=False,
-            task_config_json=task_config_json,
+            task_config_json=merged_task_config or None,
             task_origin_type=str(task_origin_type or "").strip() or "manual",
             parent_project_id=parent_project_id,
             parent_task_id=parent_task_id,
@@ -1552,7 +1586,7 @@ class TaskService:
             "run_root": run_root,
             "workspace_root": workspace_root,
             "input_summary": {
-                "files_list_path": str(Path(row.input_path) / "modules" / str(row.module_name or "") / "files.list") if row.input_path and row.module_name else None,
+                "files_list_path": _preferred_files_list_path(row),
             } if include_heavy else None,
             "output_summary": {
                 "r1_functions_path": str(Path(workspace_root) / "r1-functions") if workspace_root else None,

@@ -21,6 +21,7 @@ class TaskCreateRequest(BaseModel):
     input_path: str                          # 模块目录（含 modules/ 子目录或直接含 files.list）
     module_name: str                         # 具体模块名（从 list_modules 中选择）
     source_path: Optional[str] = None       # 源码根目录（用于解析 files.list 中的路径）
+    input_contract: Optional[dict[str, Any]] = None
     output_path: Optional[str] = None
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
@@ -231,6 +232,7 @@ async def create_task(
         input_path=body.input_path,
         module_name=body.module_name,
         source_path=body.source_path,
+        input_contract=body.input_contract,
         output_path=body.output_path,
         task_description=body.task_description,
         prompt_template_id=body.prompt_template_id,
