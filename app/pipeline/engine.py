@@ -674,8 +674,7 @@ class PipelineEngine:
                 ws_file_path = dirs.source / _rel
                 worker_result_file = dirs.stage_result_file("r1_w", "worker", file_hash, fs.r1_attempts)
                 worker_raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, fs.r1_attempts)
-                j_prompt = P.build_r1_j_prompt(
-                    file_name=Path(file_path).name,
+                j_prompt = P.build_r1_file_j_prompt(
                     func_count=len(fs.functions),
                     ws_file_path=str(ws_file_path),
                     gaps_file=str(gaps_file) if gaps_file.exists() else "",

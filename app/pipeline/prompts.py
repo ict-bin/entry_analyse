@@ -40,7 +40,7 @@ def _retry_section(feedback: str, label: str = "Judge 评审意见") -> str:
 
 # ─── R1a Judge / R1 Judge ─────────────────────────────────────────────────────
 
-def build_r1_j_prompt(
+def build_r1_file_j_prompt(
     file_name: str,
     func_count: int,
     ws_file_path: str,
@@ -49,7 +49,7 @@ def build_r1_j_prompt(
     worker_result_file: str = "",
     worker_raw_file: str = "",
 ) -> str:
-    """R1a Judge：文件级覆盖率验证，必须先审阅本轮 Worker 结果文件。"""
+    """R1 Judge（文件级）：文件级覆盖率验证，必须先审阅本轮 Worker 结果文件。"""
     if gaps_file:
         gap_hint = (
             f"源文件路径：`{ws_file_path}`\n\n"
@@ -67,7 +67,7 @@ def build_r1_j_prompt(
             f"`python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}` 确认列表。"
         )
     return (
-        f"# Round 1a Judge — 覆盖率验证：`{file_name}`\n\n"
+        f"# R1 Judge（文件级）— 覆盖率验证：`{file_name}`\n\n"
         f"funcdb 共 {func_count} 个函数。\n\n"
         f"{gap_hint}\n\n"
         f"输出格式：\n```\n通过: 是\n反馈: <验证结论>\n```"
