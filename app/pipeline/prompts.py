@@ -199,6 +199,12 @@ def build_r2_w_prompt(
             f"**步骤 2**：分析是否有外部输入：\n\n"
             f"   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
             f"   **主动型（A）**：函数体调用 {_PATTERNS} 等\n"
+            f"\n"
+            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true：**\n"
+            f"   - 函数名以 `Create/Fill/Build/Make/Send/Write/Prepare/FillIn` 开头，"
+            f"且函数体是构造或发送消息（分配 buffer、填写字段、调用发送 API）\n"
+            f"   - 函数是 FSM action（`FsmAct*`）：`ctx_base` 是内部上下文，不是外部消息\n"
+            f"   - 函数参数全为内部对象/指针，无数据包/消息内容的实际读取（只做内存填充或状态更新）\n"
         )
     else:
         step2 = (
@@ -207,6 +213,12 @@ def build_r2_w_prompt(
             f"     → `has_external_input: false`\n"
             f"   - 有命中行：精确定位（`sed -n '<行号>p' {file_path}`）确认后分析 taint\n"
             f"   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）\n"
+            f"\n"
+            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true：**\n"
+            f"   - 函数名以 `Create/Fill/Build/Make/Send/Write/Prepare/FillIn` 开头，"
+            f"且函数体是构造或发送消息（分配 buffer、填写字段、调用发送 API）\n"
+            f"   - 函数是 FSM action（`FsmAct*`）：`ctx_base` 是内部上下文，不是外部消息\n"
+            f"   - 函数参数全为内部对象/指针，无数据包/消息内容的实际读取（只做内存填充或状态更新）\n"
         )
 
     return (
@@ -340,162 +352,67 @@ def build_r3_w_func_prompt(
     end_line: int,
     file_path: str,
     r3_func_out_path: "Path",
-    caller_ctx: "dict | None" = None,
-    other_candidates: "list[dict] | None" = None,  # 已废弃，保留居兼容
+    caller_ctx: "dict | None" = None,       # 保留参数签名兼容，内部不使用
+    other_candidates: "list[dict] | None" = None,  # 已废弃，保留兼容
     is_retry: bool = False,
     feedback: str = "",
 ) -> str:
     """
     R3 Worker（函数级并行）：对单个候选函数判断是否为模块外部入口。
 
-    v4 变化：
-      - 移除 other_candidates（CC 岛子对单文件内调用关系已建全图）
-      - 新增 caller_ctx：包含模块级完整调用链（direct_callers + ancestors）
-      - 判断逻辑均基于 caller_ctx。不再要求 LLM grep 同文件其他候选
+    v5 变化：
+      - 完全移除 caller_ctx：R3 只看函数体本身，不追查调用链
+      - 补充 filter 规则：Create/Fill/FsmAct 等发送/构造型函数可过滤
     """
-    if caller_ctx is None:
-        caller_ctx = {}
     basename = os.path.basename(file_path)
     abs_path = os.path.abspath(file_path)
-    retry = _retry_section(feedback) if is_retry else ""
-
-    # 构建 caller 上下文展示表
-    direct_callers = caller_ctx.get("direct_callers", [])
-    ancestors      = caller_ctx.get("ancestors", [])
-    has_any_caller = caller_ctx.get("has_any_caller", bool(direct_callers))
-
-    if not direct_callers:
-        caller_block = (
-            "> 无模块内调用者（CC 静态建图未发现任何调用关系），强烈建议 `keep`（直接外部边界）。"
-        )
-    else:
-        rows = ["| caller 名称 | call_type | 调用者是否有外部输入 |",
-                "|-----------|-----------|---------------------|"
-                ]
-        for c in direct_callers[:8]:
-            name   = (c.get("name") or "?")[:40]
-            ctype  = c.get("call_type", "?")
-            r2ok   = "是✔" if c.get("is_r2_passed") else "否"
-            rows.append(f"| `{name}` | `{ctype}` | {r2ok} |")
-        caller_block = "\n".join(rows)
-        if ancestors:
-            anc_names = ", ".join(
-                f"`{a.get('name','?')}` (depth={a.get('depth','?')})"
-                for a in ancestors[:4]
-            )
-            caller_block += f"\n\n上游祖先：{anc_names}"
-
+    retry    = _retry_section(feedback) if is_retry else ""
     sed_body = f"sed -n '{start_line},{end_line}p' {abs_path}"
-    grep_cb  = (
-        f"grep -n '{func_name}' {abs_path} | "
-        f"grep -i 'register" + r"\|hook\|bind\|RegFunc\|SubIf\|MsgBind\|callback'" + "'"
-    )
 
     return (
         f"# R3 Worker \u2014 单函数入口判断\n\n"
         f"{retry}"
-        f"| 字段 | 値 |\n"
+        f"| 字段 | 值 |\n"
         f"|------|-------|\n"
         f"| func_hash | `{func_hash}` |\n"
         f"| name | `{func_name}` |\n"
+        f"| 签名 | `{signature}` |\n"
         f"| 行范围 | {start_line}~{end_line} |\n"
         f"| 文件 | `{basename}` |\n\n"
-        f"## 调用链上下文（来自静态建图，全模块覆盖）\n\n"
-        f"{caller_block}\n\n"
-        f"## 决策规则\n\n"
-        f"基于上方调用链信息，结合函数体内容，判断是否是模块外部入口：\n\n"
-        f"- **无 caller**：直接模块边界，强烈 keep\n"
-        f"- **call_type=`ptr`**：本函数被函数指针/回调注册调用 \u2192 `dispatch_target`/`callback`，保留\n"
-        f"- **有 caller 且 R2=是，且 call_type=`direct`**：数据可能来自 caller → 需读函数体确认\n"
-        f"- **有 caller 且 R2=否**： caller 是纯内部函数，不传递外部数据 \u2192 保留\n"
-        f"- **不确定时**：保守保留（宁可误报不漏报）\n\n"
-        f"## 分析步骤\n\n"
-        f"### 步骤 1：读取函数体\n\n"
+        f"## 判断规则\n\n"
+        f"**只看函数体本身**，判断本函数是否是模块的外部入口：\n\n"
+        f"**应 `keep` 的情况（满足任一即保留）：**\n"
+        f"- 函数体内有直接接收外部数据的调用（网络/IPC/消息队列/管道等）\n"
+        f"- 签名参数直接承载来自模块外部的原始数据（mbuf/msg/message/request/packet 等），"
+        f"且函数体内有对这些参数数据的解析/处理逻辑\n"
+        f"- 函数是回调类型（被框架/定时器/FSM 直接调用，处理外部事件）\n\n"
+        f"**应 `filter` 的情况（满足任一可过滤）：**\n"
+        f"- 函数名以 `Create/Fill/Build/Make/Send/Write/Prepare/FillIn` 开头，"
+        f"且函数体是**构造或发送**消息（分配 buffer、填写字段、调用发送 API）\n"
+        f"- 函数体只做格式转换/内存填充/字段映射，无对外部来源数据的处理\n"
+        f"- 函数是 FSM action（`FsmAct*`）或状态日志，只操作内部上下文\n"
+        f"- 函数是内部计数/统计更新（`Update*Stats/Count/Increment`）\n\n"
+        f"**不确定时：保守保留（宁可误报不漏报）**\n\n"
+        f"## 步骤 1：读取函数体\n\n"
         f"```bash\n{sed_body}\n```\n\n"
-        f"判断：\n"
-        f"- 有没有主动获取外部数据的调用（网络/IPC/消息队列等）\n"
-        f"- 根据**代码语义**判断，不依赖特定函数名模式\n\n"
-        f"### 步骤 2：检查回调注册（若 caller_ctx 显示有 ptr 调用者，可跳过）\n\n"
-        f"```bash\n{grep_cb}\n```\n\n"
-        f"### 步骤 3：写出判断结果\n\n"
+        f"基于函数体，直接判断：\n"
+        f"- 有没有从外部接收数据的行为（recv/IPC 读取/消息处理）\n"
+        f"- 有没有 Create/Fill/Send 等发送型行为\n"
+        f"- 参数携带的数据是\u201c被该函数消费的外部输入\u201d还是\u201c调用者传来的内部状态\u201d\n\n"
+        f"## 步骤 2：写出判断结果\n\n"
         f"使用 `write` 工具写到：`{r3_func_out_path}`\n\n"
         f"```json\n"
         f"{{\n"
         f'  "decision": "keep",\n'
         f'  "entry_type": "A",\n'
         f'  "entry_role": "boundary",\n'
-        f'  "reason": "具体判断依据（≤80字）"\n'
+        f'  "reason": "判断依据（\u226480字）"\n'
         f"}}\n"
         f"```\n\n"
         f"- `decision`: `keep` 或 `filter`\n"
-        f"- `entry_type`: `A`（主动）/ `P`（被动/回调/dispatch_target）/ `-`（filter）\n"
+        f"- `entry_type`: `A`（主动获取）/ `P`（被动接收）/ `-`（filter）\n"
         f"- `entry_role`: `boundary`/`dispatch_target`/`callback`/`ipc_handler`（filter 时留空）\n"
     )
-    basename = os.path.basename(file_path)
-    retry = _retry_section(feedback) if is_retry else ""
-
-    if other_candidates:
-        others_str = "\n".join(
-            f"  - `{c['name']}` (line {c['start_line']}-{c['end_line']})"
-            for c in other_candidates[:40]
-        )
-        if len(other_candidates) > 40:
-            others_str += f"\n  (\u2026\u5171 {len(other_candidates)} \u4e2a)"
-    else:
-        others_str = "  \uff08\u65e0\u5176\u4ed6\u5019\u9009\u51fd\u6570\uff09"
-
-    grep_cb  = f"grep -n '{func_name}' {file_path} | grep -i 'register" + r"\|hook\|bind\|RegFunc\|SubIf\|MsgBind\|callback'" + "'"
-    grep_cal = f"grep -n '{func_name}(' {file_path} | grep -v '^{start_line}:' | head -10"
-    sed_body = f"sed -n '{start_line},{end_line}p' {file_path}"
-
-    return (
-        f"# R3 Worker \u2014 \u5355\u51fd\u6570\u5165\u53e3\u5224\u65ad\n\n"
-        f"{retry}"
-        f"| \u5b57\u6bb5 | \u5024 |\n"
-        f"|------|-------|\n"
-        f"| func_hash | `{func_hash}` |\n"
-        f"| name | `{func_name}` |\n"
-        f"| \u884c\u8303\u56f4 | {start_line}~{end_line} |\n"
-        f"| \u6587\u4ef6 | `{basename}` |\n\n"
-        f"**\u540c\u6587\u4ef6\u5176\u4ed6 R2 \u5019\u9009\u51fd\u6570**\uff08\u53ef\u80fd\u8c03\u7528\u672c\u51fd\u6570\uff0c\u53ef\u80fd\u662f\u672c\u51fd\u6570\u7684\u8c03\u7528\u8005\uff09\uff1a\n\n"
-        f"{others_str}\n\n"
-        f"## \u4efb\u52a1\n\n"
-        f"\u5224\u65ad `{func_name}` \u662f\u5426\u662f\u6a21\u5757\u7684**\u5916\u90e8\u5165\u53e3**"
-        f"\uff08\u76f4\u63a5\u6216\u95f4\u63a5\u63a5\u6536\u6765\u81ea\u6a21\u5757\u5916\u90e8\u7684\u6570\u636e\uff09\u3002\n\n"
-        f"## \u5206\u6790\u6b65\u9aa4\n\n"
-        f"### \u6b65\u9aa4 1\uff1a\u8bfb\u53d6\u51fd\u6570\u4f53\n\n"
-        f"```bash\n{sed_body}\n```\n\n"
-        f"\u76f4\u63a5\u9605\u8bfb\u4ee3\u7801\uff0c\u5224\u65ad\uff1a\n"
-        f"- \u6709\u6ca1\u6709\u4ece\u5916\u90e8\u6e90\u4e3b\u52a8\u83b7\u53d6\u6570\u636e\u7684\u8c03\u7528\uff08\u7f51\u7edc recv/read\u3001IPC \u6d88\u606f\u63a5\u6536\u3001\u961f\u5217/\u7ba1\u9053\u8bfb\u53d6\u3001\u5b9a\u65f6\u5668\u6d88\u606f\u7b49\uff09\n"
-        f"- \u6839\u636e**\u4ee3\u7801\u8bed\u4e49**\u5224\u65ad\uff0c\u4e0d\u4f9d\u8d56\u7279\u5b9a\u51fd\u6570\u540d\u6a21\u5f0f\n\n"
-        f"### \u6b65\u9aa4 2\uff1a\u68c0\u67e5\u56de\u8c03\u6ce8\u518c\uff08\u88ab\u52a8\u578b\uff09\n\n"
-        f"```bash\n{grep_cb}\n```\n"
-        f"\u6709\u547d\u4e2d \u2192 **\u88ab\u52a8\u578b\u56de\u8c03\u5165\u53e3\uff08P\uff09**\uff0c`entry_role=callback`\n\n"
-        f"### \u6b65\u9aa4 3\uff1a\u68c0\u67e5\u8c03\u7528\u8005\uff08\u533a\u5206\u9876\u5c42\u5165\u53e3 vs \u5b50\u51fd\u6570\uff09\n\n"
-        f"```bash\n{grep_cal}\n```\n\n"
-        f"\u5bf9\u547d\u4e2d\u7684**\u8c03\u7528\u8005**\u9010\u4e00\u5224\u65ad\uff1a\n"
-        f"- \u8c03\u7528\u8005\u5728\u4e0a\u65b9\u300c\u5176\u4ed6\u5019\u9009\u51fd\u6570\u300d\u5217\u8868\u4e2d \u2192 \u672c\u51fd\u6570\u662f**\u5b50\u51fd\u6570**\uff0c**\u5220\u9664**\n"
-        f"- \u8c03\u7528\u8005\u51fd\u6570\u540d\u542b `Dispatch/ProcMsg/MsgProc/Handler` \u7b49\u5206\u53d1\u7279\u5f81"
-        f" \u2192 dispatch_target\uff0c**\u4fdd\u7559**\uff08`entry_role=dispatch_target`\uff09\n"
-        f"- \u8c03\u7528\u8005\u4e0d\u5728\u5019\u9009\u5217\u8868\u4e14\u4e0d\u662f dispatcher \u2192 \u5de5\u5177\u51fd\u6570 \u2192 **\u5220\u9664**\n"
-        f"- \u65e0\u8c03\u7528\u8005\uff08\u6216\u4ec5\u5728\u5176\u4ed6\u6587\u4ef6\u4e2d\u88ab\u8c03\u7528\uff09 \u2192 **\u4fdd\u7559**\n\n"
-        f"### \u6b65\u9aa4 4\uff1a\u5199\u51fa\u5224\u65ad\u7ed3\u679c\n\n"
-        f"\u4f7f\u7528 `write` \u5de5\u5177\u5199\u51fa\u5230\uff1a`{r3_func_out_path}`\n\n"
-        f"\u683c\u5f0f\uff08JSON \u5355\u5bf9\u8c61\uff09\uff1a\n"
-        f"```json\n"
-        f"{{\n"
-        f'  "decision": "keep",\n'
-        f'  "entry_type": "A",\n'
-        f'  "entry_role": "boundary",\n'
-        f'  "reason": "\u51fd\u6570\u4f53\u4e2d\u76f4\u63a5\u8c03\u7528\u4e86 xxx \u63a5\u6536\u5916\u90e8\u7f51\u7edc\u6570\u636e"\n'
-        f"}}\n"
-        f"```\n\n"
-        f"- `decision`: `keep` \u6216 `filter`\n"
-        f"- `entry_type`: `A`\uff08\u4e3b\u52a8\uff09/ `P`\uff08\u88ab\u52a8/\u56de\u8c03/dispatch_target\uff09/ `-`\uff08filter \u65f6\uff09\n"
-        f"- `entry_role`: `boundary`/`dispatch_target`/`callback`/`ipc_handler`\uff08filter \u65f6\u7559\u7a7a\uff09\n"
-        f"- `reason`: \u4e00\u53e5\u8bdd\u8bf4\u660e\u5224\u65ad\u4f9d\u636e\uff08\u226480\u5b57\uff09\n"
-    )
-
 
 
 # ─── R3 Judge ─────────────────────────────────────────────────────────────────

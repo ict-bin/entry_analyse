@@ -89,6 +89,55 @@ def _split_gap_at_blanks(
     return chunks if chunks else [(start, end)]
 
 
+# ─── Gap 分类（R1 预筛优化）─────────────────────────────────────────────────────
+
+_SKIPPABLE_KINDS = frozenset({
+    "extern_block", "include_macro_block", "comment_block",
+    "struct_enum_block", "forward_decl_block",
+})
+
+
+def _classify_gap(lines_data: list[str], start: int, end: int) -> str:
+    """
+    程序化判断 gap 区间类型，不调用 LLM。
+
+    返回值：
+      'extern_block'        - 连续 extern 声明
+      'include_macro_block' - include/define/pragma 块
+      'comment_block'       - 注释块
+      'struct_enum_block'   - typedef/struct/enum 定义（无函数体花括号）
+      'forward_decl_block'  - 函数前向声明（行尾分号，无函数体）
+      'likely_function'     - 疑似含函数体（有匹配的 { 和 }）
+      'ambiguous'           - 无法确定
+    """
+    seg = [l for l in lines_data[start - 1 : end] if l.strip()]
+    if not seg:
+        return "comment_block"
+
+    total       = len(seg)
+    extern_n    = sum(1 for l in seg if l.strip().startswith("extern "))
+    include_n   = sum(1 for l in seg if l.strip().startswith(
+        ("#include", "#define", "#pragma", "#undef",
+         "#ifdef", "#ifndef", "#endif", "#if ")))
+    comment_n   = sum(1 for l in seg if l.strip().startswith(
+        ("//", "/*", " *", "*/")))
+    typedef_n   = sum(1 for l in seg if re.match(r'\s*(typedef|struct|enum|union)\b', l))
+    forward_n   = sum(1 for l in seg
+                      if re.match(r'\s*\w[\w\s\*]+\(', l)
+                      and l.rstrip().endswith(';')
+                      and '{' not in l)
+    brace_open  = sum(1 for l in seg if '{' in l)
+    brace_close = sum(1 for l in seg if '}' in l)
+
+    if extern_n  >= total * 0.6: return "extern_block"
+    if include_n >= total * 0.6: return "include_macro_block"
+    if comment_n >= total * 0.8: return "comment_block"
+    if typedef_n > 0 and brace_open <= 2: return "struct_enum_block"
+    if forward_n >= total * 0.4 and brace_open <= 2: return "forward_decl_block"
+    if brace_open >= 2 and brace_close >= 2: return "likely_function"
+    return "ambiguous"
+
+
 def _compute_gaps(
     funcs: list["FunctionExtract"],
     file_path: str,
@@ -138,7 +187,8 @@ def _compute_gaps(
             if has_code:
                 # 超大 gap 按空行切分，避免 agent 一次性面对整个文件
                 for cs, ce in _split_gap_at_blanks(lines, gap_start, gap_end, min_size=min_gap):
-                    gaps.append({"start": cs, "end": ce, "lines": ce - cs + 1})
+                    kind = _classify_gap(lines, cs, ce)
+                    gaps.append({"start": cs, "end": ce, "lines": ce - cs + 1, "kind": kind})
         prev_end = seg_end
 
     return gaps
@@ -178,6 +228,8 @@ def build_r1_w_initial_prompt(
     file_hash: str,
     dirs: "PipelineDirs",
     gaps_file_path: "Path | None" = None,
+    gaps_llm_file_path: "Path | None" = None,
+    skipped_n: int = 0,
     gaps: "list | None" = None,  # deprecated, ignored
 ) -> str:
     """
@@ -185,6 +237,8 @@ def build_r1_w_initial_prompt(
 
     Gap 内容单独存储到 {file_hash}_gaps.json，
     通过 sed 读取，不嵌入 prompt，避免大文件时 prompt 超大。
+
+    gaps_llm_file_path: 经预筛后只含 LLM 需审查条目的 gaps 文件，若提供则 W 使用此文件而非全量文件。
     """
     basename = os.path.basename(file_path)
     abs_path = os.path.abspath(file_path)
@@ -198,14 +252,23 @@ def build_r1_w_initial_prompt(
             f"需检查 gap 区间是否有遗漏函数。"
         )
 
-    if gaps_file_path and gaps_file_path.exists():
+    # W 优先使用预筛后的 LLM gaps 文件；如果无预筛文件则退化到全量文件
+    _display_gap_file = gaps_llm_file_path or gaps_file_path
+    _has_gap_file     = bool(_display_gap_file and _display_gap_file.exists())
+
+    if _has_gap_file:
+        _skipped_hint = (
+            f"（已预筛：{skipped_n} 个 gap 确认为 extern/macro/comment/typedef，无需检查）\n\n"
+            if skipped_n > 0 else ""
+        )
         gap_instruction = (
             f"## Gap 文件（ctags 未覆盖的行区间）\n\n"
+            f"{_skipped_hint}"
             f"请读取 gap 信息文件：\n\n"
             f"```bash\n"
-            f"cat {gaps_file_path}\n"
+            f"cat {_display_gap_file}\n"
             f"```\n\n"
-            f"每个 gap 条目包含 `start`/`end`/`lines` 字段。"
+            f"每个 gap 条目包含 `start`/`end`/`lines`/`kind` 字段。"
             f"对于每个 gap，用 sed 查看具体内容：\n\n"
             f"```bash\n"
             f"sed -n '<start>,<end>p' {abs_path}\n"
@@ -413,18 +476,90 @@ async def run_r1_worker(
         # 计算 gaps 并写入文件（不嵌入 prompt，避免大文件时 prompt 超大）
         gaps_file = dirs.r1_gaps_file(file_hash)
         gaps_list = _compute_gaps(static_funcs, file_path)
+        llm_gaps  = [g for g in gaps_list if g.get("kind") not in _SKIPPABLE_KINDS]
+        skipped_n = len(gaps_list) - len(llm_gaps)
+
+        # 写全量 gaps（R1a-J 核查用，包含 kind 字段）
+        import json as _json
         if gaps_list:
-            import json as _json
             gaps_file.write_text(
                 _json.dumps(gaps_list, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
         elif gaps_file.exists():
-            gaps_file.unlink()  # 无 gap 时删除旧文件
+            gaps_file.unlink()
+
+        # 写 LLM 专用 gaps（只含需要 LLM 审查的条目）
+        gaps_llm_file = gaps_file.with_name(f"{file_hash}_gaps_llm.json")
+        if llm_gaps:
+            gaps_llm_file.write_text(
+                _json.dumps(llm_gaps, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        elif gaps_llm_file.exists():
+            gaps_llm_file.unlink()
+
+        # 快速路径：所有 gap 均可程序化确认为非函数体，跳过 LLM
+        if not llm_gaps:
+            logger.info(
+                "R1a-W: %d/%d gaps pre-classified non-function, skip LLM for %s",
+                skipped_n, len(gaps_list), basename,
+            )
+            _safe_emit(on_event, "r1_w_start", task_id,
+                       file=basename, file_hash=file_hash, is_retry=False, retry_reason="")
+            _safe_emit(on_event, "r1_w_done", task_id,
+                       file=basename, file_hash=file_hash, tokens_in=0, tokens_out=0, error="")
+            _rp = {
+                "stage": "r1_w", "attempt": 1, "scope": "file",
+                "file_hash": file_hash, "source_file": os.path.abspath(file_path),
+                "status": "ok", "result_type": "corrections", "result": [],
+                "note": f"pre-screened: {len(gaps_list)} gaps ({skipped_n} skipped), 0 need LLM",
+            }
+            _rf  = dirs.stage_result_file("r1_w", "worker", file_hash, 1)
+            _raw = dirs.stage_raw_file("r1_w", "worker", file_hash, 1)
+            write_stage_result_files(result_file=_rf, raw_file=_raw, payload=_rp, raw_text="")
+            upsert_stage_result_index(
+                task_id=task_id, stage_key="r1_w", role_kind="worker", scope_kind="file",
+                attempt=1, file_hash=file_hash, status="ok",
+                summary=f"pre-screened:{len(gaps_list)}gaps,{skipped_n}skipped",
+                result_file_path=str(_rf), raw_file_path=str(_raw),
+            )
+            all_meta = db.get_all_meta()
+            _fo: list[FunctionExtract] = []
+            _ho: list[str] = []
+            for item in all_meta:
+                fh = item.get("func_hash", "")
+                if not fh:
+                    continue
+                _fo.append(FunctionExtract(
+                    name=item.get("name", ""), signature=item.get("signature", ""),
+                    start_line=item.get("start_line", 0), end_line=item.get("end_line", 0), body="",
+                ))
+                _ho.append(fh)
+            if not _fo and static_funcs:
+                _fo, _ho = static_funcs, func_hashes_static
+            try:
+                _mdb = ModuleDB.open(dirs.workspace)
+                _mdb.sync_file(
+                    file_hash, os.path.abspath(file_path),
+                    os.path.relpath(os.path.abspath(file_path), source_dir) if source_dir else basename,
+                    len(_fo),
+                )
+                _mdb.sync_functions(file_hash, [
+                    {"func_hash": fh, "name": fe.name, "signature": fe.signature,
+                     "start_line": fe.start_line, "end_line": fe.end_line,
+                     "body_lines": max(0, (fe.end_line or 0) - (fe.start_line or 0) + 1)}
+                    for fe, fh in zip(_fo, _ho)
+                ])
+            except Exception as exc:
+                logger.warning("R1a-W: ModuleDB sync failed (fast path) for %s: %s", basename, exc)
+            return TokenUsage(), _fo, _ho
 
         prompt = build_r1_w_initial_prompt(
             file_path, len(static_funcs), file_hash, dirs,
             gaps_file_path=gaps_file if gaps_list else None,
+            gaps_llm_file_path=gaps_llm_file if llm_gaps else None,
+            skipped_n=skipped_n,
         )
     else:
         current_count = db.stats().get("total", 0)
@@ -445,12 +580,21 @@ async def run_r1_worker(
             db.write_functions(file_hash, file_path, static_funcs, func_hashes_static, rel_path=rel)
             gaps_file  = dirs.r1_gaps_file(file_hash)
             gaps_list2 = _compute_gaps(static_funcs, file_path)
+            llm_gaps2  = [g for g in gaps_list2 if g.get("kind") not in _SKIPPABLE_KINDS]
+            skipped_n2 = len(gaps_list2) - len(llm_gaps2)
+            import json as _json2
             if gaps_list2:
-                import json as _json2
                 gaps_file.write_text(_json2.dumps(gaps_list2, ensure_ascii=False, indent=2), encoding="utf-8")
+            gaps_llm_file2 = gaps_file.with_name(f"{file_hash}_gaps_llm.json")
+            if llm_gaps2:
+                gaps_llm_file2.write_text(_json2.dumps(llm_gaps2, ensure_ascii=False, indent=2), encoding="utf-8")
+            elif gaps_llm_file2.exists():
+                gaps_llm_file2.unlink()
             prompt = build_r1_w_initial_prompt(
                 file_path, len(static_funcs), file_hash, dirs,
                 gaps_file_path=gaps_file if gaps_list2 else None,
+                gaps_llm_file_path=gaps_llm_file2 if llm_gaps2 else None,
+                skipped_n=skipped_n2,
             )
         else:
             prompt = build_r1_w_retry_prompt(file_path, file_hash, dirs, feedback)

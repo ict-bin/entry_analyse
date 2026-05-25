@@ -593,3 +593,118 @@ def generate_draft_from_func_reports(
     ]
     return chr(10).join(lines)
 
+
+# ─── 脚本化汇总 final_report.md ──────────────────────────────────────────────────
+
+def generate_final_report_from_parts(
+    output_dir: "Path",
+    module_name: str,
+) -> "Path":
+    """
+    脚本化汇总 final_report.md，不调用 LLM。
+
+    读取 entry-details.json + reports/*.md，按 entry_role 分组拼接。
+    内嵌每个函数的 R5 单函数报告（已经有 LLM 深度分析），完全不损失分析深度。
+    """
+    from pathlib import Path as _Path
+
+    out_dir     = _Path(output_dir)
+    entries_path = out_dir / "entry-details.json"
+    reports_dir  = out_dir / "reports"
+    out_path     = out_dir / "final_report.md"
+
+    import json as _json
+    entries: list[dict] = _json.loads(entries_path.read_text(encoding="utf-8"))
+
+    # 按 entry_role 分组
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        groups.setdefault(str(e.get("entry_role") or "boundary"), []).append(e)
+
+    total      = len(entries)
+    boundary_n = len(groups.get("boundary", []))
+    disp_n     = len(groups.get("dispatch_target", []))
+    cb_n       = len(groups.get("callback", []))
+    ipc_n      = len(groups.get("ipc_handler", []))
+    tag_a      = sum(1 for e in entries if e.get("tag") == "A")
+    tag_p      = total - tag_a
+    files_set  = set(str(e.get("file") or "") for e in entries)
+    now        = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines: list[str] = [
+        f"# {module_name} 外部入口安全分析报告",
+        f"",
+        f"**生成时间**：{now}  ",
+        f"**入口总数**：{total}",
+        f"",
+        f"---",
+        f"",
+        f"## 概要统计",
+        f"",
+        f"| 分类 | 数量 |",
+        f"|---|---:|",
+        f"| 模块边界（boundary） | {boundary_n} |",
+        f"| 分发目标（dispatch_target） | {disp_n} |",
+        f"| 框架回调（callback） | {cb_n} |",
+        f"| IPC 处理（ipc_handler） | {ipc_n} |",
+        f"| 主动型（A） | {tag_a} |",
+        f"| 被动型（P） | {tag_p} |",
+        f"",
+    ]
+
+    ROLE_ORDER = ["boundary", "dispatch_target", "callback", "ipc_handler"]
+    ROLE_LABEL = {
+        "boundary":        "模块边界（boundary）",
+        "dispatch_target": "分发目标（dispatch_target）",
+        "callback":        "框架回调（callback）",
+        "ipc_handler":     "IPC 处理（ipc_handler）",
+    }
+
+    for role in ROLE_ORDER:
+        entries_in = groups.get(role, [])
+        if not entries_in:
+            continue
+        lines += [
+            f"---", f"",
+            f"## {ROLE_LABEL.get(role, role)}（{len(entries_in)} 个）", f"",
+        ]
+        for e in entries_in:
+            fh = str(e.get("func_hash") or "")
+            md = reports_dir / f"{fh}.md" if fh else None
+            if md and md.exists():
+                lines.append(md.read_text(encoding="utf-8").strip())
+                lines.append("")
+            else:
+                # fallback 最小摘要
+                name   = str(e.get("function") or fh[:8] or "未知")
+                taints = ", ".join(str(t) for t in (e.get("taints") or []))
+                lines += [
+                    f"### `{name}`",
+                    f"",
+                    f"**类型**：{'A（主动型）' if e.get('tag') == 'A' else 'P（被动型）'}  ",
+                    f"**污点参数**：{taints or '未知'}  ",
+                    f"",
+                ]
+
+    # 覆盖率评估章节
+    lines += [
+        f"---", f"",
+        f"## 覆盖率评估", f"",
+        f"| 指标 | 値 |",
+        f"|---|---|",
+        f"| 分析文件数 | {len(files_set)} |",
+        f"| 识别入口总数 | {total} |",
+        f"| boundary | {boundary_n} ({boundary_n * 100 // total if total else 0}%) |",
+        f"| dispatch_target | {disp_n} ({disp_n * 100 // total if total else 0}%) |",
+        f"| callback | {cb_n} ({cb_n * 100 // total if total else 0}%) |",
+        f"| ipc_handler | {ipc_n} ({ipc_n * 100 // total if total else 0}%) |",
+        f"",
+        f"---",
+        f"",
+        f"*本报告由 SecFlow 入口分析引擎自动生成，生成时间 {now}。*",
+        f"",
+    ]
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
