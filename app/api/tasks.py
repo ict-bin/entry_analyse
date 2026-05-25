@@ -365,19 +365,48 @@ async def get_task_logs(
     enabling incremental polling: clients send back the ``total_event_count``
     they last received, and the server returns only the new tail.
 
-    Response fields:
-    - ``events``            - slice of events[since:]
-    - ``total_event_count`` - total number of events stored (use as next ``since``)
-    - ``final``             - whether the pipeline has finished writing events
-    - ``status``            - current task status
+    When ``since >= total_event_count`` a lightweight MySQL query is used so
+    the full stages_json blob is never loaded into Python memory.
     """
+    from sqlalchemy import text as _sa_text
+    from fastapi import HTTPException
     from app.db.models import AppEaTask
+
+    # --- Step 1: cheap pre-check via JSON_LENGTH (no blob loading) ----------
+    row_light = db.execute(
+        _sa_text(
+            "SELECT task_id, status, "
+            "JSON_LENGTH(stages_json, '$.events') AS event_count, "
+            "JSON_VALUE(stages_json, '$.final') AS is_final "
+            "FROM secflow_app_ea_tasks "
+            "WHERE task_id = :tid AND is_deleted = 0"
+        ),
+        {"tid": task_id},
+    ).fetchone()
+    if not row_light:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+
+    # column order: task_id=0, status=1, event_count=2, is_final=3
+    task_status = str(row_light[1] or "")
+    total = int(row_light[2] or 0)
+    is_final = bool(row_light[3] and str(row_light[3]).lower() not in ("0", "false", "null"))
+
+    # --- Step 2: if no new events, return immediately (no blob load) --------
+    if since >= total:
+        return {
+            "task_id": task_id,
+            "status": task_status,
+            "total_event_count": total,
+            "final": is_final,
+            "events": [],
+        }
+
+    # --- Step 3: new events exist – load full blob only now -----------------
     row = db.query(AppEaTask).filter(
         AppEaTask.task_id == task_id,
         AppEaTask.is_deleted.is_(False),
     ).first()
     if not row:
-        from fastapi import HTTPException
         raise HTTPException(404, f"任务不存在: {task_id}")
     payload = row.stages_json if isinstance(row.stages_json, dict) else {}
     all_events: list = payload.get("events") if isinstance(payload.get("events"), list) else []

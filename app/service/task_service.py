@@ -223,10 +223,65 @@ def _task_run_root(row: AppEaTask) -> Path | None:
     return root / "run" if root else None
 
 
+def _build_lean_file_catalog(lean_state_path: "Path") -> list[dict]:
+    """精简模式下从 lean_pipeline_state.json 构建文件级目录（替代完整模式的函数级目录）。"""
+    try:
+        payload = json.loads(lean_state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    files_raw = payload.get("files") if isinstance(payload, dict) else {}
+    if not isinstance(files_raw, dict):
+        return []
+    items: list[dict] = []
+    for file_hash, fs in files_raw.items():
+        if not isinstance(fs, dict):
+            continue
+        original_path = str(fs.get("original_path") or "")
+        file_name = Path(original_path).name if original_path else ""
+        w_state  = str(fs.get("w_state",  "pending"))
+        j_state  = str(fs.get("j_state",  "pending"))
+        j_passed = j_state == "passed"
+        items.append({
+            # 精简模式返回文件级记录，用 file_hash 作为 func_hash 供前端区分
+            "func_hash":    file_hash,
+            "file_hash":    file_hash,
+            "file":         file_name,
+            "original_path": original_path,
+            "name":         file_name,   # 前端显示文件名为函数名
+            "signature":    "",
+            "start_line":   0,
+            "end_line":     0,
+            "is_lean_file": True,        # 前端标志字段，区分精简/完整模式
+            "static_done":  bool(fs.get("static_done", False)),
+            "w_state":      w_state,
+            "w_attempts":   int(fs.get("w_attempts", 0)),
+            "j_state":      j_state,
+            "j_attempts":   int(fs.get("j_attempts", 0)),
+            "feedback":     str(fs.get("feedback", ""))[:200],
+            # 共用字段（展示层复用 r1b_state 等列）
+            "r1b_state":    "passed" if j_passed else w_state,
+            "r2_state":     j_state,
+            "r2j_state":    j_state,
+            "r3_state":     "passed" if j_passed else "pending",
+            "r4_state":     "passed" if j_passed else "pending",
+            "rep_state":    "pending",
+            "has_external_input": j_passed if j_passed else None,
+            "entry_role":   "",
+            "r4_decision":  "keep" if j_passed else "",
+            "is_entry":     j_passed,
+        })
+    items.sort(key=lambda x: x.get("file") or "")
+    return items
+
+
 def _build_function_catalog(row: AppEaTask) -> list[dict]:
     run_root = _task_run_root(row)
     if not run_root:
         return []
+    # 精简模式：优先读 lean_pipeline_state.json，返回文件级进度
+    lean_state_path = run_root / "lean_pipeline_state.json"
+    if lean_state_path.is_file():
+        return _build_lean_file_catalog(lean_state_path)
     state_path = run_root / "pipeline_state.json"
     if not state_path.is_file():
         return []
@@ -754,7 +809,69 @@ def _parse_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], 
     return _parse_session_jsonl_lines(lines)
 
 
-def _origin_payload(row: AppEaTask) -> dict:
+def _stat_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], int]:
+    """Lightweight alternative used when building the session index list.
+
+    Only reads the **first** and **last** non-empty lines of the file:
+    - first line  → session header (meta, start timestamp)
+    - last line   → last event timestamp
+    - line count  → counted while iterating, no full JSON parsing
+
+    Returns the same (session_meta, events, warnings, line_count) tuple as
+    _parse_session_jsonl_file, but with a minimal synthetic events list that
+    carries only the two boundary timestamps needed by
+    _extract_session_timestamps().  The full events list is never materialised
+    in memory, cutting per-file cost from O(file_size) to O(1).
+    """
+    session_meta: dict = {}
+    warnings: list[str] = []
+    line_count = 0
+    first_line = ""
+    last_line = ""
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                line_count += 1
+                if line_count == 1:
+                    first_line = stripped
+                last_line = stripped
+    except Exception as exc:
+        warnings.append(f"读取失败: {exc}")
+        return session_meta, [], warnings, 0
+
+    # Parse the first line to extract session header
+    try:
+        first_obj = json.loads(first_line)
+        if isinstance(first_obj, dict) and first_obj.get("type") == "session":
+            session_meta = {
+                "id": first_obj.get("id", ""),
+                "version": first_obj.get("version", ""),
+                "timestamp": first_obj.get("timestamp", ""),
+                "cwd": first_obj.get("cwd", ""),
+            }
+    except Exception:
+        pass
+
+    # Build a minimal synthetic events list (start + end timestamps only)
+    events: list[dict] = []
+    if session_meta.get("timestamp"):
+        events.append({"timestamp": session_meta["timestamp"]})
+    if last_line and last_line != first_line:
+        try:
+            last_obj = json.loads(last_line)
+            if isinstance(last_obj, dict):
+                ts = last_obj.get("timestamp") or last_obj.get("display_timestamp")
+                if ts:
+                    events.append({"timestamp": ts, "display_timestamp": ts})
+        except Exception:
+            pass
+
+    return session_meta, events, warnings, line_count
+
     task_origin_type = str(row.task_origin_type or "").strip() or "manual"
     parent_task_type = str(row.parent_task_type or "").strip() or None
     origin_label = (
@@ -987,7 +1104,7 @@ class TaskService:
             row_status=row.status,
             sessions_root=sessions_root,
             result_json=result_json,
-            parse_session_jsonl_file=_parse_session_jsonl_file,
+            parse_session_jsonl_file=_stat_session_jsonl_file,
             write_json_atomic=_write_json_atomic,
         )
 
@@ -1704,6 +1821,7 @@ class TaskService:
             "stages_json": _stages_json_summary(row.stages_json) if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
             "function_catalog": _build_function_catalog(row) if include_heavy else [],
+            "lean_mode": bool(((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False)),
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
