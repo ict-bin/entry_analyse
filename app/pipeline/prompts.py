@@ -200,11 +200,15 @@ def build_r2_w_prompt(
             f"   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
             f"   **主动型（A）**：函数体调用 {_PATTERNS} 等\n"
             f"\n"
-            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true：**\n"
-            f"   - 函数名以 `Create/Fill/Build/Make/Send/Write/Prepare/FillIn` 开头，"
-            f"且函数体是构造或发送消息（分配 buffer、填写字段、调用发送 API）\n"
-            f"   - 函数是 FSM action（`FsmAct*`）：`ctx_base` 是内部上下文，不是外部消息\n"
-            f"   - 函数参数全为内部对象/指针，无数据包/消息内容的实际读取（只做内存填充或状态更新）\n"
+            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true\n"
+            f"   （判断依据是函数体行为，不是函数名）：**\n"
+            f"   - 函数体的主要行为是构造、填充或发送数据：\n"
+            f"     分配 output buffer、写入字段、调用发送/写出 API，\n"
+            f"     而非从外部来源读取或解析数据\n"
+            f"   - 函数的上下文/状态参数只携带内部机器状态，\n"
+            f"     不携带来自外部的消息 payload（依据是函数体操作，不是参数名）\n"
+            f"   - 参数虽含 message/request 字样，但函数体只做内部状态查询或字段更新，\n"
+            f"     没有对该参数所指数据做解析或安全相关的分支处理\n"
         )
     else:
         step2 = (
@@ -214,11 +218,15 @@ def build_r2_w_prompt(
             f"   - 有命中行：精确定位（`sed -n '<行号>p' {file_path}`）确认后分析 taint\n"
             f"   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）\n"
             f"\n"
-            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true：**\n"
-            f"   - 函数名以 `Create/Fill/Build/Make/Send/Write/Prepare/FillIn` 开头，"
-            f"且函数体是构造或发送消息（分配 buffer、填写字段、调用发送 API）\n"
-            f"   - 函数是 FSM action（`FsmAct*`）：`ctx_base` 是内部上下文，不是外部消息\n"
-            f"   - 函数参数全为内部对象/指针，无数据包/消息内容的实际读取（只做内存填充或状态更新）\n"
+            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true\n"
+            f"   （判断依据是函数体行为，不是函数名）：**\n"
+            f"   - 函数体的主要行为是构造、填充或发送数据：\n"
+            f"     分配 output buffer、写入字段、调用发送/写出 API，\n"
+            f"     而非从外部来源读取或解析数据\n"
+            f"   - 函数的上下文/状态参数只携带内部机器状态，\n"
+            f"     不携带来自外部的消息 payload（依据是函数体操作，不是参数名）\n"
+            f"   - 参数虽含 message/request 字样，但函数体只做内部状态查询或字段更新，\n"
+            f"     没有对该参数所指数据做解析或安全相关的分支处理\n"
         )
 
     return (
