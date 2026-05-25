@@ -901,6 +901,42 @@ def _origin_payload(row: "AppEaTask") -> dict:
     }
 
 
+def _safe_origin_payload(row: AppEaTask) -> dict:
+    helper = globals().get("_origin_payload")
+    if callable(helper):
+        try:
+            payload = helper(row)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            logger.exception("failed to build origin payload")
+    task_origin_type = str(row.task_origin_type or "").strip() or "manual"
+    parent_task_type = str(row.parent_task_type or "").strip() or None
+    origin_label = (
+        "二进制安全-源码扫描"
+        if task_origin_type == "binary_security" and parent_task_type == "source"
+        else "二进制安全-二进制类扫描"
+        if task_origin_type == "binary_security"
+        else "手动任务"
+    )
+    return {
+        "task_origin_type": task_origin_type,
+        "parent_project_id": row.parent_project_id,
+        "parent_task_id": row.parent_task_id,
+        "parent_task_type": parent_task_type,
+        "parent_stage_name": row.parent_stage_name,
+        "parent_stage_item_id": row.parent_stage_item_id,
+        "parent_stage_item_key": row.parent_stage_item_key,
+        "origin_label": origin_label,
+        "parent_task_display": row.parent_task_id,
+        "input_contract": (
+            dict((row.task_config_json or {}).get("input_contract") or {})
+            if isinstance((row.task_config_json or {}).get("input_contract"), dict)
+            else None
+        ),
+    }
+
+
 def _preferred_files_list_path(row: AppEaTask) -> str | None:
     task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
     input_contract = task_config.get("input_contract") if isinstance(task_config.get("input_contract"), dict) else {}
@@ -1797,7 +1833,7 @@ class TaskService:
         workspace_root = str(Path(run_root) / "workspace") if run_root else None
         return {
             "task_id": row.task_id, "project_id": row.project_id,
-            **_origin_payload(row),
+            **_safe_origin_payload(row),
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "source_path": row.source_path,
             "module_name": row.module_name, "output_path": row.output_path,
