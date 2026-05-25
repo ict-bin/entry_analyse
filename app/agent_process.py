@@ -49,11 +49,44 @@ def process_group_exists(pgid: int | None) -> bool:
     return True
 
 
+_PID1_REAPER_NAMES = {
+    "init",
+    "systemd",
+    "tini",
+    "dumb-init",
+    "busybox",
+}
+
+
+def _read_proc_name(pid: int, field: str) -> str:
+    try:
+        return (pathlib.Path("/proc") / str(pid) / field).read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _pid1_is_reaper_process() -> bool:
+    """Only treat PPID=1 as orphan when PID 1 looks like a real init/reaper."""
+    pid1_comm = _read_proc_name(1, "comm").lower()
+    if pid1_comm in _PID1_REAPER_NAMES:
+        return True
+    try:
+        pid1_exe = os.path.basename(os.readlink("/proc/1/exe")).lower()
+    except Exception:
+        pid1_exe = ""
+    return pid1_exe in _PID1_REAPER_NAMES
+
+
 def cleanup_orphan_pi_processes(
     logger: Callable[[str], None],
     *,
     label: str,
 ) -> int:
+    if not _pid1_is_reaper_process():
+        return 0
     killed = 0
     proc_root = pathlib.Path("/proc")
     for proc_dir in proc_root.iterdir():

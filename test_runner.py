@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.agent_process import AgentProcessHandle
+from app import agent_process
 from app import runner
 
 
@@ -25,6 +26,20 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentPromptFileTests(unittest.TestCase):
+    def test_cleanup_orphan_pi_processes_skips_business_pid1_container(self):
+        with patch.object(agent_process, "_pid1_is_reaper_process", return_value=False):
+            killed = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test")
+        self.assertEqual(killed, 0)
+
+    def test_pid1_reaper_detection_rejects_python_main(self):
+        with patch.object(agent_process, "_read_proc_name", return_value="python3"):
+            with patch("app.agent_process.os.readlink", return_value="/usr/bin/python3"):
+                self.assertFalse(agent_process._pid1_is_reaper_process())
+
+    def test_pid1_reaper_detection_accepts_tini(self):
+        with patch.object(agent_process, "_read_proc_name", return_value="tini"):
+            self.assertTrue(agent_process._pid1_is_reaper_process())
+
     def test_agent_process_terminate_tree_force_cleans_group_after_exit(self):
         logs: list[str] = []
 
