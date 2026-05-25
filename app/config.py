@@ -88,7 +88,6 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         pipeline_parallelism=int(getattr(svc, 'pipeline_parallelism', 64) or 64),
         r1_max_rounds=int(getattr(svc, 'r1_max_rounds', -1)),
         r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
-        r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
         r3_max_rounds=int(getattr(svc, 'r3_max_rounds', -1)),
         r4_func_max_rounds=int(getattr(svc, 'r4_func_max_rounds', -1)),
         r4_final_max_rounds=int(getattr(svc, 'r4_final_max_rounds', -1)),
