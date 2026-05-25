@@ -10,6 +10,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.agent_process import cleanup_orphan_pi_processes
 from app.config import build_task_config
 from app.db import get_db
 from app.db.models import AppEaTask
@@ -24,6 +25,7 @@ _running_tasks: dict[str, asyncio.Task] = {}
 _cancel_wake: dict[str, asyncio.Event] = {}
 WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
 WORKER_SLOT_HEARTBEAT_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
+ORPHAN_PI_SWEEP_SECONDS = max(10, int(os.environ.get("EA_ORPHAN_PI_SWEEP_SECONDS", "30")))
 
 
 def trigger_instant_cancel(task_id: str) -> bool:
@@ -98,12 +100,17 @@ class WorkerService:
     async def _heartbeat_loop(self) -> None:
         from app.service import task_service as task_mod
         from app.service.worker_slot_service import get_worker_slot_service
+        last_orphan_sweep = 0.0
 
         while self._running:
             try:
                 db_gen = get_db()
                 db: Session = next(db_gen)
                 try:
+                    now_ts = now_local().timestamp()
+                    if now_ts - last_orphan_sweep >= ORPHAN_PI_SWEEP_SECONDS:
+                        cleanup_orphan_pi_processes(logger.warning, label="ea_worker_heartbeat")
+                        last_orphan_sweep = now_ts
                     project_ids = await self._discover_active_projects()
                     project_id = project_ids[0] if project_ids else ""
                     max_concurrent_tasks = getattr(task_mod._load_svc_config(), "max_concurrent_tasks", 1)
