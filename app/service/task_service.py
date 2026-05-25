@@ -16,11 +16,12 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppEaTask
+from app.db.models import AppEaTask, AppEaTaskEvent
 from app.logging_utils import log_event
 from app.models import normalize_max_concurrent_tasks
 from app.service.session_index import build_session_catalog
@@ -30,6 +31,9 @@ from app.time_utils import add_seconds_local, isoformat_local, now_local
 logger = logging.getLogger("ea.task_service")
 
 _PARENT_REUSABLE_TASK_STATUSES = {"pending", "running", "passed", "success"}
+TASK_EVENT_SOURCE_EA = "entry_analyse"
+TASK_EVENT_SOURCE_WORKER = "worker"
+TASK_EVENT_SOURCE_SYSTEM = "system"
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -160,6 +164,228 @@ def _abnormal_reason_event(reason: dict, *, event_id: str | None = None) -> dict
     }
 
 
+def _event_dedupe_key(*parts: object) -> str:
+    raw = "::".join(str(part or "").strip() for part in parts if str(part or "").strip())
+    if not raw:
+        raw = uuid.uuid4().hex
+    if len(raw) > 255:
+        import hashlib
+        raw = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+    return raw
+
+
+def _normalize_timeline_event(evt: dict[str, Any]) -> dict[str, Any]:
+    data = evt.get("data") if isinstance(evt.get("data"), dict) else {}
+    stage_key = (
+        str(evt.get("stage") or evt.get("stage_key") or data.get("stage") or data.get("stage_key") or "")
+        .strip()
+        or None
+    )
+    file_path = (
+        str(data.get("file") or data.get("original_path") or data.get("source_path") or data.get("file_path") or "")
+        .strip()
+        or None
+    )
+    function_name = (
+        str(data.get("function") or data.get("name") or data.get("function_name") or "")
+        .strip()
+        or None
+    )
+    level = str(evt.get("level") or ("error" if evt.get("error") else "info")).strip() or "info"
+    message = str(
+        evt.get("message")
+        or data.get("message")
+        or data.get("summary")
+        or data.get("text")
+        or data.get("output")
+        or evt.get("event")
+        or evt.get("type")
+        or "stage event"
+    ).strip()
+    status = (
+        str(data.get("status") or evt.get("status") or "")
+        .strip()
+        or None
+    )
+    attempt_value = data.get("attempt")
+    try:
+        attempt = int(attempt_value) if attempt_value is not None else None
+    except Exception:
+        attempt = None
+    return {
+        "event_type": str(evt.get("event") or evt.get("type") or "stage_event").strip() or "stage_event",
+        "source": TASK_EVENT_SOURCE_EA,
+        "level": level,
+        "stage_key": stage_key,
+        "file_hash": str(data.get("file_hash") or "").strip() or None,
+        "func_hash": str(data.get("func_hash") or "").strip() or None,
+        "file_path": file_path,
+        "function_name": function_name,
+        "attempt": attempt,
+        "status": status,
+        "message": message,
+        "payload": {
+            "timestamp": evt.get("timestamp"),
+            "ts": evt.get("ts"),
+            "data": data,
+        },
+    }
+
+
+def _create_task_event(
+    db: Session,
+    *,
+    task_id: str,
+    project_id: str,
+    event_type: str,
+    message: str,
+    source: str = TASK_EVENT_SOURCE_EA,
+    level: str = "info",
+    stage_key: str | None = None,
+    file_hash: str | None = None,
+    func_hash: str | None = None,
+    file_path: str | None = None,
+    function_name: str | None = None,
+    attempt: int | None = None,
+    status: str | None = None,
+    payload: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
+) -> None:
+    key = str(dedupe_key or "").strip() or _event_dedupe_key(
+        task_id,
+        source,
+        event_type,
+        stage_key,
+        file_hash,
+        func_hash,
+        file_path,
+        function_name,
+        attempt,
+        status,
+        message,
+    )
+    if db.query(AppEaTaskEvent.id).filter(AppEaTaskEvent.dedupe_key == key).first():
+        return
+    event = AppEaTaskEvent(
+        id=uuid.uuid4().hex[:16],
+        task_id=task_id,
+        project_id=project_id,
+        source=source,
+        level=level,
+        event_type=event_type,
+        stage_key=stage_key,
+        file_hash=file_hash,
+        func_hash=func_hash,
+        file_path=file_path,
+        function_name=function_name,
+        attempt=attempt,
+        status=status,
+        message=message,
+        dedupe_key=key,
+        created_at=now_local(),
+    )
+    event.payload = payload or {}
+    db.add(event)
+    db.flush()
+
+
+def _safe_create_task_event(db: Session, **kwargs: Any) -> None:
+    if not hasattr(db, "begin_nested"):
+        return
+    nested = db.begin_nested()
+    try:
+        _create_task_event(db, **kwargs)
+        nested.commit()
+    except IntegrityError:
+        nested.rollback()
+
+
+def _build_task_event_summary(db: Session, task_id: str) -> dict[str, Any]:
+    events = (
+        db.query(AppEaTaskEvent)
+        .filter(AppEaTaskEvent.task_id == task_id)
+        .order_by(AppEaTaskEvent.created_at.desc())
+        .all()
+    )
+    summary: dict[str, Any] = {"total_events": len(events)}
+    if not events:
+        return summary
+    latest = events[0]
+    summary["latest_event_type"] = latest.event_type
+    summary["latest_event_at"] = isoformat_local(latest.created_at)
+    for event in events:
+        if not summary.get("latest_stage_key") and event.stage_key:
+            summary["latest_stage_key"] = event.stage_key
+        if not summary.get("latest_file_path") and event.file_path:
+            summary["latest_file_path"] = event.file_path
+        if not summary.get("latest_function_name") and event.function_name:
+            summary["latest_function_name"] = event.function_name
+        if summary.get("latest_attempt") is None and event.attempt is not None:
+            summary["latest_attempt"] = int(event.attempt)
+        if (
+            summary.get("latest_stage_key")
+            and summary.get("latest_file_path")
+            and summary.get("latest_function_name")
+            and summary.get("latest_attempt") is not None
+        ):
+            break
+    return summary
+
+
+def get_task_timeline(db: Session, task: AppEaTask) -> dict[str, Any]:
+    rows = (
+        db.query(AppEaTaskEvent)
+        .filter(AppEaTaskEvent.task_id == task.task_id)
+        .order_by(AppEaTaskEvent.created_at.desc())
+        .all()
+    )
+    return {
+        "task_id": task.task_id,
+        "events": [
+            {
+                "id": row.id,
+                "task_id": row.task_id,
+                "project_id": row.project_id,
+                "source": row.source,
+                "level": row.level,
+                "event_type": row.event_type,
+                "stage_key": row.stage_key,
+                "file_hash": row.file_hash,
+                "func_hash": row.func_hash,
+                "file_path": row.file_path,
+                "function_name": row.function_name,
+                "attempt": row.attempt,
+                "status": row.status,
+                "message": row.message,
+                "payload": row.payload,
+                "created_at": isoformat_local(row.created_at),
+            }
+            for row in rows
+        ],
+    }
+
+
+def clear_task_timeline(db: Session, task: AppEaTask) -> int:
+    deleted = (
+        db.query(AppEaTaskEvent)
+        .filter(AppEaTaskEvent.task_id == task.task_id)
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
+
+
+def delete_task_timeline_event(db: Session, task: AppEaTask, event_id: str) -> int:
+    deleted = (
+        db.query(AppEaTaskEvent)
+        .filter(
+            AppEaTaskEvent.task_id == task.task_id,
+            AppEaTaskEvent.id == event_id,
+        )
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
+
+
 def _abnormal_reason_history(row: AppEaTask) -> list[dict]:
     stages_json = row.stages_json if isinstance(row.stages_json, dict) else {}
     events = stages_json.get("events") if isinstance(stages_json.get("events"), list) else []
@@ -201,6 +427,42 @@ def _record_abnormal_reason(row: AppEaTask, reason: dict | None, *, changed: boo
     events.append(_abnormal_reason_event(reason))
     row.stages_json = {**payload, "events": events, "final": bool(payload.get("final", False))}
     flag_modified(row, "stages_json")
+
+
+def _sync_stage_events_to_timeline(db: Session, row: AppEaTask, events: list[dict[str, Any]]) -> None:
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        normalized = _normalize_timeline_event(evt)
+        dedupe_key = _event_dedupe_key(
+            row.task_id,
+            normalized["event_type"],
+            normalized["stage_key"],
+            normalized["file_hash"],
+            normalized["func_hash"],
+            normalized["attempt"],
+            normalized["status"],
+            normalized["message"],
+            normalized["payload"].get("ts"),
+        )
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type=normalized["event_type"],
+            message=normalized["message"],
+            source=normalized["source"],
+            level=normalized["level"],
+            stage_key=normalized["stage_key"],
+            file_hash=normalized["file_hash"],
+            func_hash=normalized["func_hash"],
+            file_path=normalized["file_path"],
+            function_name=normalized["function_name"],
+            attempt=normalized["attempt"],
+            status=normalized["status"],
+            payload=normalized["payload"],
+            dedupe_key=dedupe_key,
+        )
 
 
 def _lease_deadline() -> datetime:
@@ -963,13 +1225,8 @@ def _preferred_files_list_path(row: AppEaTask) -> str | None:
 
 
 def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task_id: Optional[str], parent_stage_name: Optional[str]) -> bool:
-    return (
-        str(task_origin_type or "").strip() == "binary_security"
-        or (
-            str(parent_task_id or "").strip() != ""
-            and str(parent_stage_name or "").strip() != ""
-        )
-    )
+    del parent_task_id, parent_stage_name
+    return str(task_origin_type or "").strip() == "binary_security"
 
 
 def _normalize_entry_input_contract(input_contract: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -1082,6 +1339,7 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
             if _r:
                 _r.stages_json = {"events": [dict(e) for e in events]}
                 flag_modified(_r, "stages_json")
+                _sync_stage_events_to_timeline(_db, _r, [dict(e) for e in events])
                 _db.commit()
         finally:
             try:
@@ -1093,6 +1351,18 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 class TaskService:
+    @staticmethod
+    def get_task_timeline(db: Session, task: AppEaTask) -> dict[str, Any]:
+        return get_task_timeline(db, task)
+
+    @staticmethod
+    def clear_task_timeline(db: Session, task: AppEaTask) -> int:
+        return clear_task_timeline(db, task)
+
+    @staticmethod
+    def delete_task_timeline_event(db: Session, task: AppEaTask, event_id: str) -> int:
+        return delete_task_timeline_event(db, task, event_id)
+
     def _build_session_catalog(self, row: AppEaTask) -> dict:
         sessions_root = _task_sessions_root(row)
         if not sessions_root or not sessions_root.is_dir():
@@ -1331,11 +1601,11 @@ class TaskService:
             .limit(per_page)
             .all()
         )
-        return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
+        return {"items": [self._row_to_dict(r, db=db, include_heavy=False) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
-        return self._row_to_dict(self._get_or_404(db, task_id))
+        return self._row_to_dict(self._get_or_404(db, task_id), db=db)
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -1643,7 +1913,24 @@ class TaskService:
                     parent_stage_item_id=normalized_parent_stage_item_id or None,
                     parent_stage_item_key=normalized_parent_stage_item_key or None,
                 )
-                return self._row_to_dict(reusable)
+                _safe_create_task_event(
+                    db,
+                    task_id=reusable.task_id,
+                    project_id=reusable.project_id,
+                    event_type="task_create_deduplicated",
+                    message="复用已有入口分析任务",
+                    source=TASK_EVENT_SOURCE_SYSTEM,
+                    status=reusable.status,
+                    payload={
+                        "parent_task_id": normalized_parent_task_id,
+                        "parent_stage_name": normalized_parent_stage_name,
+                        "parent_stage_item_id": normalized_parent_stage_item_id or None,
+                        "parent_stage_item_key": normalized_parent_stage_item_key or None,
+                    },
+                    dedupe_key=_event_dedupe_key(reusable.task_id, "task_create_deduplicated", normalized_parent_task_id, normalized_parent_stage_name, normalized_parent_stage_item_id or normalized_parent_stage_item_key),
+                )
+                db.commit()
+                return self._row_to_dict(reusable, db=db)
         task_id = f"eat_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-entry-analyse"
@@ -1678,10 +1965,28 @@ class TaskService:
             parent_stage_item_key=parent_stage_item_key,
         )
         db.add(row); db.commit(); db.refresh(row)
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_created",
+            message=f"任务已创建: {row.task_name}",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={
+                "task_name": row.task_name,
+                "module_name": row.module_name,
+                "input_path": row.input_path,
+                "source_path": row.source_path,
+                "output_path": row.output_path,
+            },
+            dedupe_key=_event_dedupe_key(row.task_id, "task_created"),
+        )
+        db.commit(); db.refresh(row)
         self.schedule_dispatch(project_id)
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
-        return self._row_to_dict(row)
+        return self._row_to_dict(row, db=db)
 
     def restart_task(self, db: Session, task_id: str) -> dict:
         """Reset and restart an existing task in-place, reusing the same task ID."""
@@ -1705,6 +2010,17 @@ class TaskService:
         row.latest_abnormal_reason_json = None
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_restarted",
+            message="任务已重置并重新启动",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={"keep_history": True},
+            dedupe_key=_event_dedupe_key(row.task_id, "task_restarted", row.updated_at, row.status),
+        )
         db.commit(); db.refresh(row)
         if row.output_path:
             import shutil as _shutil
@@ -1717,17 +2033,43 @@ class TaskService:
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
-        return self._row_to_dict(row)
+        return self._row_to_dict(row, db=db)
 
     def resume_task(self, db: Session, task_id: str) -> dict:
         """续跑（暂时禁用断点续跑，直接调用 restart_task）。"""
-        return self.restart_task(db, task_id)
+        row = self._get_or_404(db, task_id)
+        result = self.restart_task(db, task_id)
+        row = self._get_or_404(db, task_id)
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_resumed",
+            message="任务已从续跑入口重新排队",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={"mode": "resume_via_restart"},
+            dedupe_key=_event_dedupe_key(row.task_id, "task_resumed", row.updated_at, row.status),
+        )
+        db.commit()
+        return result
 
     async def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         if row.status in ("passed", "failed", "error", "cancelled"):
-            return self._row_to_dict(row)
+            return self._row_to_dict(row, db=db)
         row.cancel_requested = True
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_cancel_requested",
+            message="任务已请求取消",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={"owner_pod_ip": row.owner_pod_ip},
+            dedupe_key=_event_dedupe_key(row.task_id, "task_cancel_requested", row.updated_at, row.status),
+        )
         owner_pod_ip = row.owner_pod_ip or ""
         if row.status == "pending":
             row.status = "cancelled"
@@ -1735,14 +2077,39 @@ class TaskService:
             row.owner_pod = None
             row.owner_pod_ip = None
             row.lease_expires_at = None
+            _safe_create_task_event(
+                db,
+                task_id=row.task_id,
+                project_id=row.project_id,
+                event_type="task_cancelled",
+                message="任务已在排队阶段取消",
+                source=TASK_EVENT_SOURCE_EA,
+                status=row.status,
+                dedupe_key=_event_dedupe_key(row.task_id, "task_cancelled", "pending"),
+            )
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
+        if changed and isinstance(reason, dict):
+            _safe_create_task_event(
+                db,
+                task_id=row.task_id,
+                project_id=row.project_id,
+                event_type="abnormal_reason_recorded",
+                message=str(reason.get("title") or "任务异常"),
+                source=TASK_EVENT_SOURCE_EA,
+                level="warning" if str(reason.get("status") or "") == "cancelled" else "error",
+                status=str(reason.get("status") or row.status),
+                stage_key=str(reason.get("stage_name") or "").strip() or None,
+                file_path=row.input_path,
+                payload={"reason": reason},
+                dedupe_key=_event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
+            )
         db.commit(); db.refresh(row)
         # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
         if owner_pod_ip and row.status == "running":
             import asyncio as _asyncio
             _asyncio.create_task(self._notify_cancel(owner_pod_ip, task_id))
-        return self._row_to_dict(row)
+        return self._row_to_dict(row, db=db)
 
     @staticmethod
     async def _notify_cancel(pod_ip: str, task_id: str) -> None:
@@ -1759,13 +2126,24 @@ class TaskService:
         except Exception:
             pass  # 发送失败无关紧要，轮询机制不受影响
 
-    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
+    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
         """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务不允许删除。"""
         import shutil as _shutil
         from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
         if row.status == "running":
             raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_deleted",
+            message="任务已删除",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={"delete_files": bool(delete_files)},
+            dedupe_key=_event_dedupe_key(row.task_id, "task_deleted", row.updated_at, delete_files),
+        )
         if delete_files and row.output_path:
             task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):
@@ -1774,8 +2152,10 @@ class TaskService:
                     logger.info("delete_task: removed task dir %s", task_dir)
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
+        deleted_event_count = clear_task_timeline(db, row)
         row.is_deleted = True
         db.commit()
+        return {"deleted_event_count": deleted_event_count}
 
     def _get_or_404(self, db: Session, task_id: str) -> AppEaTask:
         row = db.query(AppEaTask).filter(
@@ -1822,7 +2202,7 @@ class TaskService:
         )
 
     @staticmethod
-    def _row_to_dict(row: AppEaTask, *, include_heavy: bool = True) -> dict:
+    def _row_to_dict(row: AppEaTask, *, db: Session | None = None, include_heavy: bool = True) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         abnormal_reason = _task_abnormal_reason(row)
@@ -1870,6 +2250,7 @@ class TaskService:
             "abnormal_reason_title": (abnormal_reason or {}).get("title"),
             "abnormal_reason_code": (abnormal_reason or {}).get("code"),
             "abnormal_reason_category": (abnormal_reason or {}).get("category"),
+            "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
         }
 
 

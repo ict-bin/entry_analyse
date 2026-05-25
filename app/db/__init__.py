@@ -61,6 +61,30 @@ _MIGRATIONS = [
     """,
     "CREATE INDEX ix_ea_worker_slots_pod_name ON secflow_app_ea_worker_slots (pod_name)",
     "CREATE INDEX ix_ea_worker_slots_last_heartbeat ON secflow_app_ea_worker_slots (last_heartbeat_at)",
+    """
+    CREATE TABLE secflow_app_ea_task_event (
+        id VARCHAR(32) NOT NULL PRIMARY KEY,
+        task_id VARCHAR(64) NOT NULL,
+        project_id VARCHAR(100) NOT NULL,
+        source VARCHAR(32) NOT NULL DEFAULT 'entry_analyse',
+        level VARCHAR(16) NOT NULL DEFAULT 'info',
+        event_type VARCHAR(64) NOT NULL,
+        stage_key VARCHAR(64) NULL,
+        file_hash VARCHAR(64) NULL,
+        func_hash VARCHAR(64) NULL,
+        file_path VARCHAR(1024) NULL,
+        function_name VARCHAR(255) NULL,
+        attempt INTEGER NULL,
+        status VARCHAR(32) NULL,
+        message TEXT NOT NULL,
+        payload_json TEXT NULL,
+        dedupe_key VARCHAR(255) NOT NULL UNIQUE,
+        created_at DATETIME NOT NULL
+    )
+    """,
+    "CREATE INDEX ix_ea_task_event_task_created ON secflow_app_ea_task_event (task_id, created_at)",
+    "CREATE INDEX ix_ea_task_event_task_event_type ON secflow_app_ea_task_event (task_id, event_type, created_at)",
+    "CREATE INDEX ix_ea_task_event_task_stage_key ON secflow_app_ea_task_event (task_id, stage_key, created_at)",
 ]
 
 

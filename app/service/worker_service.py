@@ -452,6 +452,7 @@ class WorkerService:
                 row.lease_expires_at = None
                 row.cancel_requested = False
                 row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
+                task_mod._sync_stage_events_to_timeline(db, row, pre_run_events + event_buffer)
                 if result and not cancel_requested:
                     result_payload = result.model_dump(mode="json")
                     result_file = task_mod._write_task_result_json(task_snapshot, result_payload)
@@ -462,6 +463,35 @@ class WorkerService:
                     row.error = "任务已取消"
                 reason, changed = task_mod._sync_task_abnormal_reason(row)
                 task_mod._record_abnormal_reason(row, reason, changed=changed)
+                task_mod._safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="task_cancelled" if cancel_requested else ("task_finished" if row.status == "passed" else "task_failed"),
+                    message="任务已取消" if cancel_requested else ("任务执行完成" if row.status == "passed" else (row.error or "任务执行失败")),
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    level="warning" if cancel_requested else ("error" if row.status in {"failed", "error"} else "info"),
+                    stage_key="entry_analysis",
+                    file_path=row.input_path,
+                    status=row.status,
+                    payload={"owner_pod": task_mod.POD_NAME},
+                    dedupe_key=task_mod._event_dedupe_key(row.task_id, row.status, row.finished_at, "terminal"),
+                )
+                if changed and isinstance(reason, dict):
+                    task_mod._safe_create_task_event(
+                        db,
+                        task_id=row.task_id,
+                        project_id=row.project_id,
+                        event_type="abnormal_reason_recorded",
+                        message=str(reason.get("title") or "任务异常"),
+                        source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                        level="warning" if str(reason.get("status") or "") == "cancelled" else "error",
+                        status=str(reason.get("status") or row.status),
+                        stage_key=str(reason.get("stage_name") or "").strip() or None,
+                        file_path=row.input_path,
+                        payload={"reason": reason},
+                        dedupe_key=task_mod._event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
+                    )
                 db.commit()
             finally:
                 try:
@@ -486,6 +516,21 @@ class WorkerService:
                         _row.cancel_requested = False
                         # 补 flush：将本轮已收集的事件写入 stages_json（避免 pod kill 导致事件丢失）
                         _row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
+                        task_mod._sync_stage_events_to_timeline(_db2, _row, pre_run_events + event_buffer)
+                        task_mod._safe_create_task_event(
+                            _db2,
+                            task_id=_row.task_id,
+                            project_id=_row.project_id,
+                            event_type="task_cancelled",
+                            message="任务因 worker 取消而结束",
+                            source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                            level="warning",
+                            stage_key="entry_analysis",
+                            file_path=_row.input_path,
+                            status=_row.status,
+                            payload={"owner_pod": task_mod.POD_NAME, "reason": "cancelled_error"},
+                            dedupe_key=task_mod._event_dedupe_key(_row.task_id, "task_cancelled", _row.finished_at, "cancelled_error"),
+                        )
                         _db2.commit()
                 finally:
                     try: next(_gen2)
@@ -517,8 +562,38 @@ class WorkerService:
                         row.lease_expires_at = None
                         row.cancel_requested = False
                         row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
+                        task_mod._sync_stage_events_to_timeline(db, row, pre_run_events + event_buffer)
                         reason, changed = task_mod._sync_task_abnormal_reason(row)
                         task_mod._record_abnormal_reason(row, reason, changed=changed)
+                        task_mod._safe_create_task_event(
+                            db,
+                            task_id=row.task_id,
+                            project_id=row.project_id,
+                            event_type="task_cancelled" if row.status == "cancelled" else "task_error",
+                            message=row.error or "任务执行异常结束",
+                            source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                            level="warning" if row.status == "cancelled" else "error",
+                            stage_key="entry_analysis",
+                            file_path=row.input_path,
+                            status=row.status,
+                            payload={"owner_pod": task_mod.POD_NAME, "exception": str(exc)},
+                            dedupe_key=task_mod._event_dedupe_key(row.task_id, row.status, row.finished_at, "exception"),
+                        )
+                        if changed and isinstance(reason, dict):
+                            task_mod._safe_create_task_event(
+                                db,
+                                task_id=row.task_id,
+                                project_id=row.project_id,
+                                event_type="abnormal_reason_recorded",
+                                message=str(reason.get("title") or "任务异常"),
+                                source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                                level="warning" if str(reason.get("status") or "") == "cancelled" else "error",
+                                status=str(reason.get("status") or row.status),
+                                stage_key=str(reason.get("stage_name") or "").strip() or None,
+                                file_path=row.input_path,
+                                payload={"reason": reason},
+                                dedupe_key=task_mod._event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
+                            )
                         db.commit()
                 finally:
                     try:

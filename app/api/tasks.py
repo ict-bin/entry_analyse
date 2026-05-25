@@ -49,6 +49,47 @@ class TaskResultSummaryResponse(BaseModel):
     total_cost: Optional[float] = None
 
 
+class TaskActionResponse(BaseModel):
+    status: str = "ok"
+    task_id: str
+    message: str
+    deleted_event_count: int = 0
+
+
+class AppEaTaskEventResponse(BaseModel):
+    id: str
+    task_id: str
+    project_id: str
+    source: str
+    level: str
+    event_type: str
+    stage_key: Optional[str] = None
+    file_hash: Optional[str] = None
+    func_hash: Optional[str] = None
+    file_path: Optional[str] = None
+    function_name: Optional[str] = None
+    attempt: Optional[int] = None
+    status: Optional[str] = None
+    message: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+
+
+class AppEaTaskEventSummaryResponse(BaseModel):
+    total_events: int = 0
+    latest_event_type: Optional[str] = None
+    latest_event_at: Optional[str] = None
+    latest_stage_key: Optional[str] = None
+    latest_file_path: Optional[str] = None
+    latest_function_name: Optional[str] = None
+    latest_attempt: Optional[int] = None
+
+
+class AppEaTaskTimelineResponse(BaseModel):
+    task_id: str
+    events: list[AppEaTaskEventResponse] = Field(default_factory=list)
+
+
 class TaskResultResponse(BaseModel):
     task_id: str
     available: bool
@@ -322,12 +363,6 @@ async def get_task_evaluation(task_id: str, db: Session = Depends(get_db), _=Dep
 async def cancel_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return await get_task_service().cancel_task(db, task_id)
 
-
-@router.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
-    get_task_service().delete_task(db, task_id)
-
-
 @router.post("/tasks/{task_id}/restart", status_code=201)
 async def restart_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     """Reset and restart an existing task in-place, reusing the same task ID."""
@@ -340,16 +375,41 @@ async def resume_task(task_id: str, db: Session = Depends(get_db), _=Depends(get
     return get_task_service().resume_task(db, task_id)
 
 
-@router.delete("/tasks/{task_id}", status_code=204, response_class=Response)
+@router.get("/tasks/{task_id}/timeline", response_model=AppEaTaskTimelineResponse)
+async def get_task_timeline(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    svc = get_task_service()
+    task = svc._get_or_404(db, task_id)
+    return svc.get_task_timeline(db, task)
+
+
+@router.delete("/tasks/{task_id}/timeline", response_model=TaskActionResponse)
+async def clear_task_timeline(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    svc = get_task_service()
+    task = svc._get_or_404(db, task_id)
+    deleted_event_count = svc.clear_task_timeline(db, task)
+    db.commit()
+    return TaskActionResponse(task_id=task_id, message="时间线已清空", deleted_event_count=deleted_event_count)
+
+
+@router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=TaskActionResponse)
+async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    svc = get_task_service()
+    task = svc._get_or_404(db, task_id)
+    deleted_event_count = svc.delete_task_timeline_event(db, task, event_id)
+    db.commit()
+    return TaskActionResponse(task_id=task_id, message="时间线事件已删除", deleted_event_count=deleted_event_count)
+
+
+@router.delete("/tasks/{task_id}", response_model=TaskActionResponse)
 async def delete_task(
     task_id: str,
     delete_files: bool = Query(default=True),
     db: Session = Depends(get_db),
     _=Depends(get_current_user),
-) -> Response:
+) -> TaskActionResponse:
     """删除任务记录（软删除），并可选同步删除输出目录下的任务文件。"""
-    get_task_service().delete_task(db, task_id, delete_files=delete_files)
-    return Response(status_code=204)
+    cleanup = get_task_service().delete_task(db, task_id, delete_files=delete_files)
+    return TaskActionResponse(task_id=task_id, message="任务已删除", deleted_event_count=int(cleanup.get("deleted_event_count") or 0))
 
 
 @router.get("/tasks/{task_id}/logs")
