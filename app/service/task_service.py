@@ -259,7 +259,7 @@ def _build_lean_file_catalog(lean_state_path: "Path") -> list[dict]:
             "j_attempts":   int(fs.get("j_attempts", 0)),
             "feedback":     str(fs.get("feedback", ""))[:200],
             # 共用字段（展示层复用 r1b_state 等列）
-            "r1b_state":    "passed" if j_passed else w_state,
+            "r2_state":    "passed" if j_passed else w_state,
             "r2_state":     j_state,
             "r2j_state":    j_state,
             "r3_state":     "passed" if j_passed else "pending",
@@ -320,7 +320,7 @@ def _build_function_catalog(row: AppEaTask) -> list[dict]:
                 "signature": str(f.get("signature") or ""),
                 "start_line": int(f.get("start_line") or 0),
                 "end_line": int(f.get("end_line") or 0),
-                "r1b_state": str(f.get("r2_j_state") or "pending"),
+                "r2_state": str(f.get("r2_j_state") or "pending"),
                 "r2_state": str(f.get("r3_w_state") or "pending"),
                 "r2j_state": str(f.get("r3_j_state") or "pending"),
                 "r3_state": r3_state,

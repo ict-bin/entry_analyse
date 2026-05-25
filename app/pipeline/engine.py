@@ -132,14 +132,23 @@ def _count_json_array(path: Path) -> int:
 
 
 def _aggregate_r3_entries(dirs: PipelineDirs) -> list[dict]:
+    """收集 r3_func/ 目录下所有 decision=keep 的函数入口。
+
+    decision=filter 的条目不纳入（R3-W 对所有分析函数都写文件，包括被过滤的）。
+    """
     result: list[dict] = []
     for f in sorted((dirs.r3.parent / "r3_func").glob("*.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                if data.get("decision") == "filter":
+                    continue  # 跳过已被 R3-W 过滤的条目
                 result.append(data)
             elif isinstance(data, list):
-                result.extend(data)
+                result.extend(
+                    e for e in data
+                    if isinstance(e, dict) and e.get("decision") != "filter"
+                )
         except Exception:
             pass
     return result
@@ -278,7 +287,7 @@ class PipelineEngine:
 
             # R2: 准确性验证（不需要 CC）
             if func_state.r2_j_state != NodeState.PASSED:
-                await self._run_r1b_only(
+                await self._run_r2_only(
                     file_hash, func_hash, file_path, dirs, state)
             r2_done_count += 1
             if r2_done_count >= total_funcs:
@@ -324,6 +333,22 @@ class PipelineEngine:
                 )
             if self._cancel.is_set():
                 return
+
+            # R4: 结合 CC 调用链判断（跨文件凗余过滤，仅多文件模块有意义）
+            func_state = fs.functions.get(func_hash)
+            if (
+                func_state
+                and func_state.r4_decision == "keep"
+                and func_state.r4_state != NodeState.PASSED
+                and len(state.files) > 1          # 单文件模块跳过
+            ):
+                _r3_entry_path = dirs.r3.parent / "r3_func" / f"{func_hash}.json"
+                if _r3_entry_path.exists():
+                    try:
+                        _r4_entry = json.loads(_r3_entry_path.read_text(encoding="utf-8"))
+                        await self._run_r4_for_func(_r4_entry, dirs, state)
+                    except Exception as _r4_exc:
+                        logger.warning("R4-func skip for %s: %s", func_hash, _r4_exc)
 
             # R5: 单函数报告
             func_state = fs.functions.get(func_hash)
@@ -379,16 +404,16 @@ class PipelineEngine:
             return
         fs = state.files[file_hash]
         if fs.r1_j_state != NodeState.PASSED:
-            await self._run_r1a(file_hash, file_path, dirs, state)
+            await self._run_r1(file_hash, file_path, dirs, state)
         if self._cancel.is_set() or fs.r1_j_state != NodeState.PASSED:
             return
         if fs.functions:
             await asyncio.gather(*[
-                self._run_r1b_only(file_hash, fh, file_path, dirs, state)
+                self._run_r2_only(file_hash, fh, file_path, dirs, state)
                 for fh in list(fs.functions.keys())
             ])
 
-    async def _run_r1b_only(
+    async def _run_r2_only(
         self,
         file_hash: str,
         func_hash: str,
@@ -401,10 +426,10 @@ class PipelineEngine:
         func_state = fs.functions.get(func_hash)
         if func_state is None:
             return
-        r1b_max = int(getattr(self.cfg, "r1b_max_rounds", -1))
+        r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
         if func_state.r2_j_state == NodeState.PASSED:
             return
-        if not _should_continue(func_state.r2_j_attempts, r1b_max, self._cancel):
+        if not _should_continue(func_state.r2_j_attempts, r2_max, self._cancel):
             func_state.r2_j_state = NodeState.PASSED
             state.save(dirs.state_file)
             return
@@ -417,7 +442,7 @@ class PipelineEngine:
         func_name  = func_meta.get("name", func_state.name or func_hash[:8])
         start_line = func_meta.get("start_line", 0)
         end_line   = func_meta.get("end_line", 0)
-        await self._run_r1b_j(
+        await self._run_r2_j(
             file_hash, func_hash, file_path, dirs, state)
 
     # ── Phase 3 函数单元：R2 + R3-W(带 CC caller 上下文) ───────────────────
@@ -552,11 +577,11 @@ class PipelineEngine:
             return
 
         fs = state.files[file_hash]
-        r1a_max = int(getattr(self.cfg, "r1a_max_rounds", -1))
+        r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
 
         # ── R1a：文件级覆盖率 W+J ─────────────────────────────────────────────
         if fs.r1_j_state != NodeState.PASSED:
-            await self._run_r1a(file_hash, file_path, dirs, state)
+            await self._run_r1(file_hash, file_path, dirs, state)
 
         if self._cancel.is_set() or fs.r1_j_state != NodeState.PASSED:
             return
@@ -564,7 +589,7 @@ class PipelineEngine:
         # ── R1b+R2 W+J（每函数并行）──────────────────────────────────────────
         if fs.functions:
             await asyncio.gather(*[
-                self._run_r1b_then_r2wj(file_hash, fh, file_path, dirs, state)
+                self._run_r2_then_r3pre_wj(file_hash, fh, file_path, dirs, state)
                 for fh in list(fs.functions.keys())
             ])
 
@@ -577,7 +602,7 @@ class PipelineEngine:
 
     # ── R1a W+J ────────────────────────────────────────────────────────────────
 
-    async def _run_r1a(
+    async def _run_r1(
         self,
         file_hash: str,
         file_path: str,
@@ -586,9 +611,9 @@ class PipelineEngine:
     ) -> None:
         """R1a：文件级覆盖率 W+J 循环。"""
         fs = state.files[file_hash]
-        r1a_max = int(getattr(self.cfg, "r1a_max_rounds", -1))
+        r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
 
-        while _should_continue(fs.r1_attempts, r1a_max, self._cancel):
+        while _should_continue(fs.r1_attempts, r1_max, self._cancel):
             if fs.r1_j_state == NodeState.PASSED:
                 break
 
@@ -649,7 +674,7 @@ class PipelineEngine:
                 ws_file_path = dirs.source / _rel
                 worker_result_file = dirs.stage_result_file("r1_w", "worker", file_hash, fs.r1_attempts)
                 worker_raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, fs.r1_attempts)
-                j_prompt = P.build_r1a_j_prompt(
+                j_prompt = P.build_r1_j_prompt(
                     file_name=Path(file_path).name,
                     func_count=len(fs.functions),
                     ws_file_path=str(ws_file_path),
@@ -664,7 +689,7 @@ class PipelineEngine:
                     system_prompt=self._stage_sys_prompt('r1_judge'),
                     session_file=j_session,
                     cwd=str(dirs.source),
-                    context=f"r1a_j:{file_hash}",
+                    context=f"r1_j:{file_hash}",
                     acfg=acfg_j,
                 )
                 j_passed, j_feedback = _parse_j_result(ar_j.output)
@@ -691,14 +716,14 @@ class PipelineEngine:
                 break
 
         # max_rounds=0 → 跳过（直接 PASS）
-        if r1a_max == 0:
+        if r1_max == 0:
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED
             state.save(dirs.state_file)
 
     # ── R1b+R2 W+J（每函数串链）──────────────────────────────────────────────
 
-    async def _run_r1b_then_r2wj(
+    async def _run_r2_then_r3pre_wj(
         self,
         file_hash: str,
         func_hash: str,
@@ -708,7 +733,7 @@ class PipelineEngine:
     ) -> None:
         """流水线：R1b W+J 通过后进入 R2 W+J 循环。"""
         fs = state.files[file_hash]
-        r1b_max = int(getattr(self.cfg, "r1b_max_rounds", -1))
+        r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
 
         # 超大文件跳过 R1b-J
         if len(fs.functions) > R1B_J_SKIP_THRESHOLD:
@@ -725,17 +750,17 @@ class PipelineEngine:
                     return
                 if func_state.r2_j_state == NodeState.PASSED:
                     break
-                if not _should_continue(func_state.r2_j_attempts, r1b_max, self._cancel):
+                if not _should_continue(func_state.r2_j_attempts, r2_max, self._cancel):
                     func_state.r2_j_state = NodeState.PASSED
                     state.save(dirs.state_file)
                     break
 
                 # R1b-W（首次或被 J 失败触发）
                 if func_state.r2_w_state != NodeState.PASSED:
-                    await self._run_r1b_w(file_hash, func_hash, file_path, dirs, state)
+                    await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
 
                 # R1b-J
-                j_passed = await self._run_r1b_j(file_hash, func_hash, file_path, dirs, state)
+                j_passed = await self._run_r2_j(file_hash, func_hash, file_path, dirs, state)
                 if j_passed:
                     break
                 # J 失败：重置 W
@@ -777,7 +802,7 @@ class PipelineEngine:
 
     # ── R1b W ──────────────────────────────────────────────────────────────────
 
-    async def _run_r1b_w(
+    async def _run_r2_w(
         self,
         file_hash: str,
         func_hash: str,
@@ -826,7 +851,7 @@ class PipelineEngine:
 
     # ── R1b J ──────────────────────────────────────────────────────────────────
 
-    async def _run_r1b_j(
+    async def _run_r2_j(
         self,
         file_hash: str,
         func_hash: str,
@@ -849,7 +874,7 @@ class PipelineEngine:
         try:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r2_judge')
-            worker_result_file = dirs.stage_result_file("r1b_w", "worker", func_hash, max(1, attempt))
+            worker_result_file = dirs.stage_result_file("r2_w", "worker", func_hash, max(1, attempt))
             prompt = P.build_r1_j_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
@@ -861,11 +886,11 @@ class PipelineEngine:
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.source),
-                context=f"r1b_j:{func_hash}", acfg=acfg,
+                context=f"r2_j:{func_hash}", acfg=acfg,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
-                "stage": "r1b_j",
+                "stage": "r2_j",
                 "attempt": attempt,
                 "scope": "func",
                 "func_hash": func_hash,
@@ -874,10 +899,10 @@ class PipelineEngine:
                 "summary": feedback[:200],
                 "feedback": feedback,
             }
-            result_file = dirs.stage_result_file("r1b_j", "judge", func_hash, attempt)
-            raw_file = dirs.stage_raw_file("r1b_j", "judge", func_hash, attempt)
+            result_file = dirs.stage_result_file("r2_j", "judge", func_hash, attempt)
+            raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, attempt)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r1b_j", role_kind="judge", scope_kind="func", attempt=attempt,
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=attempt,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
                                       summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
             func_state.r2_j_feedback = feedback
@@ -1554,25 +1579,35 @@ class PipelineEngine:
         self, dirs: PipelineDirs, state: PipelineState
     ) -> list[dict]:
         """
-        v4 R4 简化版：
-          Step 3: 收集所有 R3-kept 函数
-          Step 4: 直接跑 R4-final-J
-          Step 5: R4-per-func 已删除（职能已并入 R3-W）
+        R4 流水线：
+          Step 3: 收集所有 R3-kept 函数（过滤 decision=filter 条目）
+          Step 3.5: 应用 R4 per-func 决策（过滤 decision=remove 条目）
+          Step 4: 跑 R4-final-J
         """
-        # Step 3: 收集 R3-kept 入口
-        final_entries = _aggregate_r3_entries(dirs)
-        if not final_entries:
+        # Step 3: 收集 R3-kept 入口（_aggregate_r3_entries 已过滤 decision=filter）
+        r3_entries = _aggregate_r3_entries(dirs)
+        if not r3_entries:
             try:
                 from .module_db import ModuleDB
-                final_entries = ModuleDB.open(dirs.workspace).get_r3_kept()
+                r3_entries = ModuleDB.open(dirs.workspace).get_r3_kept()
             except Exception:
                 pass
 
-        if not final_entries:
+        if not r3_entries:
             logger.info("R4: no R3 entries, skipping")
             state.r6_state = NodeState.PASSED
             state.save(dirs.state_file)
             return []
+
+        if self._cancel.is_set():
+            return r3_entries
+
+        # Step 3.5: 应用 R4 per-func 决策（过滤 decision=remove）
+        final_entries = self._collect_r4_kept(r3_entries, dirs, state)
+        if not final_entries:
+            # 如果 R4 全部过滤（极端情况），保守回退到 R3 结果
+            logger.warning("R4: all entries filtered by R4 per-func, reverting to R3 entries")
+            final_entries = r3_entries
 
         if self._cancel.is_set():
             return final_entries
@@ -1663,6 +1698,18 @@ class PipelineEngine:
         entry_role  = entry.get("entry_role", "boundary")
         file_path   = entry.get("file", "")
 
+        # 收集当前 R3-kept 入口名单，供 prompt 中对照调用者身份
+        r3_kept_names: list[str] = []
+        r3_func_dir = dirs.r3.parent / "r3_func"
+        if r3_func_dir.is_dir():
+            for _p in r3_func_dir.glob("*.json"):
+                try:
+                    _d = json.loads(_p.read_text(encoding="utf-8"))
+                    if _d.get("decision") != "filter" and _d.get("function"):
+                        r3_kept_names.append(_d["function"])
+                except Exception:
+                    pass
+
         is_retry = bool(getattr(func_state, 'r4_attempts', 1) and getattr(func_state, 'r4_attempts', 1) > 1)
         prev_result = result_file if is_retry and result_file.exists() else None
         prompt = P.build_r4_func_w_prompt(
@@ -1674,6 +1721,7 @@ class PipelineEngine:
             is_retry=is_retry,
             feedback=getattr(func_state, 'r4_reason', '') if is_retry else '',
             judge_result_file=str(prev_result) if prev_result else "",
+            r3_kept_names=r3_kept_names,
         )
 
         self._emit("r4_w_start", func_hash=func_hash,

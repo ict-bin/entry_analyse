@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS file_meta (
     rel_path      TEXT NOT NULL DEFAULT '',
     basename      TEXT NOT NULL DEFAULT '',
     total_funcs   INTEGER DEFAULT 0,
-    r1a_passed    INTEGER DEFAULT 0,
+    r1_passed    INTEGER DEFAULT 0,
     created_at    REAL
 );
 
@@ -123,7 +123,7 @@ class ModuleDB:
             conn.execute(
                 """INSERT OR REPLACE INTO file_meta
                        (file_hash, original_path, rel_path, basename,
-                        total_funcs, r1a_passed, created_at)
+                        total_funcs, r1_passed, created_at)
                    VALUES (?, ?, ?, ?, ?, 1, ?)""",
                 (file_hash, original_path, rel_path, basename,
                  total_funcs, time.time()),

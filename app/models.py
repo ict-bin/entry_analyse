@@ -105,8 +105,8 @@ class ServiceConfig(BaseModel):
 
     # 各阶段轮次配置（-1=无限，0=跳过，N=上限）
     pipeline_parallelism: int = Field(default=64)
-    r1a_max_rounds: int = Field(default=-1)
-    r1b_max_rounds: int = Field(default=-1)
+    r1_max_rounds: int = Field(default=-1)
+    r2_max_rounds: int = Field(default=-1)
     r2_max_rounds: int = Field(default=-1)
     r3_max_rounds: int = Field(default=-1)
     r4_func_max_rounds: int = Field(default=-1)
@@ -191,9 +191,9 @@ class TaskConfig(BaseModel):
         description="全局并行信号量大小（同时存在的 pi 进程上限）")
 
     # ── 每阶段最大重试轮次（-1=无限重试，0=跳过，正整数=上限）─────────────────────
-    r1a_max_rounds: int = Field(default=-1,
+    r1_max_rounds: int = Field(default=-1,
         description="R1a 覆盖率 W+J 最大轮次（-1=无限）")
-    r1b_max_rounds: int = Field(default=-1,
+    r2_max_rounds: int = Field(default=-1,
         description="R1b 准确性 W+J 最大轮次（-1=无限）")
     r2_max_rounds: int = Field(default=-1,
         description="R2 外部输入分析 W+J 最大轮次（-1=无限）")

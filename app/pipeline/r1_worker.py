@@ -710,7 +710,7 @@ async def run_r1_worker(
 
 # ─── run_r2_worker ──────────────────────────────────────────────────────────
 
-async def run_r2_worker(
+async def run_r2_w_worker(
     *,
     file_path: str,
     func_hash: str,
@@ -744,7 +744,7 @@ async def run_r2_worker(
     workspace = str(dirs.source)
 
     attempt_no = 2 if is_retry else 1
-    judge_result_file = dirs.stage_result_file("r1b_j", "judge", func_hash, max(1, attempt_no - 1)) if is_retry else None
+    judge_result_file = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, attempt_no - 1)) if is_retry else None
     prompt = build_r2_w_prompt(
         func_hash=func_hash,
         func_name=func_name,
@@ -783,7 +783,7 @@ async def run_r2_worker(
 
     corrections = _parse_r1_corrections(ar.output)
     result_payload = {
-        "stage": "r1b_w",
+        "stage": "r2_w",
         "attempt": attempt_no,
         "scope": "func",
         "func_hash": func_hash,
@@ -793,11 +793,11 @@ async def run_r2_worker(
         "result_type": "corrections",
         "result": [] if corrections is None else (corrections or []),
     }
-    result_file = dirs.stage_result_file("r1b_w", "worker", func_hash, attempt_no)
-    raw_file = dirs.stage_raw_file("r1b_w", "worker", func_hash, attempt_no)
+    result_file = dirs.stage_result_file("r2_w", "worker", func_hash, attempt_no)
+    raw_file = dirs.stage_raw_file("r2_w", "worker", func_hash, attempt_no)
     write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
     upsert_stage_result_index(
-        task_id=task_id, stage_key="r1b_w", role_kind="worker", scope_kind="func",
+        task_id=task_id, stage_key="r2_w", role_kind="worker", scope_kind="func",
         attempt=attempt_no, file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
         summary=f"corrections={len(result_payload['result'])}",
         result_file_path=str(result_file), raw_file_path=str(raw_file),

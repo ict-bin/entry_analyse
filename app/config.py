@@ -86,8 +86,8 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         resume_task_id=resume_task_id,
         # 各阶段轮次配置（v3）
         pipeline_parallelism=int(getattr(svc, 'pipeline_parallelism', 64) or 64),
-        r1a_max_rounds=int(getattr(svc, 'r1a_max_rounds', -1)),
-        r1b_max_rounds=int(getattr(svc, 'r1b_max_rounds', -1)),
+        r1_max_rounds=int(getattr(svc, 'r1_max_rounds', -1)),
+        r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
         r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
         r3_max_rounds=int(getattr(svc, 'r3_max_rounds', -1)),
         r4_func_max_rounds=int(getattr(svc, 'r4_func_max_rounds', -1)),

@@ -535,7 +535,7 @@ class FunctionDB:
                  start_line, end_line, body, body_lines, time.time()),
             )
 
-    def get_functions_for_r1b(self) -> list[dict]:
+    def get_functions_for_r2(self) -> list[dict]:
         """
         返回全量函数元数据（不含 body），供 R1b-W/J 使用。
 

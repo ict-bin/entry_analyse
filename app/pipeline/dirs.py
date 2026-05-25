@@ -9,16 +9,19 @@ entry_analyse — Pipeline 目录结构管理（v5）
   │   ├── r4-module/            ← R6 产物（最终入口 entries.json）
   │   └── callchain/            ← CC 产物（callchain.db）
   ├── sessions/
-  │   ├── r1-w-{fh}.jsonl            R1 coverage Worker（文件级，跨重试共享）
-  │   ├── r1-j-{fh}-a{n}.jsonl       R1 coverage Judge（每次新建）
-  │   ├── r2-j-{fh}-a{n}.jsonl       R2 accuracy Judge（函数级，每次新建）
-  │   ├── r3-w-{fh}-{func}.jsonl     R3 entry analysis Worker
-  │   ├── r3-j-{func}-a{n}.jsonl     R3 entry analysis Judge
-  │   ├── r4-w-{func}.jsonl          R4 callchain Worker
-  │   ├── r5-w-{func}.jsonl          R5 per-func report Worker
-  │   ├── r5-j-{func}-a{n}.jsonl     R5 per-func report Judge
-  │   ├── r6-w-a{n}.jsonl            R6 final report Worker
-  │   └── r6-j-a{n}.jsonl            R6 final report / quality Judge
+  │   ├── r1-w-{fh}.jsonl            R1 覆盖率 Worker（文件级，跨重试共享）
+  │   ├── r1-j-{fh}-a{n}.jsonl       R1 覆盖率 Judge（每次新建）
+  │   ├── r2-j-{func}-a{n}.jsonl     R2 准确性 Judge（函数级，每次新建）
+  │   ├── r2-w-{func}.jsonl          R2 准确性 Worker（仅有误差时生成）
+  │   ├── r4-w-{func}.jsonl          R3 pre-step: 外部输入分析 Worker
+  │   ├── r3-j-{func}-a{n}.jsonl     R3 pre-step: 外部输入分析 Judge
+  │   ├── r3-w-{fh}-{func}.jsonl     R3 单函数入口判断 Worker
+  │   ├── r3-j-file-{fh}-a{n}.jsonl  R3 文件级 Judge
+  │   ├── r4-func-w-{func}.jsonl     R4 结合调用链判断 Worker
+  │   ├── r5-w-{func}.jsonl          R5 单函数报告 Worker
+  │   ├── r5-j-{func}-a{n}.jsonl     R5 单函数报告 Judge
+  │   ├── r6-w-a{n}.jsonl            R6 汇总报告 Worker
+  │   └── r6-j-a{n}.jsonl            R6 汇总 / 质量 Judge
   └── pipeline_state.json
 """
 
@@ -87,6 +90,7 @@ class PipelineDirs:
 
     # backward compat alias
     def r1a_gaps_file(self, file_hash: str) -> Path:
+        """backward compat alias: r1a_gaps_file → r1_gaps_file"""
         return self.r1_gaps_file(file_hash)
 
     def r3_file_path(self, file_hash: str) -> Path:
@@ -129,11 +133,13 @@ class PipelineDirs:
     def r1_j_session(self, file_hash: str, attempt: int) -> Path:
         return self.sessions / f"r1-j-{file_hash}-a{attempt}.jsonl"
 
-    # backward compat aliases
+    # backward compat aliases (r1a_ → r1_, r1b_ → r2_)
     def r1a_w_session(self, file_hash: str) -> Path:
+        """backward compat: r1a_w_session → r1_w_session"""
         return self.r1_w_session(file_hash)
 
     def r1a_j_session(self, file_hash: str, attempt: int) -> Path:
+        """backward compat: r1a_j_session → r1_j_session"""
         return self.r1_j_session(file_hash, attempt)
 
     # R2 Accuracy（函数级，只有 J，无独立 W session）
@@ -142,9 +148,11 @@ class PipelineDirs:
 
     # backward compat aliases
     def r1b_j_session(self, func_hash: str, attempt: int) -> Path:
+        """backward compat: r1b_j_session → r2_j_session"""
         return self.r2_j_session(func_hash, attempt)
 
     def r1b_w_session(self, func_hash: str) -> Path:
+        """R2 accuracy Worker session (r1b 命名保留向后兼容)"""
         return self.sessions / f"r2-w-{func_hash}.jsonl"
 
     # R3 Entry Analysis（函数级）
@@ -196,7 +204,8 @@ class PipelineDirs:
         return self.r6_j_session(attempt)
 
     def r4_func_w_session(self, func_hash: str) -> Path:
-        return self.r4_w_session(func_hash)
+        """R4 per-func Worker session（独立命名，避免与 R3 pre-step r4-w-* 冲突）"""
+        return self.sessions / f"r4-func-w-{func_hash}.jsonl"
 
     # ─── 初始化 ───────────────────────────────────────────────────────────────
 
@@ -228,7 +237,7 @@ class PipelineDirs:
         return self.r3_j_feedback_file(func_hash, attempt)
 
     def r4_j_session(self, hash_: str, attempt: int) -> Path:
-        """backward compat：旧 r4_j_session 对应 r3-j session 文件。
+        """backward compat: old r4_j_session maps to r3-j session file.
         调用方应迁移至语义明确的 r2_j_session / r3_j_session / r3_j_file_session。
         """
         return self.sessions / f"r4-j-{hash_}-a{attempt}.jsonl"

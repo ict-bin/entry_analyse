@@ -162,38 +162,38 @@ def _infer_path_descriptor(relative_path: str) -> dict:
         })
         return desc
     # R1a-W
-    r1a_w_match = re.fullmatch(r"r1a-w-([0-9a-f]+)\.jsonl", normalized)
-    if r1a_w_match:
-        fh = r1a_w_match.group(1)
-        desc.update({"stage_key": "r1a", "stage_label": "R1a 覆盖率",
-                     "stage_order": 5, "family_key": f"r1a::{fh}"})
+    r1_w_match = re.fullmatch(r"r1-w-([0-9a-f]+)\.jsonl", normalized)
+    if r1_w_match:
+        fh = r1_w_match.group(1)
+        desc.update({"stage_key": "r1", "stage_label": "R1 覆盖率",
+                     "stage_order": 5, "family_key": f"r1::{fh}"})
         return desc
     # R1a-J
-    r1a_j_match = re.fullmatch(r"r1a-j-([0-9a-f]+)-a(\d+)\.jsonl", normalized)
-    if r1a_j_match:
-        fh = r1a_j_match.group(1)
+    r1_j_match = re.fullmatch(r"r1-j-([0-9a-f]+)-a(\d+)\.jsonl", normalized)
+    if r1_j_match:
+        fh = r1_j_match.group(1)
         desc.update({"role": "judge", "role_label": "Judge",
-                     "stage_key": "r1a", "stage_label": "R1a 覆盖率",
-                     "stage_order": 5, "attempt": _safe_int(r1a_j_match.group(2)),
-                     "parent_relative_path": f"r1a-w-{fh}.jsonl",
-                     "family_key": f"r1a::{fh}", "flow_kind": "parallel"})
+                     "stage_key": "r1", "stage_label": "R1 覆盖率",
+                     "stage_order": 5, "attempt": _safe_int(r1_j_match.group(2)),
+                     "parent_relative_path": f"r1-w-{fh}.jsonl",
+                     "family_key": f"r1::{fh}", "flow_kind": "parallel"})
         return desc
     # R1b-W
-    r1b_w_match = re.fullmatch(r"r1b-w-([0-9a-f]+)\.jsonl", normalized)
-    if r1b_w_match:
-        fh = r1b_w_match.group(1)
-        desc.update({"stage_key": "r1b", "stage_label": "R1b 准确性",
-                     "stage_order": 7, "family_key": f"r1b::{fh}"})
+    r2_w_match = re.fullmatch(r"r2-w-([0-9a-f]+)\.jsonl", normalized)
+    if r2_w_match:
+        fh = r2_w_match.group(1)
+        desc.update({"stage_key": "r2", "stage_label": "R2 准确性",
+                     "stage_order": 7, "family_key": f"r2::{fh}"})
         return desc
     # R1b-J
-    r1b_j_match = re.fullmatch(r"r1b-j-([0-9a-f]+)-a(\d+)\.jsonl", normalized)
-    if r1b_j_match:
-        fh = r1b_j_match.group(1)
+    r2_j_match = re.fullmatch(r"r2-j-([0-9a-f]+)-a(\d+)\.jsonl", normalized)
+    if r2_j_match:
+        fh = r2_j_match.group(1)
         desc.update({"role": "judge", "role_label": "Judge",
-                     "stage_key": "r1b", "stage_label": "R1b 准确性",
-                     "stage_order": 7, "attempt": _safe_int(r1b_j_match.group(2)),
-                     "parent_relative_path": f"r1b-w-{fh}.jsonl",
-                     "family_key": f"r1b::{fh}", "flow_kind": "parallel"})
+                     "stage_key": "r2", "stage_label": "R2 准确性",
+                     "stage_order": 7, "attempt": _safe_int(r2_j_match.group(2)),
+                     "parent_relative_path": f"r2-w-{fh}.jsonl",
+                     "family_key": f"r2::{fh}", "flow_kind": "parallel"})
         return desc
     # R4 per-func-W
     r4fw_match = re.fullmatch(r"r4-func-w-([0-9a-f]+)\.jsonl", normalized)

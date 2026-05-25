@@ -94,7 +94,7 @@ class FunctionState:
         data = dict(data)
 
         # ── 向前兼容：旧字段 → 新字段 ──────────────────────────────────────
-        # r1b_* (v3/v4) → r2_* (v5)
+        # r2_* (v3/v4) → r2_* (v5)
         if 'r1b_j_state' in data and 'r2_j_state' not in data:
             data['r2_j_state']         = data.get('r1b_j_state', 'pending')
             data['r2_j_attempts']      = data.get('r1b_j_attempts', 0)
@@ -220,11 +220,11 @@ class FileState:
         data = dict(data)
 
         # ── 向前兼容：r1a_* (v4) → r1_* (v5) ──────────────────────────────
-        if 'r1a_w_state' in data and 'r1_w_state' not in data:
-            data['r1_w_state']  = data.get('r1a_w_state', 'pending')
+        if 'r1_w_state_legacy' in data and 'r1_w_state' not in data:
+            data['r1_w_state']  = data.get('r1_w_state_legacy', 'pending')
             data['r1_j_state']  = data.get('r1a_j_state', 'pending')
             data['r1_attempts'] = data.get('r1a_attempts', 0)
-            data['r1_feedback'] = data.get('r1a_feedback', '')
+            data['r1_feedback'] = data.get('r1_feedback', '')
         # r1_w_state alone (v2/v3 before r1a split)
         elif 'r1_w_state' in data and 'r1_j_state' not in data:
             data['r1_j_state'] = data.get('r1_w_state', 'pending')

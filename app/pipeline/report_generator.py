@@ -614,7 +614,102 @@ def generate_final_report_from_parts(
     out_path     = out_dir / "final_report.md"
 
     import json as _json
+    import re as _re
     entries: list[dict] = _json.loads(entries_path.read_text(encoding="utf-8"))
+
+    # ── TASK-03: R5 完成后回写 confidence 到 entry-details.json ─────────────
+    # R5 report .md 里有置信度，entry-details.json 写入时 R5 尚未跑，需在此补填。
+    _confidence_updated = False
+    for _e in entries:
+        _fh = str(_e.get("func_hash") or "")
+        if not _fh or _e.get("confidence") is not None:
+            continue
+        _md = reports_dir / f"{_fh}.md"
+        if not _md.exists():
+            continue
+        try:
+            _m = _re.search(r'置信度\*\*：([\d.]+)', _md.read_text(encoding="utf-8"))
+            if _m:
+                _e["confidence"] = float(_m.group(1))
+                _confidence_updated = True
+        except Exception:
+            pass
+
+    # ── TASK-08: 推断 entry_type（短期规则，长期由 R3-W 输出）────────────────
+    def _infer_entry_type(entry: dict) -> str:
+        role = str(entry.get("entry_role") or "")
+        fn   = str(entry.get("function") or "").lower()
+        sig  = str(entry.get("signature") or "").lower()
+        if role == "ipc_handler":
+            return "ipc"
+        if role == "callback":
+            return "callback"
+        if any(k in fn for k in ("mbuf", "pkt", "packet", "ether", "ip", "esp", "ah")):
+            return "network"
+        if any(k in fn for k in ("ha", "backup", "sync", "realtimebackup", "batchbackup")):
+            return "ha"
+        if any(k in fn for k in ("msg", "proc", "ipc", "pipe", "socket", "sock")):
+            return "ipc"
+        return "boundary"
+
+    _type_updated = False
+    for _e in entries:
+        if _e.get("entry_type") is None:
+            _e["entry_type"] = _infer_entry_type(_e)
+            _type_updated = True
+
+    # 回写 entry-details.json（置信度 + entry_type）
+    if _confidence_updated or _type_updated:
+        entries_path.write_text(
+            _json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    # ── TASK-09: 标注 dispatch_target 的父级入口（caller_entry）────────────────
+    # 利用 callchain.db 查询每个 dispatch_target 的调用者，
+    # 若该调用者也在当前入口列表中，则标注为父级入口（层级关系）。
+    _detail_hashes = {str(_e.get("func_hash") or "") for _e in entries if _e.get("func_hash")}
+    _caller_updated = False
+    _callchain_db = out_dir.parent.parent / "run" / "workspace" / "callchain" / "callchain.db"
+    if not _callchain_db.exists():
+        # try relative path from output dir
+        _callchain_db = out_dir / ".." / "run" / "workspace" / "callchain" / "callchain.db"
+    if _callchain_db.exists():
+        try:
+            import sys as _sys
+            _app_dir = str(out_dir.parent.parent / "app")
+            if _app_dir not in _sys.path:
+                _sys.path.insert(0, _app_dir)
+            from pipeline.callchain_db import CallchainDB  # type: ignore
+            _cc_db = CallchainDB.open(_callchain_db.parent)
+            for _e in entries:
+                if _e.get("entry_role") != "dispatch_target":
+                    continue
+                if _e.get("caller_entry"):
+                    continue
+                _fh = str(_e.get("func_hash") or "")
+                if not _fh:
+                    continue
+                try:
+                    _callers = _cc_db.get_callers(_fh)
+                    _entry_callers = [
+                        c["name"] for c in _callers
+                        if c.get("caller_hash") in _detail_hashes
+                        or c.get("func_hash") in _detail_hashes
+                    ]
+                    if _entry_callers:
+                        _e["caller_entry"] = _entry_callers[0]
+                        _caller_updated = True
+                except Exception:
+                    pass
+        except Exception:
+            pass  # callchain_db not available, skip
+
+    if _caller_updated:
+        entries_path.write_text(
+            _json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     # 按 entry_role 分组
     groups: dict[str, list[dict]] = {}
@@ -672,7 +767,17 @@ def generate_final_report_from_parts(
             fh = str(e.get("func_hash") or "")
             md = reports_dir / f"{fh}.md" if fh else None
             if md and md.exists():
-                lines.append(md.read_text(encoding="utf-8").strip())
+                _md_content = md.read_text(encoding="utf-8").strip()
+                # TASK-09: 如果有父级入口，在 md 内容开头插入标注
+                _caller = e.get("caller_entry")
+                if _caller and role == "dispatch_target":
+                    _note = f"> **上级入口**：`{_caller}`（该函数由上级入口分发触达，并列为独立入口以便污点追踪）\n"
+                    # 插入到第一行标题之后
+                    _lines_md = _md_content.split("\n")
+                    _insert_at = 1 if len(_lines_md) > 1 else len(_lines_md)
+                    _lines_md.insert(_insert_at, _note)
+                    _md_content = "\n".join(_lines_md)
+                lines.append(_md_content)
                 lines.append("")
             else:
                 # fallback 最小摘要

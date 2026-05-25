@@ -560,9 +560,27 @@ def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
             suffix = " ..." if len(bad) > 3 else ""
             log.append(f"{prefix} 过滤 {len(bad)} 个非法 taint: {preview}{suffix}")
         if not good:
-            fn = item.get('function', '')
-            log.append(f"{prefix} 过滤后 taints 为空，跳过条目 function={fn!r}")
-            continue
+            # 尝试从每个非法 taint 中提取合法标识符前缀
+            # 例如 "mbuf (received data)" → "mbuf"、"data[0] field" → "data"
+            rescued = []
+            for t in taints:
+                if not isinstance(t, str):
+                    continue
+                m = re.match(r'[a-zA-Z_][a-zA-Z0-9_]*', t.strip())
+                if m:
+                    candidate = m.group()
+                    if candidate not in rescued:
+                        rescued.append(candidate)
+            if rescued:
+                fn = item.get('function', '')
+                log.append(
+                    f"{prefix} taint 含非法字符，提取有效前缀 {rescued!r}，function={fn!r}"
+                )
+                item["taints"] = rescued
+            else:
+                fn = item.get('function', '')
+                log.append(f"{prefix} 过滤后 taints 为空，跳过条目 function={fn!r}")
+                continue
         item["taints"] = good
         # entry_role：透传并校验，非法值修复为 "boundary"
         raw_role = str(item.get("entry_role") or "").strip()

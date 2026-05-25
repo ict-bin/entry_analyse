@@ -40,7 +40,7 @@ def _retry_section(feedback: str, label: str = "Judge 评审意见") -> str:
 
 # ─── R1a Judge / R1 Judge ─────────────────────────────────────────────────────
 
-def build_r1a_j_prompt(
+def build_r1_j_prompt(
     file_name: str,
     func_count: int,
     ws_file_path: str,
@@ -240,6 +240,12 @@ def build_r2_w_prompt(
         f"{retry}\n"
         f"{step1}\n"
         f"{step2}\n"
+        f"**⚠️ 分析范围硬性限制**（不允许越出以下范围）\n\n"
+        f"- 只分析**本函数自身**的函数体和参数签名，不得分析其他函数\n"
+        f"- **禁止** grep/搜索本函数的调用者（caller 追踪是 R4 的职责）\n"
+        f"- **禁止**跨函数追踪数据流或读取其他函数的函数体\n"
+        f"- 步骤 1 无 I/O 命中行且参数名无外部数据语义 → 直接输出 has_external_input=false\n"
+        f"- **最多执行 2 次 bash**（步骤 1 读函数体算 1 次，补充确认算 1 次）\n\n"
         f"**步骤 3**：将分析结果输出在 `<result>` 标签中（**不要写任何文件**，引擎负责持久化）：\n\n"
         f"   **有外部输入时**：\n"
         f"   ```\n"
@@ -493,17 +499,30 @@ def build_r4_func_w_prompt(
     is_retry: bool = False,
     feedback: str = "",
     judge_result_file: str = "",
+    r3_kept_names: "list[str] | None" = None,
 ) -> str:
     """R4 函数级 Worker：跨文件去重判断，retry 时显式读取上一轮结果文件。"""
     retry = _retry_section(feedback) if is_retry else ""
     if is_retry and judge_result_file:
         retry += f"\n上一轮结果文件：`{judge_result_file}`（请先读取再改进）\n"
+
+    # R3 入口候选名单（用于判断调用者是否也是入口）
+    kept_section = ""
+    if r3_kept_names:
+        names_md = "\n".join(f"  - `{n}`" for n in sorted(r3_kept_names)[:30])
+        extra = f"\n  - …（共 {len(r3_kept_names)} 个）" if len(r3_kept_names) > 30 else ""
+        kept_section = (
+            f"\n## 当前 R3 入口候选名单\n\n"
+            f"{names_md}{extra}\n\n"
+            f"验证局部 1：检查 **调用关系** 中的调用者名称是否出现在上方名单中。\n"
+        )
     return (
         f"# R4 跨文件分析：`{func_name}`\n\n"
         f"{retry}"
         f"**文件**：`{file_path}`\n"
         f"**角色**：`{entry_role}`\n"
-        f"**调用关系**：{callers_info}\n\n"
+        f"**调用关系**：{callers_info}\n"
+        f"{kept_section}\n"
         f"## 判断规则\n\n"
         f"若满足以下**全部**条件，则 `decision=remove`：\n"
         f"1. 存在本模块内调用者\n"
@@ -511,7 +530,7 @@ def build_r4_func_w_prompt(
         f"3. `entry_role` **不是** `dispatch_target`\n\n"
         f"否则 `decision=keep`（保守保留）。\n\n"
         f"## 验证步骤\n\n"
-        f"1. 若有调用者，检查调用者是否也是 R3 候选入口（其他外部入口）\n"
+        f"1. 若 **调用关系** 内有调用者，对照上方 R3 入口名单确认该调用者是否也是入口\n"
         f"2. 查看函数签名，判断 taint 是参数来源还是函数体内主动读取\n\n"
         f"## 输出格式\n\n"
         f"```json\n"
