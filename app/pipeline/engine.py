@@ -41,7 +41,7 @@ from .result_index import write_stage_result_files, upsert_stage_result_index
 
 # Skills 目录：相对于本文件 (app/pipeline/engine.py) → app/pipeline/../../.pi/skills
 _EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
-from .r1_worker import run_r1_worker, run_r2_worker
+from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
 from . import prompts as P
 
@@ -822,7 +822,7 @@ class PipelineEngine:
             acfg = self.cfg.workers.agents[0]
             is_retry = func_state.r2_w_attempts > 1
             async with self._sem:
-                await run_r2_worker(
+                await run_r2_w_worker(
                     file_path=file_path,
                     func_hash=func_hash,
                     func_name=func_state.name,

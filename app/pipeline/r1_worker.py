@@ -708,7 +708,7 @@ async def run_r1_worker(
     return ar.token_usage, funcs_out, hashes_out
 
 
-# ─── run_r2_worker ──────────────────────────────────────────────────────────
+# ─── run_r2_w_worker ─────────────────────────────────────────────────────────
 
 async def run_r2_w_worker(
     *,
