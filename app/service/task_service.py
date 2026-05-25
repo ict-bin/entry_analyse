@@ -872,6 +872,8 @@ def _stat_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], i
 
     return session_meta, events, warnings, line_count
 
+
+def _origin_payload(row: "AppEaTask") -> dict:
     task_origin_type = str(row.task_origin_type or "").strip() or "manual"
     parent_task_type = str(row.parent_task_type or "").strip() or None
     origin_label = (
