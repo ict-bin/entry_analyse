@@ -790,6 +790,8 @@ class PipelineEngine:
         func_state.r2_w_state = NodeState.RUNNING
         func_state.r2_w_attempts += 1
         state.save(dirs.state_file)
+        self._emit("r2_w_start", func_hash=func_hash, function=func_state.name,
+                   file=Path(file_path).name, attempt=func_state.r2_w_attempts)
 
         try:
             acfg = self.cfg.workers.agents[0]
@@ -813,10 +815,14 @@ class PipelineEngine:
                 )
             func_state.r2_w_state = NodeState.PASSED
             state.save(dirs.state_file)
+            self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
+                       file=Path(file_path).name, passed=True)
         except Exception as exc:
             logger.error("R1b W failed for %s: %s", func_hash, exc)
             func_state.r2_w_state = NodeState.FAILED
             state.save(dirs.state_file)
+            self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
+                       file=Path(file_path).name, passed=False, error=str(exc)[:100])
 
     # ── R1b J ──────────────────────────────────────────────────────────────────
 
@@ -1333,6 +1339,9 @@ class PipelineEngine:
             if self._cancel.is_set():
                 return None
 
+            self._emit("r4_w_func_start", func_hash=func_hash, function=func_name,
+                       file=Path(file_path).name, attempt=attempt)
+
             prompt = P.build_r3_w_func_prompt(
                 func_hash=func_hash,
                 func_name=func_name,
@@ -1401,6 +1410,8 @@ class PipelineEngine:
                 if func_hash in fs.functions:
                     fs.functions[func_hash].r4_decision = "filter"
                 state.save(dirs.state_file)
+                self._emit("r4_w_func_done", func_hash=func_hash, function=func_name,
+                           decision="filter", reason=reason)
                 return None
             else:
                 entry = self._make_r3_entry(func_info, entry_role, reason)
@@ -1415,6 +1426,8 @@ class PipelineEngine:
                 except Exception:
                     pass
                 state.save(dirs.state_file)
+                self._emit("r4_w_func_done", func_hash=func_hash, function=func_name,
+                           decision="keep", reason=reason)
                 return entry
 
         # 所有保守返回路径同步 r4_decision = "keep"

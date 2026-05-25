@@ -273,6 +273,19 @@ class WorkerService:
                 "functions_list_synced",
                 "functions_list_error",
                 "callchain_done",
+                # 新增：CC 开始立即可见
+                "callchain_start",
+                # 新增：R2-W/R4-func per-func emit
+                "r2_w_start",
+                "r4_w_func_start",
+                "r4_w_func_done",
+                # 新增：精简模式关键事件
+                "lean_static_done",
+                "lean_w_start", "lean_w_done",
+                "lean_j_start", "lean_j_done",
+                "lean_module_w_start", "lean_module_w_done",
+                "lean_module_j_start", "lean_module_j_done",
+                "lean_report_start", "lean_report_done",
             }
             if n == 1 or n % 3 == 0 or event.type in immediate_events:
                 task_mod._flush_stages(task_id, event_buffer)
