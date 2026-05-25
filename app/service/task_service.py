@@ -551,6 +551,20 @@ def _write_task_result_json(row: AppEaTask, payload: dict) -> str | None:
     return str(path)
 
 
+def _stages_json_summary(stages_json: dict | None) -> dict:
+    """Return a lightweight summary of stages_json (event count + final flag).
+
+    Full event arrays are intentionally excluded to keep GET /tasks/{id}
+    responses small (~5 KB instead of potentially several MB). Clients that
+    need the complete event stream should call GET /tasks/{id}/logs.
+    """
+    if not isinstance(stages_json, dict):
+        return {"event_count": 0, "final": False}
+    events = stages_json.get("events")
+    count = len(events) if isinstance(events, list) else 0
+    return {"event_count": count, "final": bool(stages_json.get("final", False))}
+
+
 def _lightweight_result_json(row: AppEaTask, payload: dict | None, result_file: str | None = None) -> dict | None:
     if not isinstance(payload, dict):
         return None
@@ -1687,7 +1701,7 @@ class TaskService:
             "cancel_requested": row.cancel_requested,
             "error": row.error,
             "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
-            "stages_json": row.stages_json if include_heavy else None,
+            "stages_json": _stages_json_summary(row.stages_json) if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
             "function_catalog": _build_function_catalog(row) if include_heavy else [],
             "created_by": row.created_by,

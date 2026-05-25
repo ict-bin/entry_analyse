@@ -353,8 +353,24 @@ async def delete_task(
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_task_logs(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
-    """Return stages_json for the task (stage events used as structured log stream)."""
+async def get_task_logs(
+    task_id: str,
+    since: int = 0,
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """Return stages_json events for the task.
+
+    Use ``since`` (default 0) to fetch only events after a known offset,
+    enabling incremental polling: clients send back the ``total_event_count``
+    they last received, and the server returns only the new tail.
+
+    Response fields:
+    - ``events``            - slice of events[since:]
+    - ``total_event_count`` - total number of events stored (use as next ``since``)
+    - ``final``             - whether the pipeline has finished writing events
+    - ``status``            - current task status
+    """
     from app.db.models import AppEaTask
     row = db.query(AppEaTask).filter(
         AppEaTask.task_id == task_id,
@@ -363,10 +379,16 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db), _=Depends(g
     if not row:
         from fastapi import HTTPException
         raise HTTPException(404, f"任务不存在: {task_id}")
+    payload = row.stages_json if isinstance(row.stages_json, dict) else {}
+    all_events: list = payload.get("events") if isinstance(payload.get("events"), list) else []
+    total = len(all_events)
+    since_clamped = max(0, min(since, total))
     return {
         "task_id": task_id,
         "status": row.status,
-        "stages_json": row.stages_json or {"events": []},
+        "total_event_count": total,
+        "final": bool(payload.get("final", False)),
+        "events": all_events[since_clamped:],
     }
 
 
