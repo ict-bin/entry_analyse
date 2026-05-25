@@ -627,6 +627,7 @@ async def run_r1_worker(
             timeout_max_retries=cfg.agent_timeout_max_retries,
             pi_max_retries=cfg.pi_max_retries,
             pi_retry_delay=cfg.pi_retry_delay,
+            max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
         )
 
     _safe_emit(on_event, "r1_w_done", task_id,
@@ -777,6 +778,7 @@ async def run_r2_worker(
             timeout_max_retries=cfg.agent_timeout_max_retries,
             pi_max_retries=cfg.pi_max_retries,
             pi_retry_delay=cfg.pi_retry_delay,
+            max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
         )
 
     corrections = _parse_r1_corrections(ar.output)

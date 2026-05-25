@@ -680,6 +680,7 @@ class LeanPipelineEngine:
                     timeout_max_retries=self.cfg.agent_timeout_max_retries,
                     pi_max_retries=self.cfg.pi_max_retries,
                     pi_retry_delay=self.cfg.pi_retry_delay,
+                    max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
                 )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Lean pipeline fatal error [{context}]: {ar.error}")

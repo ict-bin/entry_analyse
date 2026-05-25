@@ -684,8 +684,9 @@ class PipelineEngine:
                     break
             except Exception as exc:
                 logger.error("R1a J failed for %s: %s", file_hash, exc)
-                # J 异常保守通过
-                fs.r1_j_state = NodeState.PASSED
+                # J 异常 → 标记 FAILED，交由 max_rounds 控制重试
+                fs.r1_j_state = NodeState.FAILED
+                fs.r1_feedback = f"judge exception: {str(exc)[:300]}"
                 state.save(dirs.state_file)
                 break
 
@@ -887,9 +888,9 @@ class PipelineEngine:
             return passed
         except Exception as exc:
             logger.error("R1b J failed for %s: %s", func_hash, exc)
-            func_state.r2_j_state = NodeState.PASSED   # 异常保守通过
+            func_state.r2_j_state = NodeState.FAILED   # J 异常→FAILED，交 max_rounds 重试
             state.save(dirs.state_file)
-            return True
+            return False
 
     # ── R2 Worker ─────────────────────────────────────────────────────────────
 
@@ -1108,9 +1109,9 @@ class PipelineEngine:
 
         except Exception as exc:
             logger.error("R2 J func failed for %s: %s", func_hash, exc)
-            func_state.r3_j_state = NodeState.PASSED
+            func_state.r3_j_state = NodeState.FAILED  # J 异常→FAILED，交 max_rounds 重试
             state.save(dirs.state_file)
-            return True, ""
+            return False, f"judge exception: {str(exc)[:300]}"
 
     # ── R3 ────────────────────────────────────────────────────────────────────
 
@@ -1798,10 +1799,11 @@ class PipelineEngine:
                 state.save(dirs.state_file)
             except Exception as exc:
                 logger.error("R4 final J failed: %s", exc)
-                state.r6_state = NodeState.PASSED
+                # J 异常→FAILED，交 r4_final_max_rounds 控制重试
+                state.r6_state = NodeState.FAILED
                 state.save(dirs.state_file)
-                self._r4_j_confirmed = True
-                break
+                self._r4_j_confirmed = False
+                continue
 
     # ── Report per-func 并行 ──────────────────────────────────────────────────
 
@@ -1980,9 +1982,10 @@ class PipelineEngine:
             except Exception as exc:
                 logger.warning("Report-func J failed for %s: %s", func_hash, exc)
                 if func_state:
-                    func_state.r5_state = NodeState.PASSED
-                    func_state.r5_path  = str(report_out)
-                break
+                    # J 异常→FAILED，交 report_func_max_rounds 重试
+                    func_state.r5_state = NodeState.FAILED
+                feedback = f"judge exception: {str(exc)[:300]}"
+                continue
 
         if func_state:
             if func_state.r5_state != NodeState.PASSED:
@@ -2073,6 +2076,7 @@ class PipelineEngine:
                     timeout_max_retries=self.cfg.agent_timeout_max_retries,
                     pi_max_retries=self.cfg.pi_max_retries,
                     pi_retry_delay=self.cfg.pi_retry_delay,
+                    max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
                 )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Pipeline fatal error [{context}]: {ar.error}")

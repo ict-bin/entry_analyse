@@ -444,6 +444,27 @@ def _is_retryable_query_engine_401_error(result: AgentResult) -> bool:
     return False
 
 
+def _is_empty_response(result: AgentResult) -> bool:
+    """检测上游静默失败：pi 进程正常退出但 assistant 返回的内容为空。
+
+    判定条件（同时成立）：
+      * exit_code == 0
+      * 无 result.error
+      * result.output 去除空白后为空
+      * 无 assistant message 或最后一条 assistant 的 usage.output == 0
+    """
+    if result.exit_code != 0:
+        return False
+    if result.error:
+        return False
+    if (result.output or "").strip():
+        return False
+    # 检查 assistant token usage。若 output token > 0 说明有生成，只是文本为空（以其他形式返回），不算空回复
+    if result.token_usage.output > 0:
+        return False
+    return True
+
+
 def _is_pi_crash(result: AgentResult) -> bool:
     """pi 进程级崩溃（非 API 错误、非致命错误）。"""
     if result.exit_code == 0:
@@ -494,6 +515,7 @@ async def _run_with_context_overflow_recovery(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    max_consecutive_empty_responses: int = 3,
 ) -> AgentResult:
     result = await _run_with_pi_retry(
         args=args,
@@ -505,6 +527,7 @@ async def _run_with_context_overflow_recovery(
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        max_consecutive_empty_responses=max_consecutive_empty_responses,
     )
     if not _is_context_overflow_error(result.error):
         return result
@@ -535,6 +558,7 @@ async def _run_with_context_overflow_recovery(
             retry_delay=retry_delay,
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
+            max_consecutive_empty_responses=max_consecutive_empty_responses,
         )
 
     if single_input_tokens > single_input_limit:
@@ -560,6 +584,7 @@ async def _run_with_context_overflow_recovery(
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        max_consecutive_empty_responses=max_consecutive_empty_responses,
     )
 
 
@@ -587,6 +612,7 @@ async def run_agent(
     pi_max_retries: int = -1,
     pi_retry_delay: float = 5.0,
     timeout_continue_prompt: str = "",
+    max_consecutive_empty_responses: int = 3,
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
@@ -653,6 +679,7 @@ async def run_agent(
                     retry_delay=retry_delay,
                     pi_max_retries=pi_max_retries,
                     pi_retry_delay=pi_retry_delay,
+                    max_consecutive_empty_responses=max_consecutive_empty_responses,
                 )
                 return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
             except asyncio.TimeoutError:
@@ -702,6 +729,7 @@ async def _run_with_pi_retry(
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
     pi_max_retries: int, pi_retry_delay: float,
+    max_consecutive_empty_responses: int = 3,
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     pi_attempt = 0
@@ -718,6 +746,7 @@ async def _run_with_pi_retry(
                 stdin_data=stdin_data,
                 cancel_event=cancel_event, on_stream=on_stream,
                 max_retries=max_retries, retry_delay=retry_delay,
+                max_consecutive_empty_responses=max_consecutive_empty_responses,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -784,10 +813,12 @@ async def _run_with_api_retry(
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
+    max_consecutive_empty_responses: int = 3,
 ) -> AgentResult:
     """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
     api_attempt = 0
     query_engine_401_failures = 0
+    empty_response_failures = 0
 
     while True:
         result = AgentResult()
@@ -931,6 +962,38 @@ async def _run_with_api_retry(
         # ── 致命错误 → 不重试，直接返回让外层处理 ──
         if _is_fatal_error(result):
             return result
+
+        # ── 空回复（上游模型静默失败）→ 按 API 错误同样退避重试 ──
+        if _is_empty_response(result):
+            empty_response_failures += 1
+            can_retry_empty = (
+                max_consecutive_empty_responses == -1
+                or empty_response_failures <= max_consecutive_empty_responses
+            )
+            label = f"{empty_response_failures}/{_fmt_max(max_consecutive_empty_responses)}"
+            if can_retry_empty:
+                delay = _backoff(retry_delay, empty_response_failures)
+                _log_warn(
+                    f"上游模型返回空回复 [{label}] (exit=0, output=空, usage 0/0)，"
+                    f"{delay:.0f}s 后重试"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n⚠️ 模型空回复，{delay:.0f}s 后重试 ({label})...\n"
+                    )
+                await asyncio.sleep(delay)
+                continue
+            _log_error(
+                f"上游模型连续空回复超限 [{label}]，停止重试"
+            )
+            result.error = (
+                f"upstream returned empty responses {empty_response_failures} times in a row "
+                f"(limit={max_consecutive_empty_responses})"
+            )
+            result.exit_code = -1
+            return result
+        # 非空回复 → 重置计数
+        empty_response_failures = 0
 
         # ── Query engine 401：使用 API 超时同款退避，但单独限制连续 10 次 ──
         if _is_retryable_query_engine_401_error(result):

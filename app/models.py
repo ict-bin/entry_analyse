@@ -91,6 +91,10 @@ class ServiceConfig(BaseModel):
     agent_timeout_max_retries: int = Field(default=3, description="超时后最大自动重试次数，-1=无限")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃重试次数，-1 为无限重试")
     pi_retry_delay: float = Field(default=5.0, description="pi 进程重试等待秒数")
+    max_consecutive_empty_responses: int = Field(
+        default=3,
+        description="允许的最大连续空回复次数（模型返回 exit=0 但 assistant content 全空 + usage 0/0）；-1=无限重试不视为失败",
+    )
     worker_parallel: bool = Field(default=False)
     worker_parallelism: int = Field(default=WORKER_PARALLELISM_DEFAULT)
     master_merge_mode: str = Field(default="hierarchical")
@@ -161,6 +165,10 @@ class TaskConfig(BaseModel):
     agent_timeout_max_retries: int = Field(default=3)
     pi_max_retries: int = Field(default=-1)
     pi_retry_delay: float = Field(default=5.0)
+    max_consecutive_empty_responses: int = Field(
+        default=3,
+        description="允许的最大连续空回复次数；-1=无限重试不视为失败",
+    )
     worker_parallel: bool = Field(default=False)
     worker_parallelism: int = Field(default=WORKER_PARALLELISM_DEFAULT)
     master_merge_mode: str = Field(default="hierarchical")

@@ -1483,6 +1483,17 @@ class TaskService:
         merged_task_config = dict(task_config_json or {})
         if normalized_input_contract:
             merged_task_config["input_contract"] = normalized_input_contract
+        # 创建时快照项目配置中心，仅供查看使用、不参与运行时 override
+        # （运行时 _load_svc_config_from_db 依然读取最新项目配置）
+        try:
+            from app.service.config_service import get_config_service
+            snapshot_cfg = dict(get_config_service().get_config(db, project_id) or {})
+            for _k in ("updated_at", "project_id"):
+                snapshot_cfg.pop(_k, None)
+            if snapshot_cfg:
+                merged_task_config["project_config_snapshot"] = snapshot_cfg
+        except Exception as _exc:
+            logger.warning("snapshot project config failed for %s: %s", project_id, _exc)
         row = AppEaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=normalized_input_path,
