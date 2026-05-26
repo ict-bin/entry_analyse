@@ -177,6 +177,7 @@ class PipelineDirs:
 
     # R4 Callchain（函数级）
     def r4_w_session(self, func_hash: str) -> Path:
+        """Deprecated: was wrongly used by R3-W. Now only kept for backward compat."""
         return self.sessions / f"r4-w-{func_hash}.jsonl"
 
     # backward compat
