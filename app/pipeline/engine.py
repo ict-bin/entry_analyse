@@ -297,6 +297,11 @@ class PipelineEngine:
             if self._cancel.is_set():
                 return
 
+            # R2a 未通过：函数边界不可信，跳过后续所有阶段
+            func_state = fs.functions.get(func_hash)
+            if func_state is None or func_state.r2_j_state != NodeState.PASSED:
+                return
+
             # ── R2b: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
             await self._run_func_r2_r3(
                 func_hash, file_hash, file_path, dirs, state)
