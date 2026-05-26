@@ -40,7 +40,16 @@ from .extractor import compute_file_hash, compute_func_hash
 from .result_index import write_stage_result_files, upsert_stage_result_index
 
 # Skills 目录：相对于本文件 (app/pipeline/engine.py) → app/pipeline/../../.pi/skills
-_EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
+_EA_SKILLS_DIR       = Path(__file__).parent.parent.parent / ".pi" / "skills"
+# 按阶段/角色隔离的 skill 目录，防止不同阶段的 skill 互相干扰
+_EA_WORKER_SKILLS   = _EA_SKILLS_DIR / "worker"   # 所有 Worker：ea-output-format
+_EA_SHARED_SKILLS   = _EA_SKILLS_DIR / "shared"   # 共享工具：query-functions-db 等
+_EA_R1_JUDGE_SKILLS = _EA_SKILLS_DIR / "r1-judge" # R1-J 专用：static回调覆盖检查
+
+def _skill_paths(*dirs) -> list[str] | None:
+    """构建 skill_paths，过滤不存在的目录，全空时返回 None。"""
+    result = [str(d) for d in dirs if d.is_dir()]
+    return result if result else None
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
 from . import prompts as P
@@ -711,6 +720,7 @@ class PipelineEngine:
                     cwd=str(dirs.source),
                     context=f"r1_j:{file_hash}",
                     acfg=acfg_j,
+                    skill_paths=_skill_paths(_EA_SHARED_SKILLS, _EA_R1_JUDGE_SKILLS),
                 )
                 j_passed, j_feedback = _parse_j_result(ar_j.output)
                 fs.r1_j_state = NodeState.PASSED if j_passed else NodeState.FAILED
@@ -907,6 +917,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.source),
                 context=f"r2_j:{func_hash}", acfg=acfg,
+            skill_paths=_skill_paths(_EA_SHARED_SKILLS),
             )
             passed, feedback = _parse_j_result(ar.output)
             # DELETE 裁定：函数不存在（宏定义等），从 funcdb 删除并强制通过
@@ -1055,6 +1066,7 @@ class PipelineEngine:
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.source),
                     context=f"r2_w:{func_hash}", acfg=acfg,
+                    skill_paths=_skill_paths(_EA_SHARED_SKILLS, _EA_WORKER_SKILLS),
                 )
 
                 analysis = _parse_r2_analysis(ar.output)
@@ -1166,6 +1178,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.source),
                 context=f"r2_jf:{func_hash}", acfg=acfg,
+            skill_paths=_skill_paths(_EA_SHARED_SKILLS),
             )
             passed, feedback = _parse_j_result(ar.output)
 
@@ -1480,6 +1493,7 @@ class PipelineEngine:
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.source),
                     context=f"r3_w_func:{func_name}", acfg=acfg,
+                    skill_paths=_skill_paths(_EA_WORKER_SKILLS),
                 )
             except Exception as exc:
                 logger.warning("R3-W-func agent error for %s: %s", func_name, exc)
@@ -1611,6 +1625,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.source),
                 context=f"r3_entry_j:{func_hash}", acfg=acfg,
+            skill_paths=None,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
@@ -1655,6 +1670,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.source),
                 context=f"r3_j:{file_hash}", acfg=acfg,
+            skill_paths=None,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
@@ -1909,6 +1925,7 @@ class PipelineEngine:
                 session_file=session_file,
                 cwd=str(dirs.source),
                 context=f"r4_func:{func_hash}",
+                skill_paths=_skill_paths(_EA_WORKER_SKILLS, _EA_SHARED_SKILLS),
                 acfg=acfg,
             )
         except Exception as exc:
@@ -2009,6 +2026,7 @@ class PipelineEngine:
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.source),
                     context="r4_final_j", acfg=acfg,
+                skill_paths=None,
                 )
                 passed, feedback = _parse_j_result(ar.output)
                 state.r6_feedback = feedback
@@ -2168,6 +2186,7 @@ class PipelineEngine:
                     session_file=session_w,
                     cwd=str(out_dir),
                     context=f"report_func_w:{func_hash}",
+                    skill_paths=_skill_paths(_EA_WORKER_SKILLS, _EA_SHARED_SKILLS),
                     acfg=acfg,
                 )
             except Exception as exc:
@@ -2205,6 +2224,7 @@ class PipelineEngine:
                     session_file=j_session,
                     cwd=str(out_dir),
                     context=f"report_func_j:{func_hash}",
+                skill_paths=None,
                     acfg=acfg_j,
                 )
                 j_passed, j_feedback = _parse_j_result(j_ar.output)
@@ -2297,6 +2317,7 @@ class PipelineEngine:
         cwd: str,
         context: str = "",
         acfg: AgentInstanceConfig,
+        skill_paths: list[str] | None = None,   # 阶段专用 skill 路径，None=不加载任何 skill
     ) -> AgentResult:
         async with self._sem:
             async with model_capacity_slot(
@@ -2313,7 +2334,7 @@ class PipelineEngine:
                     thinking_level=(
                         acfg.thinking_level or self.cfg.workers.default_thinking_level),
                     session_file=session_file,
-                    skill_paths=[str(_EA_SKILLS_DIR)] if _EA_SKILLS_DIR.is_dir() else None,
+                    skill_paths=skill_paths,   # 由调用方显式指定，不再全局共享
                     cancel_event=self._cancel,
                     max_retries=self.cfg.agent_max_retries,
                     retry_delay=self.cfg.agent_retry_delay,

@@ -8,6 +8,7 @@ description: >
            识别 parsed_http_message/callback 类型的 static 函数、
            调查 r1_w stage result 中 parse_note=fallback_json 的情况。
   DO NOT USE FOR: 修改 funcdb、重跑 R1、分析 R3/R4 阶段。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---

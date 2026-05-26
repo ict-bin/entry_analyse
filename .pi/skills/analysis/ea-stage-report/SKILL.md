@@ -7,6 +7,7 @@ description: >
   USE FOR: 分析某任务某阶段的执行质量、排查 pipeline 问题、生成阶段质量报告、
            对比不同任务同一阶段的执行效果。
   DO NOT USE FOR: 修改 pipeline 代码、重跑任务、读取源代码文件。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---

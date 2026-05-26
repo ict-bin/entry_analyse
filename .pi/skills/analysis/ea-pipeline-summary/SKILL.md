@@ -7,6 +7,7 @@ description: >
   USE FOR: 任务完成后全量质量报告、对比多个任务的执行效率、
            排查哪个阶段耗时/token 占比异常、生成给人工审查的执行摘要。
   DO NOT USE FOR: 单独分析某阶段、修改代码、重跑任务。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---

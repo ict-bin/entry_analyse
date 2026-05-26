@@ -40,8 +40,26 @@ from .extractor import (
     extract_functions_static,
 )
 
-# Skills 目录（与 engine.py 保持一致）
-_EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
+# Skills 目录（按阶段隔离，与 engine.py 保持一致）
+_EA_SKILLS_DIR      = Path(__file__).parent.parent.parent / ".pi" / "skills"
+_EA_WORKER_SKILLS   = _EA_SKILLS_DIR / "worker"   # R1-W: ea-output-format
+_EA_SHARED_SKILLS   = _EA_SKILLS_DIR / "shared"   # R1-W/J: query-functions-db等
+_EA_R1_JUDGE_SKILLS = _EA_SKILLS_DIR / "r1-judge" # R1-J: static回调覆盖检查
+
+def _r1_worker_skill_paths() -> list[str] | None:
+    """R1-W 所需 skill: shared(工具) + worker(输出格式自检)"""
+    result = [str(d) for d in [_EA_SHARED_SKILLS, _EA_WORKER_SKILLS] if d.is_dir()]
+    return result if result else None
+
+def _r1_judge_skill_paths() -> list[str] | None:
+    """R1-J 所需 skill: shared(工具) + r1-judge(static回调覆盖检查)"""
+    result = [str(d) for d in [_EA_SHARED_SKILLS, _EA_R1_JUDGE_SKILLS] if d.is_dir()]
+    return result if result else None
+
+def _r2_worker_skill_paths() -> list[str] | None:
+    """R2-W 所需 skill: shared(工具) + worker(输出格式自检)"""
+    result = [str(d) for d in [_EA_SHARED_SKILLS, _EA_WORKER_SKILLS] if d.is_dir()]
+    return result if result else None
 
 logger = logging.getLogger("ea.pipeline.r1_worker")
 
@@ -624,7 +642,7 @@ async def run_r1_worker(
             cwd=workspace,
             thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
             session_file=session_f,
-            skill_paths=[str(_EA_SKILLS_DIR)] if _EA_SKILLS_DIR.is_dir() else None,
+            skill_paths=_r1_worker_skill_paths(),
             cancel_event=cancel_event,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,
@@ -775,7 +793,7 @@ async def run_r2_w_worker(
             cwd=workspace,
             thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
             session_file=session_f,
-            skill_paths=[str(_EA_SKILLS_DIR)] if _EA_SKILLS_DIR.is_dir() else None,
+            skill_paths=_r2_worker_skill_paths(),
             cancel_event=cancel_event,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,

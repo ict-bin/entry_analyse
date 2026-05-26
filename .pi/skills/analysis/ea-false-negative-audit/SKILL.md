@@ -8,6 +8,7 @@ description: >
   USE FOR: 任务完成后验证 functions.list 的完整性、生成漏报分析报告、
            定位漏报发生在哪个阶段（R1/R2/R3）、计算误报率和漏报率。
   DO NOT USE FOR: 修改 functions.list、重跑任务、分析 token 消耗。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---
