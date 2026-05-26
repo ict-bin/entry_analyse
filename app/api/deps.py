@@ -40,3 +40,16 @@ async def ensure_project_access(project_id: str, token: str) -> Dict:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except AuthServiceError as exc:
         raise HTTPException(status_code=403, detail=f"project access denied: {exc}") from exc
+
+
+def ensure_admin_user(user: Dict) -> Dict:
+    platform_role = str(user.get("platform_role") or "").strip()
+    role_names = {str(item).strip() for item in (user.get("role") or []) if str(item).strip()}
+    token_type = str(user.get("token_type") or "").strip().lower()
+    if token_type == "machine":
+        return user
+    if platform_role in {"super_admin", "ordinary_admin"}:
+        return user
+    if {"super_admin", "admin", "ordinary_admin"} & role_names:
+        return user
+    raise HTTPException(status_code=403, detail="需要管理员权限")
