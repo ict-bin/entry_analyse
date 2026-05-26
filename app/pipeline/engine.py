@@ -921,7 +921,7 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
-                "stage": "r2_j",
+                "stage": "r2a_j",
                 "attempt": attempt,
                 "scope": "func",
                 "func_hash": func_hash,
@@ -930,10 +930,10 @@ class PipelineEngine:
                 "summary": feedback[:200],
                 "feedback": feedback,
             }
-            result_file = dirs.stage_result_file("r2_j", "judge", func_hash, attempt)
-            raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, attempt)
+            result_file = dirs.stage_result_file("r2a_j", "judge", func_hash, attempt)
+            raw_file = dirs.stage_raw_file("r2a_j", "judge", func_hash, attempt)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=attempt,
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r2a_j", role_kind="judge", scope_kind="func", attempt=attempt,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
                                       summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
             func_state.r2_j_feedback = feedback
