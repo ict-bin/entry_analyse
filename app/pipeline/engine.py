@@ -1255,7 +1255,8 @@ class PipelineEngine:
                 self._emit("r3_w_done",
                            func_hash=func_hash, function=func_state.name,
                            has_external_input=func_state.has_external_input,
-                           entry_role=func_state.entry_role or None)
+                           entry_role=func_state.entry_role or None,
+                           r4_decision=func_state.r4_decision or None)
                 break
 
             except Exception as exc:
@@ -1369,7 +1370,8 @@ class PipelineEngine:
             state.save(dirs.state_file)
             self._emit("r3_j_done",
                        func_hash=func_hash, function=func_state.name,
-                       passed=passed, summary=summary)
+                       passed=passed, summary=summary,
+                       r4_decision=func_state.r4_decision or None)
             return passed, summary
 
         except Exception as exc:
