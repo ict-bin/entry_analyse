@@ -2372,6 +2372,9 @@ class TaskService:
                     logger.info("delete_task: removed task dir %s", task_dir)
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
+                    raise HTTPException(status_code=409, detail=f"任务目录删除失败: {task_dir}: {_e}") from _e
+                if os.path.exists(task_dir):
+                    raise HTTPException(status_code=409, detail=f"任务目录删除失败，目录仍然存在: {task_dir}")
         deleted_event_count = clear_task_timeline(db, row)
         row.is_deleted = True
         db.commit()

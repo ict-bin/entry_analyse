@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -123,6 +124,33 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(3, payload["deleted_event_count"])
         self.assertEqual("任务已删除", payload["message"])
+
+    def test_delete_task_fails_when_workspace_remove_fails(self):
+        self._insert_task(task_id="eat_delete_fail", status="failed")
+        db = self.SessionLocal()
+        try:
+            row = db.query(AppEaTask).filter(AppEaTask.task_id == "eat_delete_fail").first()
+            row.output_path = "/tmp/ea-delete-fail-root"
+            db.commit()
+        finally:
+            db.close()
+
+        with mock.patch("app.service.task_service.os.path.isdir", return_value=True), mock.patch(
+            "shutil.rmtree",
+            side_effect=OSError("device busy"),
+        ):
+            response = self.client.delete("/api/app/entry-analyse/tasks/eat_delete_fail?delete_files=true")
+
+        self.assertEqual(409, response.status_code)
+        self.assertIn("任务目录删除失败", response.json()["detail"])
+
+        db = self.SessionLocal()
+        try:
+            row = db.query(AppEaTask).filter(AppEaTask.task_id == "eat_delete_fail").first()
+            self.assertIsNotNone(row)
+            self.assertFalse(bool(row.is_deleted))
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":
