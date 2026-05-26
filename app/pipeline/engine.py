@@ -1051,10 +1051,11 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2 Worker：外部输入分析（函数级，session 跨重试共享）。"""
+        """R3 Worker：外部输入分析（函数级，session 跨重试共享）。"""
         func_state = state.files[file_hash].functions[func_hash]
         r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
-        session_file = str(dirs.r4_w_session(func_hash))
+        # 修复：原来误用 dirs.r4_w_session()，生成 r4-w-*.jsonl，导致 R3-W session 被误当 R4 session
+        session_file = str(dirs.r3_w_session(file_hash, func_hash))
         db_path = dirs.r1_functions_db(file_hash)
 
         while _should_continue(func_state.r3_w_attempts, r2_max, self._cancel):
