@@ -307,36 +307,7 @@ class PipelineEngine:
                 func_hash, file_hash, file_path, dirs, state)
             if self._cancel.is_set():
                 return
-
-            # ── R3 入口判断: 单函数入口判断（R3 分析完成后立即，不等 CC）────────────────
-            func_state = fs.functions.get(func_hash)
-            if func_state and not func_state.r4_decision:
-                _func_meta: dict = {}
-                try:
-                    from .funcdb import FunctionDB as _FDB2
-                    _func_meta = _FDB2.open(dirs.r1, file_hash).get_function(func_hash) or {}
-                except Exception:
-                    pass
-                _func_info = {
-                    "func_hash":  func_hash,
-                    "name":       func_state.name or _func_meta.get("name", ""),
-                    "signature":  func_state.signature or _func_meta.get("signature", ""),
-                    "start_line": _func_meta.get("start_line", func_state.start_line),
-                    "end_line":   _func_meta.get("end_line", func_state.end_line),
-                    "analysis":   _func_meta.get("analysis"),
-                    "file_path":  file_path,
-                    "body_lines": _func_meta.get("body_lines", 0),
-                }
-                await self._run_r3_entry(
-                    file_hash=file_hash,
-                    file_path=file_path,
-                    func_info=_func_info,
-                    caller_ctx=None,   # R3 不使用 caller_ctx
-                    dirs=dirs,
-                    state=state,
-                )
-            if self._cancel.is_set():
-                return
+            # R3 分析 W 已通过 decision 字段直接设置 r4_decision，无需单独 R3 入口判断阶段
 
             # ── 等 CC 完成（仅 R4 需要 CC）──────────────────────────────
             await cc_done_event.wait()
@@ -525,10 +496,10 @@ class PipelineEngine:
         if self._cancel.is_set():
             return
 
-        # 检查 has_external_input，否则直接过滤
-        if not func_state.has_external_input:
+        # r4_decision 由 _run_r3_analysis_w 直接从 decision 字段设置
+        # has_external_input=False 时 W 已设 r4_decision=filter；兜底保障
+        if not func_state.has_external_input and not func_state.r4_decision:
             func_state.r4_decision = "filter"
-            logger.debug("R3 skip (no external input): %s", func_state.name)
             state.save(dirs.state_file)
 
 
@@ -1030,7 +1001,16 @@ class PipelineEngine:
                 if analysis is not None:
                     has_input = bool(analysis.get("has_external_input", True))
                     func_state.has_external_input = has_input
-                    if has_input:
+                    # 合并 R3 入口判断：W 直接给出 decision
+                    decision = str(analysis.get("decision") or "").lower().strip()
+                    if decision == "filter":
+                        func_state.r4_decision = "filter"
+                    elif decision == "keep":
+                        func_state.r4_decision = "keep"
+                    # 若 has_external_input=False 且 W 未给 decision，引擎兜底 filter
+                    if not has_input and not func_state.r4_decision:
+                        func_state.r4_decision = "filter"
+                    if has_input and decision != "filter":
                         from ..functions_list import VALID_ENTRY_ROLES
                         role = str(analysis.get("entry_role") or "").strip()
                         if role in VALID_ENTRY_ROLES:

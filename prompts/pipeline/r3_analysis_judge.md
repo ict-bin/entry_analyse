@@ -80,12 +80,28 @@ sed -n '{start_line},{end_line}p' {file}
 
 ---
 
+## 步骤四：验证 decision 字段
+
+在验证 taints/P/A 之后，还需验证 Worker 给出的 `decision` 是否合理：
+
+**FAIL 条件（需有明确代码证据）**：
+- `has_external_input=true` 且 `decision=filter`，但函数体确实存在接收外部数据的行为（recv/IPC/消息处理），无构造/发送/FSM特征
+- `has_external_input=false` 且 `decision=keep`（矛盾）
+- `has_external_input=true` 且 `decision=keep`，但函数体只有 send/fill/build 操作，无接收行为
+
+**不 FAIL**：
+- filter 理由是 "FSM/构造/发送" → 信任 Worker，仅在函数体明显是接收端时才质疑
+- decision 与 entry_role 组合看起来合理 → 通过
+
+
+---
+
 ## 输出格式（固定格式）
 
 通过时：
 ```
 通过: 是
-摘要: taints 字段正确，P/A 分类自洽
+摘要: taints 字段正确，P/A 分类自洽，decision 合理
 ```
 
 不通过时：
