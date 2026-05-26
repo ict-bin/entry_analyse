@@ -572,7 +572,10 @@ def build_r4_func_w_prompt(
         f"```json\n"
         f"{{\"decision\": \"keep\", \"reason\": \"直接外部边界，无模块内调用者\"}}\n"
         f"```\n"
-        f"将 JSON 写入：`{result_file}`\n"
+        f"将 JSON 写入：`{result_file}`\n\n"
+        f"## 写出前必须执行：格式自检\n\n"
+        f"加载 Skill `ea-r4-worker-result`，按其 Step1-4 完成判断并写出结果文件再结束任务。\n"
+        f"引擎读取该文件获取决策，未写文件则默认 keep（保守策略）。\n"
     )
 
 

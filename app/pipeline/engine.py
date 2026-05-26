@@ -191,6 +191,34 @@ def _aggregate_r3_entries(dirs: PipelineDirs) -> list[dict]:
     return result
 
 
+def _collect_r3_kept_from_state(state: "PipelineState") -> list[dict]:
+    """Layer3 fallback：直接从 pipeline_state 收集 r4_decision==keep 的函数。
+
+    当 r3_func/*.json 和 ModuleDB 均无数据时（旧任务断点续跑），用此兜底确保
+    R6 不因文件缺失而返回空列表。数据来源于 func_state，字段与 r3_func/*.json 一致。
+    """
+    entries: list[dict] = []
+    for file_hash, fs in state.files.items():
+        if not hasattr(fs, "functions"):
+            continue
+        original_path = getattr(fs, "original_path", "") or ""
+        for func_hash, func_st in fs.functions.items():
+            if getattr(func_st, "r4_decision", "") == "keep":
+                entries.append({
+                    "func_hash":          func_hash,
+                    "function":           getattr(func_st, "name", "") or func_hash[:8],
+                    "file":               original_path,
+                    "file_hash":          file_hash,
+                    "signature":          getattr(func_st, "signature", "") or "",
+                    "start_line":         getattr(func_st, "start_line", 0) or 0,
+                    "end_line":           getattr(func_st, "end_line", 0) or 0,
+                    "entry_role":         getattr(func_st, "entry_role", "boundary") or "boundary",
+                    "decision":           "keep",
+                    "has_external_input": bool(getattr(func_st, "has_external_input", True)),
+                })
+    return entries
+
+
 # ─── 引擎主体 ──────────────────────────────────────────────────────────────────
 
 class PipelineEngine:
@@ -352,25 +380,48 @@ class PipelineEngine:
                 return
 
             # ── R4: 结合调用链判断（本函数 R3+CC 完成即可，不等其他函数 R3）─
+            # F2 Fix: 不再以 r3_func/*.json 是否存在作为执行门控。
+            #   文件存在（F1 已写出）→ 读文件获取完整 entry；
+            #   文件不存在（旧任务断点续跑）→ 从 func_state 构造最小 entry。
             func_state = fs.functions.get(func_hash)
             if (
                 func_state
                 and func_state.r4_decision == "keep"
                 and func_state.r4_state != NodeState.PASSED
-                and len(state.files) > 1          # 单文件模块跳过
+                and len(state.files) > 1          # 单文件模块跳过（R4无意义）
             ):
                 _r3_entry_path = dirs.r3.parent / "r3_func" / f"{func_hash}.json"
-                if _r3_entry_path.exists():
-                    try:
+                try:
+                    if _r3_entry_path.exists():
                         _r4_entry = json.loads(_r3_entry_path.read_text(encoding="utf-8"))
-                        await self._run_r4_for_func(_r4_entry, dirs, state)
-                    except Exception as _r4_exc:
-                        logger.warning("R4-func skip for %s: %s", func_hash, _r4_exc)
+                    else:
+                        # 向后兼容：从 func_state 构造（旧任务无 r3_func/*.json）
+                        _r4_entry = {
+                            "func_hash":  func_hash,
+                            "function":   func_state.name or "",
+                            "file":       os.path.abspath(file_path),
+                            "entry_role": func_state.entry_role or "boundary",
+                            "decision":   "keep",
+                        }
+                    await self._run_r4_for_func(_r4_entry, dirs, state)
+                except Exception as _r4_exc:
+                    logger.warning("R4-func error for %s: %s, force-keep", func_hash, _r4_exc)
+                    func_state.r4_state = NodeState.PASSED
+                    state.save(dirs.state_file)
 
             # ── R5: 单函数报告─────────────────────────────────────────────────
+            # F3 Fix: 多文件模块须等 R4 confirmed keep 后才跑 R5，
+            #   防止 R4 把函数标为 remove 后 R5 仍生成报告。
+            #   单文件模块 R4 跳过（len(files)==1），r4_state 永远 PENDING，豁免。
             func_state = fs.functions.get(func_hash)
+            _r4_confirmed = (
+                func_state is not None
+                and func_state.r4_state == NodeState.PASSED   # R4 跑完且确认 keep
+                or len(state.files) <= 1                        # 单文件：R4 跳过，豁免
+            )
             if (out_dir and func_state and
-                    func_state.r4_decision == 'keep' and
+                    func_state.r4_decision == "keep" and
+                    _r4_confirmed and
                     func_state.r5_state != NodeState.PASSED):
                 _r3_func_dir = dirs.r3.parent / "r3_func"
                 _entry_path  = _r3_func_dir / f"{func_hash}.json"
@@ -380,7 +431,8 @@ class PipelineEngine:
                     _entry = {
                         "func_hash": func_hash,
                         "function":  func_state.name or "",
-                        "file":      file_path,
+                        "file":      os.path.abspath(file_path),
+                        "entry_role": func_state.entry_role or "boundary",
                     }
                 _reports_dir = out_dir / "reports"
                 _reports_dir.mkdir(parents=True, exist_ok=True)
@@ -581,6 +633,7 @@ class PipelineEngine:
 
     # ── Phase 4: R3-J 文件级汇总 ──────────────────────────────────────────
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r3_j_for_file(
         self, file_hash: str, file_path: str,
         dirs: PipelineDirs, state: PipelineState
@@ -625,6 +678,7 @@ class PipelineEngine:
     # ── 文件流水线(旧入口,兼容保留) ──────────────────────────────────────────
 
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_file_pipeline(
         self,
         file_hash: str,
@@ -783,6 +837,7 @@ class PipelineEngine:
 
     # ── R1b+R2 W+J（每函数串链）──────────────────────────────────────────────
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r2_then_r3pre_wj(
         self,
         file_hash: str,
@@ -1154,6 +1209,46 @@ class PipelineEngine:
                             pass
                 else:
                     func_state.has_external_input = _parse_has_external_input(ar.output)
+                    # 兜底：无分析结果时若无外部输入则 filter
+                    if not func_state.has_external_input and not func_state.r4_decision:
+                        func_state.r4_decision = "filter"
+
+                # ── F1: 写 r3_func/{func_hash}.json 供 R4/R6 消费 ─────────────
+                # _aggregate_r3_entries 和 _collect_r4_kept 均依赖此文件；
+                # 以前只由死代码 _run_r3_entry 写出，导致 R4 永远被跳过。
+                _r3_final_decision = func_state.r4_decision or "filter"
+                _r3_func_dir = dirs.r3.parent / "r3_func"
+                _r3_func_dir.mkdir(parents=True, exist_ok=True)
+                _r3_entry_data: dict = {
+                    "func_hash":          func_hash,
+                    "function":           func_state.name or "",
+                    "file":               os.path.abspath(file_path),
+                    "signature":          func_state.signature or "",
+                    "start_line":         func_state.start_line or 0,
+                    "end_line":           func_state.end_line or 0,
+                    "entry_role":         func_state.entry_role or "boundary",
+                    "decision":           _r3_final_decision,
+                    "has_external_input": bool(func_state.has_external_input),
+                    "taints":             (analysis or {}).get("taints", []),
+                    "entry_source_lines": (analysis or {}).get("entry_source_lines", []),
+                    "function_description": (analysis or {}).get("function_description", ""),
+                    "entry_reason":       (analysis or {}).get("entry_reason", ""),
+                    "taint_details":      (analysis or {}).get("taint_details", []),
+                    "justification":      (analysis or {}).get("justification", ""),
+                }
+                (_r3_func_dir / f"{func_hash}.json").write_text(
+                    json.dumps(_r3_entry_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                # 同步 r3_decision 到 ModuleDB（供 R6 fallback 查询）
+                try:
+                    from .module_db import ModuleDB as _MDB
+                    _MDB.open(dirs.workspace).update_r3_decision(
+                        func_hash, _r3_final_decision)
+                except Exception as _mdb_exc:
+                    logger.warning("R3 ModuleDB r3_decision update failed %s: %s",
+                                   func_hash, _mdb_exc)
+                # ─────────────────────────────────────────────────────────────
 
                 func_state.r3_w_state = NodeState.PASSED
                 state.save(dirs.state_file)
@@ -1309,6 +1404,7 @@ class PipelineEngine:
                 keep.append(fh)
         return keep, excluded
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r3(
         self,
         file_hash: str,
@@ -1387,6 +1483,7 @@ class PipelineEngine:
             fs.r3_state = NodeState.FAILED
             state.save(dirs.state_file)
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r3_funcs_parallel(
         self, file_hash, file_path, dirs, state, keep_hashes, funcs_with_input
     ) -> list:
@@ -1460,6 +1557,7 @@ class PipelineEngine:
             "body_lines":           func_info.get("body_lines") or 0,
         }
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r3_entry(
         self, file_hash, file_path, func_info,
         dirs, state,
@@ -1625,6 +1723,7 @@ class PipelineEngine:
             fs.functions[func_hash].r4_decision = "keep"
         return self._make_r3_entry(func_info, "boundary", "keep (max retries, conservative)")
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r3_entry_j(
         self,
         file_hash: str,
@@ -1681,6 +1780,7 @@ class PipelineEngine:
             logger.error("R3 entry J failed for %s: %s", func_hash, exc)
             return True, ""   # J 异常时保守通过，不阻塞流水线
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_r3_j(
         self, file_hash, file_path, dirs, state, session_file
     ) -> bool:
@@ -1806,17 +1906,23 @@ class PipelineEngine:
           Step 3.5: 应用 R4 per-func 决策（过滤 decision=remove 条目）
           Step 4: 跑 R4-final-J
         """
-        # Step 3: 收集 R3-kept 入口（_aggregate_r3_entries 已过滤 decision=filter）
-        r3_entries = _aggregate_r3_entries(dirs)
+        # Step 3: 收集 R3-kept 入口（三层 fallback 保证不因文件缺失漏掉入口）
+        # F4 Fix: 增加 Layer3 直接从 state 收集，彻底消除对文件/DB 写出时序的依赖。
+        r3_entries = _aggregate_r3_entries(dirs)  # Layer1: r3_func/*.json
         if not r3_entries:
             try:
                 from .module_db import ModuleDB
-                r3_entries = ModuleDB.open(dirs.workspace).get_r3_kept()
+                r3_entries = ModuleDB.open(dirs.workspace).get_r3_kept()  # Layer2: ModuleDB
             except Exception:
                 pass
+        if not r3_entries:
+            # Layer3: 直接从 pipeline state 收集（最终兜底，任何情况都不为空）
+            r3_entries = _collect_r3_kept_from_state(state)
+            if r3_entries:
+                logger.info("R4: using state-based fallback, %d entries", len(r3_entries))
 
         if not r3_entries:
-            logger.info("R4: no R3 entries, skipping")
+            logger.info("R4: no R3 entries (all filtered), skipping")
             state.r6_state = NodeState.PASSED
             state.save(dirs.state_file)
             return []
@@ -1956,6 +2062,7 @@ class PipelineEngine:
                 session_file=session_file,
                 cwd=str(dirs.source),
                 context=f"r4_func:{func_hash}",
+                # R4-W: worker skill（ea-r4-worker-result 指导结果文件写出格式）
                 skill_paths=_skill_paths(_EA_WORKER_SKILLS, _EA_SHARED_SKILLS),
                 acfg=acfg,
             )
@@ -2102,6 +2209,7 @@ class PipelineEngine:
 
     # ── Report per-func 并行 ──────────────────────────────────────────────────
 
+    # [DEPRECATED] 老流水线残留，已被新 per-func _func_pipeline 取代，未被 run() 调用。
     async def _run_per_func_reports(
         self,
         final_entries: list[dict],
