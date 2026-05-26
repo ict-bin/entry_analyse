@@ -277,7 +277,10 @@ def build_r2_w_prompt(
         f"   <result>\n"
         f'   {{"has_external_input": false}}\n'
         f"   </result>\n"
-        f"   ```\n"
+        f"   ```\n\n"
+        f"## 输出前必须执行：格式自检\n\n"
+        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
+        f"引擎仅读取 `<result>...</result>` 标签内的内容，标签外的任何 JSON 都会被静默丢弃。\n"
     )
 
 
@@ -618,7 +621,9 @@ def build_r4_w_prompt(
         f"   - **dispatch_target 不要因存在上层 dispatcher 就删除**（它们是污点追踪推荐起点）\n"
         f"3. 使用 `write` 工具将最终入口列表写出到：`{r4_out_path}`\n"
         f"   格式：JSON 数组，每项与 R3 输出格式一致（保留 entry_role 字段）。\n\n"
-        f"完成后用 `<result>` 包裹摘要：各文件入口总数 → 模块级最终入口数，跨文件删除了哪些。\n"
+        f"完成后用 `<result>` 包裹摘要：各文件入口总数 → 模块级最终入口数，跨文件删除了哪些。\n\n"
+        f"## 输出前必须执行：格式自检\n\n"
+        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
     )
 
 
@@ -733,7 +738,9 @@ def build_report_w_prompt(
         f"   - 每组入口角色末尾添加 `### 安全测试建议` 段落\n"
         f"   - 在报告末尾添加 `## 覆盖率评估` 章节\n"
         f"3. 将优化后的完整 Markdown 内容写入：`{report_out_path}`\n\n"
-        f"完成后用 `<result>` 包裹摘要：优化了哪些条目，添加了哪些内容。\n"
+        f"完成后用 `<result>` 包裹摘要：优化了哪些条目，添加了哪些内容。\n\n"
+        f"## 输出前必须执行：格式自检\n\n"
+        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
     )
 
 
