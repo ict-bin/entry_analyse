@@ -62,6 +62,21 @@ _MIGRATIONS = [
     "CREATE INDEX ix_ea_worker_slots_pod_name ON secflow_app_ea_worker_slots (pod_name)",
     "CREATE INDEX ix_ea_worker_slots_last_heartbeat ON secflow_app_ea_worker_slots (last_heartbeat_at)",
     """
+    CREATE TABLE secflow_app_ea_dispatch_leases (
+        id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        project_id VARCHAR(100) NOT NULL UNIQUE,
+        lease_owner VARCHAR(128) NOT NULL,
+        lease_token VARCHAR(64) NOT NULL,
+        operation VARCHAR(32) NOT NULL DEFAULT 'dispatch',
+        lease_expires_at DATETIME NOT NULL,
+        heartbeat_at DATETIME NOT NULL,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL
+    )
+    """,
+    "CREATE INDEX ix_ea_dispatch_leases_owner ON secflow_app_ea_dispatch_leases (lease_owner)",
+    "CREATE INDEX ix_ea_dispatch_leases_expires ON secflow_app_ea_dispatch_leases (lease_expires_at)",
+    """
     CREATE TABLE secflow_app_ea_task_event (
         id VARCHAR(32) NOT NULL PRIMARY KEY,
         task_id VARCHAR(64) NOT NULL,

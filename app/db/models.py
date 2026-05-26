@@ -152,6 +152,21 @@ class AppEaWorkerSlot(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
 
 
+class AppEaDispatchLease(Base):
+    """Cross-pod project-level dispatch lease."""
+    __tablename__ = "secflow_app_ea_dispatch_leases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    lease_owner: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    lease_token: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False, default="dispatch")
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+
 class AppEaModelsConfig(Base):
     """Global models.json configuration (LLM provider/model registry)."""
     __tablename__ = "secflow_app_ea_models_config"

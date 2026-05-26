@@ -83,6 +83,7 @@ def _render_request_metrics() -> list[str]:
 
 def _render_task_metrics() -> list[str]:
     from .db import get_db
+    from .service.worker_slot_service import get_worker_slot_service
 
     db_up = 0
     rows: list[AppEaTask] = []
@@ -204,6 +205,36 @@ def _render_task_metrics() -> list[str]:
 
     scheduler_running = 1 if _safe_running(get_scheduler_service) else 0
     worker_running = 1 if _safe_running(get_worker_service) else 0
+    slot_total_capacity = 0
+    slot_busy = 0
+    slot_available = 0
+    dispatch_limit_total = 0
+    dispatch_running_total = 0
+    dispatch_available_total = 0
+    seen_projects: set[str] = set()
+    try:
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            project_ids = sorted({str(getattr(row, "project_id", "") or "").strip() for row in rows if str(getattr(row, "project_id", "") or "").strip()})
+            for project_id in project_ids:
+                if project_id in seen_projects:
+                    continue
+                seen_projects.add(project_id)
+                cluster = get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
+                slot_total_capacity += int(cluster.get("total_capacity") or 0)
+                slot_busy += int(cluster.get("busy_slots") or 0)
+                slot_available += int(cluster.get("available_slots") or 0)
+                dispatch_limit_total += int(cluster.get("dispatch_limit") or 0)
+                dispatch_running_total += int(cluster.get("dispatch_running") or 0)
+                dispatch_available_total += int(cluster.get("dispatch_available") or 0)
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+    except Exception:
+        pass
     lines = [
         "# HELP secflow_ea_db_up Database query path for metrics is available.",
         "# TYPE secflow_ea_db_up gauge",
@@ -251,6 +282,16 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_worker_service_running Worker service running flag.",
         "# TYPE secflow_ea_worker_service_running gauge",
         f"secflow_ea_worker_service_running {worker_running}",
+        "# HELP secflow_ea_worker_slot_capacity Worker slot capacity summary.",
+        "# TYPE secflow_ea_worker_slot_capacity gauge",
+        f'{ "secflow_ea_worker_slot_capacity" }{{kind="total"}} {slot_total_capacity}',
+        f'{ "secflow_ea_worker_slot_capacity" }{{kind="busy"}} {slot_busy}',
+        f'{ "secflow_ea_worker_slot_capacity" }{{kind="available"}} {slot_available}',
+        "# HELP secflow_ea_dispatch_capacity Project dispatch concurrency summary.",
+        "# TYPE secflow_ea_dispatch_capacity gauge",
+        f'{ "secflow_ea_dispatch_capacity" }{{kind="limit"}} {dispatch_limit_total}',
+        f'{ "secflow_ea_dispatch_capacity" }{{kind="running"}} {dispatch_running_total}',
+        f'{ "secflow_ea_dispatch_capacity" }{{kind="available"}} {dispatch_available_total}',
         "# HELP secflow_ea_retry_total Aggregated retry count derived from extra rounds.",
         "# TYPE secflow_ea_retry_total counter",
         f"secflow_ea_retry_total {retry_total}",

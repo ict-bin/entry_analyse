@@ -65,6 +65,47 @@ class RunAgentPromptFileTests(unittest.TestCase):
         asyncio.run(scenario())
         self.assertTrue(any("cleaning leaked pi process group" in msg for msg in logs))
 
+    def test_cleanup_task_pi_processes_matches_cwd_prefix(self):
+        fake_proc_dirs = [Path("/proc/101")]
+
+        class FakePath(Path):
+            _flavour = type(Path())._flavour
+
+        proc_dir = FakePath("/proc/101")
+
+        def fake_iterdir():
+            return [proc_dir]
+
+        def fake_read_text(self, encoding=None, errors=None):
+            if str(self).endswith("/status"):
+                return "Name:\tpi\nPPid:\t77\n"
+            if str(self).endswith("/comm"):
+                return "pi"
+            return ""
+
+        def fake_read_bytes(self):
+            return b"pi --session /tmp/task-a/run/sessions/s1.jsonl"
+
+        logs: list[str] = []
+        with patch("app.agent_process.pathlib.Path.iterdir", side_effect=fake_iterdir):
+            with patch("app.agent_process.pathlib.Path.read_text", fake_read_text):
+                with patch("app.agent_process.pathlib.Path.read_bytes", fake_read_bytes):
+                    with patch("app.agent_process.os.readlink") as readlink:
+                        readlink.side_effect = lambda path: (
+                            "/usr/bin/pi" if str(path).endswith("/exe") else "/tmp/task-a/run/workspace"
+                        )
+                        with patch("app.agent_process.subprocess.check_output", return_value="301"):
+                            with patch("app.agent_process.os.killpg") as killpg:
+                                killed = agent_process.cleanup_task_pi_processes(
+                                    logs.append,
+                                    label="test",
+                                    task_id="task-a",
+                                    task_roots=["/tmp/task-a"],
+                                )
+        self.assertEqual(1, killed)
+        killpg.assert_called_once_with(301, agent_process.signal.SIGKILL)
+        self.assertTrue(any("task_id=task-a" in msg for msg in logs))
+
     def test_run_agent_uses_prompt_file_instead_of_raw_argv(self):
         captured = {}
 

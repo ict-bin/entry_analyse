@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.db.models import AppEaTask, AppEaWorkerSlot
 from app.models import normalize_max_concurrent_tasks
 from app.time_utils import add_seconds_local, isoformat_local, now_local
+from app.service.task_service import _load_svc_config_from_db
 
 HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 STALE_AFTER_SECONDS = max(
@@ -39,6 +40,26 @@ class WorkerSlotSnapshot:
 
 
 class WorkerSlotService:
+    def _active_running_count(self, db: Session, project_id: str) -> int:
+        return int(
+            db.query(AppEaTask)
+            .filter(
+                AppEaTask.project_id == project_id,
+                AppEaTask.is_deleted.is_(False),
+                AppEaTask.status == "running",
+                AppEaTask.cancel_requested.is_(False),
+                AppEaTask.lease_expires_at.is_not(None),
+                AppEaTask.lease_expires_at >= now_local(),
+            )
+            .count()
+        )
+
+    def _configured_dispatch_limit(self, db: Session, project_id: str) -> int:
+        if not str(project_id or "").strip():
+            return 0
+        svc = _load_svc_config_from_db(db, project_id)
+        return normalize_max_concurrent_tasks(getattr(svc, "max_concurrent_tasks", None))
+
     def upsert_heartbeat(
         self,
         db: Session,
@@ -202,6 +223,9 @@ class WorkerSlotService:
         busy_slots = sum(item["running_tasks"] for item in workers_payload)
         healthy_workers = sum(1 for item in workers_payload if item["healthy"])
         stale_workers = len(workers_payload) - healthy_workers
+        dispatch_limit = self._configured_dispatch_limit(db, project_id)
+        dispatch_running = self._active_running_count(db, project_id) if dispatch_limit > 0 else 0
+        dispatch_available = max(0, dispatch_limit - dispatch_running)
         return {
             "worker_count": len(workers_payload),
             "healthy_workers": healthy_workers,
@@ -210,6 +234,9 @@ class WorkerSlotService:
             "busy_slots": busy_slots,
             "running_jobs": busy_slots,
             "available_slots": max(0, total_capacity - busy_slots),
+            "dispatch_limit": dispatch_limit,
+            "dispatch_running": dispatch_running,
+            "dispatch_available": dispatch_available,
             "queued_tasks": queued_tasks,
             "queued_jobs": queued_tasks,
             "updated_at": isoformat_local(now),

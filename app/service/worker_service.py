@@ -10,7 +10,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.agent_process import cleanup_orphan_pi_processes
+from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_pi_processes
 from app.config import build_task_config
 from app.db import get_db
 from app.db.models import AppEaTask
@@ -26,6 +26,25 @@ _cancel_wake: dict[str, asyncio.Event] = {}
 WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
 WORKER_SLOT_HEARTBEAT_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 ORPHAN_PI_SWEEP_SECONDS = max(10, int(os.environ.get("EA_ORPHAN_PI_SWEEP_SECONDS", "30")))
+
+
+def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
+    roots: list[str] = []
+    output_path = str(row.output_path or "").strip()
+    if output_path:
+        task_root = os.path.join(output_path, row.task_id)
+        roots.extend(
+            [
+                task_root,
+                os.path.join(task_root, "run"),
+                os.path.join(task_root, "run", "sessions"),
+                os.path.join(task_root, "output"),
+            ]
+        )
+    input_path = str(row.input_path or "").strip()
+    if input_path:
+        roots.append(input_path)
+    return roots
 
 
 def trigger_instant_cancel(task_id: str) -> bool:
@@ -109,6 +128,29 @@ class WorkerService:
                 try:
                     now_ts = now_local().timestamp()
                     if now_ts - last_orphan_sweep >= ORPHAN_PI_SWEEP_SECONDS:
+                        stale_local_rows = (
+                            db.query(AppEaTask)
+                            .filter(
+                                AppEaTask.is_deleted.is_(False),
+                                AppEaTask.owner_pod == task_mod.POD_NAME,
+                                AppEaTask.status.in_(["failed", "error", "cancelled"]),
+                            )
+                            .all()
+                        )
+                        for stale_row in stale_local_rows:
+                            try:
+                                cleanup_task_pi_processes(
+                                    logger.warning,
+                                    label="ea_worker_heartbeat_task_scoped",
+                                    task_id=stale_row.task_id,
+                                    task_roots=_task_runtime_roots_from_row(stale_row),
+                                )
+                            except Exception as scoped_exc:
+                                logger.warning(
+                                    "task-scoped heartbeat cleanup failed for %s: %s",
+                                    stale_row.task_id,
+                                    scoped_exc,
+                                )
                         cleanup_orphan_pi_processes(logger.warning, label="ea_worker_heartbeat")
                         last_orphan_sweep = now_ts
                     project_ids = await self._discover_active_projects()

@@ -15,18 +15,19 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import or_
+from sqlalchemy import and_, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppEaTask, AppEaTaskEvent
+from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent
 from app.logging_utils import log_event
 from app.models import normalize_max_concurrent_tasks
 from app.service.session_index import build_session_catalog
 from app.service.runtime_role import role_enabled
 from app.time_utils import add_seconds_local, isoformat_local, now_local
+from app.agent_process import cleanup_task_pi_processes
 
 logger = logging.getLogger("ea.task_service")
 
@@ -49,6 +50,7 @@ LEASE_DURATION_SECONDS = int(os.environ.get("EA_TASK_LEASE_SECONDS", "120"))
 LEASE_RENEW_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_LEASE_RENEW_INTERVAL_SECONDS", "30"))
 CANCEL_POLL_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_CANCEL_POLL_INTERVAL_SECONDS", "3"))
 DISPATCH_CLAIM_BATCH_SIZE = _positive_int_env("EA_WORKER_DISPATCH_CLAIM_BATCH_SIZE", 1)
+DISPATCH_LEASE_SECONDS = _positive_int_env("EA_DISPATCH_LEASE_SECONDS", 30)
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
     or os.environ.get("POD_NAME")
@@ -469,9 +471,18 @@ def _lease_deadline() -> datetime:
     return add_seconds_local(now_local(), LEASE_DURATION_SECONDS)
 
 
+def _dispatch_lease_deadline() -> datetime:
+    return add_seconds_local(now_local(), DISPATCH_LEASE_SECONDS)
+
+
 def _lease_expired_expr():
     now = now_local()
     return or_(AppEaTask.lease_expires_at.is_(None), AppEaTask.lease_expires_at < now)
+
+
+def _dispatch_lease_expired_expr():
+    now = now_local()
+    return or_(AppEaDispatchLease.lease_expires_at.is_(None), AppEaDispatchLease.lease_expires_at < now)
 
 
 def _task_root(row: AppEaTask) -> Path | None:
@@ -483,6 +494,21 @@ def _task_root(row: AppEaTask) -> Path | None:
 def _task_run_root(row: AppEaTask) -> Path | None:
     root = _task_root(row)
     return root / "run" if root else None
+
+
+def _task_runtime_roots(row: AppEaTask) -> list[str]:
+    roots: list[str] = []
+    task_root = _task_root(row)
+    run_root = _task_run_root(row)
+    sessions_root = _task_sessions_root(row)
+    output_root = _task_output_root(row)
+    for path in (task_root, run_root, sessions_root, output_root):
+        if path is not None:
+            roots.append(str(path))
+    input_path = str(row.input_path or "").strip()
+    if input_path:
+        roots.append(input_path)
+    return roots
 
 
 def _build_lean_file_catalog(lean_state_path: "Path") -> list[dict]:
@@ -1428,6 +1454,53 @@ class TaskService:
         return lock
 
     @staticmethod
+    def _acquire_dispatch_lease(db: Session, project_id: str) -> str | None:
+        now = now_local()
+        token = uuid.uuid4().hex
+        lease_deadline = _dispatch_lease_deadline()
+        row = (
+            db.query(AppEaDispatchLease)
+            .filter(AppEaDispatchLease.project_id == project_id)
+            .with_for_update()
+            .first()
+        )
+        if row is None:
+            row = AppEaDispatchLease(
+                project_id=project_id,
+                lease_owner=POD_NAME,
+                lease_token=token,
+                operation="dispatch",
+                lease_expires_at=lease_deadline,
+                heartbeat_at=now,
+            )
+            db.add(row)
+            db.commit()
+            return token
+        if row.lease_owner == POD_NAME or row.lease_expires_at < now:
+            row.lease_owner = POD_NAME
+            row.lease_token = token
+            row.operation = "dispatch"
+            row.lease_expires_at = lease_deadline
+            row.heartbeat_at = now
+            db.commit()
+            return token
+        db.rollback()
+        return None
+
+    @staticmethod
+    def _release_dispatch_lease(db: Session, project_id: str, token: str) -> None:
+        db.execute(
+            update(AppEaDispatchLease)
+            .where(
+                AppEaDispatchLease.project_id == project_id,
+                AppEaDispatchLease.lease_owner == POD_NAME,
+                AppEaDispatchLease.lease_token == token,
+            )
+            .values(lease_expires_at=now_local(), heartbeat_at=now_local())
+        )
+        db.commit()
+
+    @staticmethod
     def _claim_task_row(db: Session, row_id: int) -> AppEaTask | None:
         row = (
             db.query(AppEaTask)
@@ -1472,6 +1545,82 @@ class TaskService:
         return row
 
     @staticmethod
+    def _claim_task_row_atomic(db: Session, row_id: int) -> AppEaTask | None:
+        row = (
+            db.query(AppEaTask)
+            .filter(
+                AppEaTask.id == row_id,
+                AppEaTask.is_deleted.is_(False),
+            )
+            .first()
+        )
+        if row is None or row.cancel_requested:
+            return None
+        now = now_local()
+        is_takeover = (
+            row.status == "running"
+            and row.owner_pod is not None
+            and row.owner_pod != POD_NAME
+            and (row.lease_expires_at is None or row.lease_expires_at < now)
+        )
+        if row.status not in ("pending", "running"):
+            return None
+        if row.status == "running" and not is_takeover:
+            return None
+        values: dict[str, Any] = {
+            "status": "running",
+            "owner_pod": POD_NAME,
+            "lease_expires_at": _lease_deadline(),
+            "cancel_requested": False,
+            "updated_at": now,
+        }
+        if row.started_at is None:
+            values["started_at"] = now
+        if is_takeover:
+            values["stages_json"] = None
+            values["error"] = None
+            values["result_json"] = None
+            values["latest_abnormal_reason_json"] = None
+        claim_filters = [
+            AppEaTask.id == row_id,
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.cancel_requested.is_(False),
+        ]
+        if row.status == "pending":
+            claim_filters.extend(
+                [
+                    AppEaTask.status == "pending",
+                    AppEaTask.owner_pod.is_(None),
+                ]
+            )
+        else:
+            claim_filters.extend(
+                [
+                    AppEaTask.status == "running",
+                    AppEaTask.owner_pod == row.owner_pod,
+                    AppEaTask.lease_expires_at == row.lease_expires_at,
+                    or_(AppEaTask.lease_expires_at.is_(None), AppEaTask.lease_expires_at < now),
+                ]
+            )
+        updated = db.execute(
+            update(AppEaTask)
+            .where(and_(*claim_filters))
+            .values(**values)
+        )
+        if int(getattr(updated, "rowcount", 0) or 0) != 1:
+            db.rollback()
+            return None
+        db.commit()
+        refreshed = db.query(AppEaTask).filter(AppEaTask.id == row_id).first()
+        if refreshed is not None and is_takeover:
+            logger.info(
+                "Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",
+                refreshed.task_id,
+                row.owner_pod,
+            )
+        return refreshed
+
+    @staticmethod
     def _active_running_count(db: Session, project_id: str) -> int:
         return int(
             db.query(AppEaTask)
@@ -1505,7 +1654,11 @@ class TaskService:
         async with lock:
             db_gen = get_db()
             db: Session = next(db_gen)
+            dispatch_token: str | None = None
             try:
+                dispatch_token = self._acquire_dispatch_lease(db, project_id)
+                if not dispatch_token:
+                    return
                 svc = _load_svc_config_from_db(db, project_id)
                 max_concurrent_tasks = normalize_max_concurrent_tasks(
                     getattr(svc, "max_concurrent_tasks", None)
@@ -1539,7 +1692,7 @@ class TaskService:
                     worker_service = get_worker_service()
                     if worker_service.has_local_task(row.task_id):
                         continue
-                    claimed = self._claim_task_row(db, row.id)
+                    claimed = self._claim_task_row_atomic(db, row.id)
                     if claimed is None:
                         continue
                     worker_service.start_task(claimed.task_id)
@@ -1548,6 +1701,15 @@ class TaskService:
             except Exception as exc:
                 logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)
             finally:
+                if dispatch_token:
+                    try:
+                        self._release_dispatch_lease(db, project_id, dispatch_token)
+                    except Exception as release_exc:
+                        logger.warning(
+                            "release entry-analysis dispatch lease failed for %s: %s",
+                            project_id,
+                            release_exc,
+                        )
                 _dispatch_tasks.pop(project_id, None)
                 try:
                     next(db_gen)
@@ -2056,6 +2218,7 @@ class TaskService:
 
     async def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
+        task_roots = _task_runtime_roots(row)
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row, db=db)
         row.cancel_requested = True
@@ -2105,6 +2268,16 @@ class TaskService:
                 dedupe_key=_event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
             )
         db.commit(); db.refresh(row)
+        if row.status == "running":
+            try:
+                cleanup_task_pi_processes(
+                    logger.warning,
+                    label="ea_cancel_task",
+                    task_id=row.task_id,
+                    task_roots=task_roots,
+                )
+            except Exception as exc:
+                logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
         # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
         if owner_pod_ip and row.status == "running":
             import asyncio as _asyncio
@@ -2131,8 +2304,18 @@ class TaskService:
         import shutil as _shutil
         from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
+        task_roots = _task_runtime_roots(row)
         if row.status == "running":
             raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+        try:
+            cleanup_task_pi_processes(
+                logger.warning,
+                label="ea_delete_task",
+                task_id=row.task_id,
+                task_roots=task_roots,
+            )
+        except Exception as exc:
+            logger.warning("task-scoped pi cleanup failed during delete for %s: %s", row.task_id, exc)
         _safe_create_task_event(
             db,
             task_id=row.task_id,

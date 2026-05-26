@@ -18,6 +18,36 @@ from .deps import ensure_admin_user, ensure_project_access, get_current_user
 logger = logging.getLogger(__name__)
 
 
+def _audit_agent_kill_event(
+    db: Session,
+    *,
+    project_id: str,
+    operator: str,
+    event_type: str,
+    message: str,
+    payload: dict[str, object],
+    task_id: str | None = None,
+) -> None:
+    if not task_id:
+        return
+    from app.service.task_service import _safe_create_task_event
+
+    _safe_create_task_event(
+        db,
+        task_id=task_id,
+        project_id=project_id,
+        event_type=event_type,
+        message=message,
+        source="agent_observability",
+        level="warning",
+        status="manual_action",
+        payload={
+            "operator": operator,
+            **payload,
+        },
+    )
+
+
 class TaskCreateRequest(BaseModel):
     project_id: str
     task_name: str
@@ -254,6 +284,9 @@ class EntryAnalyseSlotClusterResponse(BaseModel):
     busy_slots: int = 0
     running_jobs: int = 0
     available_slots: int = 0
+    dispatch_limit: int = 0
+    dispatch_running: int = 0
+    dispatch_available: int = 0
     queued_tasks: int = 0
     queued_jobs: int = 0
     updated_at: Optional[str] = None
@@ -580,6 +613,22 @@ async def kill_agent_process(
         row.get("session_file"),
         row.get("owner_reason"),
     )
+    _audit_agent_kill_event(
+        db,
+        project_id=project_id,
+        operator=user.get("username") or user.get("name") or "unknown",
+        event_type="agent_process_manual_kill",
+        message=f"管理员手工终止孤儿智能体进程 pid={pid}",
+        payload={
+            "pid": pid,
+            "pgid": row.get("pgid"),
+            "pod_name": row.get("pod_name"),
+            "session_file": row.get("session_file"),
+            "owner_reason": row.get("owner_reason"),
+            "kill_mode": "local",
+        },
+        task_id=row.get("task_id"),
+    )
     result = get_agent_observability_service().kill_process(pid)
     return AgentProcessKillResponse(
         requested=1,
@@ -611,6 +660,23 @@ async def kill_all_orphan_processes(
         len(killable),
         [row.get("pid") for row in killable],
     )
+    for row in killable:
+        _audit_agent_kill_event(
+            db,
+            project_id=project_id,
+            operator=user.get("username") or user.get("name") or "unknown",
+            event_type="agent_process_bulk_manual_kill",
+            message=f"管理员批量终止孤儿智能体进程 pid={int(row.get('pid') or 0)}",
+            payload={
+                "pid": int(row.get("pid") or 0),
+                "pgid": row.get("pgid"),
+                "pod_name": row.get("pod_name"),
+                "session_file": row.get("session_file"),
+                "owner_reason": row.get("owner_reason"),
+                "kill_mode": "local_bulk",
+            },
+            task_id=row.get("task_id"),
+        )
     items = [get_agent_observability_service().kill_process(int(row["pid"])) for row in killable]
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")

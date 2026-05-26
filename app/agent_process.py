@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import pathlib
+import re
 import shutil
 import signal
 import subprocess
@@ -122,6 +123,97 @@ def cleanup_orphan_pi_processes(
             pgid = None
         logger(
             f"cleaning orphan pi process [{label}] pid={pid} pgid={pgid if pgid is not None else 'unknown'}"
+        )
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+    return killed
+
+
+def _normalize_proc_path(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(pathlib.Path(raw).resolve())
+    except Exception:
+        return raw
+
+
+def _command_contains_task_id(command: str, task_id: str) -> bool:
+    normalized_command = f" {str(command or '')} "
+    return bool(task_id and task_id in normalized_command)
+
+
+def _cwd_matches_task_roots(cwd: str | None, task_roots: list[str]) -> bool:
+    normalized_cwd = _normalize_proc_path(cwd)
+    if not normalized_cwd:
+        return False
+    for root in task_roots:
+        normalized_root = _normalize_proc_path(root)
+        if not normalized_root:
+            continue
+        if normalized_cwd == normalized_root or normalized_cwd.startswith(f"{normalized_root}/"):
+            return True
+    return False
+
+
+def cleanup_task_pi_processes(
+    logger: Callable[[str], None],
+    *,
+    label: str,
+    task_id: str,
+    task_roots: list[str] | None = None,
+    include_ppid1_only: bool = False,
+) -> int:
+    roots = [root for root in (task_roots or []) if str(root or "").strip()]
+    killed = 0
+    proc_root = pathlib.Path("/proc")
+    for proc_dir in proc_root.iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            status = (proc_dir / "status").read_text(encoding="utf-8", errors="replace")
+            comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+            exe = os.path.basename(os.readlink(proc_dir / "exe"))
+            command = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+            cwd = os.readlink(proc_dir / "cwd")
+        except Exception:
+            continue
+        if comm != "pi" and exe != "node":
+            continue
+        ppid = None
+        pid = int(proc_dir.name)
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                try:
+                    ppid = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    ppid = None
+                break
+        if include_ppid1_only and ppid != 1:
+            continue
+        if not _command_contains_task_id(command, task_id) and not _cwd_matches_task_roots(cwd, roots):
+            continue
+        try:
+            pgid = int(
+                subprocess.check_output(
+                    ["sh", "-lc", f"awk '{{print $5}}' /proc/{pid}/stat"],
+                    text=True,
+                ).strip()
+            )
+        except Exception:
+            pgid = None
+        logger(
+            f"cleaning task pi process [{label}] task_id={task_id} pid={pid} "
+            f"pgid={pgid if pgid is not None else 'unknown'} cwd={cwd}"
         )
         try:
             if pgid is not None:
