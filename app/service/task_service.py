@@ -607,8 +607,9 @@ def _build_function_catalog(row: AppEaTask) -> list[dict]:
                 "signature": str(f.get("signature") or ""),
                 "start_line": int(f.get("start_line") or 0),
                 "end_line": int(f.get("end_line") or 0),
-                "r2_state": str(f.get("r2_j_state") or "pending"),
-                "r2j_state": str(f.get("r3_j_state") or "pending"),
+                "r1b_state": str(f.get("r2_j_state") or "pending"),   # R2 准确性 Judge
+                "r2_state":  str(f.get("r3_w_state") or "pending"),   # R3-W 外部输入 Worker
+                "r2j_state": str(f.get("r3_j_state") or "pending"),   # R3-J 外部输入 Judge
                 "r3_state": r3_state,
                 "r4_state": str(f.get("r4_state") or "pending"),
                 "rep_state": str(f.get("r5_state") or "pending"),
