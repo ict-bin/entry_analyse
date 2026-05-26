@@ -445,32 +445,39 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """Phase 1 中的 R1b-W+J，不跑 R2。"""
+        """R2a: J 先行评审 ctags 行号；失败则 W 带 J 反馈修正，再循环评审，直到通过或达到上限。"""
         fs = state.files[file_hash]
         func_state = fs.functions.get(func_hash)
         if func_state is None:
             return
-        r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
         if func_state.r2_j_state == NodeState.PASSED:
             return
-        if not _should_continue(func_state.r2_j_attempts, r2_max, self._cancel):
+
+        r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
+
+        while _should_continue(func_state.r2_j_attempts, r2_max, self._cancel):
+            if func_state.r2_j_state == NodeState.PASSED:
+                break
+
+            # Step 1: J 评审 ctags 行号
+            passed = await self._run_r2_j(file_hash, func_hash, file_path, dirs, state)
+            if passed:
+                break
+            if self._cancel.is_set():
+                return
+
+            # Step 2: J 失败 → W 带 J 反馈修正行号（若还有重试配额）
+            if not _should_continue(func_state.r2_j_attempts, r2_max, self._cancel):
+                break  # 无更多配额，跳出后 force-pass
+            func_state.r2_w_state = NodeState.PENDING
+            await self._run_r2a_w(file_hash, func_hash, file_path, dirs, state)
+            if self._cancel.is_set():
+                return
+
+        # 超出上限时 force-pass，不阻塞下游（“不允许漏报”原则）
+        if func_state.r2_j_state != NodeState.PASSED:
             func_state.r2_j_state = NodeState.PASSED
             state.save(dirs.state_file)
-            return
-        func_meta: dict = {}
-        try:
-            from .funcdb import FunctionDB
-            func_meta = FunctionDB.open(dirs.r1, file_hash).get_function(func_hash) or {}
-        except Exception:
-            pass
-        func_name  = func_meta.get("name", func_state.name or func_hash[:8])
-        start_line = func_meta.get("start_line", 0)
-        end_line   = func_meta.get("end_line", 0)
-        await self._run_r2_j(
-            file_hash, func_hash, file_path, dirs, state)
-
-    # ── Phase 3 函数单元：R2 + R3-W(带 CC caller 上下文) ───────────────────
-
 
     async def _run_func_r2_r3(
         self,
@@ -826,7 +833,7 @@ class PipelineEngine:
 
     # ── R1b W ──────────────────────────────────────────────────────────────────
 
-    async def _run_r2_w(
+    async def _run_r2a_w(
         self,
         file_hash: str,
         func_hash: str,
@@ -834,7 +841,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R1b Worker：函数级准确性校正。"""
+        """R2a Worker：J 判定失败后，带 J 反馈修正 ctags 行号并写回 funcdb。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_w_state = NodeState.RUNNING
         func_state.r2_w_attempts += 1
@@ -844,7 +851,6 @@ class PipelineEngine:
 
         try:
             acfg = self.cfg.workers.agents[0]
-            is_retry = func_state.r2_w_attempts > 1
             async with self._sem:
                 await run_r2_w_worker(
                     file_path=file_path,
@@ -858,8 +864,8 @@ class PipelineEngine:
                     task_id=self.task_id,
                     on_event=self._on_event,
                     cancel_event=self._cancel,
-                    is_retry=is_retry,
-                    feedback=func_state.r2_j_feedback if is_retry else "",
+                    is_retry=True,          # 永远在 J 失败后调用，必有反馈
+                    feedback=func_state.r2_j_feedback or "",
                     system_prompt=self._stage_sys_prompt('r2_worker'),
                 )
             func_state.r2_w_state = NodeState.PASSED
@@ -867,13 +873,11 @@ class PipelineEngine:
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
                        file=Path(file_path).name, passed=True)
         except Exception as exc:
-            logger.error("R1b W failed for %s: %s", func_hash, exc)
+            logger.error("R2a W failed for %s: %s", func_hash, exc)
             func_state.r2_w_state = NodeState.FAILED
             state.save(dirs.state_file)
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
                        file=Path(file_path).name, passed=False, error=str(exc)[:100])
-
-    # ── R1b J ──────────────────────────────────────────────────────────────────
 
     async def _run_r2_j(
         self,
@@ -883,7 +887,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> bool:
-        """R1b Judge：函数级准确性验证。返回 passed。"""
+        """R2a Judge：验证 ctags 提取的函数行号是否正确，返回 passed。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_j_state = NodeState.RUNNING
         func_state.r2_j_attempts += 1
@@ -898,7 +902,10 @@ class PipelineEngine:
         try:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r2_judge')
-            worker_result_file = dirs.stage_result_file("r2_w", "worker", func_hash, max(1, attempt))
+            # 使用 W 的最新结果文件（按 r2_w_attempts，而非 j_attempt）
+            worker_result_file = dirs.stage_result_file(
+                "r2_w", "worker", func_hash,
+                max(1, func_state.r2_w_attempts))
             prompt = P.build_r1_j_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
@@ -935,7 +942,7 @@ class PipelineEngine:
                 fb_file = dirs.r1_j_feedback_file(file_hash, func_hash, attempt)
                 fb_file.parent.mkdir(parents=True, exist_ok=True)
                 fb_file.write_text(feedback, encoding="utf-8")
-                func_state.r3_j_feedback_path = str(fb_file)
+                func_state.r2_j_feedback_path = str(fb_file)   # 修复: 原来误存到 r3_j_feedback_path
             state.save(dirs.state_file)
             self._emit("r2_j_done",
                        func_hash=func_hash, function=func_state.name,
@@ -943,11 +950,9 @@ class PipelineEngine:
             return passed
         except Exception as exc:
             logger.error("R1b J failed for %s: %s", func_hash, exc)
-            func_state.r2_j_state = NodeState.FAILED   # J 异常→FAILED，交 max_rounds 重试
+            func_state.r2_j_state = NodeState.FAILED
             state.save(dirs.state_file)
             return False
-
-    # ── R2 Worker ─────────────────────────────────────────────────────────────
 
     async def _run_r2_w(
         self,
