@@ -939,6 +939,27 @@ def _task_output_root(row: AppEaTask) -> Path | None:
     return root / "output" if root else None
 
 
+def _derive_task_entry_count(row: AppEaTask) -> int | None:
+    result_json = _load_task_result_json(row)
+    if isinstance(result_json, dict):
+        explicit = result_json.get("entry_count")
+        if isinstance(explicit, int):
+            return explicit
+        if isinstance(explicit, float) and explicit >= 0:
+            return int(explicit)
+
+    output_root = _task_output_root(row)
+    functions_list_path = output_root / "functions.list" if output_root else None
+    if functions_list_path and functions_list_path.is_file():
+        try:
+            loaded = json.loads(functions_list_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                return len(loaded)
+        except Exception:
+            return None
+    return None
+
+
 def _read_text_if_exists(path: Path) -> tuple[str | None, str | None]:
     if not path.exists():
         return None, f"文件不存在: {path}"
@@ -2392,12 +2413,14 @@ class TaskService:
         task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "workspace") if run_root else None
+        entry_count = _derive_task_entry_count(row)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_safe_origin_payload(row),
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "source_path": row.source_path,
             "module_name": row.module_name, "output_path": row.output_path,
+            "entry_count": entry_count,
             "task_root": task_root,
             "run_root": run_root,
             "workspace_root": workspace_root,
