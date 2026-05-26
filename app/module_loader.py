@@ -228,6 +228,11 @@ def _link_file(src: str, dst: Path) -> str:
         实际使用的策略名称："symlink" | "hardlink" | "copy"
     """
     real_src = os.path.realpath(src)
+    try:
+        if dst.exists() and os.path.samefile(real_src, str(dst)):
+            return "reuse"
+    except OSError:
+        pass
 
     # ── 策略 1：软链接 ──────────────────────────────────────────────
     try:
@@ -283,6 +288,13 @@ def prepare_workspace(
         dst.parent.mkdir(parents=True, exist_ok=True)
         if not dst.exists():
             _link_file(src, dst)
+        else:
+            try:
+                if os.path.samefile(os.path.realpath(src), str(dst.resolve())):
+                    linked.append(rel)
+                    continue
+            except OSError:
+                pass
         linked.append(rel)
 
     return linked

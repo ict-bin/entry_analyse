@@ -301,7 +301,7 @@ def build_r1_w_initial_prompt(
         f"行号精确性由 R1b 阶段单独处理。\n\n"
         f"{gap_instruction}\n\n"
         f"## 检查步骤\n\n"
-        f"1. 读取 gap 文件，用 sed 查看各 gap 区间内容\n"
+        f"1. 读取 gap 文件，批量用 sed 查看多个 gap 区间内容（**建议每次 bash 调用同时检查 4～6 个 gap，效率更高**）\n"
         f"2. 判断是否有遗漏的函数定义\n"
         f"3. 在 `<result>` 中输出修正（**只允许 new 和 delete，不允许行号修正**）：\n\n"
         f"   ```json\n"
