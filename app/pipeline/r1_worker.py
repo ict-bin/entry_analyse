@@ -198,25 +198,66 @@ def _compute_gaps(
 
 def _parse_r1_corrections(output: str) -> list[dict] | None:
     """
-    从 LLM 输出中提取 <result>[...] </result> 里的修正列表。
+    从 LLM 输出中提取修正列表。
     返回 None 表示 LLM 认为不需要修正（输出 NO_CORRECTIONS）。
+
+    解析策略（按优先级）：
+    1. 优先提取 <result>...</result> 标签内内容
+    2. 若无 <result> 标签，fallback：搜索输出中最后一个完整的 JSON 数组
+       （模型有时忘记加 <result> 标签，直接输出 json code block）
+    3. 两种情况都空 → 返回 [] 表示解析失败
     """
-    m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
-    if not m:
-        return []
-    text = m.group(1).strip()
-    if re.search(r"NO_CORRECTIONS|no_corrections|无需修正", text, re.IGNORECASE):
+    def _try_parse_json_list(text: str) -> list[dict] | None:
+        """尝试解析 JSON 列表，返回 None 表示解析失败。"""
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+        text = re.sub(r"\s*```$", "", text).strip()
+        try:
+            result = json.loads(text)
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return [result]
+        except (json.JSONDecodeError, ValueError):
+            pass
         return None
-    text = re.sub(r"^```(?:json)?\s*", "", text).strip()
-    text = re.sub(r"\s*```$", "", text).strip()
-    try:
-        result = json.loads(text)
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            return [result]
-    except (json.JSONDecodeError, ValueError):
-        pass
+
+    # ── 策略 1：<result> 标签 ──────────────────────────────────────────────
+    m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+        if re.search(r"NO_CORRECTIONS|no_corrections|无需修正", text, re.IGNORECASE):
+            return None
+        parsed = _try_parse_json_list(text)
+        if parsed is not None:
+            return parsed
+        # <result> 存在但解析失败（内容异常），继续尝试 fallback
+
+    # ── 全局 NO_CORRECTIONS 检测 ─────────────────────────────────────────
+    if re.search(r"NO_CORRECTIONS|no_corrections|无需修正", output, re.IGNORECASE):
+        # 若 NO_CORRECTIONS 出现在输出末尾（最后 200 字符），认为是最终结论
+        if re.search(r"NO_CORRECTIONS|no_corrections|无需修正", output[-200:], re.IGNORECASE):
+            return None
+
+    # ── 策略 2：fallback — 搜索最后一个完整 JSON 数组 ─────────────────────
+    # 找所有以 '[' 开头、包含 "func_hash" 或 "name" 字段的 JSON 数组
+    candidates: list[str] = []
+    # 匹配 markdown code block 中的 JSON
+    for m2 in re.finditer(r"```(?:json)?\s*\n(\[.*?\])\s*\n```", output, re.DOTALL):
+        candidates.append(m2.group(1))
+    # 匹配裸 JSON 数组（以 [{ 开头）
+    for m2 in re.finditer(r'(\[\s*\{[^\[\]]*"func_hash"[^\[\]]*\])', output, re.DOTALL):
+        candidates.append(m2.group(1))
+    # 从后往前尝试解析（取最后一个有效结果）
+    for candidate in reversed(candidates):
+        parsed = _try_parse_json_list(candidate)
+        if parsed is not None and len(parsed) > 0:
+            logger.warning(
+                "_parse_r1_corrections: <result> tag missing, "
+                "recovered %d corrections from raw JSON fallback",
+                len(parsed),
+            )
+            return parsed
+
     return []
 
 
@@ -638,6 +679,8 @@ async def run_r1_worker(
 
     # 解析并应用修正（直接写 funcdb，不经 JSON）
     corrections = _parse_r1_corrections(ar.output)
+    _fallback_used = (corrections is not None and len(corrections) > 0 and
+                      "<result>" not in (ar.output or ""))
     result_payload = {
         "stage": "r1_w",
         "attempt": attempt_no,
@@ -647,10 +690,19 @@ async def run_r1_worker(
         "status": "ok" if (corrections is None or isinstance(corrections, list)) else "parse_failed",
         "result_type": "corrections",
         "result": [] if corrections is None else (corrections or []),
+        "parse_note": "fallback_json" if _fallback_used else "result_tag",
     }
     result_file = dirs.stage_result_file("r1_w", "worker", file_hash, attempt_no)
     raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, attempt_no)
-    write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+    write_stage_result_files(
+        result_file=result_file, raw_file=raw_file,
+        payload=result_payload, raw_text=ar.output or "",
+        task_id=task_id,
+        tokens_input=ar.token_usage.input,
+        tokens_output=ar.token_usage.output,
+        model=acfg.model,
+        session_file=str(session_f),
+    )
     upsert_stage_result_index(
         task_id=task_id, stage_key="r1_w", role_kind="worker", scope_kind="file",
         attempt=attempt_no, file_hash=file_hash, status=result_payload["status"],

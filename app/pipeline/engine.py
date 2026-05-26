@@ -76,10 +76,28 @@ def _extract_result(output: str) -> str:
     return m.group(1).strip() if m else output
 
 
+# R2-J 特殊裁定：函数不存在，应从 funcdb 删除
+J_VERDICT_DELETE = "__DELETE__"
+
+
 def _parse_j_result(output: str) -> tuple[bool, str]:
-    """从 Judge 输出中解析 (passed, feedback)。"""
+    """从 Judge 输出中解析 (passed, feedback)。
+
+    返回:
+      (True,  feedback)  — 通过
+      (False, feedback)  — 不通过，需要 W 修正
+      (False, J_VERDICT_DELETE + feedback)  — 函数不存在，应从 funcdb 删除（不重试）
+    """
     clean = re.sub(r"<think>.*?</think>", "", output, flags=re.DOTALL).strip()
     text = clean or output
+
+    # 检查 R2-J 特殊裁定：通过: 删除（函数不存在，如宏定义）
+    if re.search(r"通过[：:]\s*删除|verdict[：:]\s*delete", text, re.IGNORECASE):
+        m = re.search(r"反馈[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if not m:
+            m = re.search(r"feedback[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        feedback = (m.group(1).strip() if m else text[:500])
+        return False, J_VERDICT_DELETE + feedback
 
     passed = False
     if re.search(r"通过[：:]\s*是|passed[：:]\s*true|\bPASS\b", text, re.IGNORECASE):
@@ -891,6 +909,21 @@ class PipelineEngine:
                 context=f"r2_j:{func_hash}", acfg=acfg,
             )
             passed, feedback = _parse_j_result(ar.output)
+            # DELETE 裁定：函数不存在（宏定义等），从 funcdb 删除并强制通过
+            delete_verdict = feedback.startswith(J_VERDICT_DELETE)
+            if delete_verdict:
+                real_feedback = feedback[len(J_VERDICT_DELETE):]
+                logger.info("R2-J DELETE verdict for %s (%s): %s",
+                            func_state.name, func_hash, real_feedback[:100])
+                # 从 funcdb 删除该函数
+                try:
+                    db_path = dirs.r1_functions_db(file_hash)
+                    from .funcdb import FunctionDB
+                    FunctionDB.open(dirs.r1, file_hash).delete_function(func_hash)
+                except Exception as del_exc:
+                    logger.warning("R2-J DELETE: failed to remove %s from funcdb: %s", func_hash, del_exc)
+                passed = True  # force-pass （不需要 W 修正）
+                feedback = "[DELETE] " + real_feedback
             result_payload = {
                 "stage": "r2_j",
                 "attempt": attempt,
@@ -898,6 +931,7 @@ class PipelineEngine:
                 "func_hash": func_hash,
                 "file_hash": file_hash,
                 "passed": passed,
+                "delete_verdict": delete_verdict,
                 "summary": feedback[:200],
                 "feedback": feedback,
             }
@@ -924,6 +958,49 @@ class PipelineEngine:
             func_state.r2_j_state = NodeState.FAILED
             state.save(dirs.state_file)
             return False
+
+    def _infer_entry_role_from_cc(
+        self,
+        func_hash: str,
+        dirs: "PipelineDirs",
+    ) -> str:
+        """尝试从调用链图（CC）推导 entry_role。
+
+        规则：
+          - 函数在 CC 图中无任何调用者（无入边）→ boundary（模块最外层）
+          - 被 dispatcher 类函数调用（函数名含 Dispatch/Proc/Handle/Router）→ dispatch_target
+          - 被注册/hook 类函数调用 → callback
+          - 其他有调用者 → boundary（保守）
+          - CC 尚未建图 → 返回 '' 表示无法推导
+        """
+        try:
+            from .callchain_db import CallChainDB
+            cc_db_path = dirs.callchain_db_path()
+            if not cc_db_path.exists():
+                return ""
+            with CallChainDB.open(cc_db_path) as cc:
+                callers = cc.get_callers(func_hash)
+        except Exception:
+            return ""
+
+        if not callers:
+            return "boundary"
+
+        _DISPATCHER_HINTS = (
+            "dispatch", "proc", "handle", "router", "route", "switch",
+            "process", "dealer", "demux", "classify",
+        )
+        _CALLBACK_HINTS = (
+            "register", "hook", "subscribe", "listen", "callback",
+            "addhandler", "sethandler", "install",
+        )
+        for caller_hash, caller_name in callers:
+            cn = caller_name.lower()
+            if any(h in cn for h in _DISPATCHER_HINTS):
+                return "dispatch_target"
+            if any(h in cn for h in _CALLBACK_HINTS):
+                return "callback"
+        return "boundary"
 
     async def _run_r3_analysis_w(
         self,
@@ -1013,6 +1090,15 @@ class PipelineEngine:
                     if has_input and decision != "filter":
                         from ..functions_list import VALID_ENTRY_ROLES
                         role = str(analysis.get("entry_role") or "").strip()
+                        # entry_role=unknown/空时，尝试从 CC 图推导角色（CC 已建图时）
+                        if role.lower() in ("unknown", "", "none"):
+                            inferred = self._infer_entry_role_from_cc(func_hash, dirs)
+                            if inferred:
+                                role = inferred
+                                analysis["entry_role"] = role
+                                logger.debug(
+                                    "R3: inferred entry_role=%s for %s via CC graph",
+                                    role, func_state.name)
                         if role in VALID_ENTRY_ROLES:
                             func_state.entry_role = role
                         from .funcdb import FunctionDB
@@ -1883,10 +1969,20 @@ class PipelineEngine:
     ) -> None:
         """R4 final Judge：对汇总结果进行最终验证。"""
         r4_final_max = int(getattr(self.cfg, "r4_final_max_rounds", -1))
+        # R6-J 最大轮数上限：此阶段 J 轮数异常时会消耗大量 token，限制上限避免失控
+        R6_J_MAX_ROUNDS = int(getattr(self.cfg, "r6_j_max_rounds", 3))
         while _should_continue(
             state.r6_attempts, r4_final_max, self._cancel
         ):
             if state.r6_state == NodeState.PASSED:
+                break
+            # R6-J 轮数强制上限：每轮耗时长且有大量 token，超过上限就 force-pass
+            if state.r6_attempts > R6_J_MAX_ROUNDS:
+                logger.warning(
+                    "R6-J exceeded max rounds (%d), force-pass to avoid token waste",
+                    R6_J_MAX_ROUNDS,
+                )
+                state.r6_state = NodeState.PASSED
                 break
 
             state.r6_attempts += 1
