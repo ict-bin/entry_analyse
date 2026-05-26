@@ -231,7 +231,7 @@ class PipelineEngine:
         # ─── Phase 2→5: CC + 全函数 R2→R3→R4→R5 完全并行 ─────────────────
         #
         # 同步机制：
-        #   all_r2_done_event : 最后一个函数 R2 完成时 set → 触发 CC
+        #   all_r2a_done_event : 最后一个函数 R2 完成时 set → 触发 CC
         #   cc_done_event     : CC 建图完成时 set → 各函数的 R4 可以开始
         #
         # 每个函数流水：R2 → R3（与 CC 并行）→ 等 R3+CC 双就绪 → R4 → R5
@@ -243,22 +243,22 @@ class PipelineEngine:
         ]
         total_funcs = len(all_func_triples)
 
-        all_r2_done_event: asyncio.Event = asyncio.Event()
+        all_r2a_done_event: asyncio.Event = asyncio.Event()
         cc_done_event:     asyncio.Event = asyncio.Event()
-        r2_done_count = 0
+        r2a_done_count = 0
 
         # 修复B：无函数可处理时直接解锁（防止 _cc_phase 永久挂起）
         if total_funcs == 0:
-            all_r2_done_event.set()
+            all_r2a_done_event.set()
 
         # 断点续跑：CC 已建好，直接触发
         if (dirs.callchain / 'callchain.db').exists():
             cc_done_event.set()
-            all_r2_done_event.set()
+            all_r2a_done_event.set()
 
         async def _cc_phase() -> None:
             if not cc_done_event.is_set():
-                await all_r2_done_event.wait()
+                await all_r2a_done_event.wait()
                 if not self._cancel.is_set():
                     await self._run_callchain_analysis(
                         dirs, state, module_files, file_hash_paths)
@@ -267,45 +267,43 @@ class PipelineEngine:
         async def _func_pipeline(
             func_hash: str, file_hash: str, file_path: str
         ) -> None:
-            nonlocal r2_done_count
+            nonlocal r2a_done_count
             if self._cancel.is_set():
                 return
             fs = state.files.get(file_hash)
             if fs is None or fs.r1_j_state != NodeState.PASSED:
-                # 修复A：跳过的函数也必须计入 r2_done_count
-                # 否则 all_r2_done_event 永远不会 set，_cc_phase 死锁
-                r2_done_count += 1
-                if r2_done_count >= total_funcs:
-                    all_r2_done_event.set()
+                # 修复A：跳过的函数也必须计入 r2a_done_count
+                # 否则 all_r2a_done_event 永远不会 set，_cc_phase 死锁
+                r2a_done_count += 1
+                if r2a_done_count >= total_funcs:
+                    all_r2a_done_event.set()
                 return
             func_state = fs.functions.get(func_hash)
             if func_state is None:
-                r2_done_count += 1
-                if r2_done_count >= total_funcs:
-                    all_r2_done_event.set()
+                r2a_done_count += 1
+                if r2a_done_count >= total_funcs:
+                    all_r2a_done_event.set()
                 return
 
             # R2: 准确性验证（不需要 CC）
             if func_state.r2_j_state != NodeState.PASSED:
                 await self._run_r2_only(
                     file_hash, func_hash, file_path, dirs, state)
-            r2_done_count += 1
-            if r2_done_count >= total_funcs:
-                all_r2_done_event.set()
+            r2a_done_count += 1
+            if r2a_done_count >= total_funcs:
+                all_r2a_done_event.set()
             if self._cancel.is_set():
                 return
 
-            # R3: 入口分析（不需要 CC，与 CC 并行）
-            r3_task = asyncio.create_task(
-                self._run_func_r2_r3(func_hash, file_hash, file_path, dirs, state))
-
-            # 等待 R3 和 CC 双就绪
-            await asyncio.gather(r3_task, cc_done_event.wait())
+            # ── R2b: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
+            await self._run_func_r2_r3(
+                func_hash, file_hash, file_path, dirs, state)
             if self._cancel.is_set():
                 return
 
-            # R4: per-func 入口决策（需要 CC，用 caller_ctx 增强）
-            if not func_state.r4_decision:
+            # ── R3: 单函数入口判断（R2b 完成后立即，不等 CC）────────────────
+            func_state = fs.functions.get(func_hash)
+            if func_state and not func_state.r4_decision:
                 _func_meta: dict = {}
                 try:
                     from .funcdb import FunctionDB as _FDB2
@@ -322,17 +320,22 @@ class PipelineEngine:
                     "file_path":  file_path,
                     "body_lines": _func_meta.get("body_lines", 0),
                 }
-                # R3 不使用 caller_ctx，只看函数体本身判断入口
                 await self._run_r3_w_for_func(
                     file_hash=file_hash,
                     file_path=file_path,
                     func_info=_func_info,
-                    caller_ctx=None,
+                    caller_ctx=None,   # R3 不使用 caller_ctx
                     dirs=dirs,
                     state=state,
                 )
             if self._cancel.is_set():
                 return
+
+            # ── 等 CC 完成（仅 R4 需要 CC，R3 不需要）──────────────────────────
+            await cc_done_event.wait()
+            if self._cancel.is_set():
+                return
+
 
             # R4: 结合 CC 调用链判断（跨文件凗余过滤，仅多文件模块有意义）
             func_state = fs.functions.get(func_hash)
@@ -399,7 +402,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """Phase 1 局部单元：R1a(覆盖率)+ R1b(准确性,函数级并行)。不包含 R2/R3。"""
+        """Phase 1 局部单元：仅 R1(覆盖率 W+J)。R2a 已移至 per-func 流水线内处理。"""
         if self._cancel.is_set():
             return
         fs = state.files[file_hash]
@@ -407,11 +410,6 @@ class PipelineEngine:
             await self._run_r1(file_hash, file_path, dirs, state)
         if self._cancel.is_set() or fs.r1_j_state != NodeState.PASSED:
             return
-        if fs.functions:
-            await asyncio.gather(*[
-                self._run_r2_only(file_hash, fh, file_path, dirs, state)
-                for fh in list(fs.functions.keys())
-            ])
 
     async def _run_r2_only(
         self,
