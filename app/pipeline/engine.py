@@ -1229,6 +1229,7 @@ class PipelineEngine:
                     "entry_role":         func_state.entry_role or "boundary",
                     "decision":           _r3_final_decision,
                     "has_external_input": bool(func_state.has_external_input),
+                    "tag":                (analysis or {}).get("tag", ""),
                     "taints":             (analysis or {}).get("taints", []),
                     "entry_source_lines": (analysis or {}).get("entry_source_lines", []),
                     "function_description": (analysis or {}).get("function_description", ""),
@@ -2140,6 +2141,7 @@ class PipelineEngine:
                     R6_J_MAX_ROUNDS,
                 )
                 state.r6_state = NodeState.PASSED
+                state.save(dirs.state_file)   # Fix-2: force-pass 后必须保存，否则 resume 时重跑
                 break
 
             state.r6_attempts += 1
@@ -2165,20 +2167,20 @@ class PipelineEngine:
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.source),
-                    context="r4_final_j", acfg=acfg,
+                    context="r6_j", acfg=acfg,
                 skill_paths=None,
                 )
                 passed, feedback = _parse_j_result(ar.output)
                 state.r6_feedback = feedback
 
                 if not passed and feedback:
-                    fb_file = dirs.r4_j_feedback_file(state.r6_attempts)
+                    fb_file = dirs.r6_j_feedback_file(state.r6_attempts)
                     fb_file.parent.mkdir(parents=True, exist_ok=True)
                     fb_file.write_text(feedback, encoding="utf-8")
                     state.r6_feedback = str(fb_file)
 
                 result_payload = {
-                    "stage": "r4_j",
+                    "stage": "r6_j",
                     "attempt": state.r6_attempts,
                     "scope": "module",
                     "passed": passed,
@@ -2186,10 +2188,10 @@ class PipelineEngine:
                     "feedback": feedback,
                     "entry_count": len(final_entries),
                 }
-                result_file = dirs.stage_result_file("r4_j", "judge", "module", state.r6_attempts)
-                raw_file = dirs.stage_raw_file("r4_j", "judge", "module", state.r6_attempts)
+                result_file = dirs.stage_result_file("r6_j", "judge", "module", state.r6_attempts)
+                raw_file = dirs.stage_raw_file("r6_j", "judge", "module", state.r6_attempts)
                 write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-                upsert_stage_result_index(task_id=self.task_id, stage_key="r4_j", role_kind="judge", scope_kind="module", attempt=state.r6_attempts,
+                upsert_stage_result_index(task_id=self.task_id, stage_key="r6_j", role_kind="judge", scope_kind="module", attempt=state.r6_attempts,
                                           status="passed" if passed else "failed", passed=passed, summary=feedback[:200],
                                           result_file_path=str(result_file), raw_file_path=str(raw_file))
                 self._emit("r6_j_done", passed=passed, feedback=feedback[:200],
