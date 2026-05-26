@@ -220,41 +220,47 @@ class PipelineEngine:
 
         self._emit("pipeline_start", file_count=len(module_files))
 
-        # ─── Phase 1: 所有文件 R1（并行）────────────────────────────────────
-        await asyncio.gather(*[
-            self._run_file_r1(fh, fp, dirs, state)
-            for fh, fp in file_hash_paths
-        ])
-        if self._cancel.is_set():
-            return []
-
-        # ─── Phase 2→5: CC + 全函数 R2→R3→R4→R5 完全并行 ─────────────────
+        # ─── 单一全并行流水线：文件 R1 完成后立即启动其函数的 R2/R3/R4/R5 ────────
         #
         # 同步机制：
-        #   all_r2a_done_event : 最后一个函数 R2 完成时 set → 触发 CC
-        #   cc_done_event     : CC 建图完成时 set → 各函数的 R4 可以开始
+        #   total_funcs         : R1 完成时动态累加（逐文件）
+        #   r1_done_count       : 完成 R1 的文件数
+        #   r2a_done_count      : 完成 R2a 的函数数
+        #   all_r1_done_flag    : 全部文件 R1 完成时置 True
+        #   all_r2a_done_event  : all_r1_done AND r2a_done_count >= total_funcs 时 set → CC
+        #   cc_done_event       : CC 建图完成时 set → 各函数 R4 解锁
         #
-        # 每个函数流水：R2 → R3（与 CC 并行）→ 等 R3+CC 双就绪 → R4 → R5
+        # 每个文件流：R1 完成 → 立即并行启动本文件所有函数的 (R2a→R2b→R3→等CC→R4→R5)
         #
-        all_func_triples = [
-            (func_hash, file_hash, file_path)
-            for file_hash, file_path in file_hash_paths
-            for func_hash in list(state.files[file_hash].functions.keys())
-        ]
-        total_funcs = len(all_func_triples)
+        total_files      = len(file_hash_paths)
+        total_funcs      = 0
+        r1_done_count    = 0
+        r2a_done_count   = 0
+        all_r1_done_flag = False
 
         all_r2a_done_event: asyncio.Event = asyncio.Event()
-        cc_done_event:     asyncio.Event = asyncio.Event()
-        r2a_done_count = 0
+        cc_done_event:      asyncio.Event = asyncio.Event()
 
-        # 修复B：无函数可处理时直接解锁（防止 _cc_phase 永久挂起）
-        if total_funcs == 0:
+        # 无文件时直接解锁
+        if total_files == 0:
             all_r2a_done_event.set()
 
-        # 断点续跑：CC 已建好，直接触发
+        # 断点续跑：CC 已建好，直接解锁
         if (dirs.callchain / 'callchain.db').exists():
             cc_done_event.set()
             all_r2a_done_event.set()
+
+        def _maybe_set_all_r2a_done() -> None:
+            if all_r1_done_flag and r2a_done_count >= total_funcs:
+                all_r2a_done_event.set()
+
+        def _on_r1_done(func_count: int) -> None:
+            nonlocal r1_done_count, total_funcs, all_r1_done_flag
+            total_funcs   += func_count
+            r1_done_count += 1
+            if r1_done_count == total_files:
+                all_r1_done_flag = True
+                _maybe_set_all_r2a_done()
 
         async def _cc_phase() -> None:
             if not cc_done_event.is_set():
@@ -271,27 +277,23 @@ class PipelineEngine:
             if self._cancel.is_set():
                 return
             fs = state.files.get(file_hash)
-            if fs is None or fs.r1_j_state != NodeState.PASSED:
-                # 修复A：跳过的函数也必须计入 r2a_done_count
-                # 否则 all_r2a_done_event 永远不会 set，_cc_phase 死锁
+            if fs is None:
+                # 防御性：不应出现，但需计入 r2a 防止死锁
                 r2a_done_count += 1
-                if r2a_done_count >= total_funcs:
-                    all_r2a_done_event.set()
+                _maybe_set_all_r2a_done()
                 return
             func_state = fs.functions.get(func_hash)
             if func_state is None:
                 r2a_done_count += 1
-                if r2a_done_count >= total_funcs:
-                    all_r2a_done_event.set()
+                _maybe_set_all_r2a_done()
                 return
 
-            # R2: 准确性验证（不需要 CC）
+            # ── R2a: ctags 行号准确性验证 ──────────────────────────────────
             if func_state.r2_j_state != NodeState.PASSED:
                 await self._run_r2_only(
                     file_hash, func_hash, file_path, dirs, state)
             r2a_done_count += 1
-            if r2a_done_count >= total_funcs:
-                all_r2a_done_event.set()
+            _maybe_set_all_r2a_done()   # 最后一个 R2a 完成 → 可能触发 CC
             if self._cancel.is_set():
                 return
 
@@ -331,13 +333,12 @@ class PipelineEngine:
             if self._cancel.is_set():
                 return
 
-            # ── 等 CC 完成（仅 R4 需要 CC，R3 不需要）──────────────────────────
+            # ── 等 CC 完成（仅 R4 需要 CC）──────────────────────────────
             await cc_done_event.wait()
             if self._cancel.is_set():
                 return
 
-
-            # R4: 结合 CC 调用链判断（跨文件凗余过滤，仅多文件模块有意义）
+            # ── R4: 结合调用链判断（本函数 R3+CC 完成即可，不等其他函数 R3）─
             func_state = fs.functions.get(func_hash)
             if (
                 func_state
@@ -353,7 +354,7 @@ class PipelineEngine:
                     except Exception as _r4_exc:
                         logger.warning("R4-func skip for %s: %s", func_hash, _r4_exc)
 
-            # R5: 单函数报告
+            # ── R5: 单函数报告─────────────────────────────────────────────────
             func_state = fs.functions.get(func_hash)
             if (out_dir and func_state and
                     func_state.r4_decision == 'keep' and
@@ -379,11 +380,31 @@ class PipelineEngine:
                     state=state,
                 )
 
+        async def _complete_file_pipeline(
+            file_hash: str, file_path: str
+        ) -> None:
+            if self._cancel.is_set():
+                return
+            # R1: 覆盖率 W+J
+            await self._run_file_r1(file_hash, file_path, dirs, state)
+            # 更新 R1 完成计数（动态 total_funcs）
+            fs = state.files.get(file_hash)
+            if fs is None or fs.r1_j_state != NodeState.PASSED:
+                _on_r1_done(0)
+                return
+            func_hashes = list(fs.functions.keys())
+            _on_r1_done(len(func_hashes))
+            if self._cancel.is_set() or not func_hashes:
+                return
+            # R1 完成后立即并行启动本文件所有函数的流水线
+            await asyncio.gather(*[
+                _func_pipeline(fh, file_hash, file_path)
+                for fh in func_hashes
+            ])
 
         await asyncio.gather(
             _cc_phase(),
-            *[_func_pipeline(fh, file_hash, fpath)
-              for fh, file_hash, fpath in all_func_triples],
+            *[_complete_file_pipeline(fh, fp) for fh, fp in file_hash_paths],
         )
         if self._cancel.is_set():
             return []
