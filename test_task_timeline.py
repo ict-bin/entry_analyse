@@ -172,6 +172,45 @@ class EntryTaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_list_tasks_does_not_use_detail_serializer(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_list_summary", status="failed")
+            db.add_all([
+                AppEaTaskEvent(
+                    id="evt_list_1",
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    source="system",
+                    level="info",
+                    event_type="first_event",
+                    message="first",
+                    dedupe_key="list-k1",
+                ),
+                AppEaTaskEvent(
+                    id="evt_list_2",
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    source="system",
+                    level="warning",
+                    event_type="second_event",
+                    stage_key="r3",
+                    function_name="main",
+                    attempt=2,
+                    message="second",
+                    dedupe_key="list-k2",
+                ),
+            ])
+            db.commit()
+
+            with patch.object(self.service, "_row_to_dict", side_effect=AssertionError("list path must not use detail serializer")):
+                payload = self.service.list_tasks(db, project_id="p1")
+
+            self.assertEqual(1, payload["total"])
+            self.assertEqual(task.task_id, payload["items"][0]["task_id"])
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

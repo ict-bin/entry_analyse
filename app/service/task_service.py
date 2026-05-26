@@ -960,6 +960,17 @@ def _derive_task_entry_count(row: AppEaTask) -> int | None:
     return None
 
 
+def _entry_count_from_cached_result(result_json: object) -> int | None:
+    if not isinstance(result_json, dict):
+        return None
+    explicit = result_json.get("entry_count")
+    if isinstance(explicit, int):
+        return explicit
+    if isinstance(explicit, float) and explicit >= 0:
+        return int(explicit)
+    return None
+
+
 def _read_text_if_exists(path: Path) -> tuple[str | None, str | None]:
     if not path.exists():
         return None, f"文件不存在: {path}"
@@ -1784,8 +1795,12 @@ class TaskService:
             .limit(per_page)
             .all()
         )
-        return {"items": [self._row_to_dict(r, db=db, include_heavy=False) for r in rows],
-                "total": total, "page": page, "per_page": per_page}
+        return {
+            "items": [self._row_to_list_dict(r) for r in rows],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
 
     def get_task(self, db: Session, task_id: str) -> dict:
         return self._row_to_dict(self._get_or_404(db, task_id), db=db)
@@ -2397,6 +2412,8 @@ class TaskService:
                 AppEaTask.lease_expires_at,
                 AppEaTask.cancel_requested,
                 AppEaTask.error,
+                AppEaTask.result_json,
+                AppEaTask.latest_abnormal_reason_json,
                 AppEaTask.created_by,
                 AppEaTask.created_at,
                 AppEaTask.updated_at,
@@ -2406,14 +2423,36 @@ class TaskService:
         )
 
     @staticmethod
-    def _row_to_dict(row: AppEaTask, *, db: Session | None = None, include_heavy: bool = True) -> dict:
+    def _task_abnormal_reason_light(row: AppEaTask) -> dict | None:
+        status = str(row.status or "")
+        if status not in {"failed", "error", "cancelled"}:
+            return None
+        if isinstance(row.latest_abnormal_reason_json, dict):
+            return dict(row.latest_abnormal_reason_json)
+        if status == "cancelled" or row.cancel_requested:
+            return {"code": "user_cancelled", "category": "cancel", "title": "任务已取消", "status": status}
+        message = str(row.error or "").strip()
+        if "lease" in message.lower() or "租约" in message:
+            return {"code": "lease_lost", "category": "runtime", "title": "任务租约丢失", "status": status}
+        if "cancel" in message.lower() or "取消" in message:
+            return {"code": "runtime_interrupted", "category": "runtime", "title": "运行时中断", "status": status}
+        if message:
+            return {
+                "code": "task_failed",
+                "category": "runtime",
+                "title": "任务执行失败",
+                "message": message,
+                "status": status,
+            }
+        return {"code": "task_failed", "category": "runtime", "title": "任务执行失败", "status": status}
+
+    @staticmethod
+    def _row_common_payload(row: AppEaTask, *, abnormal_reason: dict | None, entry_count: int | None) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
-        abnormal_reason = _task_abnormal_reason(row)
         task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "workspace") if run_root else None
-        entry_count = _derive_task_entry_count(row)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_safe_origin_payload(row),
@@ -2424,40 +2463,62 @@ class TaskService:
             "task_root": task_root,
             "run_root": run_root,
             "workspace_root": workspace_root,
+            "status": row.status,
+            "owner_pod": row.owner_pod,
+            "lease_expires_at": fmt(row.lease_expires_at),
+            "cancel_requested": row.cancel_requested,
+            "error": row.error,
+            "created_by": row.created_by,
+            "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
+            "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
+            "abnormal_reason": abnormal_reason,
+            "abnormal_reason_title": (abnormal_reason or {}).get("title"),
+            "abnormal_reason_code": (abnormal_reason or {}).get("code"),
+            "abnormal_reason_category": (abnormal_reason or {}).get("category"),
+        }
+
+    @staticmethod
+    def _row_to_list_dict(row: AppEaTask) -> dict:
+        return TaskService._row_common_payload(
+            row,
+            abnormal_reason=TaskService._task_abnormal_reason_light(row),
+            entry_count=_entry_count_from_cached_result(row.result_json),
+        )
+
+    @staticmethod
+    def _row_to_dict(row: AppEaTask, *, db: Session | None = None) -> dict:
+        payload = TaskService._row_common_payload(
+            row,
+            abnormal_reason=_task_abnormal_reason(row),
+            entry_count=_derive_task_entry_count(row),
+        )
+        workspace_root = payload["workspace_root"]
+        payload.update({
             "input_summary": {
                 "files_list_path": _preferred_files_list_path(row),
-            } if include_heavy else None,
+            },
             "output_summary": {
                 "r1_functions_path": str(Path(workspace_root) / "r1-functions") if workspace_root else None,
                 "r3_entries_path": str(Path(workspace_root) / "r3-entries") if workspace_root else None,
                 "r4_module_path": str(Path(workspace_root) / "r4-module") if workspace_root else None,
                 "report_path": str(Path(workspace_root) / "report") if workspace_root else None,
-            } if include_heavy else None,
+            },
             "prompt_template_id": row.prompt_template_id,
-            "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
-            "owner_pod": row.owner_pod,
-            "lease_expires_at": fmt(row.lease_expires_at),
-            "cancel_requested": row.cancel_requested,
-            "error": row.error,
-            "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
-            "stages_json": _stages_json_summary(row.stages_json) if include_heavy else None,
-            "task_config_json": row.task_config_json if include_heavy else None,
-            "function_catalog": _build_function_catalog(row) if include_heavy else [],
+            "prompt_content": row.prompt_content,
+            "result_json": _lightweight_result_json(row, row.result_json),
+            "stages_json": _stages_json_summary(row.stages_json),
+            "task_config_json": row.task_config_json,
+            "function_catalog": _build_function_catalog(row),
             "lean_mode": bool(
-                (row.task_config_json or {}).get("lean_mode",
-                    ((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False)
+                (row.task_config_json or {}).get(
+                    "lean_mode",
+                    ((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False),
                 )
             ),
-            "created_by": row.created_by,
-            "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
-            "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
-            "abnormal_reason": abnormal_reason,
-            "abnormal_reason_history": _abnormal_reason_history(row) if include_heavy else [],
-            "abnormal_reason_title": (abnormal_reason or {}).get("title"),
-            "abnormal_reason_code": (abnormal_reason or {}).get("code"),
-            "abnormal_reason_category": (abnormal_reason or {}).get("category"),
+            "abnormal_reason_history": _abnormal_reason_history(row),
             "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
-        }
+        })
+        return payload
 
 
 _task_service: TaskService | None = None

@@ -38,6 +38,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from .build_info import build_service_meta
 from .config import build_task_config, load_service_config
 from .logging_utils import configure_container_logging
 from .metrics import observe_request as observe_metrics_request, render_metrics
@@ -192,6 +193,7 @@ async def health():
         "worker_running": worker_running,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
+        **build_service_meta(),
     }
 
 

@@ -1,5 +1,7 @@
 FROM public.ecr.aws/docker/library/ubuntu:24.04
 
+ARG SECFLOW_BUILD_VERSION=""
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
@@ -31,6 +33,7 @@ COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
 COPY .pi/               ./.pi/
 COPY config.example.json .env.example ./
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /opt/entry_analyse/build_meta.json
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true \
     && chmod +x .pi/skills/write-entry-list-json/scripts/validate_entry_list.py 2>/dev/null || true
 

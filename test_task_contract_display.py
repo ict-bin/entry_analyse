@@ -92,6 +92,32 @@ class EntryTaskContractDisplayTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_list_tasks_uses_cached_entry_count_without_filesystem_fallback(self):
+        db = self.SessionLocal()
+        try:
+            row = AppEaTask(
+                task_id="eat_list_cached",
+                project_id="p1",
+                task_name="cached-entry-count",
+                input_path="/archive/modules/network",
+                source_path="/archive/source-root",
+                module_name="network",
+                output_path="/archive/out",
+                prompt_content="prompt",
+                status="passed",
+                result_json={"entry_count": 7},
+            )
+            db.add(row)
+            db.commit()
+
+            with patch("app.service.task_service._derive_task_entry_count", side_effect=AssertionError("list path must not read artifact files")):
+                payload = self.service.list_tasks(db, project_id="p1")
+
+            self.assertEqual(1, payload["total"])
+            self.assertEqual(7, payload["items"][0]["entry_count"])
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
