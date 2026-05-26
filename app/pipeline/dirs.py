@@ -162,6 +162,12 @@ class PipelineDirs:
     def r3_j_session(self, func_hash: str, attempt: int) -> Path:
         return self.sessions / f"r3-j-{func_hash}-a{attempt}.jsonl"
 
+    def r3_entry_w_session(self, func_hash: str) -> Path:
+        return self.sessions / f"r3-entry-w-{func_hash}.jsonl"
+
+    def r3_entry_j_session(self, func_hash: str, attempt: int) -> Path:
+        return self.sessions / f"r3-entry-j-{func_hash}-a{attempt}.jsonl"
+
     # backward compat: old r2_w/j sessions
     def r2_w_session(self, file_hash: str, func_hash: str) -> Path:
         return self.r3_w_session(file_hash, func_hash)

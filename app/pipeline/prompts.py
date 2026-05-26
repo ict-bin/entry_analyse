@@ -431,6 +431,39 @@ def build_r3_w_func_prompt(
 
 # ─── R3 Judge ─────────────────────────────────────────────────────────────────
 
+def build_r3_entry_j_prompt(
+    func_hash: str,
+    func_name: str,
+    start_line: int,
+    end_line: int,
+    file_path: str,
+    worker_result_file: str = "",
+) -> str:
+    """
+    R3 Entry Judge：验证 Worker 的 keep/filter 决策是否有充分的代码证据支撑。
+    """
+    abs_path = os.path.abspath(file_path)
+    sed_body = f"sed -n '{start_line},{end_line}p' {abs_path}"
+    return (
+        f"# R3 Entry Judge — 入口判断验证\n\n"
+        f"| 字段 | 値 |\n"
+        f"|------|-------|\n"
+        f"| func_hash | `{func_hash}` |\n"
+        f"| name | `{func_name}` |\n"
+        f"| 行范围 | {start_line}~{end_line} |\n"
+        f"| 文件 | `{os.path.basename(file_path)}` |\n\n"
+        f"## 步骤 1：读取 Worker 结果\n\n"
+        f"```bash\ncat {worker_result_file}\n```\n\n"
+        f"## 步骤 2：读取函数体\n\n"
+        f"```bash\n{sed_body}\n```\n\n"
+        f"## 步骤 3：验证 decision 是否有代码证据支撑\n\n"
+        f"参照系统提示词中的验证规则，判断 Worker 的 keep/filter 决策是否自洽。\n\n"
+        f"## 输出格式\n\n"
+        f"通过时：\n```\n通过: 是\n摘要: decision 有代码证据支撑\n```\n\n"
+        f"不通过时：\n```\n通过: 否\n摘要: <≤060字，说明核心问题>\n反馈: <指出哪段代码与判断矛盾，应如何修正>\n```\n"
+    )
+
+
 def build_r3_j_prompt(
     file_path: str,
     r3_entries_path: Path,

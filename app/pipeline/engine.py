@@ -225,34 +225,34 @@ class PipelineEngine:
         # 同步机制：
         #   total_funcs         : R1 完成时动态累加（逐文件）
         #   r1_done_count       : 完成 R1 的文件数
-        #   r2a_done_count      : 完成 R2a 的函数数
+        #   r2_done_count      : 完成 R2 的函数数
         #   all_r1_done_flag    : 全部文件 R1 完成时置 True
-        #   all_r2a_done_event  : all_r1_done AND r2a_done_count >= total_funcs 时 set → CC
+        #   all_r2_done_event  : all_r1_done AND r2_done_count >= total_funcs 时 set → CC
         #   cc_done_event       : CC 建图完成时 set → 各函数 R4 解锁
         #
-        # 每个文件流：R1 完成 → 立即并行启动本文件所有函数的 (R2a→R2b→R3→等CC→R4→R5)
+        # 每个文件流：R1 完成 → 立即并行启动本文件所有函数的 (R2→R3分析→R3入口→等CC→R4→R5)
         #
         total_files      = len(file_hash_paths)
         total_funcs      = 0
         r1_done_count    = 0
-        r2a_done_count   = 0
+        r2_done_count   = 0
         all_r1_done_flag = False
 
-        all_r2a_done_event: asyncio.Event = asyncio.Event()
+        all_r2_done_event: asyncio.Event = asyncio.Event()
         cc_done_event:      asyncio.Event = asyncio.Event()
 
         # 无文件时直接解锁
         if total_files == 0:
-            all_r2a_done_event.set()
+            all_r2_done_event.set()
 
         # 断点续跑：CC 已建好，直接解锁
         if (dirs.callchain / 'callchain.db').exists():
             cc_done_event.set()
-            all_r2a_done_event.set()
+            all_r2_done_event.set()
 
-        def _maybe_set_all_r2a_done() -> None:
-            if all_r1_done_flag and r2a_done_count >= total_funcs:
-                all_r2a_done_event.set()
+        def _maybe_set_all_r2_done() -> None:
+            if all_r1_done_flag and r2_done_count >= total_funcs:
+                all_r2_done_event.set()
 
         def _on_r1_done(func_count: int) -> None:
             nonlocal r1_done_count, total_funcs, all_r1_done_flag
@@ -260,11 +260,11 @@ class PipelineEngine:
             r1_done_count += 1
             if r1_done_count == total_files:
                 all_r1_done_flag = True
-                _maybe_set_all_r2a_done()
+                _maybe_set_all_r2_done()
 
         async def _cc_phase() -> None:
             if not cc_done_event.is_set():
-                await all_r2a_done_event.wait()
+                await all_r2_done_event.wait()
                 if not self._cancel.is_set():
                     await self._run_callchain_analysis(
                         dirs, state, module_files, file_hash_paths)
@@ -273,42 +273,42 @@ class PipelineEngine:
         async def _func_pipeline(
             func_hash: str, file_hash: str, file_path: str
         ) -> None:
-            nonlocal r2a_done_count
+            nonlocal r2_done_count
             if self._cancel.is_set():
                 return
             fs = state.files.get(file_hash)
             if fs is None:
                 # 防御性：不应出现，但需计入 r2a 防止死锁
-                r2a_done_count += 1
-                _maybe_set_all_r2a_done()
+                r2_done_count += 1
+                _maybe_set_all_r2_done()
                 return
             func_state = fs.functions.get(func_hash)
             if func_state is None:
-                r2a_done_count += 1
-                _maybe_set_all_r2a_done()
+                r2_done_count += 1
+                _maybe_set_all_r2_done()
                 return
 
-            # ── R2a: ctags 行号准确性验证 ──────────────────────────────────
+            # ── R2: ctags 行号准确性验证 ──────────────────────────────────
             if func_state.r2_j_state != NodeState.PASSED:
-                await self._run_r2_only(
+                await self._run_r2(
                     file_hash, func_hash, file_path, dirs, state)
-            r2a_done_count += 1
-            _maybe_set_all_r2a_done()   # 最后一个 R2a 完成 → 可能触发 CC
+            r2_done_count += 1
+            _maybe_set_all_r2_done()   # 最后一个 R2 完成 → 可能触发 CC
             if self._cancel.is_set():
                 return
 
-            # R2a 未通过：函数边界不可信，跳过后续所有阶段
+            # R2 未通过：函数边界不可信，跳过后续所有阶段
             func_state = fs.functions.get(func_hash)
             if func_state is None or func_state.r2_j_state != NodeState.PASSED:
                 return
 
-            # ── R2b: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
-            await self._run_func_r2_r3(
+            # ── R3 分析: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
+            await self._run_r3_analysis(
                 func_hash, file_hash, file_path, dirs, state)
             if self._cancel.is_set():
                 return
 
-            # ── R3: 单函数入口判断（R2b 完成后立即，不等 CC）────────────────
+            # ── R3 入口判断: 单函数入口判断（R3 分析完成后立即，不等 CC）────────────────
             func_state = fs.functions.get(func_hash)
             if func_state and not func_state.r4_decision:
                 _func_meta: dict = {}
@@ -327,7 +327,7 @@ class PipelineEngine:
                     "file_path":  file_path,
                     "body_lines": _func_meta.get("body_lines", 0),
                 }
-                await self._run_r3_w_for_func(
+                await self._run_r3_entry(
                     file_hash=file_hash,
                     file_path=file_path,
                     func_info=_func_info,
@@ -428,7 +428,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """Phase 1 局部单元：仅 R1(覆盖率 W+J)。R2a 已移至 per-func 流水线内处理。"""
+        """Phase 1 局部单元：仅 R1(覆盖率 W+J)。R2 已移至 per-func 流水线内处理。"""
         if self._cancel.is_set():
             return
         fs = state.files[file_hash]
@@ -437,7 +437,7 @@ class PipelineEngine:
         if self._cancel.is_set() or fs.r1_j_state != NodeState.PASSED:
             return
 
-    async def _run_r2_only(
+    async def _run_r2(
         self,
         file_hash: str,
         func_hash: str,
@@ -445,7 +445,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2a: J 先行评审 ctags 行号；失败则 W 带 J 反馈修正，再循环评审，直到通过或达到上限。"""
+        """R2: J 先行评审 ctags 行号；失败则 W 带 J 反馈修正，再循环评审，直到通过或达到上限。"""
         fs = state.files[file_hash]
         func_state = fs.functions.get(func_hash)
         if func_state is None:
@@ -470,7 +470,7 @@ class PipelineEngine:
             if not _should_continue(func_state.r2_j_attempts, r2_max, self._cancel):
                 break  # 无更多配额，跳出后 force-pass
             func_state.r2_w_state = NodeState.PENDING
-            await self._run_r2a_w(file_hash, func_hash, file_path, dirs, state)
+            await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
             if self._cancel.is_set():
                 return
 
@@ -479,7 +479,7 @@ class PipelineEngine:
             func_state.r2_j_state = NodeState.PASSED
             state.save(dirs.state_file)
 
-    async def _run_func_r2_r3(
+    async def _run_r3_analysis(
         self,
         func_hash: str,
         file_hash: str,
@@ -492,7 +492,7 @@ class PipelineEngine:
           1. R2-W（外部输入分析）+ R2-J（验证）
           2. 检查 has_external_input，否则跳过后续
 
-        注意：per-func 入口决策 (_run_r3_w_for_func) 由 _func_pipeline 在
+        注意：per-func 入口决策 (_run_r3_entry) 由 _func_pipeline 在
         CC 完成后调用（R4 步骤），确保能获得完整的 caller_ctx。
         """
         if self._cancel.is_set():
@@ -504,7 +504,7 @@ class PipelineEngine:
 
         # R2-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
         if func_state.r3_w_state != NodeState.PASSED:
-            await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
+            await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
 
         if self._cancel.is_set():
             return
@@ -513,7 +513,7 @@ class PipelineEngine:
             while _should_continue(func_state.r3_j_attempts, r2_j_max, self._cancel):
                 if func_state.r3_j_state == NodeState.PASSED:
                     break
-                passed, _ = await self._run_r2_j_for_func(
+                passed, _ = await self._run_r3_analysis_j(
                     file_hash, func_hash, file_path, dirs, state)
                 if passed:
                     break
@@ -521,7 +521,7 @@ class PipelineEngine:
                 func_state.r3_w_feedback = (
                     func_state.r3_j_feedback_path or func_state.r3_j_feedback_summary or ""
                 )
-                await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
+                await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
         if self._cancel.is_set():
             return
 
@@ -815,7 +815,7 @@ class PipelineEngine:
             if func_state.r3_w_state != NodeState.PASSED:
                 await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
 
-            j_passed, summary = await self._run_r2_j_for_func(
+            j_passed, summary = await self._run_r3_analysis_j(
                 file_hash, func_hash, file_path, dirs, state)
             if j_passed:
                 break
@@ -833,7 +833,7 @@ class PipelineEngine:
 
     # ── R1b W ──────────────────────────────────────────────────────────────────
 
-    async def _run_r2a_w(
+    async def _run_r2_w(
         self,
         file_hash: str,
         func_hash: str,
@@ -841,7 +841,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2a Worker：J 判定失败后，带 J 反馈修正 ctags 行号并写回 funcdb。"""
+        """R2 Worker：J 判定失败后，带 J 反馈修正 ctags 行号并写回 funcdb。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_w_state = NodeState.RUNNING
         func_state.r2_w_attempts += 1
@@ -873,7 +873,7 @@ class PipelineEngine:
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
                        file=Path(file_path).name, passed=True)
         except Exception as exc:
-            logger.error("R2a W failed for %s: %s", func_hash, exc)
+            logger.error("R2 W failed for %s: %s", func_hash, exc)
             func_state.r2_w_state = NodeState.FAILED
             state.save(dirs.state_file)
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
@@ -887,7 +887,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> bool:
-        """R2a Judge：验证 ctags 提取的函数行号是否正确，返回 passed。"""
+        """R2 Judge：验证 ctags 提取的函数行号是否正确，返回 passed。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_j_state = NodeState.RUNNING
         func_state.r2_j_attempts += 1
@@ -921,7 +921,7 @@ class PipelineEngine:
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
-                "stage": "r2a_j",
+                "stage": "r2_j",
                 "attempt": attempt,
                 "scope": "func",
                 "func_hash": func_hash,
@@ -930,10 +930,10 @@ class PipelineEngine:
                 "summary": feedback[:200],
                 "feedback": feedback,
             }
-            result_file = dirs.stage_result_file("r2a_j", "judge", func_hash, attempt)
-            raw_file = dirs.stage_raw_file("r2a_j", "judge", func_hash, attempt)
+            result_file = dirs.stage_result_file("r2_j", "judge", func_hash, attempt)
+            raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, attempt)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r2a_j", role_kind="judge", scope_kind="func", attempt=attempt,
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=attempt,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
                                       summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
             func_state.r2_j_feedback = feedback
@@ -954,7 +954,7 @@ class PipelineEngine:
             state.save(dirs.state_file)
             return False
 
-    async def _run_r2_w(
+    async def _run_r3_analysis_w(
         self,
         file_hash: str,
         func_hash: str,
@@ -980,7 +980,7 @@ class PipelineEngine:
                        func_hash=func_hash, function=func_state.name)
             try:
                 acfg = self.cfg.workers.agents[0]
-                sys_prompt = self._stage_sys_prompt('r3_worker')
+                sys_prompt = self._stage_sys_prompt('r3_analysis_worker')
                 is_retry = func_state.r3_w_attempts > 1
                 r2_feedback = (
                     func_state.r3_w_feedback
@@ -989,7 +989,7 @@ class PipelineEngine:
                 body_lines = max(
                     0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
                 )
-                prev_j_result = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, func_state.r3_w_attempts - 1)) if is_retry else None
+                prev_j_result = dirs.stage_result_file("r3_j", "judge", func_hash, max(1, func_state.r3_w_attempts - 1)) if is_retry else None
                 prompt = P.build_r2_w_prompt(
                     func_hash=func_hash,
                     func_name=func_state.name,
@@ -1011,7 +1011,7 @@ class PipelineEngine:
 
                 analysis = _parse_r2_analysis(ar.output)
                 result_payload = {
-                    "stage": "r2_w",
+                    "stage": "r3_w",
                     "attempt": func_state.r3_w_attempts,
                     "scope": "func",
                     "func_hash": func_hash,
@@ -1021,10 +1021,10 @@ class PipelineEngine:
                     "result_type": "analysis",
                     "result": analysis if analysis is not None else {"has_external_input": _parse_has_external_input(ar.output)},
                 }
-                result_file = dirs.stage_result_file("r2_w", "worker", func_hash, func_state.r3_w_attempts)
-                raw_file = dirs.stage_raw_file("r2_w", "worker", func_hash, func_state.r3_w_attempts)
+                result_file = dirs.stage_result_file("r3_w", "worker", func_hash, func_state.r3_w_attempts)
+                raw_file = dirs.stage_raw_file("r3_w", "worker", func_hash, func_state.r3_w_attempts)
                 write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-                upsert_stage_result_index(task_id=self.task_id, stage_key="r2_w", role_kind="worker", scope_kind="func", attempt=func_state.r3_w_attempts,
+                upsert_stage_result_index(task_id=self.task_id, stage_key="r3_w", role_kind="worker", scope_kind="func", attempt=func_state.r3_w_attempts,
                                           file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
                                           summary=str(result_payload["result"])[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
                 if analysis is not None:
@@ -1061,7 +1061,7 @@ class PipelineEngine:
 
     # ── R2 Judge（函数级）────────────────────────────────────────────────────
 
-    async def _run_r2_j_for_func(
+    async def _run_r3_analysis_j(
         self,
         file_hash: str,
         func_hash: str,
@@ -1083,8 +1083,8 @@ class PipelineEngine:
                    func_hash=func_hash, function=func_state.name)
         try:
             acfg = self._judge_acfg()
-            sys_prompt = self._stage_sys_prompt('r3_judge')
-            worker_result_file = dirs.stage_result_file("r2_w", "worker", func_hash, max(1, func_state.r3_w_attempts))
+            sys_prompt = self._stage_sys_prompt('r3_analysis_judge')
+            worker_result_file = dirs.stage_result_file("r3_w", "worker", func_hash, max(1, func_state.r3_w_attempts))
             prompt = P.build_r2_j_func_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
@@ -1136,7 +1136,7 @@ class PipelineEngine:
                 summary = "taints 为空，必须列出至少一个承载外部数据的参数名"[:60]
 
             result_payload = {
-                "stage": "r2_j",
+                "stage": "r3_j",
                 "attempt": func_state.r3_j_attempts,
                 "scope": "func",
                 "func_hash": func_hash,
@@ -1145,10 +1145,10 @@ class PipelineEngine:
                 "summary": summary,
                 "feedback": feedback,
             }
-            result_file = dirs.stage_result_file("r2_j", "judge", func_hash, func_state.r3_j_attempts)
-            raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, func_state.r3_j_attempts)
+            result_file = dirs.stage_result_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
+            raw_file = dirs.stage_raw_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=func_state.r3_j_attempts,
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r3_j", role_kind="judge", scope_kind="func", attempt=func_state.r3_j_attempts,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
                                       summary=summary, result_file_path=str(result_file), raw_file_path=str(raw_file))
 
@@ -1301,7 +1301,7 @@ class PipelineEngine:
             })
 
         tasks = [
-            self._run_r3_w_for_func(
+            self._run_r3_entry(
                 file_hash=file_hash,
                 file_path=file_path,
                 func_info=info,
@@ -1350,7 +1350,7 @@ class PipelineEngine:
             "body_lines":           func_info.get("body_lines") or 0,
         }
 
-    async def _run_r3_w_for_func(
+    async def _run_r3_entry(
         self, file_hash, file_path, func_info,
         dirs, state,
         other_candidates=None,   # 已废弃，保留居兼容
@@ -1380,14 +1380,14 @@ class PipelineEngine:
                 fs.functions[func_hash].r4_decision = "filter"
             return None
 
-        session_dir = dirs.r4_w_session(file_hash).parent
-        session_file = str(session_dir / f"r3-w-{file_hash}-{func_hash[:8]}.jsonl")
+        # session 使用专用 r3_entry_w_session
+        session_file = str(dirs.r3_entry_w_session(func_hash))
         r3_func_dir = dirs.r3.parent / "r3_func"
         r3_func_dir.mkdir(parents=True, exist_ok=True)
         r3_func_out = r3_func_dir / f"{func_hash}.json"
 
         acfg = self.cfg.workers.agents[0]
-        sys_prompt = self._stage_sys_prompt("r3_worker")
+        sys_prompt = self._stage_sys_prompt("r3_entry_worker")
 
         for attempt in range(1, max_attempts + 1):
             if self._cancel.is_set():
@@ -1444,7 +1444,7 @@ class PipelineEngine:
             reason     = str(decision_data.get("reason", ""))[:200]
 
             result_payload = {
-                "stage": "r3_w",
+                "stage": "r3_entry_w",
                 "attempt": attempt,
                 "scope": "func",
                 "func_hash": func_hash,
@@ -1453,12 +1453,37 @@ class PipelineEngine:
                 "entry_role": entry_role,
                 "reason": reason,
             }
-            result_file = dirs.stage_result_file("r3_w", "worker", func_hash, attempt)
-            raw_file = dirs.stage_raw_file("r3_w", "worker", func_hash, attempt)
+            result_file = dirs.stage_result_file("r3_entry_w", "worker", func_hash, attempt)
+            raw_file = dirs.stage_raw_file("r3_entry_w", "worker", func_hash, attempt)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=json.dumps(decision_data, ensure_ascii=False))
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r3_w", role_kind="worker", scope_kind="func", attempt=attempt,
+            upsert_stage_result_index(task_id=self.task_id, stage_key="r3_entry_w", role_kind="worker", scope_kind="func", attempt=attempt,
                                       file_hash=file_hash, func_hash=func_hash, status=decision, summary=reason,
                                       result_file_path=str(result_file), raw_file_path=str(raw_file))
+
+            # ── R3 入口 Judge：验证 W 的 keep/filter 决策 ────────────────────
+            func_state_j = fs.functions.get(func_hash)
+            func_info_j = {
+                "start_line": func_state_j.start_line if func_state_j else func_info.get("start_line", 0),
+                "end_line":   func_state_j.end_line   if func_state_j else func_info.get("end_line", 0),
+            }
+            j_passed, j_feedback = await self._run_r3_entry_j(
+                file_hash=file_hash,
+                func_hash=func_hash,
+                func_name=func_name,
+                file_path=file_path,
+                start_line=func_info_j["start_line"],
+                end_line=func_info_j["end_line"],
+                worker_result_file=str(result_file),
+                attempt=attempt,
+                dirs=dirs,
+                state=state,
+            )
+            if not j_passed:
+                # J 拒绝：将 feedback 存给 W 下次 retry
+                fs.r3_func_state[f"{func_hash}_feedback"] = j_feedback
+                r3_func_out.unlink(missing_ok=True)   # 清除 W 输出文件，下轮重距
+                continue
+
             if decision == "filter":
                 fs.r3_func_state[func_hash] = "passed_filter"
                 if func_hash in fs.functions:
@@ -1488,6 +1513,61 @@ class PipelineEngine:
         if func_hash in fs.functions and not fs.functions[func_hash].r4_decision:
             fs.functions[func_hash].r4_decision = "keep"
         return self._make_r3_entry(func_info, "boundary", "keep (max retries, conservative)")
+
+    async def _run_r3_entry_j(
+        self,
+        file_hash: str,
+        func_hash: str,
+        func_name: str,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+        worker_result_file: str,
+        attempt: int,
+        dirs: PipelineDirs,
+        state: PipelineState,
+    ) -> tuple[bool, str]:
+        """R3 入口判断 Judge：验证 Worker 的 keep/filter 决策是否有充分的代码证据。"""
+        self._emit("r3_entry_j_start", func_hash=func_hash, function=func_name, attempt=attempt)
+        try:
+            acfg     = self._judge_acfg()
+            sys_prompt = self._stage_sys_prompt("r3_entry_judge")
+            session_file = str(dirs.r3_entry_j_session(func_hash, attempt))
+            prompt = P.build_r3_entry_j_prompt(
+                func_hash=func_hash,
+                func_name=func_name,
+                start_line=start_line,
+                end_line=end_line,
+                file_path=file_path,
+                worker_result_file=worker_result_file,
+            )
+            ar = await self._call_agent(
+                prompt=prompt, system_prompt=sys_prompt,
+                session_file=session_file, cwd=str(dirs.source),
+                context=f"r3_entry_j:{func_hash}", acfg=acfg,
+            )
+            passed, feedback = _parse_j_result(ar.output)
+            result_payload = {
+                "stage": "r3_entry_j", "attempt": attempt, "scope": "func",
+                "func_hash": func_hash, "file_hash": file_hash,
+                "passed": passed, "summary": feedback[:200], "feedback": feedback,
+            }
+            result_file = dirs.stage_result_file("r3_entry_j", "judge", func_hash, attempt)
+            raw_file    = dirs.stage_raw_file(   "r3_entry_j", "judge", func_hash, attempt)
+            write_stage_result_files(result_file=result_file, raw_file=raw_file,
+                                     payload=result_payload, raw_text=ar.output or "")
+            upsert_stage_result_index(
+                task_id=self.task_id, stage_key="r3_entry_j", role_kind="judge",
+                scope_kind="func", attempt=attempt, file_hash=file_hash,
+                func_hash=func_hash, status="passed" if passed else "failed",
+                passed=passed, summary=feedback[:200],
+                result_file_path=str(result_file), raw_file_path=str(raw_file))
+            self._emit("r3_entry_j_done", func_hash=func_hash, function=func_name,
+                       passed=passed, feedback=feedback[:200], attempt=attempt)
+            return passed, feedback
+        except Exception as exc:
+            logger.error("R3 entry J failed for %s: %s", func_hash, exc)
+            return True, ""   # J 异常时保守通过，不阻塞流水线
 
     async def _run_r3_j(
         self, file_hash, file_path, dirs, state, session_file
