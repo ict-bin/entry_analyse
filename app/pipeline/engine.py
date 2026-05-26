@@ -109,14 +109,24 @@ def _parse_j_result(output: str) -> tuple[bool, str]:
         return False, J_VERDICT_DELETE + feedback
 
     passed = False
-    if re.search(r"通过[：:]\s*是|passed[：:]\s*true|\bPASS\b", text, re.IGNORECASE):
+    # BUG-R2C Fix: 支持模型输出的多种变体格式
+    # 通过：「通过: 是」「验证通过」「通过：✅」「通过: ✅」
+    if re.search(
+        r"通过[：:]\s*[是✅]|验证通过[：:\s✅]|\bpassed[：:]\s*true|\bPASS\b",
+        text, re.IGNORECASE
+    ):
         passed = True
-    elif re.search(r"通过[：:]\s*否|passed[：:]\s*false|\bFAIL\b", text, re.IGNORECASE):
+    # 不通过：「通过: 否」「不通过」「验证不通过」「通过: ✗」
+    elif re.search(
+        r"通过[：:]\s*[否✗]|[不未]通过|\bpassed[：:]\s*false|\bFAIL\b",
+        text, re.IGNORECASE
+    ):
         passed = False
 
-    m = re.search(r"反馈[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+    # 反馈提取：支持「反馈：」「**反馈**：」「反馈:」等 markdown 变体
+    m = re.search(r"(?:\*\*)?反馈(?:\*\*)?[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
     if not m:
-        m = re.search(r"feedback[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        m = re.search(r"(?:\*\*)?feedback(?:\*\*)?[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
     feedback = m.group(1).strip() if m else text[:500]
     return passed, feedback
 
@@ -471,6 +481,26 @@ class PipelineEngine:
             await self._run_r2_w(file_hash, func_hash, file_path, dirs, state)
             if self._cancel.is_set():
                 return
+
+            # BUG-R2A Fix: W 修完 funcdb 后立即同步 func_state，
+            # 否则下一轮 R2-J 仍用旧 start_line/name，形成无限循环
+            try:
+                from .funcdb import FunctionDB as _FuncDB
+                updated = _FuncDB.open(dirs.r1, file_hash).get_function(func_hash)
+                if updated:
+                    if updated.get("start_line"):
+                        func_state.start_line = int(updated["start_line"])
+                    if updated.get("end_line"):
+                        func_state.end_line = int(updated["end_line"])
+                    if updated.get("name"):
+                        func_state.name = str(updated["name"])
+                    if updated.get("signature"):
+                        func_state.signature = str(updated["signature"])
+                    state.save(dirs.state_file)
+                    logger.debug("R2 synced func_state from funcdb: %s start_line=%s name=%s",
+                                 func_hash, func_state.start_line, func_state.name)
+            except Exception as _sync_exc:
+                logger.warning("R2 funcdb sync failed for %s: %s", func_hash, _sync_exc)
 
         # 超出上限时 force-pass，不阻塞下游（“不允许漏报”原则）
         if func_state.r2_j_state != NodeState.PASSED:
