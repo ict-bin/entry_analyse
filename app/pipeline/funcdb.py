@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS functions (
     has_external_input INTEGER DEFAULT NULL,
     entry_role         TEXT DEFAULT '',
     entry_confidence   REAL DEFAULT NULL,
+    r3_decision        TEXT DEFAULT NULL,   -- 'keep' | 'filter'
+    r4_decision        TEXT DEFAULT NULL,   -- 'keep' | 'filter'
     updated_at         REAL,
     FOREIGN KEY (file_hash) REFERENCES file_meta(file_hash)
 );
@@ -68,6 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_functions_has_input
 
 CREATE INDEX IF NOT EXISTS idx_functions_start_line
     ON functions(file_hash, start_line);
+
+CREATE INDEX IF NOT EXISTS idx_functions_r3_decision
+    ON functions(r3_decision);
+
+CREATE INDEX IF NOT EXISTS idx_functions_r4_decision
+    ON functions(r4_decision);
 """
 
 
@@ -109,6 +117,15 @@ class FunctionDB:
                 conn.execute("ALTER TABLE functions ADD COLUMN entry_confidence REAL DEFAULT NULL")
             except Exception:
                 pass  # 列已存在，忽略
+            # 向前兼容迁移：补充 r3_decision / r4_decision
+            try:
+                conn.execute("ALTER TABLE functions ADD COLUMN r3_decision TEXT DEFAULT NULL")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE functions ADD COLUMN r4_decision TEXT DEFAULT NULL")
+            except Exception:
+                pass
             # 向前兼容迁移：老 DB 可能没有 rel_path 列
             try:
                 conn.execute("ALTER TABLE file_meta ADD COLUMN rel_path TEXT NOT NULL DEFAULT ''")
@@ -230,6 +247,42 @@ class FunctionDB:
                 "UPDATE functions SET entry_confidence=?, updated_at=? WHERE func_hash=?",
                 (round(float(confidence), 4), time.time(), func_hash),
             )
+
+    def update_r3_decision(self, func_hash: str, decision: str) -> None:
+        """R3-W/J 完成后：写 r3_decision（keep/filter）到 FuncDB。"""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE functions SET r3_decision=?, updated_at=? WHERE func_hash=?",
+                (decision, time.time(), func_hash),
+            )
+
+    def update_r4_decision(self, func_hash: str, decision: str) -> None:
+        """R4-W/J 完成后：写 r4_decision（keep/filter）到 FuncDB。"""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE functions SET r4_decision=?, updated_at=? WHERE func_hash=?",
+                (decision, time.time(), func_hash),
+            )
+
+    def get_keep_entries(self) -> list[dict]:
+        """R6 层叠自 FuncDB 读取： r3_decision=keep 且 (r4_decision IS NULL OR r4_decision=keep)。"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT f.func_hash, f.file_hash, f.name, f.signature,
+                          f.start_line, f.end_line, f.body_lines,
+                          f.has_external_input, f.analysis, f.entry_role,
+                          f.entry_confidence, f.r3_decision, f.r4_decision,
+                          fm.rel_path, fm.original_path
+                   FROM functions f
+                   LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
+                   WHERE f.r3_decision = 'keep'
+                     AND (f.r4_decision IS NULL OR f.r4_decision = 'keep')
+                   ORDER BY fm.rel_path, f.start_line"""
+            ).fetchall()
+        cols = ["func_hash","file_hash","name","signature","start_line","end_line",
+                "body_lines","has_external_input","analysis","entry_role",
+                "entry_confidence","r3_decision","r4_decision","file_path","original_path"]
+        return [dict(zip(cols, r)) for r in rows]
 
     def sync_from_json(self, data: dict) -> None:
         """

@@ -1296,55 +1296,20 @@ class PipelineEngine:
                             func_state.entry_role = role
                         from .funcdb import FunctionDB
                         FunctionDB.open(dirs.r1, file_hash).set_analysis(func_hash, analysis)
-                        # 同步到 ModuleDB
-                        try:
-                            from .module_db import ModuleDB
-                            ModuleDB.open(dirs.workspace).update_analysis(func_hash, analysis)
-                        except Exception:
-                            pass
                 else:
                     func_state.has_external_input = _parse_has_external_input(ar.output)
                     # 兜底：无分析结果时若无外部输入则 filter
                     if not func_state.has_external_input and not func_state.r4_decision:
                         func_state.r4_decision = "filter"
 
-                # ── F1: 写 r3_func/{func_hash}.json 供 R4/R6 消费 ─────────────
-                # _aggregate_r3_entries 和 _collect_r4_kept 均依赖此文件；
-                # 以前只由死代码 _run_r3_entry 写出，导致 R4 永远被跳过。
+                # 将 r3_decision 写入 FuncDB（权威来源）
                 _r3_final_decision = func_state.r4_decision or "filter"
-                _r3_func_dir = dirs.r3.parent / "r3_func"
-                _r3_func_dir.mkdir(parents=True, exist_ok=True)
-                _r3_entry_data: dict = {
-                    "func_hash":          func_hash,
-                    "function":           func_state.name or "",
-                    "file":               os.path.abspath(file_path),
-                    "signature":          func_state.signature or "",
-                    "start_line":         func_state.start_line or 0,
-                    "end_line":           func_state.end_line or 0,
-                    "entry_role":         func_state.entry_role or "boundary",
-                    "decision":           _r3_final_decision,
-                    "has_external_input": bool(func_state.has_external_input),
-                    "tag":                (analysis or {}).get("tag", ""),
-                    "taints":             (analysis or {}).get("taints", []),
-                    "entry_source_lines": (analysis or {}).get("entry_source_lines", []),
-                    "function_description": (analysis or {}).get("function_description", ""),
-                    "entry_reason":       (analysis or {}).get("entry_reason", ""),
-                    "taint_details":      (analysis or {}).get("taint_details", []),
-                    "justification":      (analysis or {}).get("justification", ""),
-                }
-                (_r3_func_dir / f"{func_hash}.json").write_text(
-                    json.dumps(_r3_entry_data, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                # 同步 r3_decision 到 ModuleDB（供 R6 fallback 查询）
                 try:
-                    from .module_db import ModuleDB as _MDB
-                    _MDB.open(dirs.workspace).update_r3_decision(
-                        func_hash, _r3_final_decision)
-                except Exception as _mdb_exc:
-                    logger.warning("R3 ModuleDB r3_decision update failed %s: %s",
-                                   func_hash, _mdb_exc)
-                # ─────────────────────────────────────────────────────────────
+                    from .funcdb import FunctionDB as _FDB
+                    _FDB.open(dirs.r1, file_hash).update_r3_decision(func_hash, _r3_final_decision)
+                except Exception as _fdb_exc:
+                    logger.warning("R3 FuncDB r3_decision update failed %s: %s",
+                                   func_hash, _fdb_exc)
 
                 func_state.r3_w_state = NodeState.PASSED
                 state.save(dirs.state_file)
@@ -2000,41 +1965,33 @@ class PipelineEngine:
           Step 3.5: 应用 R4 per-func 决策（过滤 decision=remove 条目）
           Step 4: 跑 R4-final-J
         """
-        # Step 3: 收集 R3-kept 入口（三层 fallback 保证不因文件缺失漏掉入口）
-        # F4 Fix: 增加 Layer3 直接从 state 收集，彻底消除对文件/DB 写出时序的依赖。
-        r3_entries = _aggregate_r3_entries(dirs)  # Layer1: r3_func/*.json
-        if not r3_entries:
+        # 从所有 FuncDB 聚合最终入口（r3_decision=keep 且 r4_decision=keep/NULL）
+        from .funcdb import FunctionDB as _FDB
+        final_entries: list[dict] = []
+        for db_file in sorted(dirs.r1.glob("*_functions.db")):
+            file_hash = db_file.stem.replace("_functions", "")
             try:
-                from .module_db import ModuleDB
-                r3_entries = ModuleDB.open(dirs.workspace).get_r3_kept()  # Layer2: ModuleDB
-            except Exception:
-                pass
-        if not r3_entries:
-            # Layer3: 直接从 pipeline state 收集（最终兜底，任何情况都不为空）
-            r3_entries = _collect_r3_kept_from_state(state)
-            if r3_entries:
-                logger.info("R4: using state-based fallback, %d entries", len(r3_entries))
+                entries = _FDB.open(dirs.r1, file_hash).get_keep_entries()
+                final_entries.extend(entries)
+            except Exception as _e:
+                logger.warning("R6 FuncDB read failed %s: %s", file_hash, _e)
 
-        if not r3_entries:
-            logger.info("R4: no R3 entries (all filtered), skipping")
+        if not final_entries:
+            # 兜底：FuncDB 无数据（极端情况），从 state 收集
+            final_entries = _collect_r3_kept_from_state(state)
+            if final_entries:
+                logger.info("R6: FuncDB empty, using state fallback, %d entries", len(final_entries))
+
+        if not final_entries:
+            logger.info("R6: no keep entries, skipping")
             state.r6_state = NodeState.PASSED
             state.save(dirs.state_file)
             return []
 
         if self._cancel.is_set():
-            return r3_entries
-
-        # Step 3.5: 应用 R4 per-func 决策（过滤 decision=remove）
-        final_entries = self._collect_r4_kept(r3_entries, dirs, state)
-        if not final_entries:
-            # 如果 R4 全部过滤（极端情况），保守回退到 R3 结果
-            logger.warning("R4: all entries filtered by R4 per-func, reverting to R3 entries")
-            final_entries = r3_entries
-
-        if self._cancel.is_set():
             return final_entries
 
-        # Step 4: R6 脚本化聚合（Fix-3）
+        # R6 脚本化校验
         if state.r6_state != NodeState.PASSED:
             await self._script_finalize_r6(final_entries, dirs, state)
 
@@ -2042,21 +1999,6 @@ class PipelineEngine:
             state.r6_state = NodeState.PASSED
             state.save(dirs.state_file)
 
-        dirs.r4.mkdir(parents=True, exist_ok=True)
-        r4_path = dirs.r4_entries_path()
-        r4_path.write_text(
-            json.dumps(final_entries, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        try:
-            from .module_db import ModuleDB
-            mdb = ModuleDB.open(dirs.workspace)
-            kept_hashes = {e.get("func_hash") for e in final_entries if e.get("func_hash")}
-            for e in final_entries:
-                fh = e.get("func_hash")
-                if fh:
-                    mdb.update_r4_decision(fh, "keep")
-        except Exception:
-            pass
         self._r4_j_confirmed = True
         return final_entries
 
@@ -2181,6 +2123,20 @@ class PipelineEngine:
             func_state.r4_reason   = reason
             # r4_state = PASSED 由 R4-J 通过后设置，此处不设
             state.save(dirs.state_file)
+            # 将 r4_decision 写入 FuncDB（权威来源）
+            file_hash_for_func = ""
+            for _fs in state.files.values():
+                if func_hash in _fs.functions:
+                    file_hash_for_func = _fs.file_hash
+                    break
+            if file_hash_for_func:
+                try:
+                    from .funcdb import FunctionDB as _FDB
+                    _FDB.open(dirs.r1, file_hash_for_func).update_r4_decision(
+                        func_hash, decision)
+                except Exception as _e:
+                    logger.warning("R4 FuncDB r4_decision update failed %s: %s",
+                                   func_hash, _e)
 
         self._emit("r4_w_done", func_hash=func_hash, function=func_name,
                    decision=decision, reason=reason)
@@ -2292,14 +2248,14 @@ class PipelineEngine:
                 if func_hash in fs.functions:
                     func_state = fs.functions[func_hash]
                     break
-            if func_state and func_state.r4_decision == "remove":
+            if func_state and func_state.r4_decision == "filter":
                 continue
             # 检查 result file
             result_file = dirs.r4_func_result_file(func_hash)
             if result_file.exists():
                 try:
                     d = json.loads(result_file.read_text(encoding="utf-8"))
-                    if str(d.get("decision", "keep")).lower() == "remove":
+                    if str(d.get("decision", "keep")).lower() == "filter":
                         continue
                 except Exception:
                     pass
@@ -2488,21 +2444,29 @@ class PipelineEngine:
             self._emit("r5_w_start",
                        func_hash=func_hash, function=func_name, attempt=attempts)
 
-            # 从 ModuleDB 补充完整分析数据
+            # 从 FuncDB 补充完整分析数据
             entry_rich = dict(entry)
             try:
-                from .module_db import ModuleDB
-                mdb_entries = ModuleDB.open(dirs.workspace).get_by_file(
-                    entry.get("file_hash", ""))
-                for me in mdb_entries:
-                    if me.get("func_hash") == func_hash:
-                        a = me.get("analysis") or {}
-                        entry_rich.setdefault("function_description",
-                                              a.get("function_description", ""))
+                file_hash_r5 = entry.get("file_hash", "")
+                if not file_hash_r5:
+                    # 从 state 查找
+                    for _fs in state.files.values():
+                        if func_hash in _fs.functions:
+                            file_hash_r5 = _fs.file_hash
+                            break
+                if file_hash_r5:
+                    from .funcdb import FunctionDB as _FDBR5
+                    fn_data = _FDBR5.open(dirs.r1, file_hash_r5).get_function(func_hash)
+                    if fn_data:
+                        a = fn_data.get("analysis") or {}
+                        if isinstance(a, str):
+                            import json as _json
+                            try: a = _json.loads(a)
+                            except: a = {}
+                        entry_rich.setdefault("function_description", a.get("function_description", ""))
                         entry_rich.setdefault("entry_reason", a.get("entry_reason", ""))
                         entry_rich.setdefault("taint_details", a.get("taint_details", []))
-                        entry_rich["entry_confidence"] = me.get("entry_confidence")
-                        break
+                        entry_rich["entry_confidence"] = fn_data.get("entry_confidence")
             except Exception:
                 pass
 
