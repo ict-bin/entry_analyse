@@ -547,7 +547,6 @@ class PipelineEngine:
 
         # ─── Phase 6: R6 最终报告 ─────────────────────────────────────────
         final_entries = await self._run_r4_pipeline(dirs, state)
-        final_entries = await self._run_r4_pipeline(dirs, state)
 
         # Fix-5: 从 sessions JSONL 聚合 token 用量
         self._total_token_usage = _aggregate_session_tokens(dirs.sessions)
