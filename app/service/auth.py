@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Dict, Optional
@@ -41,6 +42,7 @@ class AuthService:
         self._cache_enabled = cfg.token_cache_enabled
         self._cache_ttl_seconds = cfg.token_cache_ttl_minutes * 60
         self._token_cache: Dict[str, TokenCacheEntry] = {}
+        self._inflight_validations: Dict[str, asyncio.Future] = {}
 
     @property
     def validate_url(self) -> str:
@@ -75,24 +77,42 @@ class AuthService:
         if cached is not None:
             return cached
 
-        headers = {"Authorization": f"Bearer {token}"}
-        params = {"project_id": project_id} if project_id else None
+        cache_key = self._cache_key(token, project_id)
+        inflight = self._inflight_validations.get(cache_key)
+        if inflight is not None:
+            return await asyncio.shield(inflight)
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        future.add_done_callback(lambda fut: None if fut.cancelled() else fut.exception())
+        self._inflight_validations[cache_key] = future
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.validate_url, headers=headers, params=params)
-        except httpx.TimeoutException as exc:
-            raise AuthServiceError("认证服务请求超时") from exc
-        except httpx.ConnectError as exc:
-            raise AuthServiceError(f"无法连接到认证服务: {exc}") from exc
+            headers = {"Authorization": f"Bearer {token}"}
+            params = {"project_id": project_id} if project_id else None
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self.validate_url, headers=headers, params=params)
+            except httpx.TimeoutException as exc:
+                raise AuthServiceError("认证服务请求超时") from exc
+            except httpx.ConnectError as exc:
+                raise AuthServiceError(f"无法连接到认证服务: {exc}") from exc
 
-        if response.status_code == 401:
-            raise TokenInvalidError("Token已过期或无效")
-        if response.status_code != 200:
-            raise AuthServiceError(f"认证服务返回异常状态码: {response.status_code}")
+            if response.status_code == 401:
+                raise TokenInvalidError("Token已过期或无效")
+            if response.status_code != 200:
+                raise AuthServiceError(f"认证服务返回异常状态码: {response.status_code}")
 
-        data = response.json()
-        self._set_cached_user(token, project_id, data)
-        return data
+            data = response.json()
+            self._set_cached_user(token, project_id, data)
+            future.set_result(data)
+            return data
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            self._inflight_validations.pop(cache_key, None)
 
 
 _auth_service: Optional[AuthService] = None

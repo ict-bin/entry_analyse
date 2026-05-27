@@ -257,6 +257,33 @@ class TaskSessionFileResponse(BaseModel):
     line_count: int = 0
 
 
+class TaskRuntimeSummaryResponse(BaseModel):
+    task_id: str
+    project_id: Optional[str] = None
+    status: str
+    generated_at: Optional[str] = None
+    task_root: Optional[str] = None
+    run_root: Optional[str] = None
+    sessions_root: Optional[str] = None
+    session_index_path: Optional[str] = None
+    session_index_generated_at: Optional[str] = None
+    cache_hit: bool = False
+    cache_age_seconds: Optional[float] = None
+    session_count: int = 0
+    active_session_count: int = 0
+    worker_count: int = 0
+    judge_count: int = 0
+    sub_worker_count: int = 0
+    latest_round: Optional[int] = None
+    active_rounds: list[int] = Field(default_factory=list)
+    active_stage_keys: list[str] = Field(default_factory=list)
+    active_roles: list[str] = Field(default_factory=list)
+    latest_active_event_at: Optional[str] = None
+    entry_count: Optional[int] = None
+    event_summary: Optional[dict[str, Any]] = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskEvaluationResponse(BaseModel):
     task_id: str
     status: str
@@ -989,8 +1016,23 @@ async def kill_all_orphan_processes(
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
-    return get_task_service().get_task(db, task_id)
+async def get_task(
+    task_id: str,
+    include_function_catalog: bool = Query(False),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    return get_task_service().get_task_with_options(db, task_id, include_function_catalog=include_function_catalog)
+
+
+@router.get("/tasks/{task_id}/runtime-summary", response_model=TaskRuntimeSummaryResponse)
+async def get_task_runtime_summary(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    return get_task_service().get_task_runtime_summary(db, task_id)
+
+
+@router.get("/tasks/{task_id}/function-catalog", response_model=list[dict[str, Any]])
+async def get_task_function_catalog(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    return get_task_service().get_task_function_catalog(db, task_id)
 
 
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
@@ -1004,8 +1046,13 @@ async def list_task_sessions(task_id: str, db: Session = Depends(get_db), _=Depe
 
 
 @router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
-async def get_task_session_index(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
-    return get_task_service().get_task_session_index(db, task_id)
+async def get_task_session_index(
+    task_id: str,
+    refresh: bool = Query(False),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    return get_task_service().get_task_session_index(db, task_id, refresh=refresh)
 
 
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)

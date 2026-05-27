@@ -85,6 +85,8 @@ _SESSION_THINKING_LEVEL_MAP: dict[str, str] = {
     "x-high": "xhigh",
 }
 _SESSION_INDEX_REFRESH_SECONDS = _positive_int_env("EA_SESSION_INDEX_REFRESH_SECONDS", 5)
+_SESSION_INDEX_RUNNING_CACHE_SECONDS = _positive_int_env("EA_SESSION_INDEX_RUNNING_CACHE_SECONDS", 45)
+_SESSION_INDEX_TERMINAL_CACHE_SECONDS = _positive_int_env("EA_SESSION_INDEX_TERMINAL_CACHE_SECONDS", 300)
 
 
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
@@ -680,6 +682,13 @@ def _load_cached_session_catalog(
     except Exception as exc:
         logger.warning("failed to load cached session index %s: %s", index_path, exc)
         return None
+
+
+def _session_index_cache_seconds_for_status(status: str) -> int:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"pending", "running"}:
+        return _SESSION_INDEX_RUNNING_CACHE_SECONDS
+    return _SESSION_INDEX_TERMINAL_CACHE_SECONDS
 
 
 def _load_task_result_json(row: AppEaTask) -> dict | None:
@@ -1459,7 +1468,7 @@ class TaskService:
     def delete_task_timeline_event(db: Session, task: AppEaTask, event_id: str) -> int:
         return delete_task_timeline_event(db, task, event_id)
 
-    def _build_session_catalog(self, row: AppEaTask) -> dict:
+    def _build_session_catalog(self, row: AppEaTask, *, force_refresh: bool = False) -> dict:
         sessions_root = _task_sessions_root(row)
         if not sessions_root or not sessions_root.is_dir():
             return {
@@ -1492,14 +1501,15 @@ class TaskService:
                 },
                 "warnings": [],
             }
-        cached = _load_cached_session_catalog(
-            task_id=row.task_id,
-            row_status=row.status,
-            sessions_root=sessions_root,
-            max_age_seconds=_SESSION_INDEX_REFRESH_SECONDS,
-        )
-        if cached is not None:
-            return cached
+        if not force_refresh:
+            cached = _load_cached_session_catalog(
+                task_id=row.task_id,
+                row_status=row.status,
+                sessions_root=sessions_root,
+                max_age_seconds=_session_index_cache_seconds_for_status(row.status),
+            )
+            if cached is not None:
+                return cached
         result_json = _load_task_result_json(row)
         return build_session_catalog(
             task_id=row.task_id,
@@ -1841,6 +1851,9 @@ class TaskService:
         }
 
     def get_task(self, db: Session, task_id: str) -> dict:
+        return self.get_task_with_options(db, task_id, include_function_catalog=False)
+
+    def get_task_with_options(self, db: Session, task_id: str, *, include_function_catalog: bool = False) -> dict:
         # 排除 stages_json 大字段（平均 75KB、最大 509KB），改用轻量 JSON_LENGTH 查询获取 event_count/final
         row = (
             db.query(AppEaTask)
@@ -1867,7 +1880,7 @@ class TaskService:
         if not row:
             from fastapi import HTTPException
             raise HTTPException(404, f"任务不存在: {task_id}")
-        return self._row_to_dict(row, db=db)
+        return self._row_to_dict(row, db=db, include_function_catalog=include_function_catalog)
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -1961,9 +1974,9 @@ class TaskService:
         row = self._get_or_404(db, task_id)
         return self._build_session_catalog(row).get("items", [])
 
-    def get_task_session_index(self, db: Session, task_id: str) -> dict:
+    def get_task_session_index(self, db: Session, task_id: str, *, refresh: bool = False) -> dict:
         row = self._get_or_404(db, task_id)
-        catalog = self._build_session_catalog(row)
+        catalog = self._build_session_catalog(row, force_refresh=refresh)
         return {
             "task_id": catalog.get("task_id") or row.task_id,
             "status": catalog.get("status") or row.status,
@@ -1972,6 +1985,97 @@ class TaskService:
             "generated_at": catalog.get("generated_at"),
             **(catalog.get("index") or {}),
         }
+
+    def get_task_runtime_summary(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
+        run_root = _task_run_root(row)
+        sessions_root = _task_sessions_root(row)
+        warnings: list[str] = []
+        cache_hit = False
+        cache_age_seconds: float | None = None
+        session_index_generated_at: str | None = None
+        session_index_path = str((sessions_root / "index.json")) if sessions_root else None
+        index_summary: dict[str, Any] = {}
+        nodes: list[dict[str, Any]] = []
+
+        if sessions_root and sessions_root.is_dir():
+            cached = _load_cached_session_catalog(
+                task_id=row.task_id,
+                row_status=row.status,
+                sessions_root=sessions_root,
+                max_age_seconds=_session_index_cache_seconds_for_status(row.status),
+            )
+            if cached is not None:
+                cache_hit = True
+                session_index_generated_at = cached.get("generated_at")
+                index_summary = (cached.get("index") or {}).get("summary") or {}
+                nodes = (cached.get("index") or {}).get("nodes") or []
+                if session_index_path:
+                    try:
+                        cache_age_seconds = max(0.0, _time.time() - (sessions_root / "index.json").stat().st_mtime)
+                    except OSError:
+                        cache_age_seconds = None
+            elif row.status in {"pending", "running"}:
+                warnings.append("会话索引缓存暂未生成，运行态摘要使用轻量兜底信息。")
+
+        active_nodes = [
+            node for node in nodes
+            if isinstance(node, dict) and (node.get("is_active") or str(node.get("status") or "").lower() in {"active", "running"})
+        ]
+        active_stage_keys = sorted({str(node.get("stage_key") or "").strip() for node in active_nodes if str(node.get("stage_key") or "").strip()})
+        active_roles = sorted({str(node.get("role") or "").strip() for node in active_nodes if str(node.get("role") or "").strip()})
+        active_rounds = sorted({
+            round_number for node in active_nodes
+            if isinstance(node, dict) and (round_number := _round_number_from_session_node(node))
+        })
+        latest_round = max(
+            (_round_number_from_session_node(node) or 0) for node in nodes if isinstance(node, dict)
+        ) or None
+        latest_event_at = None
+        if active_nodes:
+            latest_event_at = max(
+                (str(node.get("last_event_at") or "").strip() for node in active_nodes if str(node.get("last_event_at") or "").strip()),
+                default=None,
+            )
+
+        if latest_round is None and run_root and run_root.is_dir():
+            for round_dir in run_root.glob("round_*"):
+                round_number = _round_number_from_path(round_dir)
+                if round_number and (latest_round is None or round_number > latest_round):
+                    latest_round = round_number
+
+        event_summary = _build_task_event_summary(db, row.task_id)
+        return {
+            "task_id": row.task_id,
+            "project_id": row.project_id,
+            "status": row.status,
+            "generated_at": isoformat_local(now_local()),
+            "task_root": task_root,
+            "run_root": str(run_root) if run_root else None,
+            "sessions_root": str(sessions_root) if sessions_root else None,
+            "session_index_path": session_index_path,
+            "session_index_generated_at": session_index_generated_at,
+            "cache_hit": cache_hit,
+            "cache_age_seconds": cache_age_seconds,
+            "session_count": int(index_summary.get("session_count") or len(nodes) or 0),
+            "active_session_count": int(index_summary.get("active_session_count") or len(active_nodes) or 0),
+            "worker_count": int(index_summary.get("worker_count") or 0),
+            "judge_count": int(index_summary.get("judge_count") or 0),
+            "sub_worker_count": int(index_summary.get("sub_worker_count") or 0),
+            "latest_round": latest_round,
+            "active_rounds": active_rounds,
+            "active_stage_keys": active_stage_keys,
+            "active_roles": active_roles,
+            "latest_active_event_at": latest_event_at,
+            "entry_count": _derive_task_entry_count(row),
+            "event_summary": event_summary,
+            "warnings": warnings,
+        }
+
+    def get_task_function_catalog(self, db: Session, task_id: str) -> list[dict]:
+        row = self._get_or_404(db, task_id)
+        return _build_function_catalog(row)
 
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -2554,7 +2658,7 @@ class TaskService:
         )
 
     @staticmethod
-    def _row_to_dict(row: AppEaTask, *, db: Session | None = None) -> dict:
+    def _row_to_dict(row: AppEaTask, *, db: Session | None = None, include_function_catalog: bool = False) -> dict:
         payload = TaskService._row_common_payload(
             row,
             abnormal_reason=_task_abnormal_reason(row),
@@ -2576,7 +2680,6 @@ class TaskService:
             "result_json": _lightweight_result_json(row, row.result_json),
             "stages_json": _stages_json_light(db, row.task_id) if db is not None else _stages_json_summary(row.stages_json),
             "task_config_json": _parse_task_config(row.task_config_json),
-            "function_catalog": _build_function_catalog(row),
             "lean_mode": bool(
                 _parse_task_config(row.task_config_json).get(
                     "lean_mode",
@@ -2586,6 +2689,8 @@ class TaskService:
             "abnormal_reason_history": _abnormal_reason_history(row),
             "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
         })
+        if include_function_catalog:
+            payload["function_catalog"] = _build_function_catalog(row)
         return payload
 
 
