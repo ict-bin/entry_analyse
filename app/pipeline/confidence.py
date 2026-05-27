@@ -65,7 +65,7 @@ def compute_confidence(
         analysis:         R3-W 写入的 analysis 字典（来自 funcdb 或 analysis 字段）
                           必须包含 has_external_input/tag/taints/entry_role/taint_details 等
         func_state_dict:  FunctionState.to_dict() 的输出（可选）
-                          用于读取 r2_j_state 字段
+                          用于读取 r3_j_state 字段
         callchain_role:   CallchainDB.get_callchain_role() 的输出（可选）
                           用于读取 callers_count/callers_outside_module/
                           is_only_called_by_dispatcher
