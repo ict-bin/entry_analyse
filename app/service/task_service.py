@@ -893,6 +893,32 @@ def _write_task_result_json(row: AppEaTask, payload: dict) -> str | None:
     return str(path)
 
 
+def _stages_json_light(db: "Session", task_id: str) -> dict:
+    """Return {event_count, final} using MySQL JSON functions; never loads the blob.
+
+    Mirrors the pre-check in GET /tasks/{id}/logs so the full stages_json
+    column is not transferred from MySQL to Python just to count events.
+    """
+    from sqlalchemy import text as _sa_text
+    try:
+        row = db.execute(
+            _sa_text(
+                "SELECT JSON_LENGTH(stages_json, '$.events') AS ec, "
+                "JSON_VALUE(stages_json, '$.final') AS fin "
+                "FROM secflow_app_ea_tasks WHERE task_id = :tid AND is_deleted = 0"
+            ),
+            {"tid": task_id},
+        ).fetchone()
+        if row:
+            return {
+                "event_count": int(row[0] or 0),
+                "final": bool(row[1] and str(row[1]).lower() not in ("0", "false", "null")),
+            }
+    except Exception:
+        pass
+    return {"event_count": 0, "final": False}
+
+
 def _stages_json_summary(stages_json: dict | None) -> dict:
     """Return a lightweight summary of stages_json (event count + final flag).
 
@@ -1192,6 +1218,19 @@ def _stat_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], i
     return session_meta, events, warnings, line_count
 
 
+def _parse_task_config(val: object) -> dict:
+    """task_config_json 字段可能是 dict 或 JSON 字符串，统一解析为 dict。"""
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _origin_payload(row: "AppEaTask") -> dict:
     task_origin_type = str(row.task_origin_type or "").strip() or "manual"
     parent_task_type = str(row.parent_task_type or "").strip() or None
@@ -1202,6 +1241,8 @@ def _origin_payload(row: "AppEaTask") -> dict:
         if task_origin_type == "binary_security"
         else "手动任务"
     )
+    _tcj = _parse_task_config(row.task_config_json)
+    _ic  = _tcj.get("input_contract")
     return {
         "task_origin_type": task_origin_type,
         "parent_project_id": row.parent_project_id,
@@ -1212,11 +1253,7 @@ def _origin_payload(row: "AppEaTask") -> dict:
         "parent_stage_item_key": row.parent_stage_item_key,
         "origin_label": origin_label,
         "parent_task_display": row.parent_task_id,
-        "input_contract": (
-            dict((row.task_config_json or {}).get("input_contract") or {})
-            if isinstance((row.task_config_json or {}).get("input_contract"), dict)
-            else None
-        ),
+        "input_contract": dict(_ic) if isinstance(_ic, dict) else None,
     }
 
 
@@ -1249,15 +1286,15 @@ def _safe_origin_payload(row: AppEaTask) -> dict:
         "origin_label": origin_label,
         "parent_task_display": row.parent_task_id,
         "input_contract": (
-            dict((row.task_config_json or {}).get("input_contract") or {})
-            if isinstance((row.task_config_json or {}).get("input_contract"), dict)
+            dict((_parse_task_config(row.task_config_json)).get("input_contract") or {})
+            if isinstance((_parse_task_config(row.task_config_json)).get("input_contract"), dict)
             else None
         ),
     }
 
 
 def _preferred_files_list_path(row: AppEaTask) -> str | None:
-    task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
+    task_config = _parse_task_config(row.task_config_json)
     input_contract = task_config.get("input_contract") if isinstance(task_config.get("input_contract"), dict) else {}
     candidates = [
         input_contract.get("files_list_path"),
@@ -1804,7 +1841,33 @@ class TaskService:
         }
 
     def get_task(self, db: Session, task_id: str) -> dict:
-        return self._row_to_dict(self._get_or_404(db, task_id), db=db)
+        # 排除 stages_json 大字段（平均 75KB、最大 509KB），改用轻量 JSON_LENGTH 查询获取 event_count/final
+        row = (
+            db.query(AppEaTask)
+            .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
+            .options(load_only(
+                AppEaTask.id, AppEaTask.task_id, AppEaTask.project_id,
+                AppEaTask.task_origin_type, AppEaTask.parent_project_id,
+                AppEaTask.parent_task_id, AppEaTask.parent_task_type,
+                AppEaTask.parent_stage_name, AppEaTask.parent_stage_item_id,
+                AppEaTask.parent_stage_item_key, AppEaTask.task_name,
+                AppEaTask.task_description, AppEaTask.input_path,
+                AppEaTask.source_path, AppEaTask.module_name, AppEaTask.output_path,
+                AppEaTask.prompt_template_id, AppEaTask.prompt_content,
+                AppEaTask.status, AppEaTask.owner_pod, AppEaTask.lease_expires_at,
+                AppEaTask.cancel_requested, AppEaTask.error, AppEaTask.result_json,
+                AppEaTask.latest_abnormal_reason_json, AppEaTask.created_by,
+                AppEaTask.created_at, AppEaTask.updated_at,
+                AppEaTask.started_at, AppEaTask.finished_at,
+                AppEaTask.task_config_json,
+                # 注意：此处故意不包含 AppEaTask.stages_json
+            ))
+            .first()
+        )
+        if not row:
+            from fastapi import HTTPException
+            raise HTTPException(404, f"任务不存在: {task_id}")
+        return self._row_to_dict(row, db=db)
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -2194,7 +2257,7 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         from sqlalchemy.orm.attributes import flag_modified
-        clean_config = {k: v for k, v in (row.task_config_json or {}).items()
+        clean_config = {k: v for k, v in (_parse_task_config(row.task_config_json) or {}).items()
                         if k not in ("start_stage", "resume_workspace")} or None
         row.task_config_json = clean_config
         row.status = "pending"
@@ -2423,6 +2486,7 @@ class TaskService:
                 AppEaTask.updated_at,
                 AppEaTask.started_at,
                 AppEaTask.finished_at,
+                AppEaTask.task_config_json,   # 必须包含：_safe_origin_payload 访问该字段，缺少会触发 N+1 延迟加载
             ),
         )
 
@@ -2510,13 +2574,13 @@ class TaskService:
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content,
             "result_json": _lightweight_result_json(row, row.result_json),
-            "stages_json": _stages_json_summary(row.stages_json),
-            "task_config_json": row.task_config_json,
+            "stages_json": _stages_json_light(db, row.task_id) if db is not None else _stages_json_summary(row.stages_json),
+            "task_config_json": _parse_task_config(row.task_config_json),
             "function_catalog": _build_function_catalog(row),
             "lean_mode": bool(
-                (row.task_config_json or {}).get(
+                _parse_task_config(row.task_config_json).get(
                     "lean_mode",
-                    ((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False),
+                    (_parse_task_config(row.task_config_json).get("project_config_snapshot") or {}).get("lean_mode", False),
                 )
             ),
             "abnormal_reason_history": _abnormal_reason_history(row),
