@@ -630,7 +630,39 @@ def build_r4_w_prompt(
     )
 
 
-# ─── R4 Judge ─────────────────────────────────────────────────────────────────
+
+
+def build_r4_j_func_prompt(
+    func_hash: str,
+    func_name: str,
+    file_path: str,
+    r4_result_file: str,
+    callers_context: str,
+) -> str:
+    """R4-J: verify R4-W keep/filter decision has sufficient callchain evidence."""
+    r4_result_section = ""
+    if r4_result_file:
+        try:
+            from pathlib import Path as _P
+            _p = _P(r4_result_file)
+            if _p.exists():
+                r4_result_section = (
+                    "\n\n## R4-W 决策结果\n```json\n"
+                    + _p.read_text(encoding="utf-8")
+                    + "\n```"
+                )
+        except Exception:
+            pass
+    return (
+        "验证 R4-W 对以下函数的 keep/filter 决策：\n\n"
+        "- 函数：`" + func_name + "`\n"
+        "- 文件：`" + file_path + "`\n"
+        "- func_hash：`" + func_hash + "`\n"
+        + r4_result_section
+        + "\n\n## 调用链信息\n\n"
+        + (callers_context or "（调用链信息不可用）")
+    )
+
 
 def build_r4_j_prompt(
     r4_entries_path: Path,

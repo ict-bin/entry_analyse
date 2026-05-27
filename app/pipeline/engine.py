@@ -459,14 +459,12 @@ class PipelineEngine:
                 func_state
                 and func_state.r4_decision == "keep"
                 and func_state.r4_state != NodeState.PASSED
-                and len(state.files) > 1          # 单文件模块跳过（R4无意义）
             ):
                 _r3_entry_path = dirs.r3.parent / "r3_func" / f"{func_hash}.json"
                 try:
                     if _r3_entry_path.exists():
                         _r4_entry = json.loads(_r3_entry_path.read_text(encoding="utf-8"))
                     else:
-                        # 向后兼容：从 func_state 构造（旧任务无 r3_func/*.json）
                         _r4_entry = {
                             "func_hash":  func_hash,
                             "function":   func_state.name or "",
@@ -474,20 +472,37 @@ class PipelineEngine:
                             "entry_role": func_state.entry_role or "boundary",
                             "decision":   "keep",
                         }
-                    await self._run_r4_for_func(_r4_entry, dirs, state)
+                    # R4 W+J 循环
+                    r4_func_max = int(getattr(self.cfg, "r4_func_max_rounds", -1))
+                    r4_j_max    = int(getattr(self.cfg, "r4_func_j_max_rounds", -1))
+                    while _should_continue(func_state.r4_attempts, r4_func_max, self._cancel):
+                        if func_state.r4_state == NodeState.PASSED:
+                            break
+                        # R4-W
+                        await self._run_r4_for_func(_r4_entry, dirs, state)
+                        if self._cancel.is_set():
+                            break
+                        # R4-J
+                        j_passed = await self._run_r4_j(_r4_entry, dirs, state)
+                        if j_passed:
+                            func_state.r4_state = NodeState.PASSED
+                            state.save(dirs.state_file)
+                            break
+                        # J 失败：重置 W 状态带反馈重跑
+                        if not _should_continue(func_state.r4_j_attempts, r4_j_max, self._cancel):
+                            # 超出 J 上限： force-pass（不允许漏报）
+                            func_state.r4_state = NodeState.PASSED
+                            state.save(dirs.state_file)
+                            break
+                        func_state.r4_j_state = NodeState.PENDING
+                    # 超出 W 上限： force-pass
+                    if func_state.r4_state != NodeState.PASSED:
+                        func_state.r4_state = NodeState.PASSED
+                        state.save(dirs.state_file)
                 except Exception as _r4_exc:
                     logger.warning("R4-func error for %s: %s, force-keep", func_hash, _r4_exc)
                     func_state.r4_state = NodeState.PASSED
                     state.save(dirs.state_file)
-            elif (
-                func_state
-                and func_state.r4_decision == "keep"
-                and func_state.r4_state != NodeState.PASSED
-            ):
-                # 单文件模块（len(files)<=1）：R4 无意义，直接确认已通过
-                # 使前端能以 r4_state='passed' 作为唯一信号判断 R4 完成
-                func_state.r4_state = NodeState.PASSED
-                state.save(dirs.state_file)
 
             # ── R5: 单函数报告─────────────────────────────────────────────────
             # F3 Fix: 多文件模块须等 R4 confirmed keep 后才跑 R5，
@@ -2162,12 +2177,107 @@ class PipelineEngine:
                 pass
 
         if func_state:
-            func_state.r4_state = NodeState.PASSED
             func_state.r4_decision = decision
             func_state.r4_reason   = reason
+            # r4_state = PASSED 由 R4-J 通过后设置，此处不设
+            state.save(dirs.state_file)
 
         self._emit("r4_w_done", func_hash=func_hash, function=func_name,
                    decision=decision, reason=reason)
+
+    async def _run_r4_j(
+        self,
+        entry: dict,
+        dirs: PipelineDirs,
+        state: PipelineState,
+    ) -> bool:
+        """R4-J：验证 R4-W 的 keep/filter 决策是否有充分的调用链证据。"""
+        func_hash = entry.get("func_hash", "")
+        func_name = entry.get("function", func_hash[:8])
+        func_state: FunctionState | None = None
+        for fs in state.files.values():
+            if func_hash in fs.functions:
+                func_state = fs.functions[func_hash]
+                break
+        if func_state is None:
+            return True
+
+        func_state.r4_j_state = NodeState.RUNNING
+        func_state.r4_j_attempts += 1
+        state.save(dirs.state_file)
+
+        session_file = str(dirs.r4_func_j_session(func_hash, func_state.r4_j_attempts))
+        r4_result_file = dirs.r4_func_result_file(func_hash)
+
+        # 构建调用链上下文供 J 核验
+        callers_context = ""
+        try:
+            from .callchain_db import CallchainDB
+            cc_db = CallchainDB.open(dirs.callchain)
+            callers  = cc_db.get_callers(func_hash)
+            r3_callers = cc_db.get_r3_callers(func_hash)
+            lines = []
+            if callers:
+                lines.append(f"直接调用者（{len(callers)}个）："
+                             + ", ".join(c.get('name','?')[:30] for c in callers[:8]))
+            else:
+                lines.append("无模块内调用者（直接外部边界）")
+            if r3_callers:
+                lines.append(f"R3-kept 入口调用者（{len(r3_callers)}个）："
+                             + ", ".join(c.get('name','?')[:30] for c in r3_callers[:8]))
+            else:
+                lines.append("无 R3-kept 入口调用者")
+            callers_context = "\n".join(lines)
+        except Exception as _cc_exc:
+            callers_context = f"调用链信息不可用：{_cc_exc}"
+
+        prompt = P.build_r4_j_func_prompt(
+            func_hash=func_hash,
+            func_name=func_name,
+            file_path=entry.get("file", ""),
+            r4_result_file=str(r4_result_file) if r4_result_file.exists() else "",
+            callers_context=callers_context,
+        )
+        self._emit("r4_j_start", func_hash=func_hash, function=func_name,
+                   attempt=func_state.r4_j_attempts)
+        try:
+            acfg = self._judge_acfg()
+            ar = await self._call_agent(
+                prompt=prompt,
+                system_prompt=self._stage_sys_prompt("r4_func_judge"),
+                session_file=session_file,
+                cwd=str(dirs.stage_cwd("r4_func_w")),  # 与 R4-W 共用 cwd
+                context=f"r4_j:{func_hash}",
+                acfg=acfg,
+            )
+            passed, feedback = _parse_j_result(ar.output)
+            result_file = dirs.stage_result_file("r4_j", "judge", func_hash, func_state.r4_j_attempts)
+            raw_file    = dirs.stage_raw_file(   "r4_j", "judge", func_hash, func_state.r4_j_attempts)
+            result_payload = {
+                "stage": "r4_j", "attempt": func_state.r4_j_attempts, "scope": "func",
+                "func_hash": func_hash, "passed": passed,
+                "summary": feedback[:200], "feedback": feedback,
+            }
+            write_stage_result_files(result_file=result_file, raw_file=raw_file,
+                                     payload=result_payload, raw_text=ar.output or "")
+            upsert_stage_result_index(
+                task_id=self.task_id, stage_key="r4_j", role_kind="judge",
+                scope_kind="func", attempt=func_state.r4_j_attempts,
+                func_hash=func_hash, status="passed" if passed else "failed",
+                passed=passed, summary=feedback[:200],
+                result_file_path=str(result_file), raw_file_path=str(raw_file),
+            )
+            func_state.r4_j_state    = NodeState.PASSED if passed else NodeState.FAILED
+            func_state.r4_j_feedback = feedback
+            state.save(dirs.state_file)
+            self._emit("r4_j_done", func_hash=func_hash, function=func_name,
+                       passed=passed, attempt=func_state.r4_j_attempts)
+            return passed
+        except Exception as exc:
+            logger.error("R4-J failed for %s: %s", func_hash, exc)
+            func_state.r4_j_state = NodeState.FAILED
+            state.save(dirs.state_file)
+            return False
 
     def _collect_r4_kept(
         self, r3_entries: list[dict], dirs: PipelineDirs, state: PipelineState

@@ -73,6 +73,10 @@ class FunctionState:
     r4_reason:    str = ""    # 跨文件分析理由（旧加载兼容）
     r4_state:     NodeState = NodeState.PENDING
     r4_attempts:  int = 0
+    # R4-J 独立状态（r4_state=PASSED 仅在 J 通过后设置）
+    r4_j_state:    NodeState = NodeState.PENDING
+    r4_j_attempts: int = 0
+    r4_j_feedback: str = ""
 
     # ── R5：单函数报告（原 per-func report）──────────────────────────────────
     r5_state:    NodeState = NodeState.PENDING
@@ -85,7 +89,7 @@ class FunctionState:
         d = asdict(self)
         for _f in ('r2_w_state', 'r2_j_state',
                    'r3_w_state', 'r3_j_state',
-                   'r4_state', 'r5_state'):
+                   'r4_state', 'r4_j_state', 'r5_state'):
             d[_f] = getattr(self, _f).value
         return d
 
@@ -138,12 +142,13 @@ class FunctionState:
 
         for _f in ('r2_w_state', 'r2_j_state',
                    'r3_w_state', 'r3_j_state',
-                   'r4_state', 'r5_state'):
+                   'r4_state', 'r4_j_state', 'r5_state'):
             data[_f] = NodeState(data.get(_f, 'pending'))
 
         data.setdefault('entry_role', '')
         data.setdefault('r4_decision', '')
         data.setdefault('r4_note', '')
+        data.setdefault('r4_j_feedback', '')
         data.setdefault('r5_path', '')
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 

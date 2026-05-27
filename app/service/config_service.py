@@ -38,6 +38,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r2_max_rounds": -1,
     "r3_max_rounds": -1,
     "r4_func_max_rounds": -1,   # Fix-3: 默认 -1 启用 per-func R4 Agent；0=跳过
+    "r4_func_j_max_rounds": -1,  # R4-J 默认 -1；0=跳过
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,

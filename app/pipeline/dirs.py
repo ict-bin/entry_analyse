@@ -224,6 +224,10 @@ class PipelineDirs:
         """R4 per-func Worker session（独立命名，避免与 R3 pre-step r4-w-* 冲突）"""
         return self.sessions / f"r4-func-w-{func_hash}.jsonl"
 
+    def r4_func_j_session(self, func_hash: str, attempt: int) -> Path:
+        """R4 per-func Judge session（每次新建）"""
+        return self.sessions / f"r4-func-j-{func_hash}-a{attempt}.jsonl"
+
     # ─── 初始化 ───────────────────────────────────────────────────────────────
 
     def stage_result_file(self, stage_key: str, role_kind: str, scope_key: str, attempt: int) -> Path:
