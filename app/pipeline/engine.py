@@ -479,11 +479,20 @@ class PipelineEngine:
                     logger.warning("R4-func error for %s: %s, force-keep", func_hash, _r4_exc)
                     func_state.r4_state = NodeState.PASSED
                     state.save(dirs.state_file)
+            elif (
+                func_state
+                and func_state.r4_decision == "keep"
+                and func_state.r4_state != NodeState.PASSED
+            ):
+                # 单文件模块（len(files)<=1）：R4 无意义，直接确认已通过
+                # 使前端能以 r4_state='passed' 作为唯一信号判断 R4 完成
+                func_state.r4_state = NodeState.PASSED
+                state.save(dirs.state_file)
 
             # ── R5: 单函数报告─────────────────────────────────────────────────
             # F3 Fix: 多文件模块须等 R4 confirmed keep 后才跑 R5，
             #   防止 R4 把函数标为 remove 后 R5 仍生成报告。
-            #   单文件模块 R4 跳过（len(files)==1），r4_state 永远 PENDING，豁免。
+            #   单文件模块 R4 跳过但 r4_state 会被标为 PASSED（上方 elif 分支），豁免。
             func_state = fs.functions.get(func_hash)
             _r4_confirmed = (
                 func_state is not None
@@ -546,7 +555,6 @@ class PipelineEngine:
             return []
 
         # ─── Phase 6: R6 最终报告 ─────────────────────────────────────────
-        final_entries = await self._run_r4_pipeline(dirs, state)
         final_entries = await self._run_r4_pipeline(dirs, state)
 
         # Fix-5: 从 sessions JSONL 聚合 token 用量

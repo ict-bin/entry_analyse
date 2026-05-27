@@ -744,7 +744,8 @@ async def run_r2_w_worker(
     file_hash = compute_file_hash(file_path)
     db = FunctionDB.open(dirs.r1, file_hash)
     session_f = str(dirs.r1b_w_session(func_hash))
-    workspace = str(dirs.stage_cwd("r2_w"))  # R2-W 专属 cwd（.pi/skills/ 已预置） = 2 if is_retry else 1
+    workspace = str(dirs.stage_cwd("r2_w"))  # R2-W 专属 cwd（.pi/skills/ 已预置）
+    attempt_no = 2 if is_retry else 1
     judge_result_file = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, attempt_no - 1)) if is_retry else None
     prompt = build_r2_w_prompt(
         func_hash=func_hash,
