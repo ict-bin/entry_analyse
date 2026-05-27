@@ -1192,6 +1192,19 @@ def _stat_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], i
     return session_meta, events, warnings, line_count
 
 
+def _parse_task_config(val: object) -> dict:
+    """task_config_json 字段可能是 dict 或 JSON 字符串，统一解析为 dict。"""
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _origin_payload(row: "AppEaTask") -> dict:
     task_origin_type = str(row.task_origin_type or "").strip() or "manual"
     parent_task_type = str(row.parent_task_type or "").strip() or None
@@ -1202,6 +1215,8 @@ def _origin_payload(row: "AppEaTask") -> dict:
         if task_origin_type == "binary_security"
         else "手动任务"
     )
+    _tcj = _parse_task_config(row.task_config_json)
+    _ic  = _tcj.get("input_contract")
     return {
         "task_origin_type": task_origin_type,
         "parent_project_id": row.parent_project_id,
@@ -1212,11 +1227,7 @@ def _origin_payload(row: "AppEaTask") -> dict:
         "parent_stage_item_key": row.parent_stage_item_key,
         "origin_label": origin_label,
         "parent_task_display": row.parent_task_id,
-        "input_contract": (
-            dict((row.task_config_json or {}).get("input_contract") or {})
-            if isinstance((row.task_config_json or {}).get("input_contract"), dict)
-            else None
-        ),
+        "input_contract": dict(_ic) if isinstance(_ic, dict) else None,
     }
 
 
@@ -1249,15 +1260,15 @@ def _safe_origin_payload(row: AppEaTask) -> dict:
         "origin_label": origin_label,
         "parent_task_display": row.parent_task_id,
         "input_contract": (
-            dict((row.task_config_json or {}).get("input_contract") or {})
-            if isinstance((row.task_config_json or {}).get("input_contract"), dict)
+            dict((_parse_task_config(row.task_config_json)).get("input_contract") or {})
+            if isinstance((_parse_task_config(row.task_config_json)).get("input_contract"), dict)
             else None
         ),
     }
 
 
 def _preferred_files_list_path(row: AppEaTask) -> str | None:
-    task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
+    task_config = _parse_task_config(row.task_config_json)
     input_contract = task_config.get("input_contract") if isinstance(task_config.get("input_contract"), dict) else {}
     candidates = [
         input_contract.get("files_list_path"),
@@ -2194,7 +2205,7 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         from sqlalchemy.orm.attributes import flag_modified
-        clean_config = {k: v for k, v in (row.task_config_json or {}).items()
+        clean_config = {k: v for k, v in (_parse_task_config(row.task_config_json) or {}).items()
                         if k not in ("start_stage", "resume_workspace")} or None
         row.task_config_json = clean_config
         row.status = "pending"
@@ -2508,12 +2519,12 @@ class TaskService:
             "prompt_content": row.prompt_content,
             "result_json": _lightweight_result_json(row, row.result_json),
             "stages_json": _stages_json_summary(row.stages_json),
-            "task_config_json": row.task_config_json,
+            "task_config_json": _parse_task_config(row.task_config_json),
             "function_catalog": _build_function_catalog(row),
             "lean_mode": bool(
-                (row.task_config_json or {}).get(
+                _parse_task_config(row.task_config_json).get(
                     "lean_mode",
-                    ((row.task_config_json or {}).get("project_config_snapshot") or {}).get("lean_mode", False),
+                    (_parse_task_config(row.task_config_json).get("project_config_snapshot") or {}).get("lean_mode", False),
                 )
             ),
             "abnormal_reason_history": _abnormal_reason_history(row),
