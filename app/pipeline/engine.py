@@ -1072,7 +1072,7 @@ class PipelineEngine:
             worker_result_file = dirs.stage_result_file(
                 "r2_w", "worker", func_hash,
                 max(1, func_state.r2_w_attempts))
-            prompt = P.build_r1_j_prompt(
+            prompt = P.build_r2_j_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
                 start_line=func_state.start_line,
@@ -1131,7 +1131,7 @@ class PipelineEngine:
                        passed=passed, feedback=feedback[:200], attempt=attempt)
             return passed
         except Exception as exc:
-            logger.error("R1b J failed for %s: %s", func_hash, exc)
+            logger.error("R2-J failed for %s: %s", func_hash, exc)
             func_state.r2_j_state = NodeState.FAILED
             state.save(dirs.state_file)
             return False
@@ -1216,7 +1216,7 @@ class PipelineEngine:
                     0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
                 )
                 prev_j_result = dirs.stage_result_file("r3_j", "judge", func_hash, max(1, func_state.r3_w_attempts - 1)) if is_retry else None
-                prompt = P.build_r2_w_prompt(
+                prompt = P.build_r3_w_prompt(
                     func_hash=func_hash,
                     func_name=func_state.name,
                     signature=func_state.signature,
@@ -1231,8 +1231,8 @@ class PipelineEngine:
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
-                    session_file=session_file, cwd=str(dirs.stage_cwd("r2_w")),
-                    context=f"r2_w:{func_hash}", acfg=acfg,
+                    session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
+                    context=f"r3_w:{func_hash}", acfg=acfg,
                 )
 
                 analysis = _parse_r2_analysis(ar.output)
@@ -1341,7 +1341,7 @@ class PipelineEngine:
                 break
 
             except Exception as exc:
-                logger.error("R2 W failed for %s: %s", func_hash, exc)
+                logger.error("R3-W failed for %s: %s", func_hash, exc)
                 func_state.r3_w_state = NodeState.FAILED
                 state.save(dirs.state_file)
 
@@ -1371,7 +1371,7 @@ class PipelineEngine:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r3_analysis_judge')
             worker_result_file = dirs.stage_result_file("r3_w", "worker", func_hash, max(1, func_state.r3_w_attempts))
-            prompt = P.build_r2_j_func_prompt(
+            prompt = P.build_r3_j_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
                 signature=func_state.signature,
@@ -1384,8 +1384,8 @@ class PipelineEngine:
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
-                context=f"r2_jf:{func_hash}", acfg=acfg,
+                session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
+                context=f"r3_j:{func_hash}", acfg=acfg,
             )
             passed, feedback = _parse_j_result(ar.output)
 
@@ -1455,7 +1455,7 @@ class PipelineEngine:
             return passed, summary
 
         except Exception as exc:
-            logger.error("R2 J func failed for %s: %s", func_hash, exc)
+            logger.error("R3-J failed for %s: %s", func_hash, exc)
             func_state.r3_j_state = NodeState.FAILED  # J 异常→FAILED，交 max_rounds 重试
             state.save(dirs.state_file)
             return False, f"judge exception: {str(exc)[:300]}"

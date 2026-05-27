@@ -74,7 +74,7 @@ def build_r1_file_j_prompt(
     )
 
 
-def build_r1_j_prompt(
+def build_r2_j_prompt(  # 正确命名：R2-J 行号准确性验证
     func_hash: str,
     func_name: str,
     start_line: int,
@@ -119,9 +119,9 @@ def build_r1_j_prompt(
     )
 
 
-# ─── R2 Worker ────────────────────────────────────────────────────────────────
+# ─── R3 Worker ──────────────────────────────────────────────────────────────
 
-def build_r2_w_prompt(
+def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
     func_hash: str,
     func_name: str,
     signature: str,
@@ -284,9 +284,9 @@ def build_r2_w_prompt(
     )
 
 
-# ─── R2 Judge（函数级） ────────────────────────────────────────────────────────
+# ─── R3 Judge（函数级） ──────────────────────────────────────────────────────
 
-def build_r2_j_func_prompt(
+def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
     func_hash: str,
     func_name: str,
     signature: str,
@@ -766,3 +766,10 @@ def build_report_j_prompt(
         f"反馈: <若不通过，说明具体缺陷和建议>\n"
         f"```\n"
     )
+
+
+# ─── 向后兼容别名（旧命名 → 新命名）──────────────────────────────────────────
+# 旧代码不应再使用以下别名，仅用于平滑过渡
+build_r1_j_prompt     = build_r2_j_prompt     # 原R2-J（行号验证），错误地叫r1_j
+build_r2_w_prompt     = build_r3_w_prompt     # 原R3-W（外部输入分析），错误地叫r2_w
+build_r2_j_func_prompt = build_r3_j_prompt   # 原R3-J（分析验证），错误地叫r2_j_func
