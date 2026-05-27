@@ -345,9 +345,11 @@ def _resolve_model_for_pi(model: str) -> str:
 def _build_args(
     pi_cmd: list[str], model: str, tools: list[str],
     thinking_level: str, session_file: str | None,
-    skill_paths: list[str] | None = None,
 ) -> list[str]:
-    """构造 pi 命令行参数（不含 system prompt 和 prompt）。"""
+    """构造 pi 命令行参数（不含 system prompt 和 prompt）。
+
+    Skills 通过复制到 {cwd}/.pi/skills/ 被 pi 自动发现，不再用 --skill CLI 参数注入。
+    """
     args = [*pi_cmd, "--mode", "json", "-p"]
     if session_file:
         args.extend(["--session", session_file])
@@ -359,9 +361,6 @@ def _build_args(
         args.extend(["--tools", ",".join(tools)])
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])
-    if skill_paths:
-        for sp in skill_paths:
-            args.extend(["--skill", sp])
     # 注意：prompt 不拼入命令行参数，而是通过 stdin 发送，
     # 以避免超出 Linux ARG_MAX 命令行长度限制。
     return args
@@ -498,7 +497,6 @@ async def _run_with_context_overflow_recovery(
     tools: list[str],
     thinking_level: str,
     session_file: str | None,
-    skill_paths: list[str] | None,
     cwd: str,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
@@ -538,7 +536,7 @@ async def _run_with_context_overflow_recovery(
         _log_warn(msg)
         if on_stream:
             on_stream(f"\n⚠️ {msg}\n")
-        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file, skill_paths)
+        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
         await _run_with_pi_retry(
             args=compaction_args,
             cwd=cwd,
@@ -592,7 +590,6 @@ async def run_agent(
     cwd: str = ".",
     thinking_level: str = "off",
     session_file: str | None = None,
-    skill_paths: list[str] | None = None,
     on_stream: Callable[[str], None] | None = None,
     cancel_event: asyncio.Event | None = None,
     max_retries: int = 3,
@@ -611,6 +608,8 @@ async def run_agent(
     外层：pi 进程级重试（拉起失败、崩溃、被 kill）
     内层：API 级重试（连接超时、限流、服务器错误）
     致命：Model not found / Unauthorized → 不重试，result.fatal=True
+
+    Skills 通过复制到 {cwd}/.pi/skills/ 被 pi 自动发现，不再通过参数注入。
     """
     try:
         pi_cmd = _find_pi_command()
@@ -622,7 +621,7 @@ async def run_agent(
         r.fatal = True
         return r
 
-    args = _build_args(pi_cmd, model, tools, thinking_level, session_file, skill_paths)
+    args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
 
     # System Prompt → 临时文件
     tmp_dir: str | None = None
@@ -662,7 +661,6 @@ async def run_agent(
                     tools=tools,
                     thinking_level=thinking_level,
                     session_file=session_file,
-                    skill_paths=skill_paths,
                     cwd=os.path.abspath(cwd),
                     cancel_event=cancel_event,
                     on_stream=on_stream,

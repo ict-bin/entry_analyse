@@ -137,7 +137,7 @@ write functions.list
 写入完成后，使用以下命令验证 JSON 格式和字段完整性：
 
 ```bash
-python3 /opt/entry_analyse/.pi/skills/write-functions-list/scripts/validate_functions_list.py functions.list
+python3 .pi/skills/write-functions-list/scripts/validate_functions_list.py functions.list
 ```
 
 验证通过时输出：`✅ functions.list: N entries, all fields valid`  

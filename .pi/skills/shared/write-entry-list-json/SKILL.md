@@ -131,7 +131,7 @@ write entry-list-merged.json
 写入完成后，使用以下命令验证 JSON 格式和字段完整性：
 
 ```bash
-python3 /opt/entry_analyse/.pi/skills/write-entry-list-json/scripts/validate_entry_list.py entry-list-merged.json
+python3 .pi/skills/write-entry-list-json/scripts/validate_entry_list.py entry-list-merged.json
 ```
 
 验证通过时输出：`✅ entry-list-merged.json: N entries, all fields valid`

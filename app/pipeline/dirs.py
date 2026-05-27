@@ -4,6 +4,16 @@ entry_analyse — Pipeline 目录结构管理（v5）
   run/
   ├── workspace/
   │   ├── source/               ← 源文件软链接
+  │   ├── stage_cwd/            ← 各阶段专属 cwd（含 .pi/skills/ skill 隔离）
+  │   │   ├── r1_w/             ← R1-W cwd
+  │   │   ├── r1_j/             ← R1-J cwd
+  │   │   ├── r2_w/             ← R2-W cwd
+  │   │   ├── r2_j/             ← R2-J cwd
+  │   │   ├── r3_w/             ← R3-W cwd
+  │   │   ├── r3_j/             ← R3-J cwd
+  │   │   ├── r4_func_w/        ← R4-func-W cwd
+  │   │   ├── r5_w/             ← R5-W cwd
+  │   │   └── r5_j/             ← R5-J cwd
   │   ├── r1-functions/         ← R1+R2 产物（funcdb SQLite）
   │   ├── r3-entries/           ← R3/R4 产物（per-func 决策 JSON）
   │   ├── r4-module/            ← R6 产物（最终入口 entries.json）
@@ -224,9 +234,25 @@ class PipelineDirs:
         safe = str(scope_key or "module").replace("/", "_").replace("\\", "_")
         return self.stage_results / f"{stage_key}-{role_kind}-{safe}-a{attempt}.txt"
 
+    # ─── 阶段专属 cwd ──────────────────────────────────────────────────────────
+
+    @property
+    def stage_cwd_root(self) -> Path:
+        """所有阶段 cwd 的父目录。"""
+        return self.workspace / "stage_cwd"
+
+    def stage_cwd(self, stage_name: str) -> Path:
+        """返回指定阶段的专属 cwd，格式：workspace/stage_cwd/{stage_name}/。"""
+        return self.stage_cwd_root / stage_name
+
     def setup(self) -> None:
-        for d in (self.source, self.r1, self.r3, self.r4, self.callchain, self.stage_results, self.sessions):
+        for d in (self.source, self.r1, self.r3, self.r4, self.callchain,
+                  self.stage_results, self.sessions, self.stage_cwd_root):
             d.mkdir(parents=True, exist_ok=True)
+        # 创建各阶段 cwd 根目录（不含 .pi/skills，由 setup_stage_skills 负责）
+        for stage in ("r1_w", "r1_j", "r2_w", "r2_j",
+                      "r3_w", "r3_j", "r4_func_w", "r5_w", "r5_j"):
+            self.stage_cwd(stage).mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_task(cls, output_dir: str, task_id: str) -> "PipelineDirs":

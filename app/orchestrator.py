@@ -353,9 +353,11 @@ class Orchestrator:
                 "module_name":       cfg.module_name,
                 "file_count":        len(resolved_files) if resolved_files else 0,
                 "total_duration_ms": result.total_duration_ms,
-                "total_tokens":      result.total_tokens.model_dump()
-                                     if hasattr(result, "total_tokens") and result.total_tokens
-                                     else {},
+                # Fix-5: 从 engine 实例读取已聚合的 session token 用量
+                "total_tokens":      getattr(engine, "_total_token_usage", None)
+                                     or (result.total_tokens.model_dump()
+                                         if hasattr(result, "total_tokens") and result.total_tokens
+                                         else {}),
             }
             await engine.generate_final_report(
                 run_dir=run_dir,

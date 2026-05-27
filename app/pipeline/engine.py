@@ -40,16 +40,53 @@ from .extractor import compute_file_hash, compute_func_hash
 from .result_index import write_stage_result_files, upsert_stage_result_index
 
 # Skills 目录：相对于本文件 (app/pipeline/engine.py) → app/pipeline/../../.pi/skills
-_EA_SKILLS_DIR       = Path(__file__).parent.parent.parent / ".pi" / "skills"
-# 按阶段/角色隔离的 skill 目录，防止不同阶段的 skill 互相干扰
-_EA_WORKER_SKILLS   = _EA_SKILLS_DIR / "worker"   # 所有 Worker：ea-output-format
-_EA_SHARED_SKILLS   = _EA_SKILLS_DIR / "shared"   # 共享工具：query-functions-db 等
-_EA_R1_JUDGE_SKILLS = _EA_SKILLS_DIR / "r1-judge" # R1-J 专用：static回调覆盖检查
+_EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
 
-def _skill_paths(*dirs) -> list[str] | None:
-    """构建 skill_paths，过滤不存在的目录，全空时返回 None。"""
-    result = [str(d) for d in dirs if d.is_dir()]
-    return result if result else None
+# 各阶段 cwd 对应的 skill 目录列表（skill 名 → 来源目录路径，幂等复制到 stage_cwd/.pi/skills/）
+_STAGE_SKILLS: dict[str, list[Path]] = {
+    "r1_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
+                  _EA_SKILLS_DIR / "shared" / "query-functions-db",
+                  _EA_SKILLS_DIR / "shared" / "write-functions-list",
+                  _EA_SKILLS_DIR / "shared" / "write-entry-list-json"],
+    "r1_j":      [_EA_SKILLS_DIR / "shared" / "query-functions-db",
+                  _EA_SKILLS_DIR / "r1-judge" / "ea-r1-judge-guide"],
+    "r2_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
+                  _EA_SKILLS_DIR / "shared" / "query-functions-db"],
+    "r2_j":      [_EA_SKILLS_DIR / "shared" / "query-functions-db"],
+    "r3_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
+                  _EA_SKILLS_DIR / "worker" / "ea-r3-worker-result"],
+    "r3_j":      [],   # 无 skill
+    "r4_func_w": [_EA_SKILLS_DIR / "worker" / "ea-r4-worker-result",
+                  _EA_SKILLS_DIR / "worker" / "ea-output-format",
+                  _EA_SKILLS_DIR / "shared" / "query-functions-db"],
+    "r5_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
+                  _EA_SKILLS_DIR / "shared" / "query-functions-db"],
+    "r5_j":      [],   # 无 skill
+}
+
+
+def setup_stage_skills(dirs: "PipelineDirs") -> None:
+    """
+    将各阶段 skill 目录复制到对应 stage_cwd/.pi/skills/（幂等，已存在则跳过）。
+    在 pipeline run() 初始化阶段调用一次。
+    """
+    import shutil
+    for stage, skill_srcs in _STAGE_SKILLS.items():
+        skills_dest = dirs.stage_cwd(stage) / ".pi" / "skills"
+        skills_dest.mkdir(parents=True, exist_ok=True)
+        for src_dir in skill_srcs:
+            if not src_dir.is_dir():
+                logger.warning("skill dir not found, skip: %s", src_dir)
+                continue
+            dest = skills_dest / src_dir.name
+            if dest.exists():
+                continue   # 幂等：已复制则跳过
+            try:
+                shutil.copytree(src_dir, dest)
+            except Exception as _e:
+                logger.warning("skill copy failed %s -> %s: %s", src_dir, dest, _e)
+
+
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
 from . import prompts as P
@@ -61,6 +98,39 @@ R1B_J_SKIP_THRESHOLD = int(os.getenv("EA_R1J_SKIP_THRESHOLD", "80"))
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
+
+
+def _aggregate_session_tokens(sessions_dir: "Path") -> dict:
+    """展开所有 sessions/*.jsonl，聚合 token 用量（Fix-5）。"""
+    totals: dict = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+    if not sessions_dir.is_dir():
+        return totals
+    for jf in sessions_dir.glob("*.jsonl"):
+        try:
+            for raw_line in jf.read_text(encoding="utf-8", errors="replace").splitlines():
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                usage = (obj.get("message") or {}).get("usage") or {}
+                totals["input"]       += int(usage.get("input", 0) or 0)
+                totals["output"]      += int(usage.get("output", 0) or 0)
+                totals["cache_read"]  += int(usage.get("cacheRead", 0) or 0)
+                totals["cache_write"] += int(usage.get("cacheWrite", 0) or 0)
+                cost = usage.get("cost") or 0
+                if isinstance(cost, dict):
+                    totals["cost"] += float(cost.get("total", 0) or 0)
+                else:
+                    totals["cost"] += float(cost)
+        except Exception as _e:
+            logger.debug("token agg error %s: %s", jf.name, _e)
+    return {k: int(v) if k != "cost" else round(v, 6) for k, v in totals.items()}
+
 
 def _should_continue(attempts: int, max_rounds: int, cancel: asyncio.Event) -> bool:
     """
@@ -270,6 +340,7 @@ class PipelineEngine:
         """
         dirs = PipelineDirs(run=run_dir)
         dirs.setup()
+        setup_stage_skills(dirs)   # Fix-1+2: 将 skill 复制到各阶段专属 cwd
 
         self._source_dir = str(Path(source_dir).resolve())
         self._out_dir = out_dir
@@ -476,6 +547,10 @@ class PipelineEngine:
 
         # ─── Phase 6: R6 最终报告 ─────────────────────────────────────────
         final_entries = await self._run_r4_pipeline(dirs, state)
+        final_entries = await self._run_r4_pipeline(dirs, state)
+
+        # Fix-5: 从 sessions JSONL 聚合 token 用量
+        self._total_token_usage = _aggregate_session_tokens(dirs.sessions)
 
         return final_entries
 
@@ -801,10 +876,9 @@ class PipelineEngine:
                     prompt=j_prompt,
                     system_prompt=self._stage_sys_prompt('r1_judge'),
                     session_file=j_session,
-                    cwd=str(dirs.source),
+                    cwd=str(dirs.stage_cwd("r1_j")),
                     context=f"r1_j:{file_hash}",
                     acfg=acfg_j,
-                    skill_paths=_skill_paths(_EA_SHARED_SKILLS, _EA_R1_JUDGE_SKILLS),
                 )
                 j_passed, j_feedback = _parse_j_result(ar_j.output)
                 fs.r1_j_state = NodeState.PASSED if j_passed else NodeState.FAILED
@@ -1000,9 +1074,8 @@ class PipelineEngine:
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.source),
+                session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
                 context=f"r2_j:{func_hash}", acfg=acfg,
-            skill_paths=_skill_paths(_EA_SHARED_SKILLS),
             )
             passed, feedback = _parse_j_result(ar.output)
             # DELETE 裁定：函数不存在（宏定义等），从 funcdb 删除并强制通过
@@ -1150,9 +1223,8 @@ class PipelineEngine:
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
-                    session_file=session_file, cwd=str(dirs.source),
+                    session_file=session_file, cwd=str(dirs.stage_cwd("r2_w")),
                     context=f"r2_w:{func_hash}", acfg=acfg,
-                    skill_paths=_skill_paths(_EA_SHARED_SKILLS, _EA_WORKER_SKILLS),
                 )
 
                 analysis = _parse_r2_analysis(ar.output)
@@ -1304,9 +1376,8 @@ class PipelineEngine:
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.source),
+                session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
                 context=f"r2_jf:{func_hash}", acfg=acfg,
-            skill_paths=_skill_paths(_EA_SHARED_SKILLS),
             )
             passed, feedback = _parse_j_result(ar.output)
 
@@ -1623,9 +1694,8 @@ class PipelineEngine:
             try:
                 await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
-                    session_file=session_file, cwd=str(dirs.source),
+                    session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
                     context=f"r3_w_func:{func_name}", acfg=acfg,
-                    skill_paths=_skill_paths(_EA_WORKER_SKILLS),
                 )
             except Exception as exc:
                 logger.warning("R3-W-func agent error for %s: %s", func_name, exc)
@@ -1756,9 +1826,8 @@ class PipelineEngine:
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.source),
+                session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
                 context=f"r3_entry_j:{func_hash}", acfg=acfg,
-            skill_paths=None,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
@@ -1802,9 +1871,8 @@ class PipelineEngine:
             )
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.source),
+                session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
                 context=f"r3_j:{file_hash}", acfg=acfg,
-            skill_paths=None,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_payload = {
@@ -1943,10 +2011,9 @@ class PipelineEngine:
         if self._cancel.is_set():
             return final_entries
 
-        # Step 4: R4-final-J
-        r4_final_max = int(getattr(self.cfg, "r4_final_max_rounds", -1))
-        if r4_final_max != 0 and state.r6_state != NodeState.PASSED:
-            await self._run_r4_final_j(final_entries, dirs, state)
+        # Step 4: R6 脚本化聚合（Fix-3）
+        if state.r6_state != NodeState.PASSED:
+            await self._script_finalize_r6(final_entries, dirs, state)
 
         if state.r6_state != NodeState.PASSED:
             state.r6_state = NodeState.PASSED
@@ -2063,10 +2130,9 @@ class PipelineEngine:
                 prompt=prompt,
                 system_prompt=self._stage_sys_prompt('r4_worker'),
                 session_file=session_file,
-                cwd=str(dirs.source),
+                cwd=str(dirs.stage_cwd("r4_func_w")),
                 context=f"r4_func:{func_hash}",
                 # R4-W: worker skill（ea-r4-worker-result 指导结果文件写出格式）
-                skill_paths=_skill_paths(_EA_WORKER_SKILLS, _EA_SHARED_SKILLS),
                 acfg=acfg,
             )
         except Exception as exc:
@@ -2122,6 +2188,37 @@ class PipelineEngine:
             kept.append(entry)
         return kept
 
+    async def _script_finalize_r6(
+        self, final_entries: list[dict], dirs: "PipelineDirs", state: "PipelineState"
+    ) -> None:
+        """
+        Fix-3: R6 脚本化聚合。
+        R5 已对每个 keep 函数产出完整报告，R6 只做字段完整性校验 + 设 r6_state=PASSED。
+        不再调用 LLM Judge，彻底消除幻觉统计和无效 force-pass 问题。
+        """
+        issues: list[str] = []
+        for e in final_entries:
+            fname = e.get("function") or e.get("name") or ""
+            if not fname:
+                issues.append(f"missing 'function': hash={e.get('func_hash')}")
+            if not e.get("taints"):
+                issues.append(f"empty taints: {fname}")
+            if e.get("tag") not in ("P", "A"):
+                issues.append(f"invalid tag={e.get('tag')!r}: {fname}")
+        if issues:
+            logger.warning(
+                "R6 script validation: %d field issue(s) in %d entries: %s",
+                len(issues), len(final_entries), issues[:5],
+            )
+        state.r6_state = NodeState.PASSED
+        state.r6_attempts = max(state.r6_attempts, 1)
+        state.r6_feedback = (
+            f"script: {len(final_entries)} entries, {len(issues)} field warnings"
+        )
+        state.save(dirs.state_file)
+        self._emit("r6_script_done",
+                   entry_count=len(final_entries), warnings=len(issues))
+
     async def _run_r4_final_j(
         self, final_entries: list[dict], dirs: PipelineDirs, state: PipelineState
     ) -> None:
@@ -2166,9 +2263,8 @@ class PipelineEngine:
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
-                    session_file=session_file, cwd=str(dirs.source),
+                    session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
                     context="r6_j", acfg=acfg,
-                skill_paths=None,
                 )
                 passed, feedback = _parse_j_result(ar.output)
                 state.r6_feedback = feedback
@@ -2327,9 +2423,8 @@ class PipelineEngine:
                     prompt=w_prompt,
                     system_prompt=self._stage_sys_prompt("r5_worker"),
                     session_file=session_w,
-                    cwd=str(out_dir),
+                    cwd=str(dirs.stage_cwd("r5_w")),
                     context=f"report_func_w:{func_hash}",
-                    skill_paths=_skill_paths(_EA_WORKER_SKILLS, _EA_SHARED_SKILLS),
                     acfg=acfg,
                 )
             except Exception as exc:
@@ -2365,9 +2460,8 @@ class PipelineEngine:
                     prompt=j_prompt,
                     system_prompt=self._stage_sys_prompt("r5_judge"),
                     session_file=j_session,
-                    cwd=str(out_dir),
+                    cwd=str(dirs.stage_cwd("r5_j")),
                     context=f"report_func_j:{func_hash}",
-                skill_paths=None,
                     acfg=acfg_j,
                 )
                 j_passed, j_feedback = _parse_j_result(j_ar.output)
@@ -2460,7 +2554,6 @@ class PipelineEngine:
         cwd: str,
         context: str = "",
         acfg: AgentInstanceConfig,
-        skill_paths: list[str] | None = None,   # 阶段专用 skill 路径，None=不加载任何 skill
     ) -> AgentResult:
         async with self._sem:
             async with model_capacity_slot(
@@ -2477,7 +2570,7 @@ class PipelineEngine:
                     thinking_level=(
                         acfg.thinking_level or self.cfg.workers.default_thinking_level),
                     session_file=session_file,
-                    skill_paths=skill_paths,   # 由调用方显式指定，不再全局共享
+                    # Skills 已通过 setup_stage_skills 复制到 cwd/.pi/skills/，不需 CLI 参数注入
                     cancel_event=self._cancel,
                     max_retries=self.cfg.agent_max_retries,
                     retry_delay=self.cfg.agent_retry_delay,
