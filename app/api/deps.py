@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 from app.service.auth import AuthServiceError, TokenInvalidError, get_auth_service
 
@@ -40,6 +40,15 @@ async def ensure_project_access(project_id: str, token: str) -> Dict:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except AuthServiceError as exc:
         raise HTTPException(status_code=403, detail=f"project access denied: {exc}") from exc
+
+
+async def require_project_access(
+    project_id: str,
+    user_and_token=Depends(get_current_user),
+) -> Tuple[Dict, str]:
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    return user_and_token
 
 
 def ensure_admin_user(user: Dict) -> Dict:

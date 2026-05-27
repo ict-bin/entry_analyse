@@ -17,7 +17,7 @@ from app.service.task_service import get_task_service
 from app.service.worker_slot_service import get_worker_slot_service
 
 from . import router
-from .deps import ensure_admin_user, ensure_project_access, get_current_user
+from .deps import ensure_admin_user, ensure_project_access, get_current_user, require_project_access
 
 logger = logging.getLogger(__name__)
 AGGREGATE_CACHE_TTL_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "5")))
@@ -645,7 +645,7 @@ async def create_task(
 
 
 @router.get("/tasks")
-async def list_tasks(
+def list_tasks(
     project_id: str = Query(...),
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=1000),
@@ -655,10 +655,8 @@ async def list_tasks(
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     return get_task_service().list_tasks(
         db,
         project_id=project_id,
@@ -673,26 +671,22 @@ async def list_tasks(
 
 
 @router.get("/projects/{project_id}/slot-cluster", response_model=EntryAnalyseSlotClusterResponse)
-async def get_slot_cluster(
+def get_slot_cluster(
     project_id: str,
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     from app.service.worker_slot_service import get_worker_slot_service
 
     return get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
 
 
 @router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse)
-async def get_agent_observability_summary(
+def get_agent_observability_summary(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     from app.service.agent_observability import get_agent_observability_service
 
     snapshot = get_agent_observability_service().build_snapshot(db, project_id=project_id)
@@ -712,7 +706,7 @@ async def get_agent_observability_aggregate_summary(
 
 
 @router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse])
-async def list_agent_processes(
+def list_agent_processes(
     project_id: str = Query(...),
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
@@ -722,10 +716,8 @@ async def list_agent_processes(
     kill_allowed: Optional[bool] = Query(None),
     orphan_only: bool = Query(False),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     from app.service.agent_observability import get_agent_observability_service
 
     rows = list(get_agent_observability_service().build_snapshot(db, project_id=project_id)["processes"])
@@ -780,7 +772,7 @@ async def list_agent_aggregate_processes(
 
 
 @router.get("/agent-observability/sessions", response_model=list[AgentSessionSnapshotResponse])
-async def list_agent_sessions(
+def list_agent_sessions(
     project_id: str = Query(...),
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
@@ -789,10 +781,8 @@ async def list_agent_sessions(
     live_only: bool = Query(False),
     orphan_only: bool = Query(False),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     from app.service.agent_observability import get_agent_observability_service
 
     rows = list(get_agent_observability_service().build_snapshot(db, project_id=project_id)["sessions"])
@@ -842,26 +832,22 @@ async def list_agent_aggregate_sessions(
 
 
 @router.get("/agent-observability/sessions/content")
-async def get_agent_session_content(
+def get_agent_session_content(
     project_id: str = Query(...),
     task_id: str = Query(...),
     session_file: str = Query(...),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     return get_task_service().get_task_session_file(db, task_id, session_file)
 
 
 @router.get("/agent-observability/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
-async def list_agent_tasks(
+def list_agent_tasks(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     from app.service.agent_observability import get_agent_observability_service
 
     return get_agent_observability_service().build_snapshot(db, project_id=project_id)["tasks"]
@@ -879,13 +865,11 @@ async def list_agent_aggregate_tasks(
 
 
 @router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse])
-async def list_agent_pods(
+def list_agent_pods(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
+    _=Depends(require_project_access),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
     from app.service.agent_observability import get_agent_observability_service
 
     return get_agent_observability_service().build_snapshot(db, project_id=project_id)["pods"]
@@ -1016,7 +1000,7 @@ async def kill_all_orphan_processes(
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(
+def get_task(
     task_id: str,
     include_function_catalog: bool = Query(False),
     db: Session = Depends(get_db),
@@ -1026,27 +1010,27 @@ async def get_task(
 
 
 @router.get("/tasks/{task_id}/runtime-summary", response_model=TaskRuntimeSummaryResponse)
-async def get_task_runtime_summary(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def get_task_runtime_summary(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_runtime_summary(db, task_id)
 
 
 @router.get("/tasks/{task_id}/function-catalog", response_model=list[dict[str, Any]])
-async def get_task_function_catalog(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def get_task_function_catalog(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_function_catalog(db, task_id)
 
 
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
-async def get_task_result(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def get_task_result(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_result(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
-async def list_task_sessions(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def list_task_sessions(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().list_task_sessions(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
-async def get_task_session_index(
+def get_task_session_index(
     task_id: str,
     refresh: bool = Query(False),
     db: Session = Depends(get_db),
@@ -1056,12 +1040,12 @@ async def get_task_session_index(
 
 
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)
-async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db), _=Depends(get_current_user)):
+def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_session_file(db, task_id, path)
 
 
 @router.get("/tasks/{task_id}/evaluation", response_model=TaskEvaluationResponse)
-async def get_task_evaluation(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def get_task_evaluation(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_evaluation(db, task_id)
 
 
@@ -1070,26 +1054,26 @@ async def cancel_task(task_id: str, db: Session = Depends(get_db), _=Depends(get
     return await get_task_service().cancel_task(db, task_id)
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
-async def restart_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def restart_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     """Reset and restart an existing task in-place, reusing the same task ID."""
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
-async def resume_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def resume_task(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     """Resume an interrupted task from the last completed stage (断点续跑)."""
     return get_task_service().resume_task(db, task_id)
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=AppEaTaskTimelineResponse)
-async def get_task_timeline(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def get_task_timeline(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     svc = get_task_service()
     task = svc._get_or_404(db, task_id)
     return svc.get_task_timeline(db, task)
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=TaskActionResponse)
-async def clear_task_timeline(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def clear_task_timeline(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     svc = get_task_service()
     task = svc._get_or_404(db, task_id)
     deleted_event_count = svc.clear_task_timeline(db, task)
@@ -1098,7 +1082,7 @@ async def clear_task_timeline(task_id: str, db: Session = Depends(get_db), _=Dep
 
 
 @router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=TaskActionResponse)
-async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     svc = get_task_service()
     task = svc._get_or_404(db, task_id)
     deleted_event_count = svc.delete_task_timeline_event(db, task, event_id)
@@ -1107,7 +1091,7 @@ async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = 
 
 
 @router.delete("/tasks/{task_id}", response_model=TaskActionResponse)
-async def delete_task(
+def delete_task(
     task_id: str,
     delete_files: bool = Query(default=True),
     db: Session = Depends(get_db),
@@ -1119,7 +1103,7 @@ async def delete_task(
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_task_logs(
+def get_task_logs(
     task_id: str,
     since: int = 0,
     db: Session = Depends(get_db),
@@ -1188,14 +1172,14 @@ async def get_task_logs(
 
 
 @router.post("/generate-prompt")
-async def generate_prompt(body: GeneratePromptRequest, _=Depends(get_current_user)):
+def generate_prompt(body: GeneratePromptRequest, _=Depends(get_current_user)):
     """Auto-generate a prompt from an input path."""
     from app.service.task_service import generate_prompt_from_path
     return {"prompt": generate_prompt_from_path(body.input_path)}
 
 
 @router.get("/modules")
-async def list_modules(
+def list_modules(
     base_path: str = Query(..., description="模块目录（含 files.list 或子模块）"),
     _=Depends(get_current_user),
 ):

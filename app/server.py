@@ -177,7 +177,7 @@ class AnalyseRequest(BaseModel):
 
 @app.get("/health")
 @app.get("/api/app/entry-analyse/health")
-async def health():
+def health():
     bootstrap = get_runtime_bootstrap().status()
     scheduler_running = False
     worker_running = False
@@ -208,7 +208,7 @@ async def health():
 
 @app.get("/ready")
 @app.get("/api/app/entry-analyse/ready")
-async def ready():
+def ready():
     bootstrap = get_runtime_bootstrap()
     if bootstrap.management_ready():
         return {"status": "ready", **bootstrap.status()}
