@@ -222,8 +222,9 @@ async def metrics():
 
 
 @app.get("/modules")
-async def get_modules(cwd: str = ""):
+def get_modules(cwd: str = ""):
     """列出可用模块。"""
+    _ensure_legacy_worker_runtime()
     target = cwd or TARGET_DIR
     modules = list_modules(target)
     return {"target_dir": target, "modules": modules}
