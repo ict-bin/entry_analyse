@@ -684,8 +684,8 @@ class PipelineEngine:
         if self._cancel.is_set():
             return
         if func_state.r3_w_state == NodeState.PASSED:
-            r2_j_max = int(getattr(self.cfg, "r2_j_max_rounds", -1))
-            while _should_continue(func_state.r3_j_attempts, r2_j_max, self._cancel):
+            r3_j_max = int(getattr(self.cfg, "r3_j_max_rounds", -1))
+            while _should_continue(func_state.r3_j_attempts, r3_j_max, self._cancel):
                 if func_state.r3_j_state == NodeState.PASSED:
                     break
                 passed, _ = await self._run_r3_analysis_j(

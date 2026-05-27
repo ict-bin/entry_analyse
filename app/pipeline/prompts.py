@@ -363,63 +363,6 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
 
 
 
-def build_r3_j_prompt(
-    file_path: str,
-    r3_entries_path: Path,
-    db_path: Path,
-    worker_result_file: str = "",
-) -> str:
-    """
-    R3 Judge：评审文件级入口过滤结果。
-
-    v3 变化：
-    - 期望激进过滤（10-40个入口为合理范围），不因"保守"为由放宽
-    - Fill/Crypto/Subscribe 误留 → 必须 FAIL
-    """
-    basename = os.path.basename(file_path)
-    _AWK = r"recv|SOCK_Recv|LibRcvMsg|MsgReceive|recvfrom|APPTMR_Lib"
-
-    return (
-        f"# R3 Judge — 文件级入口过滤评审\n\n"
-        f"文件：`{basename}`\n\n"
-        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
-        f"## 步骤 1：读取 R3 过滤结果\n\n"
-        f"```bash\n"
-        f"cat {r3_entries_path}\n"
-        f"```\n\n"
-        f"## 步骤 2：对比过滤前候选列表\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py list-entries {db_path}\n"
-        f"```\n\n"
-        f"了解哪些函数被删除了，是否合理。\n\n"
-        f"## 步骤 3：验证保留列表中的每个函数\n\n"
-        f"对每个保留函数，快速验证是否真正是顶层入口：\n"
-        f"```bash\n"
-        f"# 检查签名\n"
-        f"sed -n '<start_line>p' {file_path}\n"
-        f"# 检查是否有主动 I/O 调用\n"
-        f"awk 'NR>=<start> && NR<=<end> && /{_AWK}/ {{print NR" + chr(34) + f": " + chr(34) + f"$0}}' {file_path}\n"
-
-        f"```\n\n"
-        f"## 评审标准\n\n"
-        f"**必须 FAIL 的情况**：\n"
-        f"- 保留了 Fill*/Disp*/Display* 类函数（写输出缓冲区，不是入口）\n"
-        f"- 保留了加密算法原语（AesCbc/Sha/Md5/Des 等）\n"
-        f"- 保留了 Subscribe/Init/Create 类函数且无 recv 类调用\n"
-        f"- 保留了一个函数，但其调用者也在保留列表中（子函数未被过滤）\n\n"
-        f"**不应 FAIL 的情况**：\n"
-        f"- 保留数量很少（0-10个），但每个函数都能证明是顶层入口\n"
-        f"- 过滤比例较高（>80%被删除），只要保留的函数确实是入口\n\n"
-        f"**参考范围**：400+ 函数的 IPSec/协议类模块，真实外部入口通常 **10-40 个**。\n"
-        f"保留 100+ 个几乎肯定是过滤不足。\n\n"
-        f"## 输出格式\n\n"
-        f"```\n"
-        f"通过: <是/否>\n"
-        f"反馈: <若不通过，说明具体哪个保留函数有问题及原因>\n"
-        f"```\n"
-    )
-
-
 # ─── R4 Worker ────────────────────────────────────────────────────────────────
 
 def build_r4_func_w_prompt(
