@@ -361,110 +361,6 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
     )
 
 
-def build_r3_w_func_prompt(
-    func_hash: str,
-    func_name: str,
-    signature: str,
-    start_line: int,
-    end_line: int,
-    file_path: str,
-    r3_func_out_path: "Path",
-    caller_ctx: "dict | None" = None,       # 保留参数签名兼容，内部不使用
-    other_candidates: "list[dict] | None" = None,  # 已废弃，保留兼容
-    is_retry: bool = False,
-    feedback: str = "",
-) -> str:
-    """
-    R3 Worker（函数级并行）：对单个候选函数判断是否为模块外部入口。
-
-    v5 变化：
-      - 完全移除 caller_ctx：R3 只看函数体本身，不追查调用链
-      - 补充 filter 规则：Create/Fill/FsmAct 等发送/构造型函数可过滤
-    """
-    basename = os.path.basename(file_path)
-    abs_path = os.path.abspath(file_path)
-    retry    = _retry_section(feedback) if is_retry else ""
-    sed_body = f"sed -n '{start_line},{end_line}p' {abs_path}"
-
-    return (
-        f"# R3 Worker \u2014 单函数入口判断\n\n"
-        f"{retry}"
-        f"| 字段 | 值 |\n"
-        f"|------|-------|\n"
-        f"| func_hash | `{func_hash}` |\n"
-        f"| name | `{func_name}` |\n"
-        f"| 签名 | `{signature}` |\n"
-        f"| 行范围 | {start_line}~{end_line} |\n"
-        f"| 文件 | `{basename}` |\n\n"
-        f"## 判断规则\n\n"
-        f"**只看函数体本身**，判断本函数是否是模块的外部入口：\n\n"
-        f"**应 `keep` 的情况（满足任一即保留）：**\n"
-        f"- 函数体内有直接接收外部数据的调用（网络/IPC/消息队列/管道等）\n"
-        f"- 签名参数直接承载来自模块外部的原始数据（mbuf/msg/message/request/packet 等），"
-        f"且函数体内有对这些参数数据的解析/处理逻辑\n"
-        f"- 函数是回调类型（被框架/定时器/FSM 直接调用，处理外部事件）\n\n"
-        f"**应 `filter` 的情况（满足任一可过滤）：**\n"
-        f"- 函数名以 `Create/Fill/Build/Make/Send/Write/Prepare/FillIn` 开头，"
-        f"且函数体是**构造或发送**消息（分配 buffer、填写字段、调用发送 API）\n"
-        f"- 函数体只做格式转换/内存填充/字段映射，无对外部来源数据的处理\n"
-        f"- 函数是 FSM action（`FsmAct*`）或状态日志，只操作内部上下文\n"
-        f"- 函数是内部计数/统计更新（`Update*Stats/Count/Increment`）\n\n"
-        f"**不确定时：保守保留（宁可误报不漏报）**\n\n"
-        f"## 步骤 1：读取函数体\n\n"
-        f"```bash\n{sed_body}\n```\n\n"
-        f"基于函数体，直接判断：\n"
-        f"- 有没有从外部接收数据的行为（recv/IPC 读取/消息处理）\n"
-        f"- 有没有 Create/Fill/Send 等发送型行为\n"
-        f"- 参数携带的数据是\u201c被该函数消费的外部输入\u201d还是\u201c调用者传来的内部状态\u201d\n\n"
-        f"## 步骤 2：写出判断结果\n\n"
-        f"使用 `write` 工具写到：`{r3_func_out_path}`\n\n"
-        f"```json\n"
-        f"{{\n"
-        f'  "decision": "keep",\n'
-        f'  "entry_type": "A",\n'
-        f'  "entry_role": "boundary",\n'
-        f'  "reason": "判断依据（\u226480字）"\n'
-        f"}}\n"
-        f"```\n\n"
-        f"- `decision`: `keep` 或 `filter`\n"
-        f"- `entry_type`: `A`（主动获取）/ `P`（被动接收）/ `-`（filter）\n"
-        f"- `entry_role`: `boundary`/`dispatch_target`/`callback`/`ipc_handler`（filter 时留空）\n"
-    )
-
-
-# ─── R3 Judge ─────────────────────────────────────────────────────────────────
-
-def build_r3_entry_j_prompt(
-    func_hash: str,
-    func_name: str,
-    start_line: int,
-    end_line: int,
-    file_path: str,
-    worker_result_file: str = "",
-) -> str:
-    """
-    R3 Entry Judge：验证 Worker 的 keep/filter 决策是否有充分的代码证据支撑。
-    """
-    abs_path = os.path.abspath(file_path)
-    sed_body = f"sed -n '{start_line},{end_line}p' {abs_path}"
-    return (
-        f"# R3 Entry Judge — 入口判断验证\n\n"
-        f"| 字段 | 値 |\n"
-        f"|------|-------|\n"
-        f"| func_hash | `{func_hash}` |\n"
-        f"| name | `{func_name}` |\n"
-        f"| 行范围 | {start_line}~{end_line} |\n"
-        f"| 文件 | `{os.path.basename(file_path)}` |\n\n"
-        f"## 步骤 1：读取 Worker 结果\n\n"
-        f"```bash\ncat {worker_result_file}\n```\n\n"
-        f"## 步骤 2：读取函数体\n\n"
-        f"```bash\n{sed_body}\n```\n\n"
-        f"## 步骤 3：验证 decision 是否有代码证据支撑\n\n"
-        f"参照系统提示词中的验证规则，判断 Worker 的 keep/filter 决策是否自洽。\n\n"
-        f"## 输出格式\n\n"
-        f"通过时：\n```\n通过: 是\n摘要: decision 有代码证据支撑\n```\n\n"
-        f"不通过时：\n```\n通过: 否\n摘要: <≤060字，说明核心问题>\n反馈: <指出哪段代码与判断矛盾，应如何修正>\n```\n"
-    )
 
 
 def build_r3_j_prompt(
@@ -579,58 +475,6 @@ def build_r4_func_w_prompt(
     )
 
 
-def build_r4_w_prompt(
-    r3_entries_files: list[Path],
-    r4_out_path: Path,
-    module_name: str,
-    callchain_db: "Path | None" = None,
-    is_retry: bool = False,
-    feedback: str = "",
-) -> str:
-    """R4 Worker：模块级跨文件分析，输出最终外部入口列表。"""
-    if r3_entries_files:
-        file_list = "\n".join(f"  - `{f}`" for f in sorted(r3_entries_files))
-    else:
-        file_list = "  (no R3 results)"
-    retry = _retry_section(feedback) if is_retry else ""
-    # callchain 辅助块（仅当 DB 存在时展示）
-    cc_section = ""
-    if callchain_db is not None:
-        cc_section = (
-            f"## 调用链辅助分析（callchain.db 已就绪）\n\n"
-            f"对于每个 R3 候选入口，可用以下命令查询其调用链角色：\n"
-            f"```bash\n"
-            f"python3 /opt/entry_analyse/scripts/ea_db.py callchain-role {callchain_db} <func_hash>\n"
-            f"```\n\n"
-            f"根据输出的 `recommendation` 字段决定是否保留：\n"
-            f"- `保留（dispatch_target）` → 污点追踪推荐起点，**保留**\n"
-            f"- `保留（boundary）` → 没有模块内调用者，**保留**\n"
-            f"- `建议考虑删除` → 被多个内部函数调用，需配合代码确认后再决定\n\n"
-        )
-    return (
-        f"# R4 Worker — 模块级外部入口汇总\n\n"
-        f"模块：`{module_name}`\n"
-        f"{retry}\n"
-        f"{cc_section}"
-        f"## R3 各文件入口结果（完整路径，可直接 read）\n\n"
-        f"{file_list if file_list else '（无 R3 结果）'}\n\n"
-        f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取以上所有 R3 结果文件\n"
-        f"2. 分析跨文件调用关系：\n"
-        f"   - 若文件 A 的 funcX 调用了文件 B 的 funcY，"
-        f"且 funcY 接收的外部数据来自 funcX 传入的参数\n"
-        f"     → funcY 不是模块级最外层入口，**删除 funcY**，保留 funcX\n"
-        f"   - 若 funcY 直接调用 recv() 或直接被模块外部框架回调 → 独立入口，**保留**\n"
-        f"   - **dispatch_target 不要因存在上层 dispatcher 就删除**（它们是污点追踪推荐起点）\n"
-        f"3. 使用 `write` 工具将最终入口列表写出到：`{r4_out_path}`\n"
-        f"   格式：JSON 数组，每项与 R3 输出格式一致（保留 entry_role 字段）。\n\n"
-        f"完成后用 `<result>` 包裹摘要：各文件入口总数 → 模块级最终入口数，跨文件删除了哪些。\n\n"
-        f"## 输出前必须执行：格式自检\n\n"
-        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
-    )
-
-
-
 
 def build_r4_j_func_prompt(
     func_hash: str,
@@ -663,29 +507,6 @@ def build_r4_j_func_prompt(
         + (callers_context or "（调用链信息不可用）")
     )
 
-
-def build_r4_j_prompt(
-    r4_entries_path: Path,
-    module_name: str,
-    worker_result_file: str = "",
-) -> str:
-    """R4 Judge：评审模块级最终入口列表。"""
-    return (
-        f"# R4 Judge — 模块级入口评审\n\n"
-        f"模块：`{module_name}`\n\n"
-        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
-        f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取 R4 最终入口列表：`{r4_entries_path}`\n"
-        f"2. 评审：\n"
-        f"   - 每个入口的分类（P/A）是否正确\n"
-        f"   - taints / entry_source_lines 是否准确\n"
-        f"   - 是否有遗漏的跨文件调用链分析\n\n"
-        f"## 输出格式\n\n"
-        f"```\n"
-        f"通过: <是/否>\n"
-        f"反馈: <若不通过，说明哪个入口有问题及原因>\n"
-        f"```\n"
-    )
 
 
 # ─── Report Worker / Judge ───────────────────────────────────────────────────────────────
@@ -750,54 +571,6 @@ def build_report_func_j_prompt(
     )
 
 
-def build_report_w_prompt(
-    draft_path: "Path",
-    report_out_path: "Path",
-    module_name: str,
-    is_retry: bool = False,
-    feedback: str = "",
-    judge_result_file: str = "",
-) -> str:
-    """Report Worker：读取草稿 Markdown，丰富化内容，写出最终报告。"""
-    retry = _retry_section(feedback) if is_retry else ""
-    if is_retry and judge_result_file:
-        retry += f"\n上一轮 Judge 结果文件：`{judge_result_file}`（请先读取再改进）\n"
-    return (
-        f"# Report Worker — 安全分析报告丰富化\n\n"
-        f"模块：`{module_name}`\n"
-        f"{retry}\n"
-        f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取草稿文件：`{draft_path}`\n"
-        f"2. 阐读内容，按系统提示中的要求对每个入口条目进行丰富化：\n"
-        f"   - 补充缺失的 function_description/entry_reason/taint_details\n"
-        f"   - 每组入口角色末尾添加 `### 安全测试建议` 段落\n"
-        f"   - 在报告末尾添加 `## 覆盖率评估` 章节\n"
-        f"3. 将优化后的完整 Markdown 内容写入：`{report_out_path}`\n\n"
-        f"完成后用 `<result>` 包裹摘要：优化了哪些条目，添加了哪些内容。\n\n"
-        f"## 输出前必须执行：格式自检\n\n"
-        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
-    )
-
-
-def build_report_j_prompt(
-    report_path: "Path",
-    module_name: str,
-    worker_result_file: str = "",
-) -> str:
-    """Report Judge：评审安全分析报告质量。"""
-    return (
-        f"# Report Judge — 安全分析报告质量审核\n\n"
-        f"模块：`{module_name}`\n\n"
-        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
-        f"## 步骤\n\n"
-        f"1. 使用 `read` 工具读取报告文件：`{report_path}`\n"
-        f"2. 按系统提示中的维度逐一检查\n\n"
-        f"## 输出格式\n\n"
-        f"```\n"
-        f"通过: <是/否>\n"
-        f"反馈: <若不通过，说明具体缺陷和建议>\n"
-        f"```\n"
-    )
 
 
 # ─── 向后兼容别名（旧命名 → 新命名）──────────────────────────────────────────

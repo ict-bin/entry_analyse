@@ -98,7 +98,7 @@ class FunctionState:
         data = dict(data)
 
         # ── 向前兼容：旧字段 → 新字段 ──────────────────────────────────────
-        # r2_* (v3/v4) → r2_* (v5)
+        # r1b_*/r1_j_* (v3/v4) -> r2_* (v5)  《可下线时间：旧任务全部迁移完成后》
         if 'r1b_j_state' in data and 'r2_j_state' not in data:
             data['r2_j_state']         = data.get('r1b_j_state', 'pending')
             data['r2_j_attempts']      = data.get('r1b_j_attempts', 0)
@@ -129,12 +129,12 @@ class FunctionState:
                 data['r2_w_state']    = data.get('r1b_w_state', 'pending')
                 data['r2_w_attempts'] = data.get('r1b_w_attempts', 0)
 
-        # r3_decision (v4) → r4_decision (v5)
+        # r3_decision (v4)  《可下线时间：旧任务全部迁移完成后》 → r4_decision (v5)
         if 'r3_decision' in data and 'r4_decision' not in data:
             data['r4_decision'] = data.get('r3_decision', '')
             data['r4_note']     = data.get('r3_cross_file_note', '')
 
-        # report_* (v4) → r5_* (v5)
+        # report_* (v4) -> r5_* (v5)  《可下线时间：旧任务全部迁移完成后》
         if 'report_state' in data and 'r5_state' not in data:
             data['r5_state']    = data.get('report_state', 'pending')
             data['r5_attempts'] = data.get('report_attempts', 0)
@@ -168,16 +168,7 @@ class FileState:
     r1_attempts: int = 0
     r1_feedback: str = ""
 
-    # ── R3：文件级汇总状态（旧加载工下防崩溃字段）──────────────────────
-    r3_state:    NodeState = NodeState.PENDING
-    r3_attempts: int = 0
-    r3_feedback: str = ""
-
     # ── 函数级状态 ───────────────────────────────────────────────────────────
-    # R3 per-func decision cache: {func_hash: "passed_keep"|"passed_filter"}
-    # Persisted to pipeline_state.json for resume support
-    r3_func_state: dict = field(default_factory=dict)
-
     functions: dict[str, FunctionState] = field(default_factory=dict)
 
     updated_at: float = field(default_factory=time.time)
@@ -215,7 +206,6 @@ class FileState:
             'r1_attempts':   self.r1_attempts,
             'r1_feedback':   self.r1_feedback,
             'updated_at':    self.updated_at,
-            'r3_func_state': self.r3_func_state,
             'functions': {fh: fs.to_dict() for fh, fs in self.functions.items()},
         }
 
@@ -241,8 +231,6 @@ class FileState:
         obj.functions = {
             fh: FunctionState.from_dict(fd) for fh, fd in funcs_raw.items()
         }
-        obj.r3_func_state = {k: v for k, v in data.get('r3_func_state', {}).items()
-                             if isinstance(v, str)}
         return obj
 
 

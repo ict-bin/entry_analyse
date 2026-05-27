@@ -1,19 +1,16 @@
 """
-entry_analyse — Pipeline DAG 调度引擎（v3）
+entry_analyse — Pipeline DAG 调度引擎（v5）
 
 架构（新）：
 
   文件级并行：
-    R1a-W+J（覆盖率）→ R1b-W+J（准确性，函数级并行）
-      → R2-W+J（外部输入分析，函数级并行）
-      → R3（pre-filter + 函数级W并行 + 文件级J）
-
-  after 所有文件 R3 完成：
-    CC（静态调用链，无 LLM）→ R4-per-func-W（函数级并行，跨文件分析）
-    → R4-final-J（汇总验证）
-
-  after R4-final-J：
-    Report-per-func-W+J（函数级并行）→ Report-final-W+J
+    R1（覆盖率 W+J，文件级并行）
+    R2（准确性 J先行，函数级并行）
+    R3（外部输入分析 W+J，函数级并行，与 CC 并发）
+    CC（静态调用链建图，等 R2 全量完成）
+    R4（调用链冗余判断 W+J，函数级并行，等 CC）
+    R5（单函数报告 W+J，函数级并行）
+    R6（最终产物聚合，脚本化）
 
 并发控制：
   单一 asyncio.Semaphore(pipeline_parallelism) 限制所有 pi 进程数量。
@@ -293,7 +290,7 @@ def _collect_r3_kept_from_state(state: "PipelineState") -> list[dict]:
 
 class PipelineEngine:
     """
-    四轮流水线 DAG 调度引擎（v3）。
+    六阶段流水线 DAG 调度引擎（v5）：R1→R2→R3→CC→R4→R5→R6。
 
     使用方式：
         engine = PipelineEngine(cfg, task_id, on_event, cancel_event)
@@ -738,7 +735,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R1a：文件级覆盖率 W+J 循环。"""
+        """R1：文件级覆盖率 W+J 循环。"""
         fs = state.files[file_hash]
         r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
 
@@ -746,7 +743,7 @@ class PipelineEngine:
             if fs.r1_j_state == NodeState.PASSED:
                 break
 
-            # R1a-W
+            # R1-W
             fs.r1_w_state = NodeState.RUNNING
             fs.r1_attempts += 1
             state.save(dirs.state_file)
@@ -778,7 +775,7 @@ class PipelineEngine:
                 state.save(dirs.state_file)
 
             except Exception as exc:
-                logger.error("R1a W failed for %s: %s", file_path, exc)
+                logger.error("R1-W failed for %s: %s", file_path, exc)
                 fs.r1_w_state = NodeState.FAILED
                 state.save(dirs.state_file)
                 break
@@ -786,7 +783,7 @@ class PipelineEngine:
             if self._cancel.is_set():
                 break
 
-            # R1a-J（文件级覆盖率验证）
+            # R1-J（文件级覆盖率验证）
             j_session = str(dirs.r1_j_session(file_hash, fs.r1_attempts))
             self._emit("r1_j_start", file_hash=file_hash,
                        file=Path(file_path).name, attempt=fs.r1_attempts)
@@ -837,7 +834,7 @@ class PipelineEngine:
                 if j_passed:
                     break
             except Exception as exc:
-                logger.error("R1a J failed for %s: %s", file_hash, exc)
+                logger.error("R1-J failed for %s: %s", file_hash, exc)
                 # J 异常 → 标记 FAILED，交由 max_rounds 控制重试
                 fs.r1_j_state = NodeState.FAILED
                 fs.r1_feedback = f"judge exception: {str(exc)[:300]}"
@@ -860,7 +857,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2 Worker：J 判定失败后，带 J 反馈修正 ctags 行号并写回 funcdb。"""
+        """R2-W：J 判定失败后，带 J 反馈修正 ctags 行号并写回 funcdb。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_w_state = NodeState.RUNNING
         func_state.r2_w_attempts += 1
@@ -892,7 +889,7 @@ class PipelineEngine:
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
                        file=Path(file_path).name, passed=True)
         except Exception as exc:
-            logger.error("R2 W failed for %s: %s", func_hash, exc)
+            logger.error("R2-W failed for %s: %s", func_hash, exc)
             func_state.r2_w_state = NodeState.FAILED
             state.save(dirs.state_file)
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
@@ -906,7 +903,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> bool:
-        """R2 Judge：验证 ctags 提取的函数行号是否正确，返回 passed。"""
+        """R2-J：验证 ctags 提取的函数行号是否正确，返回 passed。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_j_state = NodeState.RUNNING
         func_state.r2_j_attempts += 1
@@ -1163,7 +1160,7 @@ class PipelineEngine:
                 func_state.r3_w_state = NodeState.FAILED
                 state.save(dirs.state_file)
 
-    # ── R2 Judge（函数级）────────────────────────────────────────────────────
+    # ── R2-J ────────────────────────────────────────────────────
 
     async def _run_r3_analysis_j(
         self,
@@ -1476,7 +1473,7 @@ class PipelineEngine:
             acfg = self.cfg.workers.agents[0]
             await self._call_agent(
                 prompt=prompt,
-                system_prompt=self._stage_sys_prompt('r4_worker'),
+                system_prompt=self._stage_sys_prompt('r4_func_worker'),
                 session_file=session_file,
                 cwd=str(dirs.stage_cwd("r4_func_w")),
                 context=f"r4_func:{func_hash}",
