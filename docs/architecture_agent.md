@@ -515,3 +515,203 @@ r4-func-w-{func}.jsonl   R4-W   reuse across retries
 r4-func-j-{func}-a{n}.jsonl  R4-J  new per attempt
 r5-w-{func}.jsonl         R5-W   reuse across retries
 r5-j-{func}-a{n}.jsonl   R5-J   new per attempt
+
+---
+## CODE_SUBMISSION
+
+### REPO_STRUCTURE
+
+MAIN_REPO: runshine/sothoth  branch=v2.1
+SUBMODULE: ict-bin/entry_analyse  branch=main
+  path: 13-secflow-service/image_build/secflow-app-entry-analyse/
+  remote: https://github.com/ict-bin/entry_analyse.git
+
+RULE: ALWAYS push submodule FIRST, then update main repo pointer.
+      CI reads the submodule at the pointer recorded in sothoth.
+      If main repo points to an unpushed submodule commit, CI checkout fails.
+
+### SUBMISSION_STEPS
+
+STEP 1: Commit and push to submodule
+  cd 13-secflow-service/image_build/secflow-app-entry-analyse
+  git add -A
+  git commit -m "<message>"
+  git pull --rebase origin main && git push origin main
+
+STEP 2: Update main repo submodule pointer
+  cd <sothoth_root>
+  git fetch origin v2.1 && git reset --hard origin/v2.1  # sync first
+  git add 13-secflow-service/image_build/secflow-app-entry-analyse
+  git commit -m "update entry_analyse: <description> (<submodule_sha>)"
+  git push
+
+STEP 3: Verify CI triggered
+  Check https://github.com/runshine/sothoth/actions
+  Workflow: build-secflow-app-entry-analyse-image
+  Trigger condition: push to v2.* branch with changes under
+    13-secflow-service/image_build/secflow-app-entry-analyse/**
+
+NOTE: If no path-matching changes, CI will NOT auto-trigger.
+      Use workflow_dispatch to manually trigger:
+  curl -X POST https://api.github.com/repos/runshine/sothoth/actions/workflows/<id>/dispatches
+    -H "Authorization: Bearer <TOKEN>" -d '{"ref":"v2.1"}'
+  Workflow ID for entry-analyse: 272546265
+
+### CI_MONITORING
+
+Poll until completed:
+  GET https://api.github.com/repos/runshine/sothoth/actions/runs?per_page=5
+  Filter: workflow_runs[].name contains "entry"
+  Check: status == "completed" AND conclusion == "success"
+
+DATE_TAG formula (used for image tagging):
+  SHORT_SHA = github.sha[:7]
+  COMMIT_TS = git show -s --format=%ct <sha>
+  DATE_TAG  = strftime('%Y%m%d-%H%M%S', localtime(COMMIT_TS, tz=Asia/Shanghai)) + "-" + SHORT_SHA
+  Example: 20260527-163152-7bb63b6
+
+IMAGE_TAGS produced by CI:
+  ghcr.io/runshine/secflow-app-entry-analyse:latest
+  ghcr.io/runshine/secflow-app-entry-analyse:<DATE_TAG>
+
+---
+## POD_DEPLOYMENT
+
+### NAMESPACE
+  secflow-ns
+
+### DEPLOYMENTS
+  secflow-app-entry-analyse          (API, replicas=1)
+  secflow-app-entry-analyse-worker   (Worker, replicas=4)
+  secflow-app-entry-analyse-scheduler (Scheduler, replicas=2)
+
+### CONTAINER_NAME_MAP
+  deployment secflow-app-entry-analyse          -> container: secflow-app-entry-analyse
+  deployment secflow-app-entry-analyse-worker   -> container: secflow-app-entry-analyse-worker
+  deployment secflow-app-entry-analyse-scheduler-> container: secflow-app-entry-analyse-scheduler
+
+### DEPLOYMENT_STEPS
+
+STEP 1: Wait for CI to complete (see CI_MONITORING)
+
+STEP 2: Calculate new DATE_TAG from the triggering commit sha
+  python3 -c "
+  import datetime
+  ts = <COMMIT_TS>
+  dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=8)))
+  print(dt.strftime('%Y%m%d-%H%M%S') + '-' + '<SHORT_SHA>')
+  "
+
+STEP 3: Update deployment images
+  NEW_IMAGE="ghcr.io/runshine/secflow-app-entry-analyse:<DATE_TAG>"
+  kubectl set image deployment/secflow-app-entry-analyse \
+    secflow-app-entry-analyse=$NEW_IMAGE -n secflow-ns
+  kubectl set image deployment/secflow-app-entry-analyse-worker \
+    secflow-app-entry-analyse-worker=$NEW_IMAGE -n secflow-ns
+  kubectl set image deployment/secflow-app-entry-analyse-scheduler \
+    secflow-app-entry-analyse-scheduler=$NEW_IMAGE -n secflow-ns
+
+STEP 4: Wait for rollout
+  kubectl get pods -n secflow-ns | grep "entry-analyse" | grep -v "import\|Completed\|Terminating"
+  All pods should be Running within ~60s
+
+STEP 5: Force-delete stuck/error pods if any
+  kubectl delete pod <pod_name> -n secflow-ns --force --grace-period=0
+
+STEP 6: Verify new code is running
+  WPOD=$(kubectl get pod -n secflow-ns -l app=secflow-app-entry-analyse-worker \
+    -o jsonpath='{.items[0].metadata.name}')
+  kubectl exec -n secflow-ns $WPOD -- python3 -c "
+    import sys; sys.path.insert(0,'/opt/entry_analyse')
+    from app.pipeline.engine import PipelineEngine
+    print(PipelineEngine._run_r6_finalize)  # should exist
+  "
+
+NOTE: rollout restart reuses the existing image tag in the deployment spec.
+      Always use 'kubectl set image' with the new DATE_TAG to actually deploy new code.
+      Do NOT use 'kubectl rollout restart' alone — it won't pull a new image if the tag hasn't changed.
+
+---
+## ENVIRONMENT_CONNECTION
+
+### K8S_ACCESS
+  kubectl is configured locally to access the cluster.
+  Namespace: secflow-ns
+  No additional setup needed.
+
+### EXEC_INTO_POD
+
+Get a running worker pod:
+  WPOD=$(kubectl get pod -n secflow-ns -l app=secflow-app-entry-analyse-worker \
+    --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+
+Execute Python code:
+  kubectl exec -n secflow-ns $WPOD -- bash -c "python3 -c \"...\""
+
+NOTE: Use bash -c wrapper to avoid Windows shell escaping issues.
+      Inside pod, code path is /opt/entry_analyse/
+
+### DATABASE_ACCESS
+
+From pod (no direct external access):
+  DB host: mysql.sothothv2-ns.svc.cluster.local:3306
+  DB name: secflow_entry_analyse
+  Credentials: in /app/service.yaml inside pod
+
+Read credentials from pod:
+  kubectl exec -n secflow-ns $APOD -- bash -c "cat /app/service.yaml"
+  Field: database.username / database.password / database.name
+
+Connect from pod for ad-hoc queries:
+  kubectl exec -n secflow-ns $APOD -- bash -c "
+  python3 -c \"
+  import yaml
+  cfg = yaml.safe_load(open('/app/service.yaml'))
+  db = cfg['database']
+  url = 'mysql+pymysql://{}:{}@{}:{}/{}'.format(
+    db['username'], db['password'], db['host'], db.get('port',3306), db['name'])
+  from app.db import init_db; init_db(url)
+  from app.db import get_db
+  from app.db.models import AppEaTask
+  db_session = next(get_db())
+  task = db_session.query(AppEaTask).filter(AppEaTask.task_id=='eat_xxx').first()
+  print(task.status, task.task_config_json)
+  \"
+  "
+
+### TASK_WORKSPACE_ACCESS
+
+Task data path pattern:
+  /data/files/<project_id>/app/secflow-app-entry-analyse/<task_id>/
+    run/                  <- pipeline state and all working files
+      pipeline_state.json
+      workspace/
+        r1-functions/     <- FuncDB files ({file_hash}_functions.db)
+        r3_func/          <- R3 per-func JSON (kept for backward compat)
+        r4-module/        <- R4-W result files (r4-func-{hash}.json)
+        callchain/        <- callchain.db
+        stage-results/    <- all stage result files
+        stage_cwd/        <- per-stage cwd with .pi/skills/
+      sessions/           <- LLM session JSONL files
+    input/                <- source files (read-only)
+    output/               <- final delivery (functions.list, final_report.md)
+
+Find task run_dir from DB:
+  task_config = json.loads(task.task_config_json or '{}')
+  # output_path field gives the base output dir
+  # run_dir = output_path + '/' + task_id + '/run'
+
+Access from any running pod (shared PVC):
+  kubectl exec -n secflow-ns $WPOD -- bash -c "ls /data/files/<project_id>/app/secflow-app-entry-analyse/"
+
+### GITHUB_API_ACCESS
+
+Token: read from git credential store
+  r=subprocess.run(['git','credential','fill'],
+    input='protocol=https\nhost=github.com\n', capture_output=True, text=True)
+  TOKEN=''.join(l.split('=',1)[1].strip() for l in r.stdout.split('\n') if l.startswith('password='))
+
+Common endpoints:
+  List workflow runs: GET /repos/runshine/sothoth/actions/runs?per_page=10
+  Trigger dispatch:  POST /repos/runshine/sothoth/actions/workflows/<id>/dispatches
+  List jobs:         GET /repos/runshine/sothoth/actions/runs/<run_id>/jobs
