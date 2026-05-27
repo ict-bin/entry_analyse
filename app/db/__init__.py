@@ -43,6 +43,8 @@ _MIGRATIONS = [
     "CREATE INDEX ix_ea_tasks_project_deleted_status_lease_id ON secflow_app_ea_tasks (project_id, is_deleted, status, lease_expires_at, id)",
     "CREATE INDEX ix_ea_tasks_parent_stage_item_id_lookup ON secflow_app_ea_tasks (project_id, is_deleted, parent_task_id, parent_stage_name, parent_stage_item_id, created_at, id)",
     "CREATE INDEX ix_ea_tasks_parent_stage_item_key_lookup ON secflow_app_ea_tasks (project_id, is_deleted, parent_task_id, parent_stage_name, parent_stage_item_key, created_at, id)",
+    # 列表默认按 updated_at DESC 排序，加入覆盖索引消除 filesort
+    "CREATE INDEX ix_ea_tasks_project_deleted_updated_id ON secflow_app_ea_tasks (project_id, is_deleted, updated_at, id)",
     "CREATE INDEX ix_ea_stage_result_task_stage_role_attempt ON secflow_app_ea_stage_result_index (task_id, stage_key, role_kind, attempt)",
     "CREATE INDEX ix_ea_stage_result_task_func_stage ON secflow_app_ea_stage_result_index (task_id, func_hash, stage_key)",
     "CREATE INDEX ix_ea_stage_result_task_file_stage ON secflow_app_ea_stage_result_index (task_id, file_hash, stage_key)",

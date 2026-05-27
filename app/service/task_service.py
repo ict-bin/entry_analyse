@@ -893,6 +893,32 @@ def _write_task_result_json(row: AppEaTask, payload: dict) -> str | None:
     return str(path)
 
 
+def _stages_json_light(db: "Session", task_id: str) -> dict:
+    """Return {event_count, final} using MySQL JSON functions; never loads the blob.
+
+    Mirrors the pre-check in GET /tasks/{id}/logs so the full stages_json
+    column is not transferred from MySQL to Python just to count events.
+    """
+    from sqlalchemy import text as _sa_text
+    try:
+        row = db.execute(
+            _sa_text(
+                "SELECT JSON_LENGTH(stages_json, '$.events') AS ec, "
+                "JSON_VALUE(stages_json, '$.final') AS fin "
+                "FROM secflow_app_ea_tasks WHERE task_id = :tid AND is_deleted = 0"
+            ),
+            {"tid": task_id},
+        ).fetchone()
+        if row:
+            return {
+                "event_count": int(row[0] or 0),
+                "final": bool(row[1] and str(row[1]).lower() not in ("0", "false", "null")),
+            }
+    except Exception:
+        pass
+    return {"event_count": 0, "final": False}
+
+
 def _stages_json_summary(stages_json: dict | None) -> dict:
     """Return a lightweight summary of stages_json (event count + final flag).
 
@@ -1815,7 +1841,33 @@ class TaskService:
         }
 
     def get_task(self, db: Session, task_id: str) -> dict:
-        return self._row_to_dict(self._get_or_404(db, task_id), db=db)
+        # 排除 stages_json 大字段（平均 75KB、最大 509KB），改用轻量 JSON_LENGTH 查询获取 event_count/final
+        row = (
+            db.query(AppEaTask)
+            .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
+            .options(load_only(
+                AppEaTask.id, AppEaTask.task_id, AppEaTask.project_id,
+                AppEaTask.task_origin_type, AppEaTask.parent_project_id,
+                AppEaTask.parent_task_id, AppEaTask.parent_task_type,
+                AppEaTask.parent_stage_name, AppEaTask.parent_stage_item_id,
+                AppEaTask.parent_stage_item_key, AppEaTask.task_name,
+                AppEaTask.task_description, AppEaTask.input_path,
+                AppEaTask.source_path, AppEaTask.module_name, AppEaTask.output_path,
+                AppEaTask.prompt_template_id, AppEaTask.prompt_content,
+                AppEaTask.status, AppEaTask.owner_pod, AppEaTask.lease_expires_at,
+                AppEaTask.cancel_requested, AppEaTask.error, AppEaTask.result_json,
+                AppEaTask.latest_abnormal_reason_json, AppEaTask.created_by,
+                AppEaTask.created_at, AppEaTask.updated_at,
+                AppEaTask.started_at, AppEaTask.finished_at,
+                AppEaTask.task_config_json,
+                # 注意：此处故意不包含 AppEaTask.stages_json
+            ))
+            .first()
+        )
+        if not row:
+            from fastapi import HTTPException
+            raise HTTPException(404, f"任务不存在: {task_id}")
+        return self._row_to_dict(row, db=db)
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -2431,6 +2483,7 @@ class TaskService:
                 AppEaTask.updated_at,
                 AppEaTask.started_at,
                 AppEaTask.finished_at,
+                AppEaTask.task_config_json,   # 必须包含：_safe_origin_payload 访问该字段，缺少会触发 N+1 延迟加载
             ),
         )
 
@@ -2518,7 +2571,7 @@ class TaskService:
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content,
             "result_json": _lightweight_result_json(row, row.result_json),
-            "stages_json": _stages_json_summary(row.stages_json),
+            "stages_json": _stages_json_light(db, row.task_id) if db is not None else _stages_json_summary(row.stages_json),
             "task_config_json": _parse_task_config(row.task_config_json),
             "function_catalog": _build_function_catalog(row),
             "lean_mode": bool(
