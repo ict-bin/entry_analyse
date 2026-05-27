@@ -100,7 +100,7 @@ class PipelineDirs:
 
     # backward compat alias
     def r1a_gaps_file(self, file_hash: str) -> Path:
-        """backward compat alias: r1a_gaps_file → r1_gaps_file"""
+        """v4旧名（R1a → R1），新代码使用 r1_gaps_file"""
         return self.r1_gaps_file(file_hash)
 
     def r3_file_path(self, file_hash: str) -> Path:
@@ -143,13 +143,13 @@ class PipelineDirs:
     def r1_j_session(self, file_hash: str, attempt: int) -> Path:
         return self.sessions / f"r1-j-{file_hash}-a{attempt}.jsonl"
 
-    # backward compat aliases (r1a_ → r1_, r1b_ → r2_)
+    # 向后兼容别名（v4旧命名 → v5正名）：r1a_ = R1（文件级）, r1b_ = R2（ctags 准确性）
     def r1a_w_session(self, file_hash: str) -> Path:
-        """backward compat: r1a_w_session → r1_w_session"""
+        """v4旧名（R1a-W → R1-W），新代码使用 r1_w_session"""
         return self.r1_w_session(file_hash)
 
     def r1a_j_session(self, file_hash: str, attempt: int) -> Path:
-        """backward compat: r1a_j_session → r1_j_session"""
+        """v4旧名（R1a-J → R1-J），新代码使用 r1_j_session"""
         return self.r1_j_session(file_hash, attempt)
 
     # R2 Accuracy（函数级，只有 J，无独立 W session）
@@ -158,11 +158,11 @@ class PipelineDirs:
 
     # backward compat aliases
     def r1b_j_session(self, func_hash: str, attempt: int) -> Path:
-        """backward compat: r1b_j_session → r2_j_session"""
+        """v4旧名（R1b-J → R2-J ctags 准确性），新代码使用 r2_j_session"""
         return self.r2_j_session(func_hash, attempt)
 
     def r1b_w_session(self, func_hash: str) -> Path:
-        """R2 accuracy Worker session (r1b 命名保留向后兼容)"""
+        """v4旧名（R1b-W → R2-W ctags 修正），新代码使用 r2_w_session"""
         return self.sessions / f"r2-w-{func_hash}.jsonl"
 
     # R3 Entry Analysis（函数级）

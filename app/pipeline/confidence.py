@@ -5,11 +5,11 @@ entry_analyse — 入口置信度评分计算
 表示"该函数是真实外部入口"的概率估计。
 
 评分维度及权重：
-  BASE_SCORE              = 0.35   # R2-W 判定 has_external_input=true 的基础分
+  BASE_SCORE              = 0.35   # R3-W 判定 has_external_input=true 的基础分
 
   tag_A                   = +0.20  # 主动型（有 recv 明确证据），最强证据
-  entry_source_lines      = +0.08  # R2-W 提供了具体的代码证据行
-  r2_j_passed             = +0.15  # R2-J 验证通过（taints 真实，P/A 分类正确）
+  entry_source_lines      = +0.08  # R3-W 提供了具体的代码证据行
+  r3_j_passed             = +0.15  # R3-J 验证通过（taints 真实，P/A 分类正确）
   entry_role_boundary     = +0.15  # 确认是模块最外层边界
   entry_role_callback     = +0.12  # 框架注册回调
   entry_role_ipc_handler  = +0.10  # IPC 消息处理器
@@ -38,7 +38,7 @@ BASE_SCORE = 0.35
 _WEIGHTS: dict[str, float] = {
     "tag_A":                   0.20,
     "entry_source_lines":      0.08,
-    "r2_j_passed":             0.15,
+    "r3_j_passed":             0.15,
     "entry_role_boundary":     0.15,
     "entry_role_callback":     0.12,
     "entry_role_ipc_handler":  0.10,
@@ -62,7 +62,7 @@ def compute_confidence(
     计算入口置信度分数。
 
     Args:
-        analysis:         R2-W 写入的 analysis 字典（来自 funcdb 或 analysis 字段）
+        analysis:         R3-W 写入的 analysis 字典（来自 funcdb 或 analysis 字段）
                           必须包含 has_external_input/tag/taints/entry_role/taint_details 等
         func_state_dict:  FunctionState.to_dict() 的输出（可选）
                           用于读取 r2_j_state 字段
@@ -92,12 +92,12 @@ def compute_confidence(
         score += _WEIGHTS["entry_source_lines"]
         flags["entry_source_lines"] = True
 
-    # ── R2-J 验证加分 ─────────────────────────────────────────────────────────
+    # ── R3-J 验证加分 ─────────────────────────────────────────────────────────
     if func_state_dict:
-        r2_j_state = str(func_state_dict.get("r2_j_state") or "").lower()
-        if r2_j_state == "passed":
-            score += _WEIGHTS["r2_j_passed"]
-            flags["r2_j_passed"] = True
+        r3_j_state = str(func_state_dict.get("r3_j_state") or "").lower()
+        if r3_j_state == "passed":
+            score += _WEIGHTS["r3_j_passed"]
+            flags["r3_j_passed"] = True
 
     # ── 入口角色加分 ──────────────────────────────────────────────────────────
     entry_role = str(analysis.get("entry_role") or "").strip().lower()

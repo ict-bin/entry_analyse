@@ -12,7 +12,7 @@ entry_analyse — 函数数据库（SQLite）封装层
   db.write_functions(...)                 ← R1-W 初次批量写入
   db.update_function(func_hash, **kwargs) ← R1-W 修正单函数
   db.delete_function(func_hash)           ← R1-W 删除纯声明
-  db.set_analysis(func_hash, analysis)    ← R2-W 写分析结果（无需外部锁）
+  db.set_analysis(func_hash, analysis)    ← R3-W 写分析结果（无需外部锁）
   db.sync_from_json(data)                 ← 修正后全量重同步
   db.get_function(func_hash)              ← 查单条（含 body）
   db.get_all_meta()                       ← 全量元数据（无 body）
@@ -210,14 +210,14 @@ class FunctionDB:
 
     def set_analysis(self, func_hash: str, analysis_dict: dict) -> None:
         """
-        写入 R2-W 分析结果，同时更新 entry_role 字段。
+        写入 R3-W 分析结果，同时更新 entry_role 字段。
 
         SQLite WAL 原子写，无需外部 asyncio.Lock。
-        多个 R2-W 协程可安全并发调用。
+        多个 R3-W 协程可安全并发调用。
 
         Args:
             func_hash:     函数 hash
-            analysis_dict: R2-W 输出的分析 dict（含 has_external_input 字段）
+            analysis_dict: R3-W 输出的分析 dict（含 has_external_input 字段）
         """
         has_input = 1 if analysis_dict.get("has_external_input") else 0
         from ..functions_list import VALID_ENTRY_ROLES
@@ -389,7 +389,7 @@ class FunctionDB:
         """
         查询全量元数据（不含 body）。
 
-        供 R2-J/R3 Agent 获取函数列表，无截断风险（每条约 200 字节）。
+        供 R3-W/R3-J/R4-W Agent 获取函数列表，无截断风险（每条约 200 字节）。
 
         Returns:
             按 start_line 升序的 list，每项含
@@ -422,7 +422,7 @@ class FunctionDB:
         """
         查询 has_external_input=1 的函数（含 analysis、entry_role、file_path，不含 body）。
 
-        供 R2-J/R3-W/R3-J/R4-W Agent 获取已确认外部入口列表。
+        供 R3-W/R3-J/R4-W Agent 获取已确认外部入口列表。
 
         Returns:
             按 start_line 升序的 list，每项含
@@ -472,7 +472,7 @@ class FunctionDB:
         source_file: str,
     ) -> None:
         """
-        直接在 DB 内应用 R1a/R1b Worker 输出的修正列表。
+        直接在 DB 内应用 R1-W/R2-W Worker 输出的修正列表。
 
         取代旧的 _apply_r1_corrections(data, ...) + sync_from_json(data) 两步，
         所有 body 从源文件重提取（不信任 LLM）。
@@ -590,9 +590,9 @@ class FunctionDB:
 
     def get_functions_for_r2(self) -> list[dict]:
         """
-        返回全量函数元数据（不含 body），供 R1b-W/J 使用。
+        返回全量函数元数据（不含 body），供 R2-W/J 使用。
 
-        与 get_all_meta() 相同，但语义更明确（R1b 准确性验证专用）。
+        与 get_all_meta() 相同，但语义更明确（R2 ctags 准确性验证专用）。
         """
         return self.get_all_meta()
 

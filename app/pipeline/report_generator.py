@@ -315,7 +315,7 @@ def generate_report(
     lines.append("")
     lines.append("- **boundary** / **callback** / **ipc_handler**：模块外部边界，适合作为 Fuzzer 入口或安全审计起点")
     lines.append("- **dispatch_target**：被 dispatcher 分发的处理函数，**推荐作为污点分析（Taint Analysis）起点**，可避免从 dispatcher 追踪造成路径爆炸")
-    lines.append("- **置信度** `0.0-1.0`：基于 tag/entry_role/R2-J验证/调用链等多维证据综合评分，分数越高越可信")
+    lines.append("- **置信度** `0.0-1.0`：基于 tag/entry_role/R3-J验证/调用链等多维证据综合评分，分数越高越可信")
     lines.append("")
 
     # 各组入口详情

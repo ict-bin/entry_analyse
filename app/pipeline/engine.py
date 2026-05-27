@@ -90,8 +90,8 @@ from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
 
-# 函数数超过此阈值时跳过 R1b-J（ctags 对大文件整体可靠）
-R1B_J_SKIP_THRESHOLD = int(os.getenv("EA_R1J_SKIP_THRESHOLD", "80"))
+# 函数数超过此阈值时跳过 R2-J（ctags 对大文件整体可靠）
+R2J_SKIP_THRESHOLD = int(os.getenv("EA_R2J_SKIP_THRESHOLD", "80"))
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -574,7 +574,7 @@ class PipelineEngine:
 
         return final_entries
 
-    # ── Phase 1 文件单元：仅 R1a + R1b ────────────────────────────────────────
+    # ── Phase 1 文件单元：R1（文件级 W+J）+ R2（ctags 行号准确性）──────────────
 
     async def _run_file_r1(
         self,
@@ -664,7 +664,7 @@ class PipelineEngine:
     ) -> None:
         """
         Phase 3 函数单元：
-          1. R2-W（外部输入分析）+ R2-J（验证）
+          1. R3-W（外部输入分析）+ R3-J（验证）
           2. 检查 has_external_input，否则跳过后续
 
         注意：per-func 入口决策 (_run_r3_entry) 由 _func_pipeline 在
@@ -677,7 +677,7 @@ class PipelineEngine:
             return
         func_state = fs.functions[func_hash]
 
-        # R2-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
+        # R3-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
         if func_state.r3_w_state != NodeState.PASSED:
             await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
 
@@ -847,7 +847,7 @@ class PipelineEngine:
             fs.r1_j_state = NodeState.PASSED
             state.save(dirs.state_file)
 
-    # ── R1b+R2 W+J（每函数串链）──────────────────────────────────────────────
+    # ── R2（ctags 行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
 
     async def _run_r2_w(
         self,
@@ -1039,12 +1039,12 @@ class PipelineEngine:
     ) -> None:
         """R3 Worker：外部输入分析（函数级，session 跨重试共享）。"""
         func_state = state.files[file_hash].functions[func_hash]
-        r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
+        r3_max = int(getattr(self.cfg, "r3_max_rounds", -1))
         # 修复：原来误用 dirs.r4_w_session()，生成 r4-w-*.jsonl，导致 R3-W session 被误当 R4 session
         session_file = str(dirs.r3_w_session(file_hash, func_hash))
         db_path = dirs.r1_functions_db(file_hash)
 
-        while _should_continue(func_state.r3_w_attempts, r2_max, self._cancel):
+        while _should_continue(func_state.r3_w_attempts, r3_max, self._cancel):
             if func_state.r3_w_state == NodeState.PASSED:
                 break
 
@@ -1160,7 +1160,7 @@ class PipelineEngine:
                 func_state.r3_w_state = NodeState.FAILED
                 state.save(dirs.state_file)
 
-    # ── R2-J ────────────────────────────────────────────────────
+    # ── R3-J ────────────────────────────────────────────────────
 
     async def _run_r3_analysis_j(
         self,

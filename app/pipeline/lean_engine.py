@@ -203,7 +203,7 @@ class LeanPipelineEngine:
 
         fs = state.files[file_hash]
 
-        # Step 1: 静态提取（无 LLM，替代完整模式的 R1a+R1b）
+        # Step 1: 静态提取（无 LLM，替代完整模式的 R1（ctags 提取）+R2（ctags 准确性校正））
         if not fs.static_done:
             await self._static_extract(file_hash, file_path, dirs, state)
 
@@ -222,9 +222,9 @@ class LeanPipelineEngine:
         state: LeanPipelineState,
     ) -> None:
         """
-        ctags 静态提取函数列表，写入 funcdb。无 LLM，替代完整模式的 R1a+R1b。
+        ctags 静态提取函数列表，写入 funcdb。无 LLM，替代完整模式的 R1（ctags 提取）+R2（ctags 准确性校正）。
 
-        精简模式不做行号精确性校正（R1b），接受 ctags 的原始输出，
+        精简模式不做行号精确性校正（R2），接受 ctags 的原始输出，
         这是"允许一定漏报误报"设计的组成部分。
         """
         basename = os.path.basename(file_path)

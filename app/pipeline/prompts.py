@@ -2,11 +2,11 @@
 entry_analyse — Pipeline 各阶段 Prompt 构建器
 
 设计原则（v3）：
-  - R2-W 初始 prompt = 纯元数据（func_hash/name/行号），固定大小
-  - R2-J 函数级：每函数独立验证 taints + P/A 分类，输出摘要行
-  - R2-W retry：feedback = "【摘要(≤60字)】详细见文件：path"
-  - R3-W：主动过滤，默认删除，仅保留可证明的顶层入口
-  - R3-J：期望激进过滤，Fill/Crypto/Subscribe 误留 → FAIL
+  - R3-W 初始 prompt = 纯元数据（func_hash/name/行号），固定大小
+  - R3-J 函数级：每函数独立验证 taints + P/A 分类，输出摘要行
+  - R3-W retry：feedback = "【摘要(≤60字)】详细见文件：path"
+  - R4-W：结合调用链判断，默认 keep，有上层入口调用则 filter
+  - R4-J：验证 R4-W 的 keep/filter 决策是否有调用链证据
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _retry_section(feedback: str, label: str = "Judge 评审意见") -> str:
     return f"\n## 上次结果有问题，请修正\n\n{feedback}\n"
 
 
-# ─── R1a Judge / R1 Judge ─────────────────────────────────────────────────────
+# ─── R1 Judge（文件级覆盖率验证）──────────────────────────────────────────────
 
 def build_r1_file_j_prompt(
     file_name: str,
@@ -83,12 +83,12 @@ def build_r2_j_prompt(  # 正确命名：R2-J 行号准确性验证
     worker_result_file: str = "",
 ) -> str:
     """
-    R1 Judge：验证 ctags 提取的函数行号是否正确。
+    R2 Judge：验证 ctags 提取的函数行号是否正确（J-first，J 失败后 W 修正）。
     用 bash sed 而非 read+offset（消除 off-by-one）。
     """
     basename = os.path.basename(file_path)
     return (
-        f"# R1 Judge — 函数行号验证\n\n"
+        f"# R2 Judge — ctags 行号准确性验证\n\n"
         f"| 字段       | 值                |\n"
         f"|------------|-------------------|\n"
         f"| func_hash  | `{func_hash}`     |\n"
@@ -230,7 +230,7 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
         )
 
     return (
-        f"# R2 Worker — 函数外部输入分析\n\n"
+        f"# R3 Worker — 外部输入分析\n\n"
         f"| 字段      | 值                       |\n"
         f"|-----------|-------------------------|\n"
         f"| func_hash | `{func_hash}`            |\n"
@@ -298,7 +298,7 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
     worker_result_file: str = "",
 ) -> str:
     """
-    R2 Judge（函数级）：验证单个函数的 R2 分析质量。
+    R3 Judge（函数级）：验证单个函数的外部输入分析质量。
 
     v2 变化：
     - 删除 awk 硬编码模式扫描（仅适用于特定项目）
@@ -309,7 +309,7 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
     sed_body = f"sed -n '{start_line},{end_line}p' {file_path}"
 
     return (
-        f"# R2 Judge \u2014 \u51fd\u6570\u7ea7\u5206\u6790\u9a8c\u8bc1\n\n"
+        f"# R3 Judge \u2014 \u5916\u90e8\u8f93\u5165\u5206\u6790\u9a8c\u8bc1\n\n"
         f"| \u5b57\u6bb5      | \u5024                       |\n"
         f"|-----------|-------------------------|\n"
         f"| func_hash | `{func_hash}`            |\n"
@@ -518,6 +518,6 @@ def build_report_func_j_prompt(
 
 # ─── 向后兼容别名（旧命名 → 新命名）──────────────────────────────────────────
 # 旧代码不应再使用以下别名，仅用于平滑过渡
-build_r1_j_prompt     = build_r2_j_prompt     # 原R2-J（行号验证），错误地叫r1_j
-build_r2_w_prompt     = build_r3_w_prompt     # 原R3-W（外部输入分析），错误地叫r2_w
-build_r2_j_func_prompt = build_r3_j_prompt   # 原R3-J（分析验证），错误地叫r2_j_func
+build_r1_j_prompt     = build_r2_j_prompt     # v4旧名 r1_j → v5正名 build_r2_j_prompt
+build_r2_w_prompt     = build_r3_w_prompt     # v4旧名 r2_w → v5正名 build_r3_w_prompt（注意：r1_worker.py 有同名本地函数用于 R2-W ctags 修正，非此别名）
+build_r2_j_func_prompt = build_r3_j_prompt   # v4旧名 r2_j_func → v5正名 build_r3_j_prompt

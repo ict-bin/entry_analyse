@@ -633,7 +633,7 @@ def write_functions_db(
 
     与 write_functions_json() 同步调用，提供 Agent 可查询的结构化存储：
     - Agent 通过 `ea_db.py get <db> <func_hash>` 按需查询单条（无截断）
-    - R2-W 分析结果通过 FunctionDB.set_analysis() 写回（无需 asyncio.Lock）
+    - R3-W 分析结果通过 FunctionDB.set_analysis() 写回（无需 asyncio.Lock）
 
     Args:
         funcs:         FunctionExtract 列表

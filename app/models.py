@@ -107,7 +107,6 @@ class ServiceConfig(BaseModel):
     pipeline_parallelism: int = Field(default=64)
     r1_max_rounds: int = Field(default=-1)
     r2_max_rounds: int = Field(default=-1)
-    r2_max_rounds: int = Field(default=-1)
     r3_max_rounds: int = Field(default=-1)
     r4_func_max_rounds: int = Field(default=-1)
     r4_final_max_rounds: int = Field(default=-1)
@@ -128,7 +127,7 @@ class ServiceConfig(BaseModel):
     # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
     lean_mode: bool = Field(
         default=False,
-        description="精简模式：跳过 R1b/CC/per-func R2-R3，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
+        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
     )
     lean_file_max_rounds: int = Field(
         default=-1,
@@ -192,13 +191,11 @@ class TaskConfig(BaseModel):
 
     # ── 每阶段最大重试轮次（-1=无限重试，0=跳过，正整数=上限）─────────────────────
     r1_max_rounds: int = Field(default=-1,
-        description="R1a 覆盖率 W+J 最大轮次（-1=无限）")
+        description="R1 文件级 ctags 提取+覆盖率 W+J 最大轮次（-1=无限）")
     r2_max_rounds: int = Field(default=-1,
-        description="R1b 准确性 W+J 最大轮次（-1=无限）")
-    r2_max_rounds: int = Field(default=-1,
-        description="R2 外部输入分析 W+J 最大轮次（-1=无限）")
+        description="R2 ctags 行号准确性 W+J 最大轮次（-1=无限）")
     r3_max_rounds: int = Field(default=-1,
-        description="R3 入口过滤 W+J 最大轮次（-1=无限）")
+        description="R3 外部输入分析 W+J 最大轮次（-1=无限）")
     r4_func_max_rounds: int = Field(default=-1,
         description="R4 per-func 跨文件分析最大轮次（-1=无限）")
     r4_final_max_rounds: int = Field(default=-1,
@@ -211,7 +208,7 @@ class TaskConfig(BaseModel):
     # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
     lean_mode: bool = Field(
         default=False,
-        description="精简模式：跳过 R1b/CC/per-func R2-R3，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
+        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
     )
     lean_file_max_rounds: int = Field(
         default=-1,

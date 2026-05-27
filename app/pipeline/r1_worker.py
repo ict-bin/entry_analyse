@@ -16,7 +16,7 @@ entry_analyse — Round 1 Workers（v3）
 设计原则：
   - body 始终由 Python 从源文件提取，不由 LLM 生成
   - funcdb 是唯一 source of truth，不再有 functions.json 读写
-  - session 跨重试共享（R1a-W / R1b-W 各自独立 session）
+  - session 跨重试共享（R1-W / R2-W 各自独立 session）
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ _EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"  # 不�
 logger = logging.getLogger("ea.pipeline.r1_worker")
 
 
-# ─── Gap 计算（R1a 轻量化）────────────────────────────────────────────────────
+# ─── Gap 计算（R1-W 轻量化）────────────────────────────────────────────────────
 
 # 单个 gap 超过此行数时按空行切分
 MAX_GAP_CHUNK = 80
@@ -220,7 +220,7 @@ def _parse_r1_corrections(output: str) -> list[dict] | None:
     return []
 
 
-# ─── R1a Prompt 构建 ──────────────────────────────────────────────────────────
+# ─── R1-W Prompt 构建 ──────────────────────────────────────────────────────────
 
 def build_r1_w_initial_prompt(
     file_path: str,
@@ -233,7 +233,7 @@ def build_r1_w_initial_prompt(
     gaps: "list | None" = None,  # deprecated, ignored
 ) -> str:
     """
-    R1a-W 首次 prompt：文件级覆盖率检查（Gap 文件模式）。
+    R1-W 首次 prompt：文件级覆盖率检查（Gap 文件模式）。
 
     Gap 内容单独存储到 {file_hash}_gaps.json，
     通过 sed 读取，不嵌入 prompt，避免大文件时 prompt 超大。
@@ -298,7 +298,7 @@ def build_r1_w_initial_prompt(
         f"## 当前状态\n\n{status_text}\n\n"
         f"## 任务\n\n"
         f"**只检查覆盖率（全不全），不检查行号精确性（准不准）。**\n\n"
-        f"行号精确性由 R1b 阶段单独处理。\n\n"
+        f"行号精确性由 R2 阶段单独处理。\n\n"
         f"{gap_instruction}\n\n"
         f"## 检查步骤\n\n"
         f"1. 读取 gap 文件，批量用 sed 查看多个 gap 区间内容（**建议每次 bash 调用同时检查 4～6 个 gap，效率更高**）\n"
@@ -325,7 +325,7 @@ def build_r1_w_retry_prompt(
     dirs: PipelineDirs,
     feedback: str,
 ) -> str:
-    """R1a-W 重试 prompt（文件级覆盖率 J 失败后）。"""
+    """R1-W 重试 prompt（文件级覆盖率 J 失败后）。"""
     db_path = dirs.r1_functions_db(file_hash)
     gaps_file = dirs.r1_gaps_file(file_hash)
     abs_path = os.path.abspath(file_path)
@@ -367,7 +367,7 @@ def build_r1_w_retry_prompt(
     )
 
 
-# ─── R1b Prompt 构建 ──────────────────────────────────────────────────────────
+# ─── R2-W Prompt 构建 ──────────────────────────────────────────────────────────
 
 def build_r2_w_prompt(
     func_hash: str,
@@ -380,7 +380,7 @@ def build_r2_w_prompt(
     judge_result_file: str = "",
 ) -> str:
     """
-    R1b-W prompt：单函数行号/签名准确性校正。
+    R2-W prompt：单函数行号/签名准确性校正。
 
     LLM 职责：用 bash sed 实际读取指定行，确认/修正 start_line/end_line。
     """
@@ -483,7 +483,7 @@ async def run_r1_worker(
         llm_gaps  = [g for g in gaps_list if g.get("kind") not in _SKIPPABLE_KINDS]
         skipped_n = len(gaps_list) - len(llm_gaps)
 
-        # 写全量 gaps（R1a-J 核查用，包含 kind 字段）
+        # 写全量 gaps（R1-J 核查用，包含 kind 字段）
         import json as _json
         if gaps_list:
             gaps_file.write_text(
@@ -506,7 +506,7 @@ async def run_r1_worker(
         # 快速路径：所有 gap 均可程序化确认为非函数体，跳过 LLM
         if not llm_gaps:
             logger.info(
-                "R1a-W: %d/%d gaps pre-classified non-function, skip LLM for %s",
+                "R1-W: %d/%d gaps pre-classified non-function, skip LLM for %s",
                 skipped_n, len(gaps_list), basename,
             )
             _safe_emit(on_event, "r1_w_start", task_id,
@@ -556,7 +556,7 @@ async def run_r1_worker(
                     for fe, fh in zip(_fo, _ho)
                 ])
             except Exception as exc:
-                logger.warning("R1a-W: ModuleDB sync failed (fast path) for %s: %s", basename, exc)
+                logger.warning("R1-W: ModuleDB sync failed (fast path) for %s: %s", basename, exc)
             return TokenUsage(), _fo, _ho
 
         prompt = build_r1_w_initial_prompt(
@@ -569,7 +569,7 @@ async def run_r1_worker(
         current_count = db.stats().get("total", 0)
         if current_count == 0:
             # funcdb 为空（可能 pod kill 导致 WAL 丢失）—降级为 fresh start
-            logger.warning("R1a-W: funcdb empty on retry for %s, falling back to fresh start", basename)
+            logger.warning("R1-W: funcdb empty on retry for %s, falling back to fresh start", basename)
             _safe_emit(on_event, "r1_static_extract", task_id,
                        file=basename, file_hash=file_hash)
             static_funcs = extract_functions_static(file_path)
@@ -661,12 +661,12 @@ async def run_r1_worker(
         result_file_path=str(result_file), raw_file_path=str(raw_file),
     )
     if corrections is None:
-        logger.info("R1a W: no corrections needed for %s", basename)
+        logger.info("R1-W: no corrections needed for %s", basename)
     elif corrections:
-        logger.info("R1a W: applying %d corrections for %s", len(corrections), basename)
+        logger.info("R1-W: applying %d corrections for %s", len(corrections), basename)
         db.apply_corrections(corrections, file_path)
     else:
-        logger.warning("R1a W: could not parse corrections for %s", basename)
+        logger.warning("R1-W: could not parse corrections for %s", basename)
 
     # 从 funcdb 读取最终结果
     all_meta = db.get_all_meta()
@@ -681,13 +681,13 @@ async def run_r1_worker(
             signature=item.get("signature", ""),
             start_line=item.get("start_line", 0),
             end_line=item.get("end_line", 0),
-            body="",   # R1a 不需要 body，body 在 funcdb 中
+            body="",   # R1-W 不需要 body，body 在 funcdb 中
         ))
         hashes_out.append(fh)
 
     # 降级：funcdb 为空时用静态结果
     if not funcs_out and static_funcs:
-        logger.warning("R1a W: funcdb empty for %s, falling back to static results", basename)
+        logger.warning("R1-W: funcdb empty for %s, falling back to static results", basename)
         funcs_out  = static_funcs
         hashes_out = func_hashes_static
 
@@ -706,7 +706,7 @@ async def run_r1_worker(
             for fe, fh in zip(funcs_out, hashes_out)
         ])
     except Exception as exc:
-        logger.warning("R1a W: ModuleDB sync failed for %s: %s", basename, exc)
+        logger.warning("R1-W: ModuleDB sync failed for %s: %s", basename, exc)
 
     return ar.token_usage, funcs_out, hashes_out
 
@@ -743,7 +743,7 @@ async def run_r2_w_worker(
 
     file_hash = compute_file_hash(file_path)
     db = FunctionDB.open(dirs.r1, file_hash)
-    session_f = str(dirs.r1b_w_session(func_hash))
+    session_f = str(dirs.r2_w_session(func_hash))
     workspace = str(dirs.stage_cwd("r2_w"))  # R2-W 专属 cwd（.pi/skills/ 已预置）
     attempt_no = 2 if is_retry else 1
     judge_result_file = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, attempt_no - 1)) if is_retry else None
@@ -804,12 +804,12 @@ async def run_r2_w_worker(
         result_file_path=str(result_file), raw_file_path=str(raw_file),
     )
     if corrections is None:
-        logger.debug("R1b W: no corrections needed for %s", func_hash)
+        logger.debug("R2-W: no corrections needed for %s", func_hash)
     elif corrections:
-        logger.info("R1b W: applying %d corrections for %s", len(corrections), func_hash)
+        logger.info("R2-W: applying %d corrections for %s", len(corrections), func_hash)
         db.apply_corrections(corrections, file_path)
     else:
-        logger.warning("R1b W: could not parse corrections for %s", func_hash)
+        logger.warning("R2-W: could not parse corrections for %s", func_hash)
 
     return ar.token_usage
 

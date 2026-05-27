@@ -1,7 +1,7 @@
 """
 entry_analyse — 模块级中心数据库（SQLite）
 
-R1a 通过后将函数元数据（不含 body）同步到此 DB，
+R1-W 通过后将函数元数据（不含 body）同步到此 DB，
 后续 R2/R3/R4/CC/Report 全部通过此 DB 进行跨文件查询，
 无需遍历多个文件级 funcdb。
 
@@ -10,14 +10,14 @@ R1a 通过后将函数元数据（不含 body）同步到此 DB，
 设计原则：
   - 无 body 列（节省空间，body 查询由文件级 funcdb 提供）
   - 支持跨文件查询（所有文件的函数在同一张表）
-  - 同步写入（每次 R1a/R2/R3/R4 决策后立即调用）
+  - 同步写入（每次 R1-W/R3-W/R4-W 决策后立即调用）
   - SQLite WAL 模式，天然支持并发读写
 
 公开接口：
   ModuleDB.open(workspace_dir)           ← 工厂方法
-  db.sync_file(file_hash, ...)           ← R1a 通过后同步文件元数据
-  db.sync_functions(file_hash, funcs)    ← R1a 通过后批量同步函数
-  db.update_analysis(func_hash, analysis) ← R2-W 通过后更新分析结果
+  db.sync_file(file_hash, ...)           ← R1-W 通过后同步文件元数据
+  db.sync_functions(file_hash, funcs)    ← R1-W 通过后批量同步函数
+  db.update_analysis(func_hash, analysis) ← R3-W 通过后更新分析结果
   db.update_r3_decision(func_hash, dec)  ← R3 keep/filter 后更新
   db.update_r4_decision(func_hash, dec)  ← R4 per-func 后更新
   db.update_confidence(func_hash, score) ← CC 置信度更新
@@ -116,7 +116,7 @@ class ModuleDB:
         rel_path: str,
         total_funcs: int,
     ) -> None:
-        """R1a 通过后：同步文件元数据。"""
+        """R1-W 通过后：同步文件元数据。"""
         from pathlib import Path as _Path
         basename = _Path(original_path).name
         with self._get_conn() as conn:
@@ -135,7 +135,7 @@ class ModuleDB:
         funcs: list[dict],
     ) -> None:
         """
-        R1a 通过后：批量同步函数元数据（INSERT OR IGNORE，不覆盖已有分析结果）。
+        R1-W 通过后：批量同步函数元数据（INSERT OR IGNORE，不覆盖已有分析结果）。
 
         funcs: list of dict with keys:
           func_hash, name, signature, start_line, end_line, body_lines
@@ -163,7 +163,7 @@ class ModuleDB:
             )
 
     def update_analysis(self, func_hash: str, analysis: dict) -> None:
-        """R2-W 通过后：更新函数分析结果。"""
+        """R3-W 通过后：更新函数分析结果。"""
         has_input = 1 if analysis.get("has_external_input") else 0
         from ..functions_list import VALID_ENTRY_ROLES
         role = str(analysis.get("entry_role") or "").strip()

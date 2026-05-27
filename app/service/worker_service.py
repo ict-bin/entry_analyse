@@ -324,7 +324,7 @@ class WorkerService:
                 "callchain_done",
                 # 新增：CC 开始立即可见
                 "callchain_start",
-                # 新增：R2-W/R4-func per-func emit
+                # R2-W/R4-func per-func emit 事件
                 "r2_w_start",
                 "r4_w_func_start",
                 "r4_w_func_done",

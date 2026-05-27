@@ -46,7 +46,7 @@ class FunctionState:
     end_line:   int = 0
     signature:  str = ""
 
-    # ── R2：函数级准确性（原 R1b）────────────────────────────────────────────
+    # ── R2：ctags 行号准确性（v4旧名 R1b）────────────────────────────────────────────
     r2_w_state:    NodeState = NodeState.PENDING
     r2_w_attempts: int = 0
     r2_j_state:    NodeState = NodeState.PENDING
@@ -98,7 +98,7 @@ class FunctionState:
         data = dict(data)
 
         # ── 向前兼容：旧字段 → 新字段 ──────────────────────────────────────
-        # r1b_*/r1_j_* (v3/v4) -> r2_* (v5)  《可下线时间：旧任务全部迁移完成后》
+        # r1b_*（v4旧名 R1b=ctags准确性）→ r2_*（v5正名 R2）  可下线时间：旧任务全部迁移后
         if 'r1b_j_state' in data and 'r2_j_state' not in data:
             data['r2_j_state']         = data.get('r1b_j_state', 'pending')
             data['r2_j_attempts']      = data.get('r1b_j_attempts', 0)
@@ -115,7 +115,7 @@ class FunctionState:
         # old r2_* (entry analysis, v4) → r3_* (v5)
         if 'r2_w_state' in data and 'r3_w_state' not in data:
             # Distinguish: old r2_w was entry analysis (now r3), new r2_w is accuracy (already set above)
-            # If r1b_j_state existed, r2_w_state was set from r1b, so old r2_* is entry analysis
+            # If r1b_j_state existed, r2_w_state was set from r1b (ctags accuracy), so old r2_* = entry analysis → now r3_*
             if 'r1b_j_state' in data or 'r1_j_state' in data:
                 data['r3_w_state']    = data.get('r2_w_state', 'pending')
                 data['r3_w_attempts'] = data.get('r2_w_attempts', 0)
@@ -123,7 +123,7 @@ class FunctionState:
                 data['has_external_input'] = data.get('has_external_input')
                 data['r3_j_state']    = data.get('r2_j_state', 'pending')
                 data['r3_j_attempts'] = data.get('r2_j_attempts', 0)
-                # Re-set r2_* from r1b_* for accuracy
+                # Re-set r2_*（ctags accuracy）from r1b_*（v4旧名）
                 data['r2_j_state']    = data.get('r1b_j_state', data.get('r1_j_state', 'pending'))
                 data['r2_j_attempts'] = data.get('r1b_j_attempts', 0)
                 data['r2_w_state']    = data.get('r1b_w_state', 'pending')
@@ -162,7 +162,7 @@ class FileState:
     file_hash:     str
     original_path: str
 
-    # ── R1：文件级覆盖率（原 R1a）────────────────────────────────────────────
+    # ── R1：文件级 ctags 提取+覆盖率（v4旧名 R1a）────────────────────────────────────────────
     r1_w_state:  NodeState = NodeState.PENDING
     r1_j_state:  NodeState = NodeState.PENDING
     r1_attempts: int = 0
@@ -214,7 +214,7 @@ class FileState:
         funcs_raw = data.pop('functions', {})
         data = dict(data)
 
-        # ── 向前兼容：r1a_* (v4) → r1_* (v5) ──────────────────────────────
+        # ── 向前兼容：r1a_*（v4旧名 R1a=ctags提取）→ r1_*（v5正名 R1）────────
         if 'r1_w_state_legacy' in data and 'r1_w_state' not in data:
             data['r1_w_state']  = data.get('r1_w_state_legacy', 'pending')
             data['r1_j_state']  = data.get('r1a_j_state', 'pending')

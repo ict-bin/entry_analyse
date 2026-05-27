@@ -161,14 +161,14 @@ def _infer_path_descriptor(relative_path: str) -> dict:
             "flow_kind": "parallel",
         })
         return desc
-    # R1a-W
+    # R1-W
     r1_w_match = re.fullmatch(r"r1-w-([0-9a-f]+)\.jsonl", normalized)
     if r1_w_match:
         fh = r1_w_match.group(1)
         desc.update({"stage_key": "r1", "stage_label": "R1 覆盖率",
                      "stage_order": 5, "family_key": f"r1::{fh}"})
         return desc
-    # R1a-J
+    # R1-J
     r1_j_match = re.fullmatch(r"r1-j-([0-9a-f]+)-a(\d+)\.jsonl", normalized)
     if r1_j_match:
         fh = r1_j_match.group(1)
@@ -178,14 +178,14 @@ def _infer_path_descriptor(relative_path: str) -> dict:
                      "parent_relative_path": f"r1-w-{fh}.jsonl",
                      "family_key": f"r1::{fh}", "flow_kind": "parallel"})
         return desc
-    # R1b-W
+    # R2-W（ctags 行号修正 Worker）
     r2_w_match = re.fullmatch(r"r2-w-([0-9a-f]+)\.jsonl", normalized)
     if r2_w_match:
         fh = r2_w_match.group(1)
         desc.update({"stage_key": "r2", "stage_label": "R2 准确性",
                      "stage_order": 7, "family_key": f"r2::{fh}"})
         return desc
-    # R1b-J
+    # R2-J（ctags 行号准确性 Judge）
     r2_j_match = re.fullmatch(r"r2-j-([0-9a-f]+)-a(\d+)\.jsonl", normalized)
     if r2_j_match:
         fh = r2_j_match.group(1)
