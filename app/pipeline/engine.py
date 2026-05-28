@@ -13,7 +13,8 @@ entry_analyse — Pipeline DAG 调度引擎（v5）
     R6（最终产物聚合，脚本化）
 
 并发控制：
-  单一 asyncio.Semaphore(pipeline_parallelism) 限制所有 pi 进程数量。
+  PrioritySemaphore(pipeline_parallelism) 限制所有 pi 进程数量。
+  优先级：R1(1) > R2(2) > R3(3) > R4(4) > R5(5)，低编号阶段优先获得槽位。
   -1 表示无限重试（_should_continue 统一控制各阶段 while 循环）。
 """
 
@@ -87,6 +88,7 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
 
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
+from .priority_semaphore import PrioritySemaphore, SemPriority
 from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
@@ -359,7 +361,7 @@ class PipelineEngine:
             getattr(cfg, "pipeline_parallelism", None)
             or getattr(cfg, "worker_parallelism", 64)
         )
-        self._sem = asyncio.Semaphore(parallelism)
+        self._sem = PrioritySemaphore(parallelism)
         self._r4_j_confirmed: bool = False
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
@@ -817,7 +819,7 @@ class PipelineEngine:
             try:
                 acfg = self.cfg.workers.agents[0]
                 is_retry = fs.r1_attempts > 1
-                async with self._sem:
+                async with self._sem.with_priority(SemPriority.R1):
                     token_usage, funcs, func_hashes = await run_r1_worker(
                         file_path=file_path,
                         dirs=dirs,
@@ -883,6 +885,7 @@ class PipelineEngine:
                     cwd=str(dirs.stage_cwd("r1_j")),
                     context=f"r1_j:{file_hash}",
                     acfg=acfg_j,
+                    priority=SemPriority.R1,
                 )
                 j_passed, j_feedback = _parse_j_result(ar_j.output)
                 fs.r1_j_state = NodeState.PASSED if j_passed else NodeState.FAILED
@@ -933,7 +936,7 @@ class PipelineEngine:
 
         try:
             acfg = self.cfg.workers.agents[0]
-            async with self._sem:
+            async with self._sem.with_priority(SemPriority.R2):
                 await run_r2_w_worker(
                     file_path=file_path,
                     func_hash=func_hash,
@@ -1000,6 +1003,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
                 context=f"r2_j:{func_hash}", acfg=acfg,
+                priority=SemPriority.R2,
             )
             passed, feedback = _parse_j_result(ar.output)
             # DELETE 裁定：函数不存在（宏定义等），从 funcdb 删除并强制通过
@@ -1149,6 +1153,7 @@ class PipelineEngine:
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
                     context=f"r3_w:{func_hash}", acfg=acfg,
+                    priority=SemPriority.R3,
                 )
 
                 analysis = _parse_r2_analysis(ar.output)
@@ -1267,6 +1272,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
                 context=f"r3_j:{func_hash}", acfg=acfg,
+                priority=SemPriority.R3,
             )
             passed, feedback = _parse_j_result(ar.output)
 
@@ -1552,6 +1558,7 @@ class PipelineEngine:
                 context=f"r4_func:{func_hash}",
                 # R4-W: worker skill（ea-r4-worker-result 指导结果文件写出格式）
                 acfg=acfg,
+                priority=SemPriority.R4,
             )
         except Exception as exc:
             logger.warning("R4-func W failed for %s: %s, keeping", func_hash, exc)
@@ -1660,6 +1667,7 @@ class PipelineEngine:
                 cwd=str(dirs.stage_cwd("r4_func_w")),  # 与 R4-W 共用 cwd
                 context=f"r4_j:{func_hash}",
                 acfg=acfg,
+                priority=SemPriority.R4,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_file = dirs.stage_result_file("r4_j", "judge", func_hash, func_state.r4_j_attempts)
@@ -1850,6 +1858,7 @@ class PipelineEngine:
                     cwd=str(dirs.stage_cwd("r5_w")),
                     context=f"report_func_w:{func_hash}",
                     acfg=acfg,
+                    priority=SemPriority.R5,
                 )
             except Exception as exc:
                 logger.warning("Report-func W failed for %s: %s", func_hash, exc)
@@ -1888,6 +1897,7 @@ class PipelineEngine:
                     cwd=str(dirs.stage_cwd("r5_j")),
                     context=f"report_func_j:{func_hash}",
                     acfg=acfg_j,
+                    priority=SemPriority.R5,
                 )
                 j_passed, j_feedback = _parse_j_result(j_ar.output)
                 j_result_file = dirs.stage_result_file("r5_j", "judge", func_hash, attempts)
@@ -1984,8 +1994,9 @@ class PipelineEngine:
         cwd: str,
         context: str = "",
         acfg: AgentInstanceConfig,
+        priority: int = SemPriority.R5,
     ) -> AgentResult:
-        async with self._sem:
+        async with self._sem.with_priority(priority):
             async with model_capacity_slot(
                 acfg.model,
                 enabled=self.cfg.model_capacity_enabled,
