@@ -48,6 +48,10 @@ _WEIGHTS: dict[str, float] = {
     "only_by_dispatcher":      0.05,
     # 惩罚项（负数）
     "many_internal_callers":  -0.10,
+    # ── 新增信号─────────────────────────────────────────────────
+    "msg_handler_name":       0.05,   # 函数名含 Proc*Msg/Handle*Msg/OnMsg*
+    "received_log_evidence":  0.08,   # entry_reason 含 "Received"/"Recv"/"接收"
+    "low_evidence":          -0.05,   # 纯参数名推断，无 body/命名/日志证据
 }
 
 
@@ -101,6 +105,9 @@ def compute_confidence(
 
     # ── 入口角色加分 ──────────────────────────────────────────────────────────
     entry_role = str(analysis.get("entry_role") or "").strip().lower()
+    # fallback 到 func_state_dict.entry_role（修复 entry_role 加分从不生效的 Bug）
+    if not entry_role and func_state_dict:
+        entry_role = str(func_state_dict.get("entry_role") or "").strip().lower()
     if entry_role == "boundary":
         score += _WEIGHTS["entry_role_boundary"]
         flags["entry_role_boundary"] = True
@@ -127,7 +134,32 @@ def compute_confidence(
         score += _WEIGHTS["taint_details_complete"]
         flags["taint_details_complete"] = True
 
-    # ── 调用链信息加分/减分（若有 callchain_role）────────────────────────────
+    # ── 消息处理命名模式加分（Proc*Msg / Handle*Msg / OnMsg* 通用模式） ────────
+    import re as _re
+    _func_name = str(func_state_dict.get("name") or "") if func_state_dict else ""
+    _MSG_PAT = _re.compile(
+        r"(?:Proc|Handle|Process|OnMsg)[A-Z].*(?:Msg|Request|Req|Event)",
+        _re.IGNORECASE,
+    )
+    if _func_name and _MSG_PAT.search(_func_name):
+        score += _WEIGHTS["msg_handler_name"]
+        flags["msg_handler_name"] = True
+
+    # ── "Received" 日志证明（entry_reason 中含 Received/Recv/接收 字样） ───────
+    _entry_reason = str(analysis.get("entry_reason") or "").lower()
+    if any(kw in _entry_reason for kw in ["received", "recv", "recvd", "接收"]):
+        score += _WEIGHTS["received_log_evidence"]
+        flags["received_log_evidence"] = True
+
+    # ── 低证据惩罚（纯参数名推断，无 body 证据且无命名/日志证据） ────────
+    if (not analysis.get("entry_source_lines")
+            and tag == "P"
+            and not flags.get("msg_handler_name")
+            and not flags.get("received_log_evidence")):
+        score += _WEIGHTS["low_evidence"]  # 负数
+        flags["low_evidence"] = True
+
+    # ── 调用链信息加分/减分（若有 callchain_role）─────────────────────────────────
     if callchain_role and isinstance(callchain_role, dict):
         callers_count = int(callchain_role.get("callers_count") or 0)
         ext_callers = int(callchain_role.get("callers_outside_module") or 0)

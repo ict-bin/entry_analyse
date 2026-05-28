@@ -200,6 +200,11 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
             f"   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
             f"   **主动型（A）**：函数体调用 {_PATTERNS} 等\n"
             f"\n"
+            f"   **⚠️ 请求-响应模式不得 filter（此规则优先于下方排除规则）：**\n"
+            f"   若函数同时满足以下 3 个特征，即使调用了 SendXxx/AckMsg，**必须 keep**：\n"
+            f"   1. 函数名含 `Proc`+`Msg`、`Handle`+`Msg` 或 `OnMsg`\n"
+            f"   2. 签名有 `*message`/`*msg`/`*request` 类型参数\n"
+            f"   3. 函数日志有 `\"Received\"`/`\"Recv\"`/`\"Recvd\"` 字样\n\n"
             f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true\n"
             f"   （判断依据是函数体行为，不是函数名）：**\n"
             f"   - 函数体的主要行为是构造、填充或发送数据：\n"
@@ -218,6 +223,11 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
             f"   - 有命中行：精确定位（`sed -n '<行号>p' {file_path}`）确认后分析 taint\n"
             f"   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）\n"
             f"\n"
+            f"   **⚠️ 请求-响应模式不得 filter（此规则优先于下方排除规则）：**\n"
+            f"   若函数同时满足以下 3 个特征，即使调用了 SendXxx/AckMsg，**必须 keep**：\n"
+            f"   1. 函数名含 `Proc`+`Msg`、`Handle`+`Msg` 或 `OnMsg`\n"
+            f"   2. 签名有 `*message`/`*msg`/`*request` 类型参数\n"
+            f"   3. 函数日志有 `\"Received\"`/`\"Recv\"`/`\"Recvd\"` 字样\n\n"
             f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true\n"
             f"   （判断依据是函数体行为，不是函数名）：**\n"
             f"   - 函数体的主要行为是构造、填充或发送数据：\n"
@@ -230,57 +240,22 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
         )
 
     return (
-        f"# R3 Worker — 外部输入分析\n\n"
-        f"| 字段      | 值                       |\n"
-        f"|-----------|-------------------------|\n"
-        f"| func_hash | `{func_hash}`            |\n"
-        f"| name      | `{func_name}`            |\n"
-        f"| signature | `{signature}`            |\n"
-        f"| 行范围    | {start_line}~{end_line}（共 {body_lines} 行）|\n"
+        f"# \u51fd\u6570\u5206\u6790\n\n"
+        f"| \u5b57\u6bb5 | \u5024 |\n"
+        f"|---|---|\n"
+        f"| func_hash | `{func_hash}` |\n"
+        f"| name | `{func_name}` |\n"
+        f"| signature | `{signature}` |\n"
+        f"| \u884c\u8303\u56f4 | {start_line}~{end_line}\uff08\u5171 {body_lines} \u884c\uff09|\n"
         f"{retry}\n"
+        f"## \u8bfb\u53d6\u51fd\u6570\u4f53\n\n"
         f"{step1}\n"
-        f"{step2}\n"
-        f"**⚠️ 分析范围硬性限制**（不允许越出以下范围）\n\n"
-        f"- 只分析**本函数自身**的函数体和参数签名，不得分析其他函数\n"
-        f"- **禁止** grep/搜索本函数的调用者（caller 追踪是 R4 的职责）\n"
-        f"- **禁止**跨函数追踪数据流或读取其他函数的函数体\n"
-        f"- 步骤 1 无 I/O 命中行且参数名无外部数据语义 → 直接输出 has_external_input=false\n"
-        f"- **最多执行 2 次 bash**（步骤 1 读函数体算 1 次，补充确认算 1 次）\n\n"
-        f"**步骤 3**：将分析结果输出在 `<result>` 标签中（**不要写任何文件**，引擎负责持久化）：\n\n"
-        f"   **有外部输入时**：\n"
-        f"   ```\n"
-        f"   <result>\n"
-        f"   {{\n"
-        f'     "has_external_input": true,\n'
-        f'     "tag": "P",\n'
-        f'     "entry_role": "boundary",\n'
-        f'     "taints": ["参数名"],\n'
-        f'     "entry_source_lines": [{{"line": 42, "code": "  实际代码行"}}],\n'
-        f'     "function_description": "函数职责描述",\n'
-        f'     "entry_reason": "为什么是外部入口",\n'
-        f'     "taint_details": [{{"name": "参数名", "description": "承载的外部数据语义"}}],\n'
-        f'     "justification": "判断依据"\n'
-        f"   }}\n"
-        f"   </result>\n"
-        f"   ```\n\n"
-        f'   `tag` 取值：`"P"`（被动）或 `"A"`（主动）\n\n'
-        f"   `entry_role` 判断入口在模块中的角色：\n"
-        f"   | 值 | 适用场景 |\n"
-        f"   |---|---|\n"
-        f"   | `boundary` | 模块边界入口，直接从模块外接收原始数据 |\n"
-        f"   | `dispatch_target` | 被 dispatcher 按类型分发，直接处理特定类型外部数据；**推荐作为污点追踪起点** |\n"
-        f"   | `callback` | 被外部框架（HA/Timer等）直接回调 |\n"
-        f"   | `ipc_handler` | 处理进程间通信消息 |\n\n"
-        f"   如不确定则填 `boundary`（保守默认）\n\n"
-        f"   **无外部输入时**：\n"
-        f"   ```\n"
-        f"   <result>\n"
-        f'   {{"has_external_input": false}}\n'
-        f"   </result>\n"
-        f"   ```\n\n"
-        f"## 输出前必须执行：格式自检\n\n"
-        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
-        f"引擎仅读取 `<result>...</result>` 标签内的内容，标签外的任何 JSON 都会被静默丢弃。\n"
+        f"## \u8f93\u51fa\u8981\u6c42\n\n"
+        f"\u5c06\u5206\u6790\u7ed3\u679c\u5199\u5728 `<result>...</result>` \u6807\u7b7e\u5185"
+        f"\uff08**\u5f15\u64ce\u4ec5\u8bfb\u6807\u7b7e\u5185\u5185\u5bb9**\uff0c\u6807\u7b7e\u5916\u5185\u5bb9\u88ab\u9759\u9ed8\u4e22\u5f03\uff09\uff1a\n"
+        f"- \u6709\u5916\u90e8\u8f93\u5165\u4e14 keep\uff1aJSON \u5305\u542b"
+        f" has_external_input/decision/tag/entry_role/taints/entry_source_lines/function_description/entry_reason/taint_details \u5b57\u6bb5\n"
+        f"- \u65e0\u5916\u90e8\u8f93\u5165\uff1a`{{\"has_external_input\": false, \"decision\": \"filter\"}}`\n"
     )
 
 

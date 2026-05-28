@@ -34,7 +34,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_consecutive_empty_responses": 3,
     "worker_parallel": False,
     "worker_parallelism": 128,
-    "pipeline_parallelism": 64,
+    "pipeline_parallelism": 32,   # 与 model_max_concurrency 一致，避免过多 pi 会话积压导致排队延迟
     "r1_max_rounds": -1,
     "r2_max_rounds": -1,
     "r3_max_rounds": -1,
@@ -148,6 +148,16 @@ class ConfigService:
             normalized["model_max_concurrency"] = 32
         normalized["model_capacity_enabled"] = bool(normalized.get("model_capacity_enabled", True))
         normalized["lean_mode"] = bool(normalized.get("lean_mode", False))
+        # 一致性警告：pipeline_parallelism 远超 model_max_concurrency 时会导致 model 側大量积压请求
+        _pp = normalized.get("pipeline_parallelism", 32)
+        _mc = normalized.get("model_max_concurrency", 32)
+        if isinstance(_pp, int) and isinstance(_mc, int) and _pp > _mc * 2:
+            import logging as _log
+            _log.getLogger("ea.config").warning(
+                "pipeline_parallelism=%d is more than 2x model_max_concurrency=%d; "
+                "this may cause model API queuing delays for concurrent tasks",
+                _pp, _mc,
+            )
         return normalized
 
     def get_config(self, db: Session, project_id: str) -> dict:

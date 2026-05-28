@@ -93,6 +93,24 @@ sed -n '{start_line},{end_line}p' {file}
 - filter 理由是 "FSM/构造/发送" → 信任 Worker，仅在函数体明显是接收端时才质疑
 - decision 与 entry_role 组合看起来合理 → 通过
 
+**特殊强制 FAIL：消息处理函数被误 filter**（需读函数体确认条件 C）
+
+若 Worker 给出 `has_external_input=true` + `decision=filter`，
+且函数同时具备以下全部 3 个特征，无论其他理由，**强制 FAIL**：
+
+- 条件 A：函数名含 `Proc`+`Msg` 或 `Handle`+`Msg` 或 `OnMsg`（如 ProcSubscribeMsg、HandleDataMsg、OnMsgCreate）
+- 条件 B：函数签名含 `*message`/`*msg`/`*request`/`*req` 类型指针参数
+- 条件 C：读取函数体后，日志字符串中有 `"Received"`/`"Recv"`/`"Recvd"`/`"received"` 字样  
+  （若读取文件失败则跳过本规则，不阻常流程）
+
+强制 FAIL 时回馈模板：
+```
+通过: 否
+摘要: 消息处理入口被误 filter，函数有 "Received" 日志且参数承载外部消息
+反馈: SendAck 是响应行为，不影响外部输入判断。请将 decision 改为 keep，
+      entry_role 建议改为 ipc_handler 或 boundary。
+```
+
 
 ---
 

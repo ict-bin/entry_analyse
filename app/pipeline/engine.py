@@ -363,6 +363,13 @@ class PipelineEngine:
         )
         self._sem = PrioritySemaphore(parallelism)
         self._r4_j_confirmed: bool = False
+        logger.info(
+            "Task %s: pipeline_parallelism=%d, model_max_concurrency=%d "
+            "(sem J>W: R1_J=1<R1_W=2<R2_J=3<R2_W=4<R3_J=5<R3_W=6<R4_J=7<R4_W=8<R5_J=9<R5_W=10)",
+            self.task_id,
+            parallelism,
+            getattr(cfg, "model_max_concurrency", 32),
+        )
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -774,6 +781,34 @@ class PipelineEngine:
             func_state.r4_decision = "filter"
             state.save(dirs.state_file)
 
+        # CC 已完成时：用 callchain_role 补算最终置信度（含调用链加减分）
+        if state.cc_state == NodeState.PASSED and func_state.has_external_input:
+            try:
+                from .callchain_db import CallchainDB
+                from .funcdb import FunctionDB as _FDB_CC
+                from .confidence import compute_confidence as _cc3
+                _cc_db = CallchainDB.open(dirs.callchain)
+                _chain_role = _cc_db.get_callchain_role(func_hash)
+                _fn3 = _FDB_CC.open(dirs.r1, file_hash).get_function(func_hash)
+                if _fn3 and _chain_role:
+                    _an3 = _fn3.get("analysis") or {}
+                    if isinstance(_an3, str):
+                        try: _an3 = json.loads(_an3)
+                        except: _an3 = {}
+                    _j_passed = func_state.r3_j_state == NodeState.PASSED
+                    _final_conf = _cc3(
+                        _an3,
+                        func_state_dict={
+                            "r3_j_state": "passed" if _j_passed else "",
+                            "name": func_state.name,
+                            "entry_role": func_state.entry_role or "",
+                        },
+                        callchain_role=_chain_role,
+                    )
+                    _FDB_CC.open(dirs.r1, file_hash).update_confidence(func_hash, _final_conf)
+            except Exception as _ce3:
+                logger.debug("callchain confidence update failed %s: %s", func_hash, _ce3)
+
 
     def _build_caller_context_for_r3(
         self, func_hash: str, dirs: PipelineDirs, state: PipelineState
@@ -819,7 +854,7 @@ class PipelineEngine:
             try:
                 acfg = self.cfg.workers.agents[0]
                 is_retry = fs.r1_attempts > 1
-                async with self._sem.with_priority(SemPriority.R1):
+                async with self._sem.with_priority(SemPriority.R1_W):
                     token_usage, funcs, func_hashes = await run_r1_worker(
                         file_path=file_path,
                         dirs=dirs,
@@ -885,7 +920,7 @@ class PipelineEngine:
                     cwd=str(dirs.stage_cwd("r1_j")),
                     context=f"r1_j:{file_hash}",
                     acfg=acfg_j,
-                    priority=SemPriority.R1,
+                    priority=SemPriority.R1_J,
                 )
                 j_passed, j_feedback = _parse_j_result(ar_j.output)
                 fs.r1_j_state = NodeState.PASSED if j_passed else NodeState.FAILED
@@ -936,7 +971,7 @@ class PipelineEngine:
 
         try:
             acfg = self.cfg.workers.agents[0]
-            async with self._sem.with_priority(SemPriority.R2):
+            async with self._sem.with_priority(SemPriority.R2_W):
                 await run_r2_w_worker(
                     file_path=file_path,
                     func_hash=func_hash,
@@ -1003,7 +1038,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
                 context=f"r2_j:{func_hash}", acfg=acfg,
-                priority=SemPriority.R2,
+                priority=SemPriority.R2_J,
             )
             passed, feedback = _parse_j_result(ar.output)
             # DELETE 裁定：函数不存在（宏定义等），从 funcdb 删除并强制通过
@@ -1153,7 +1188,7 @@ class PipelineEngine:
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
                     context=f"r3_w:{func_hash}", acfg=acfg,
-                    priority=SemPriority.R3,
+                    priority=SemPriority.R3_J if is_retry else SemPriority.R3_W,
                 )
 
                 analysis = _parse_r2_analysis(ar.output)
@@ -1272,7 +1307,7 @@ class PipelineEngine:
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
                 context=f"r3_j:{func_hash}", acfg=acfg,
-                priority=SemPriority.R3,
+                priority=SemPriority.R3_J,
             )
             passed, feedback = _parse_j_result(ar.output)
 
@@ -1327,6 +1362,29 @@ class PipelineEngine:
 
             func_state.r3_j_state = NodeState.PASSED if passed else NodeState.FAILED
             func_state.r3_j_feedback_summary = summary
+
+            # R3-J 通过后补算置信度（加入 r3_j_passed +0.15）
+            if passed:
+                try:
+                    from .funcdb import FunctionDB as _FDB_CONF
+                    from .confidence import compute_confidence as _cc
+                    _fn = _FDB_CONF.open(dirs.r1, file_hash).get_function(func_hash)
+                    if _fn:
+                        _an = _fn.get("analysis") or {}
+                        if isinstance(_an, str):
+                            try: _an = json.loads(_an)
+                            except: _an = {}
+                        _new_conf = _cc(
+                            _an,
+                            func_state_dict={
+                                "r3_j_state": "passed",
+                                "name": func_state.name,
+                                "entry_role": func_state.entry_role or "",
+                            },
+                        )
+                        _FDB_CONF.open(dirs.r1, file_hash).update_confidence(func_hash, _new_conf)
+                except Exception as _ce:
+                    logger.debug("confidence update after R3-J failed %s: %s", func_hash, _ce)
 
             if not passed:
                 fb_path = dirs.r2_j_feedback_file_func(func_hash, func_state.r3_j_attempts)
@@ -1558,7 +1616,7 @@ class PipelineEngine:
                 context=f"r4_func:{func_hash}",
                 # R4-W: worker skill（ea-r4-worker-result 指导结果文件写出格式）
                 acfg=acfg,
-                priority=SemPriority.R4,
+                priority=SemPriority.R4_W,
             )
         except Exception as exc:
             logger.warning("R4-func W failed for %s: %s, keeping", func_hash, exc)
@@ -1667,7 +1725,7 @@ class PipelineEngine:
                 cwd=str(dirs.stage_cwd("r4_func_w")),  # 与 R4-W 共用 cwd
                 context=f"r4_j:{func_hash}",
                 acfg=acfg,
-                priority=SemPriority.R4,
+                priority=SemPriority.R4_J,
             )
             passed, feedback = _parse_j_result(ar.output)
             result_file = dirs.stage_result_file("r4_j", "judge", func_hash, func_state.r4_j_attempts)
@@ -1858,7 +1916,7 @@ class PipelineEngine:
                     cwd=str(dirs.stage_cwd("r5_w")),
                     context=f"report_func_w:{func_hash}",
                     acfg=acfg,
-                    priority=SemPriority.R5,
+                    priority=SemPriority.R5_W,
                 )
             except Exception as exc:
                 logger.warning("Report-func W failed for %s: %s", func_hash, exc)
@@ -1897,7 +1955,7 @@ class PipelineEngine:
                     cwd=str(dirs.stage_cwd("r5_j")),
                     context=f"report_func_j:{func_hash}",
                     acfg=acfg_j,
-                    priority=SemPriority.R5,
+                    priority=SemPriority.R5_J,
                 )
                 j_passed, j_feedback = _parse_j_result(j_ar.output)
                 j_result_file = dirs.stage_result_file("r5_j", "judge", func_hash, attempts)
@@ -1994,7 +2052,7 @@ class PipelineEngine:
         cwd: str,
         context: str = "",
         acfg: AgentInstanceConfig,
-        priority: int = SemPriority.R5,
+        priority: int = SemPriority.R5_W,
     ) -> AgentResult:
         async with self._sem.with_priority(priority):
             async with model_capacity_slot(

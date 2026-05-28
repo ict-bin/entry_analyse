@@ -18,12 +18,33 @@ from typing import AsyncIterator
 
 
 class SemPriority:
-    """流水线阶段优先级常量。数字越小优先级越高。"""
-    R1 = 1   # 覆盖率分析（文件级 W+J）
-    R2 = 2   # ctags 行号准确性（函数级 W+J）
-    R3 = 3   # 外部输入分析（函数级 W+J）
-    R4 = 4   # 调用链入口判断（函数级 W+J，需等 CC）
-    R5 = 5   # 单函数报告生成（函数级 W+J）
+    """流水线阶段优先级常量。数字越小优先级越高。
+
+    J（Judge）高于同阶段 W（Worker）：
+      R1_J=1 > R1_W=2 > R2_J=3 > R2_W=4 > R3_J=5 > R3_W=6
+                      > R4_J=7 > R4_W=8 > R5_J=9 > R5_W=10
+
+    设计原则：Judge 不被下一批 Worker 挤出队列；
+    R3-W retry（J 反馈续续会话）使用 R3_J 优先级，消除 feedback 排队延迟。
+    """
+    # ── 细粒度常量（J > W within stage）────────────────────────────────────
+    R1_J = 1   # R1 Judge（覆盖率验证）
+    R1_W = 2   # R1 Worker（覆盖率分析）
+    R2_J = 3   # R2 Judge（ctags 准确性验证）
+    R2_W = 4   # R2 Worker（ctags 行号修正）
+    R3_J = 5   # R3 Judge（外部输入验证）；也作 R3-W retry 续续会话优先级
+    R3_W = 6   # R3 Worker（外部输入分析，初始轮）
+    R4_J = 7   # R4 Judge（调用链入口判断验证）
+    R4_W = 8   # R4 Worker（调用链入口判断）
+    R5_J = 9   # R5 Judge（单函数报告验证）
+    R5_W = 10  # R5 Worker（单函数报告生成）
+
+    # ── Backward-compat 别名（旧代码 SemPriority.R1~R5 不破坏）────────────
+    R1 = R1_W   # 旧 R1 → R1_W
+    R2 = R2_W   # 旧 R2 → R2_W
+    R3 = R3_W   # 旧 R3 → R3_W
+    R4 = R4_W   # 旧 R4 → R4_W
+    R5 = R5_W   # 旧 R5 → R5_W
 
 
 class PrioritySemaphore:
