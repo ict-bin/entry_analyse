@@ -152,7 +152,10 @@ class PipelineDirs:
         """v4旧名（R1a-J → R1-J），新代码使用 r1_j_session"""
         return self.r1_j_session(file_hash, attempt)
 
-    # R2 Accuracy（函数级，只有 J，无独立 W session）
+    # R2 Accuracy（函数级）
+    def r2_w_session(self, func_hash: str) -> Path:
+        return self.sessions / f"r2-w-{func_hash}.jsonl"
+
     def r2_j_session(self, func_hash: str, attempt: int) -> Path:
         return self.sessions / f"r2-j-{func_hash}-a{attempt}.jsonl"
 
@@ -163,7 +166,7 @@ class PipelineDirs:
 
     def r1b_w_session(self, func_hash: str) -> Path:
         """v4旧名（R1b-W → R2-W ctags 修正），新代码使用 r2_w_session"""
-        return self.sessions / f"r2-w-{func_hash}.jsonl"
+        return self.r2_w_session(func_hash)
 
     # R3 Entry Analysis（函数级）
     def r3_w_session(self, file_hash: str, func_hash: str) -> Path:
