@@ -215,7 +215,11 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
         "pgid": 1234,
         "command": "node /usr/bin/pi",
         "cwd": "/tmp/orphan-agent",
+        "exe": "/usr/bin/node",
         "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_session_paths": [],
     }])
     monkeypatch.setattr(
         agent_observability,
@@ -249,3 +253,71 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert row["kill_allowed"] is True
     assert row["kill_block_reason"] is None
     assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1
+
+
+def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 4321,
+        "ppid": 1,
+        "pgid": 4321,
+        "command": "codex --session /tmp/out/sessions/r1/agent.jsonl",
+        "cwd": "/tmp/workspace-worker-1",
+        "exe": "/usr/bin/codex",
+        "rss_bytes": 4096,
+        "runtime_kind": "codex",
+        "session_arg_path": "/tmp/out/sessions/r1/agent.jsonl",
+        "open_session_paths": [],
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_task_service",
+        lambda: SimpleNamespace(get_task_session_index=lambda _db, _task_id: {
+            "nodes": [{
+                "relative_path": "sessions/r1/agent.jsonl",
+                "session_name": "agent",
+                "display_name": "agent",
+                "is_active": True,
+                "stage_key": "R1",
+                "role": "worker",
+                "session_header": {"id": "sess-1"},
+            }]
+        }),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(
+                task_id="eat_1",
+                project_id="p1",
+                task_name="entry task",
+                input_path="/tmp/in",
+                output_path="/tmp/out",
+                status="running",
+                owner_pod="",
+                lease_expires_at=None,
+                stages_json={},
+            )]
+
+        def count(self):
+            return 1
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    assert snapshot["processes"][0]["runtime_kind"] == "codex"
+    assert snapshot["processes"][0]["match_source"] == "session_path"
+    assert snapshot["processes"][0]["task_id"] == "eat_1"

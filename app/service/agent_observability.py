@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pathlib
+import shlex
 import signal
 import time
 from dataclasses import dataclass, field
@@ -12,16 +13,33 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask
 from app.service.task_service import get_task_service
-from app.service.worker_slot_service import HEARTBEAT_INTERVAL_SECONDS, get_worker_slot_service
+from app.service.worker_slot_service import get_worker_slot_service
 
-ORPHAN_PROCESS_STALE_AFTER_SECONDS = max(30, int(os.environ.get("EA_AGENT_PROCESS_STALE_AFTER_SECONDS", "120")))
-ORPHAN_SESSION_STALE_AFTER_SECONDS = max(60, int(os.environ.get("EA_AGENT_SESSION_STALE_AFTER_SECONDS", "300")))
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
     or os.environ.get("POD_NAME")
     or os.environ.get("HOSTNAME")
     or "entry-analyse-pod"
 )
+
+_SESSION_ARG_KEYS = {
+    "--session",
+    "--session-file",
+    "--session_path",
+    "--session-path",
+    "--resume",
+}
+_AGENT_TOKENS: tuple[tuple[str, str], ...] = (
+    ("claude-code", "claude-code"),
+    ("claude", "claude"),
+    ("opencode", "opencode"),
+    ("codex", "codex"),
+    ("npx pi", "pi"),
+    (" pi ", "pi"),
+    ("/pi", "pi"),
+)
+_WRAPPER_NAMES = {"node", "npm", "npx", "pnpm", "yarn", "python", "python3", "uv"}
+_ACTIVE_TASK_STATUSES = {"running", "pending", "queued", "dispatching"}
 
 
 @dataclass
@@ -32,9 +50,16 @@ class AgentProcessSnapshot:
     ppid: int | None
     command: str
     cwd: str | None
+    exe: str | None
     started_at: float | None
     cpu_percent: float | None
     rss_bytes: int | None
+    runtime_kind: str | None
+    match_source: str | None
+    match_confidence: str | None
+    workspace_root: str | None
+    session_arg_path: str | None
+    open_session_paths: list[str]
     session_file: str | None
     session_id: str | None
     task_id: str | None
@@ -91,6 +116,66 @@ def _read_text(path: pathlib.Path) -> str:
         return ""
 
 
+def _normalize_path(raw: str | None) -> str | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return str(pathlib.Path(value).resolve(strict=False))
+    except Exception:
+        return value
+
+
+def _infer_runtime_kind(command: str, exe: str | None) -> str | None:
+    normalized = f" {command.lower()} "
+    for token, runtime_kind in _AGENT_TOKENS:
+        if token in normalized:
+            return runtime_kind
+    exe_name = pathlib.Path(exe or "").name.lower()
+    if exe_name in {"pi", "claude", "claude-code", "codex", "opencode"}:
+        return exe_name
+    if exe_name in _WRAPPER_NAMES:
+        for runtime_name in ("claude-code", "claude", "codex", "opencode", "pi"):
+            if runtime_name in normalized:
+                return runtime_name
+    return None
+
+
+def _extract_session_arg_path(command: str) -> str | None:
+    with contextlib.suppress(Exception):
+        tokens = shlex.split(command)
+        for index, token in enumerate(tokens):
+            if token in _SESSION_ARG_KEYS and index + 1 < len(tokens):
+                return _normalize_path(tokens[index + 1])
+            for key in _SESSION_ARG_KEYS:
+                prefix = f"{key}="
+                if token.startswith(prefix):
+                    return _normalize_path(token[len(prefix):])
+    return None
+
+
+def _collect_open_session_paths(proc_dir: pathlib.Path) -> list[str]:
+    rows: list[str] = []
+    fd_dir = proc_dir / "fd"
+    if not fd_dir.exists():
+        return rows
+    with contextlib.suppress(Exception):
+        for fd_entry in fd_dir.iterdir():
+            with contextlib.suppress(Exception):
+                target = os.readlink(fd_entry)
+                normalized = _normalize_path(target)
+                if normalized and normalized.endswith((".jsonl", ".json")):
+                    rows.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in rows:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
 def _read_proc_stat(pid: int) -> dict[str, Any]:
     proc = pathlib.Path("/proc") / str(pid)
     stat_raw = _read_text(proc / "stat")
@@ -99,6 +184,9 @@ def _read_proc_stat(pid: int) -> dict[str, Any]:
     cwd = None
     with contextlib.suppress(Exception):
         cwd = os.readlink(proc / "cwd")
+    exe = None
+    with contextlib.suppress(Exception):
+        exe = os.readlink(proc / "exe")
     fields = stat_raw.split()
     ppid = int(fields[3]) if len(fields) > 4 else None
     pgid = int(fields[4]) if len(fields) > 5 else None
@@ -109,13 +197,18 @@ def _read_proc_stat(pid: int) -> dict[str, Any]:
             if len(parts) >= 2:
                 rss_bytes = int(parts[1]) * 1024
             break
+    command = cmdline_raw or _read_text(proc / "comm")
     return {
         "pid": pid,
         "ppid": ppid,
         "pgid": pgid,
-        "command": cmdline_raw or _read_text(proc / "comm"),
+        "command": command,
         "cwd": cwd,
+        "exe": exe,
         "rss_bytes": rss_bytes,
+        "runtime_kind": _infer_runtime_kind(command, exe),
+        "session_arg_path": _extract_session_arg_path(command),
+        "open_session_paths": _collect_open_session_paths(proc),
     }
 
 
@@ -130,11 +223,61 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
             stat = _read_proc_stat(pid)
         except Exception:
             continue
-        command = str(stat.get("command") or "")
-        if " pi " not in f" {command} " and "/pi" not in command and " npx pi" not in command and "node" not in command:
+        if stat.get("runtime_kind") is None:
             continue
         results.append(stat)
     return results
+
+
+def _task_roots(row: AppEaTask) -> list[str]:
+    roots: list[str] = []
+    for item in [getattr(row, "output_path", None), getattr(row, "input_path", None)]:
+        normalized = _normalize_path(item)
+        if normalized:
+            roots.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in roots:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _path_belongs_to_root(path_value: str | None, root: str | None) -> bool:
+    if not path_value or not root:
+        return False
+    try:
+        pathlib.Path(path_value).relative_to(pathlib.Path(root))
+        return True
+    except Exception:
+        return False
+
+
+def _match_session(
+    proc: dict[str, Any],
+    *,
+    session_by_abs_path: dict[str, AgentSessionSnapshot],
+    session_by_relpath: dict[str, AgentSessionSnapshot],
+    task_roots_by_id: dict[str, list[str]],
+) -> tuple[AgentSessionSnapshot | None, str | None, str | None, str | None]:
+    for candidate in [proc.get("session_arg_path"), *(proc.get("open_session_paths") or [])]:
+        normalized = _normalize_path(candidate)
+        if normalized and normalized in session_by_abs_path:
+            return session_by_abs_path[normalized], "session_path", "high", None
+    cwd = _normalize_path(proc.get("cwd"))
+    for task_id, roots in task_roots_by_id.items():
+        for root in roots:
+            if _path_belongs_to_root(cwd, root):
+                for session in session_by_abs_path.values():
+                    if str(session.task_id or "") == task_id:
+                        return session, "task_root", "medium", root
+                return None, "task_root", "medium", root
+    for rel_path, session in session_by_relpath.items():
+        if rel_path and rel_path in str(proc.get("command") or ""):
+            return session, "session_relpath", "low", None
+    return None, None, None, None
 
 
 class AgentObservabilityService:
@@ -153,15 +296,17 @@ class AgentObservabilityService:
 
         session_rows: list[AgentSessionSnapshot] = []
         session_by_relpath: dict[str, AgentSessionSnapshot] = {}
+        session_by_abs_path: dict[str, AgentSessionSnapshot] = {}
+        task_roots_by_id = {row.task_id: _task_roots(row) for row in task_rows}
         for row in task_rows:
             catalog = get_task_service().get_task_session_index(db, row.task_id)
             for node in catalog.get("nodes") or []:
                 relative_path = str(node.get("relative_path") or "")
-                session_id = str((node.get("session_header") or {}).get("id") or node.get("session_name") or "")
+                session_id = str((node.get("session_header") or {}).get("id") or node.get("session_name") or "") or None
                 snapshot = AgentSessionSnapshot(
                     pod_name=POD_NAME,
                     session_file=relative_path,
-                    session_id=session_id or None,
+                    session_id=session_id,
                     task_id=row.task_id,
                     task_name=row.task_name,
                     stage_key=node.get("stage_key"),
@@ -177,11 +322,20 @@ class AgentObservabilityService:
                 )
                 session_rows.append(snapshot)
                 session_by_relpath[relative_path] = snapshot
+                for root in task_roots_by_id.get(row.task_id, []):
+                    absolute = _normalize_path(pathlib.Path(root) / relative_path)
+                    if absolute:
+                        session_by_abs_path[absolute] = snapshot
 
         process_rows: list[AgentProcessSnapshot] = []
         for proc in _iter_agent_processes():
-            cwd = str(proc.get("cwd") or "")
-            session_file = None
+            matched_session, match_source, match_confidence, workspace_root = _match_session(
+                proc,
+                session_by_abs_path=session_by_abs_path,
+                session_by_relpath=session_by_relpath,
+                task_roots_by_id=task_roots_by_id,
+            )
+            session_file = proc.get("session_arg_path")
             session_id = None
             task_id = None
             task_name = None
@@ -192,16 +346,11 @@ class AgentObservabilityService:
             owner_reason = "未匹配到任务或会话"
             kill_allowed = False
             kill_block_reason = "仅明确孤儿进程可手工终止"
-            matched_session = None
-            for rel_path, session in session_by_relpath.items():
-                if rel_path and rel_path in cwd:
-                    matched_session = session
-                    break
             if matched_session is not None:
                 matched_session.has_process = True
                 matched_session.process_pid = int(proc["pid"])
                 matched_session.orphan_session = False
-                session_file = matched_session.session_file
+                session_file = session_file or matched_session.session_file
                 session_id = matched_session.session_id
                 task_id = matched_session.task_id
                 task_name = matched_session.task_name
@@ -209,33 +358,45 @@ class AgentObservabilityService:
                 role_kind = matched_session.role_kind
                 task_row = task_by_id.get(task_id or "")
                 task_status = getattr(task_row, "status", None) if task_row is not None else None
-                if task_row is not None and str(task_row.status or "").strip() in {"running", "pending"}:
-                    owner_pod = str(getattr(task_row, "owner_pod", "") or "")
-                    lease_expires_at = getattr(task_row, "lease_expires_at", None)
-                    lease_live = bool(lease_expires_at and lease_expires_at.timestamp() >= time.time())
-                    if owner_pod and owner_pod in active_owner_pods:
-                        owner_kind = "tracked"
-                        owner_reason = "已关联活动任务，且 owner pod 心跳正常"
-                        kill_block_reason = "进程仍归属于活动任务"
-                    elif lease_live or matched_session.live:
-                        owner_kind = "unknown"
-                        owner_reason = "活动任务存在未过期 lease 或 live session，暂不视为孤儿"
-                        kill_block_reason = "存在活动任务运行信号，禁止手工终止"
-                    else:
-                        owner_kind = "unknown"
-                        owner_reason = "活动任务存在，但 owner pod 心跳缺失，进入保护态"
-                        kill_allowed = True
-                        kill_block_reason = None
+            elif match_source == "task_root":
+                workspace_root = workspace_root or _normalize_path(proc.get("cwd"))
+                for current_task_id, roots in task_roots_by_id.items():
+                    if any(_path_belongs_to_root(proc.get("cwd"), root) for root in roots):
+                        task_row = task_by_id.get(current_task_id)
+                        if task_row is not None:
+                            task_id = task_row.task_id
+                            task_name = task_row.task_name
+                            task_status = task_row.status
+                        break
+            task_row = task_by_id.get(task_id or "")
+            if task_row is not None and str(task_status or "").strip() in {"running", "pending"}:
+                owner_pod = str(getattr(task_row, "owner_pod", "") or "")
+                lease_expires_at = getattr(task_row, "lease_expires_at", None)
+                lease_live = bool(lease_expires_at and lease_expires_at.timestamp() >= time.time())
+                if owner_pod and owner_pod in active_owner_pods:
+                    owner_kind = "tracked"
+                    owner_reason = "已归属到活跃任务，且 owner pod 心跳正常"
+                    kill_block_reason = "进程仍归属于活动任务"
+                elif lease_live or bool(matched_session and matched_session.live):
+                    owner_kind = "unknown"
+                    owner_reason = "活动任务存在未过期 lease 或 live session，进入保护态"
+                    kill_block_reason = "存在活动任务运行信号，禁止手工终止"
                 else:
-                    owner_kind = "orphan"
-                    owner_reason = "仅匹配到终态任务/失活会话，且无活动 owner 心跳"
-                    if matched_session.live:
-                        owner_kind = "unknown"
-                        owner_reason = "终态任务但 session 仍为 live，暂不允许终止"
-                        kill_block_reason = "存在 live session，进入保护态"
-                    else:
-                        kill_allowed = True
-                        kill_block_reason = None
+                    owner_kind = "unknown"
+                    owner_reason = "活动任务存在，但 owner pod 心跳缺失"
+                    kill_allowed = True
+                    kill_block_reason = None
+            elif task_id:
+                owner_kind = "orphan"
+                owner_reason = "已归属到终态任务，且无活跃 owner pod 信号"
+                kill_allowed = True
+                kill_block_reason = None
+            elif match_source == "task_root":
+                owner_kind = "unknown"
+                owner_reason = "已按任务根路径归属，但缺少会话级精确证据"
+            else:
+                kill_allowed = True
+                kill_block_reason = None
             process_rows.append(
                 AgentProcessSnapshot(
                     pod_name=POD_NAME,
@@ -244,9 +405,16 @@ class AgentObservabilityService:
                     ppid=proc.get("ppid"),
                     command=str(proc.get("command") or ""),
                     cwd=proc.get("cwd"),
+                    exe=proc.get("exe"),
                     started_at=None,
                     cpu_percent=None,
                     rss_bytes=proc.get("rss_bytes"),
+                    runtime_kind=proc.get("runtime_kind"),
+                    match_source=match_source,
+                    match_confidence=match_confidence,
+                    workspace_root=workspace_root,
+                    session_arg_path=proc.get("session_arg_path"),
+                    open_session_paths=list(proc.get("open_session_paths") or []),
                     session_file=session_file,
                     session_id=session_id,
                     task_id=task_id,
@@ -295,7 +463,7 @@ class AgentObservabilityService:
         unknown_processes = [item for item in process_rows if item.owner_kind == "unknown"]
         orphan_sessions = [item for item in session_rows if item.orphan_session and not item.has_process]
         tracked_processes = [item for item in process_rows if item.owner_kind == "tracked"]
-        active_task_statuses = {"running", "pending", "queued", "dispatching"}
+        scanned_at = time.time()
         return {
             "summary": {
                 "pod_name": POD_NAME,
@@ -305,7 +473,7 @@ class AgentObservabilityService:
                 "killable_orphan_processes": len([item for item in orphan_processes if item.kill_allowed]),
                 "killable_suspected_orphan_processes": len([item for item in unknown_processes if item.kill_allowed]),
                 "orphan_sessions": len(orphan_sessions),
-                "scanned_at": time.time(),
+                "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
             "processes": [item.__dict__ for item in process_rows],
@@ -322,9 +490,12 @@ class AgentObservabilityService:
                 "session_count": len(session_rows),
                 "orphan_session_count": len(orphan_sessions),
                 "task_count": len(ownership_rows),
-                "active_task_count": len([item for item in ownership_rows if str(item.task_status or "") in active_task_statuses]),
-                "last_scanned_at": time.time(),
+                "active_task_count": len([item for item in ownership_rows if str(item.task_status or "") in _ACTIVE_TASK_STATUSES]),
+                "last_scanned_at": scanned_at,
                 "scan_errors": 0,
+                "processes": [item.__dict__ for item in process_rows],
+                "tasks": [item.__dict__ for item in ownership_rows],
+                "sessions": [item.__dict__ for item in session_rows],
             }],
         }
 
