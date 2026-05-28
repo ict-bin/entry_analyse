@@ -120,3 +120,49 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["available_slots"] == 3
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
+
+
+class _DeleteTaskQuery:
+    def __init__(self, row):
+        self._row = row
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def order_by(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self._row
+
+
+class _DeleteTaskDb:
+    def __init__(self, row):
+        self._row = row
+        self.commits = 0
+
+    def query(self, model):
+        del model
+        return _DeleteTaskQuery(self._row)
+
+    def commit(self):
+        self.commits += 1
+
+
+def test_delete_task_is_idempotent_when_task_missing() -> None:
+    result = task_service.TaskService().delete_task(_DeleteTaskDb(None), "eat_missing", delete_files=True)
+    assert result == {"deleted_event_count": 0}
+
+
+def test_delete_task_is_idempotent_when_task_already_deleted() -> None:
+    row = SimpleNamespace(
+        task_id="eat_deleted",
+        project_id="p1",
+        status="cancelled",
+        is_deleted=True,
+        output_path="/tmp/not-used",
+        input_path="/tmp/not-used",
+        source_path=None,
+    )
+    result = task_service.TaskService().delete_task(_DeleteTaskDb(row), "eat_deleted", delete_files=True)
+    assert result == {"deleted_event_count": 0}

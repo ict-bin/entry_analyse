@@ -300,8 +300,12 @@ def _safe_create_task_event(db: Session, **kwargs: Any) -> None:
     try:
         _create_task_event(db, **kwargs)
         nested.commit()
-    except IntegrityError:
-        nested.rollback()
+    except Exception:
+        try:
+            if nested.is_active:
+                nested.rollback()
+        except Exception:
+            pass
 
 
 def _build_task_event_summary(db: Session, task_id: str) -> dict[str, Any]:
@@ -2565,8 +2569,17 @@ class TaskService:
         """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务不允许删除。"""
         import shutil as _shutil
         from fastapi import HTTPException
-        row = self._get_or_404(db, task_id)
+        row = (
+            db.query(AppEaTask)
+            .filter(AppEaTask.task_id == task_id)
+            .order_by(AppEaTask.created_at.desc())
+            .first()
+        )
+        if row is None:
+            return {"deleted_event_count": 0}
         task_roots = _task_runtime_roots(row)
+        if row.is_deleted:
+            return {"deleted_event_count": 0}
         if row.status == "running":
             raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
         try:
@@ -2578,17 +2591,6 @@ class TaskService:
             )
         except Exception as exc:
             logger.warning("task-scoped pi cleanup failed during delete for %s: %s", row.task_id, exc)
-        _safe_create_task_event(
-            db,
-            task_id=row.task_id,
-            project_id=row.project_id,
-            event_type="task_deleted",
-            message="任务已删除",
-            source=TASK_EVENT_SOURCE_EA,
-            status=row.status,
-            payload={"delete_files": bool(delete_files)},
-            dedupe_key=_event_dedupe_key(row.task_id, "task_deleted", row.updated_at, delete_files),
-        )
         if delete_files and row.output_path:
             task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):
@@ -2600,6 +2602,17 @@ class TaskService:
                     raise HTTPException(status_code=409, detail=f"任务目录删除失败: {task_dir}: {_e}") from _e
                 if os.path.exists(task_dir):
                     raise HTTPException(status_code=409, detail=f"任务目录删除失败，目录仍然存在: {task_dir}")
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_deleted",
+            message="任务已删除",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={"delete_files": bool(delete_files)},
+            dedupe_key=_event_dedupe_key(row.task_id, "task_deleted", row.updated_at, delete_files),
+        )
         deleted_event_count = clear_task_timeline(db, row)
         row.is_deleted = True
         db.commit()
