@@ -282,7 +282,16 @@ class FunctionDB:
         cols = ["func_hash","file_hash","name","signature","start_line","end_line",
                 "body_lines","has_external_input","analysis","entry_role",
                 "entry_confidence","r3_decision","r4_decision","file_path","original_path"]
-        return [dict(zip(cols, r)) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            if d.get("analysis"):
+                try:
+                    d["analysis"] = json.loads(d["analysis"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            result.append(d)
+        return result
 
     def sync_from_json(self, data: dict) -> None:
         """

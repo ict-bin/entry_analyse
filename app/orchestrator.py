@@ -62,6 +62,12 @@ def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
             continue
         # 嵌套格式：从 analysis 子字典提取
         a = e.get("analysis") or {}
+        if isinstance(a, str):
+            try:
+                import json as _json
+                a = _json.loads(a)
+            except Exception:
+                a = {}
         flat: dict = {
             "tag":                  a.get("tag") or "P",
             "file":                 e.get("file") or "",
