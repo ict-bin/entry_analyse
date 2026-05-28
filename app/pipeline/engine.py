@@ -1277,8 +1277,6 @@ class PipelineEngine:
 
     # ── R3 ────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    @staticmethod
     async def _run_callchain_analysis(
         self, dirs, state, module_files, file_hash_paths
     ) -> None:
