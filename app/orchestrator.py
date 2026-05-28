@@ -255,7 +255,7 @@ class Orchestrator:
             )
 
             if self._cancel_event.is_set():
-                result.status = TaskStatus.FAILED
+                result.status = TaskStatus.CANCELLED
                 result.error = "任务已被取消"
             elif entries:
                 result.status = TaskStatus.PASSED

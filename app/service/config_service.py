@@ -30,11 +30,11 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "agent_timeout_max_retries": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
+    "max_consecutive_empty_responses": 3,
     "worker_parallel": False,
     "worker_parallelism": 128,
     "pipeline_parallelism": 64,
     "r1_max_rounds": -1,
-    "r2_max_rounds": -1,
     "r2_max_rounds": -1,
     "r3_max_rounds": -1,
     "r3_j_max_rounds": -1,   # R3-J（外部输入验证）最大重试轮次；-1=无限，0=跳过

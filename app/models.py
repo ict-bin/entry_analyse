@@ -108,7 +108,9 @@ class ServiceConfig(BaseModel):
     r1_max_rounds: int = Field(default=-1)
     r2_max_rounds: int = Field(default=-1)
     r3_max_rounds: int = Field(default=-1)
+    r3_j_max_rounds: int = Field(default=-1)
     r4_func_max_rounds: int = Field(default=-1)
+    r4_func_j_max_rounds: int = Field(default=-1)
     r4_final_max_rounds: int = Field(default=-1)
     report_func_max_rounds: int = Field(default=-1)
     report_final_max_rounds: int = Field(default=-1)
@@ -196,8 +198,12 @@ class TaskConfig(BaseModel):
         description="R2 ctags 行号准确性 W+J 最大轮次（-1=无限）")
     r3_max_rounds: int = Field(default=-1,
         description="R3 外部输入分析 W+J 最大轮次（-1=无限）")
+    r3_j_max_rounds: int = Field(default=-1,
+        description="R3 外部输入分析 Judge 最大轮次（-1=无限）")
     r4_func_max_rounds: int = Field(default=-1,
         description="R4 per-func 跨文件分析最大轮次（-1=无限）")
+    r4_func_j_max_rounds: int = Field(default=-1,
+        description="R4 per-func Judge 最大轮次（-1=无限）")
     r4_final_max_rounds: int = Field(default=-1,
         description="R4 汇总 Judge 最大轮次（-1=无限）")
     report_func_max_rounds: int = Field(default=-1,
@@ -257,6 +263,7 @@ class TaskStatus(str, Enum):
     PASSED = "passed"
     FAILED = "failed"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 class WorkerResult(BaseModel):
