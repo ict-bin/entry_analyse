@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from typing import Any, Dict
 
 from app.db import get_db
-from app.service.config_service import get_config_service
+from app.service.config_service import get_config_service, get_model_config_service
 
 from . import router
 from .deps import ensure_project_access, get_current_user
@@ -37,6 +37,35 @@ async def get_config(
     except SQLAlchemyError as exc:
         logger.error("get_config failed for project %s: %s", project_id, exc)
         raise HTTPException(status_code=503, detail="数据库暂时不可用，请稍后重试") from exc
+
+
+class ModelsSaveRequest(BaseModel):
+    config: Dict[str, Any]
+
+
+@router.get("/models")
+async def get_models(
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    try:
+        return get_model_config_service().get_models_config(db)
+    except SQLAlchemyError as exc:
+        logger.error("get_models failed: %s", exc)
+        raise HTTPException(status_code=503, detail="数据库暂时不可用，请稍后重试") from exc
+
+
+@router.put("/models")
+async def save_models(
+    body: ModelsSaveRequest,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    try:
+        return get_model_config_service().save_models_config(db, body.config)
+    except SQLAlchemyError as exc:
+        logger.error("save_models failed: %s", exc)
+        raise HTTPException(status_code=503, detail="保存失败，数据库暂时不可用") from exc
 
 
 @router.put("/config")
