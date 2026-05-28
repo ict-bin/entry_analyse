@@ -81,6 +81,21 @@ async def lifespan(app: FastAPI):
 
     await get_runtime_bootstrap().start(app)
 
+    # 迁移现有 DB 配置：将所有 max_rounds 字段强制设为 -1
+    if role_enabled("api"):
+        try:
+            from .service.config_service import get_config_service
+            from .db import get_db
+            _mig_db = next(get_db())
+            _n = get_config_service().migrate_max_rounds_to_unlimited(_mig_db)
+            _mig_db.close()
+            if _n:
+                import logging
+                logging.getLogger("ea.server").info("migrate_max_rounds: updated %d project configs to -1", _n)
+        except Exception as _mig_exc:
+            import logging
+            logging.getLogger("ea.server").warning("migrate_max_rounds failed: %s", _mig_exc)
+
     yield
 
     # --- shutdown ---

@@ -116,6 +116,17 @@ class ConfigService:
         normalized["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
             normalized.get("max_rounds_exceeded_action")
         )
+        # 强制所有 max_rounds 相关字段为 -1（前端不再展示，统一无限重试）
+        _MAX_ROUNDS_KEYS = [
+            "max_rounds", "min_rounds",
+            "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",
+            "r2_max_rounds", "r3_max_rounds", "r3_j_max_rounds",
+            "r4_func_max_rounds", "r4_func_j_max_rounds", "r4_final_max_rounds",
+            "report_func_max_rounds", "report_final_max_rounds",
+            "lean_file_max_rounds", "lean_module_max_rounds",
+        ]
+        for _k in _MAX_ROUNDS_KEYS:
+            normalized[_k] = -1
         normalized["max_concurrent_tasks"] = normalize_max_concurrent_tasks(
             normalized.get("max_concurrent_tasks")
         )
@@ -165,6 +176,32 @@ class ConfigService:
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
+
+    def migrate_max_rounds_to_unlimited(self, db: Session) -> int:
+        """将所有项目配置中的 max_rounds 相关字段强制设为 -1。服务启动时调用一次。"""
+        _MAX_ROUNDS_KEYS = [
+            "max_rounds", "min_rounds",
+            "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",
+            "r2_max_rounds", "r3_max_rounds", "r3_j_max_rounds",
+            "r4_func_max_rounds", "r4_func_j_max_rounds", "r4_final_max_rounds",
+            "report_func_max_rounds", "report_final_max_rounds",
+            "lean_file_max_rounds", "lean_module_max_rounds",
+        ]
+        rows = db.query(AppEaProjectConfig).all()
+        updated = 0
+        for row in rows:
+            blob = dict(row.config_json or {})
+            changed = False
+            for k in _MAX_ROUNDS_KEYS:
+                if k in blob and blob[k] != -1:
+                    blob[k] = -1
+                    changed = True
+            if changed:
+                row.config_json = blob
+                updated += 1
+        if updated:
+            db.commit()
+        return updated
 
 
 _config_service: ConfigService | None = None
