@@ -744,6 +744,17 @@ def get_slot_cluster(
     return get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
 
 
+@router.get("/workers/slot-cluster", response_model=EntryAnalyseSlotClusterResponse)
+def get_global_slot_cluster(
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    del user_and_token
+    from app.service.worker_slot_service import get_worker_slot_service
+
+    return get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
+
+
 @router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse)
 def get_agent_observability_summary(
     project_id: str = Query(...),

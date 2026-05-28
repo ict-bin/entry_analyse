@@ -40,19 +40,17 @@ class WorkerSlotSnapshot:
 
 
 class WorkerSlotService:
-    def _active_running_count(self, db: Session, project_id: str) -> int:
-        return int(
-            db.query(AppEaTask)
-            .filter(
-                AppEaTask.project_id == project_id,
-                AppEaTask.is_deleted.is_(False),
-                AppEaTask.status == "running",
-                AppEaTask.cancel_requested.is_(False),
-                AppEaTask.lease_expires_at.is_not(None),
-                AppEaTask.lease_expires_at >= now_local(),
-            )
-            .count()
+    def _active_running_count(self, db: Session, project_id: str | None) -> int:
+        query = db.query(AppEaTask).filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "running",
+            AppEaTask.cancel_requested.is_(False),
+            AppEaTask.lease_expires_at.is_not(None),
+            AppEaTask.lease_expires_at >= now_local(),
         )
+        if str(project_id or "").strip():
+            query = query.filter(AppEaTask.project_id == project_id)
+        return int(query.count())
 
     def _configured_dispatch_limit(self, db: Session, project_id: str) -> int:
         if not str(project_id or "").strip():
@@ -100,32 +98,27 @@ class WorkerSlotService:
             db.commit()
         return len(rows)
 
-    def get_cluster_snapshot(self, db: Session, *, project_id: str) -> dict[str, Any]:
+    def get_cluster_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
         now = now_local()
         stale_cutoff = add_seconds_local(now, -STALE_AFTER_SECONDS)
         worker_rows = db.query(AppEaWorkerSlot).order_by(AppEaWorkerSlot.pod_name.asc(), AppEaWorkerSlot.id.asc()).all()
-        running_rows = (
-            db.query(AppEaTask)
-            .filter(
-                AppEaTask.project_id == project_id,
-                AppEaTask.is_deleted.is_(False),
-                AppEaTask.status == "running",
-                AppEaTask.owner_pod.is_not(None),
-                AppEaTask.cancel_requested.is_(False),
-                AppEaTask.lease_expires_at.is_not(None),
-                AppEaTask.lease_expires_at >= now,
-            )
-            .all()
+        running_query = db.query(AppEaTask).filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "running",
+            AppEaTask.owner_pod.is_not(None),
+            AppEaTask.cancel_requested.is_(False),
+            AppEaTask.lease_expires_at.is_not(None),
+            AppEaTask.lease_expires_at >= now,
         )
-        queued_tasks = int(
-            db.query(AppEaTask)
-            .filter(
-                AppEaTask.project_id == project_id,
-                AppEaTask.is_deleted.is_(False),
-                AppEaTask.status == "pending",
-            )
-            .count()
+        queued_query = db.query(AppEaTask).filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "pending",
         )
+        if str(project_id or "").strip():
+            running_query = running_query.filter(AppEaTask.project_id == project_id)
+            queued_query = queued_query.filter(AppEaTask.project_id == project_id)
+        running_rows = running_query.all()
+        queued_tasks = int(queued_query.count())
 
         active_by_owner: dict[str, list[dict[str, Any]]] = {}
         for row in running_rows:
