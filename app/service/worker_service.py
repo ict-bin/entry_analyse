@@ -356,6 +356,22 @@ class WorkerService:
                 row.owner_pod = task_mod.POD_NAME
                 row.owner_pod_ip = task_mod.POD_IP
                 row.lease_expires_at = task_mod._lease_deadline()
+                task_mod._safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="task_started",
+                    message="任务已开始执行",
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    status=row.status,
+                    stage_key="entry_analysis",
+                    file_path=str(row.input_path or "").strip() or None,
+                    payload={
+                        "owner_pod": task_mod.POD_NAME,
+                        "owner_pod_ip": task_mod.POD_IP or None,
+                    },
+                    dedupe_key=task_mod._event_dedupe_key(row.task_id, "task_started", task_mod.POD_NAME, row.started_at, row.updated_at),
+                )
                 db.commit()
 
                 svc = task_mod._load_svc_config_from_db(db, row.project_id)

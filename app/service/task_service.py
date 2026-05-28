@@ -374,6 +374,25 @@ def get_task_timeline(db: Session, task: AppEaTask) -> dict[str, Any]:
 
 
 def clear_task_timeline(db: Session, task: AppEaTask) -> int:
+    existing_count = int(
+        db.query(AppEaTaskEvent)
+        .filter(AppEaTaskEvent.task_id == task.task_id)
+        .count()
+        or 0
+    )
+    _safe_create_task_event(
+        db,
+        task_id=task.task_id,
+        project_id=task.project_id,
+        event_type="task_timeline_cleared",
+        message="任务时间线已清空",
+        source=TASK_EVENT_SOURCE_EA,
+        status=str(task.status or "").strip() or None,
+        stage_key="entry_analysis",
+        file_path=str(task.input_path or "").strip() or None,
+        payload={"deleted_event_count_before_clear": existing_count},
+        dedupe_key=_event_dedupe_key(task.task_id, "task_timeline_cleared", existing_count, task.updated_at, task.status),
+    )
     deleted = (
         db.query(AppEaTaskEvent)
         .filter(AppEaTaskEvent.task_id == task.task_id)
@@ -383,6 +402,32 @@ def clear_task_timeline(db: Session, task: AppEaTask) -> int:
 
 
 def delete_task_timeline_event(db: Session, task: AppEaTask, event_id: str) -> int:
+    target = (
+        db.query(AppEaTaskEvent)
+        .filter(
+            AppEaTaskEvent.task_id == task.task_id,
+            AppEaTaskEvent.id == event_id,
+        )
+        .first()
+    )
+    if target is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.task_id,
+            project_id=task.project_id,
+            event_type="task_timeline_event_deleted",
+            message="任务时间线事件已删除",
+            source=TASK_EVENT_SOURCE_EA,
+            status=str(task.status or "").strip() or None,
+            stage_key="entry_analysis",
+            file_path=str(task.input_path or "").strip() or None,
+            payload={
+                "deleted_event_id": target.id,
+                "deleted_event_type": target.event_type,
+                "deleted_event_created_at": isoformat_local(target.created_at),
+            },
+            dedupe_key=_event_dedupe_key(task.task_id, "task_timeline_event_deleted", target.id, target.event_type, target.created_at),
+        )
     deleted = (
         db.query(AppEaTaskEvent)
         .filter(
@@ -1669,6 +1714,7 @@ class TaskService:
             and row.owner_pod != POD_NAME
         )
         if is_lease_takeover:
+            previous_owner_pod = row.owner_pod
             row.stages_json = None  # 触发 worker_service.py 中的 is_fresh_start=True
             row.error = None
             row.result_json = None
@@ -1676,12 +1722,47 @@ class TaskService:
             # 注意：不重置 started_at，保留任务真实开始时间
             logger.info("Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",
                         row.task_id, row.owner_pod)
+            _safe_create_task_event(
+                db,
+                task_id=row.task_id,
+                project_id=row.project_id,
+                event_type="task_lease_taken_over",
+                message="任务因旧租约过期被新 worker 接管",
+                source=TASK_EVENT_SOURCE_SYSTEM,
+                status="running",
+                stage_key="entry_analysis",
+                file_path=str(row.input_path or "").strip() or None,
+                payload={
+                    "previous_owner_pod": previous_owner_pod,
+                    "owner_pod": POD_NAME,
+                    "reason": "lease_takeover",
+                },
+                dedupe_key=_event_dedupe_key(row.task_id, "task_lease_taken_over", previous_owner_pod, POD_NAME, row.lease_expires_at, row.updated_at),
+            )
         row.status = "running"
         row.owner_pod = POD_NAME
         row.lease_expires_at = _lease_deadline()
         row.cancel_requested = False
         if row.started_at is None:
             row.started_at = now_local()
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_dispatched",
+            message="任务已被调度并占用执行槽位",
+            source=TASK_EVENT_SOURCE_SYSTEM,
+            status=row.status,
+            stage_key="entry_analysis",
+            file_path=str(row.input_path or "").strip() or None,
+            payload={
+                "owner_pod": POD_NAME,
+                "dispatch_mode": "select_for_update",
+                "lease_expires_at": isoformat_local(row.lease_expires_at),
+                "lease_takeover": bool(is_lease_takeover),
+            },
+            dedupe_key=_event_dedupe_key(row.task_id, "task_dispatched", POD_NAME, row.started_at, row.lease_expires_at, "select_for_update"),
+        )
         db.commit()
         db.refresh(row)
         return row
@@ -1699,6 +1780,7 @@ class TaskService:
         if row is None or row.cancel_requested:
             return None
         now = now_local()
+        previous_owner_pod = row.owner_pod
         is_takeover = (
             row.status == "running"
             and row.owner_pod is not None
@@ -1752,8 +1834,45 @@ class TaskService:
         if int(getattr(updated, "rowcount", 0) or 0) != 1:
             db.rollback()
             return None
-        db.commit()
         refreshed = db.query(AppEaTask).filter(AppEaTask.id == row_id).first()
+        if refreshed is not None:
+            if is_takeover:
+                _safe_create_task_event(
+                    db,
+                    task_id=refreshed.task_id,
+                    project_id=refreshed.project_id,
+                    event_type="task_lease_taken_over",
+                    message="任务因旧租约过期被新 worker 接管",
+                    source=TASK_EVENT_SOURCE_SYSTEM,
+                    status=refreshed.status,
+                    stage_key="entry_analysis",
+                    file_path=str(refreshed.input_path or "").strip() or None,
+                    payload={
+                        "previous_owner_pod": previous_owner_pod,
+                        "owner_pod": POD_NAME,
+                        "reason": "lease_takeover",
+                    },
+                    dedupe_key=_event_dedupe_key(refreshed.task_id, "task_lease_taken_over", previous_owner_pod, POD_NAME, row.lease_expires_at, refreshed.updated_at),
+                )
+            _safe_create_task_event(
+                db,
+                task_id=refreshed.task_id,
+                project_id=refreshed.project_id,
+                event_type="task_dispatched",
+                message="任务已被调度并占用执行槽位",
+                source=TASK_EVENT_SOURCE_SYSTEM,
+                status=refreshed.status,
+                stage_key="entry_analysis",
+                file_path=str(refreshed.input_path or "").strip() or None,
+                payload={
+                    "owner_pod": POD_NAME,
+                    "dispatch_mode": "atomic_claim",
+                    "lease_expires_at": isoformat_local(refreshed.lease_expires_at),
+                    "lease_takeover": bool(is_takeover),
+                },
+                dedupe_key=_event_dedupe_key(refreshed.task_id, "task_dispatched", POD_NAME, refreshed.started_at, refreshed.lease_expires_at, "atomic_claim"),
+            )
+        db.commit()
         if refreshed is not None and is_takeover:
             logger.info(
                 "Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",

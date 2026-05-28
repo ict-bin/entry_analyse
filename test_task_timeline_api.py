@@ -96,7 +96,7 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         response = self.client.delete("/api/app/entry-analyse/tasks/eat_api_timeline/timeline")
         self.assertEqual(200, response.status_code)
         payload = response.json()
-        self.assertEqual(2, payload["deleted_event_count"])
+        self.assertEqual(3, payload["deleted_event_count"])
 
         verify = self.client.get("/api/app/entry-analyse/tasks/eat_api_timeline/timeline")
         self.assertEqual([], verify.json()["events"])
@@ -112,7 +112,10 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         self.assertEqual(1, payload["deleted_event_count"])
 
         verify = self.client.get("/api/app/entry-analyse/tasks/eat_api_timeline/timeline")
-        self.assertEqual(["evt2"], [item["id"] for item in verify.json()["events"]])
+        event_ids = [item["id"] for item in verify.json()["events"]]
+        event_types = [item["event_type"] for item in verify.json()["events"]]
+        self.assertIn("evt2", event_ids)
+        self.assertIn("task_timeline_event_deleted", event_types)
 
     def test_delete_task_returns_deleted_event_count(self):
         self._insert_task(task_id="eat_delete_me", status="failed")
@@ -122,7 +125,7 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         response = self.client.delete("/api/app/entry-analyse/tasks/eat_delete_me?delete_files=false")
         self.assertEqual(200, response.status_code)
         payload = response.json()
-        self.assertEqual(3, payload["deleted_event_count"])
+        self.assertEqual(4, payload["deleted_event_count"])
         self.assertEqual("任务已删除", payload["message"])
 
     def test_delete_task_fails_when_workspace_remove_fails(self):

@@ -1,11 +1,15 @@
 import unittest
+from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import AppEaTask, AppEaTaskEvent, Base
+from app.service import task_service
 from app.service.task_service import TaskService
+from app.time_utils import now_local
 
 
 class EntryTaskTimelineTests(unittest.TestCase):
@@ -164,11 +168,138 @@ class EntryTaskTimelineTests(unittest.TestCase):
 
             deleted_one = self.service.delete_task_timeline_event(db, task, "evt1")
             self.assertEqual(1, deleted_one)
-            self.assertEqual(1, db.query(AppEaTaskEvent).filter(AppEaTaskEvent.task_id == task.task_id).count())
+            self.assertEqual(2, db.query(AppEaTaskEvent).filter(AppEaTaskEvent.task_id == task.task_id).count())
 
             deleted_all = self.service.clear_task_timeline(db, task)
-            self.assertEqual(1, deleted_all)
+            self.assertEqual(3, deleted_all)
             self.assertEqual(0, db.query(AppEaTaskEvent).filter(AppEaTaskEvent.task_id == task.task_id).count())
+        finally:
+            db.close()
+
+    def test_clear_timeline_records_audit_event_before_physical_delete(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db)
+            db.add(
+                AppEaTaskEvent(
+                    id="evt1",
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    source="system",
+                    level="info",
+                    event_type="first_event",
+                    message="first",
+                    dedupe_key="k1",
+                )
+            )
+            db.commit()
+
+            captured: list[dict] = []
+            original = task_service._safe_create_task_event
+
+            def _capture(_db, **kwargs):
+                captured.append(dict(kwargs))
+                return original(_db, **kwargs)
+
+            with patch("app.service.task_service._safe_create_task_event", side_effect=_capture):
+                deleted_all = self.service.clear_task_timeline(db, task)
+
+            self.assertEqual(2, deleted_all)
+            self.assertEqual("task_timeline_cleared", captured[0]["event_type"])
+            self.assertEqual(1, captured[0]["payload"]["deleted_event_count_before_clear"])
+            self.assertEqual(0, db.query(AppEaTaskEvent).filter(AppEaTaskEvent.task_id == task.task_id).count())
+        finally:
+            db.close()
+
+    def test_delete_single_timeline_event_records_audit_event_before_delete(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db)
+            db.add_all([
+                AppEaTaskEvent(
+                    id="evt1",
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    source="system",
+                    level="info",
+                    event_type="first_event",
+                    message="first",
+                    dedupe_key="k1",
+                ),
+                AppEaTaskEvent(
+                    id="evt2",
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    source="system",
+                    level="info",
+                    event_type="second_event",
+                    message="second",
+                    dedupe_key="k2",
+                ),
+            ])
+            db.commit()
+
+            captured: list[dict] = []
+            original = task_service._safe_create_task_event
+
+            def _capture(_db, **kwargs):
+                captured.append(dict(kwargs))
+                return original(_db, **kwargs)
+
+            with patch("app.service.task_service._safe_create_task_event", side_effect=_capture):
+                deleted_one = self.service.delete_task_timeline_event(db, task, "evt1")
+
+            self.assertEqual(1, deleted_one)
+            self.assertEqual("task_timeline_event_deleted", captured[0]["event_type"])
+            self.assertEqual("evt1", captured[0]["payload"]["deleted_event_id"])
+            self.assertEqual("first_event", captured[0]["payload"]["deleted_event_type"])
+            remaining_ids = [item.id for item in db.query(AppEaTaskEvent).filter(AppEaTaskEvent.task_id == task.task_id).all()]
+            self.assertIn("evt2", remaining_ids)
+            self.assertEqual(2, len(remaining_ids))
+        finally:
+            db.close()
+
+    def test_claim_task_row_atomic_records_dispatch_event(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_dispatch", status="pending")
+            claimed = self.service._claim_task_row_atomic(db, task.id)
+            self.assertIsNotNone(claimed)
+            timeline = self.service.get_task_timeline(db, claimed)
+            self.assertEqual("task_dispatched", timeline["events"][0]["event_type"])
+            self.assertEqual("atomic_claim", timeline["events"][0]["payload"]["dispatch_mode"])
+            self.assertFalse(bool(timeline["events"][0]["payload"]["lease_takeover"]))
+        finally:
+            db.close()
+
+    def test_claim_task_row_atomic_records_lease_takeover_event(self):
+        db = self.SessionLocal()
+        try:
+            stale_time = now_local() - timedelta(seconds=5)
+            row = AppEaTask(
+                task_id="eat_takeover",
+                project_id="p1",
+                task_name="takeover task",
+                input_path="/src/module-a",
+                module_name="module-a",
+                prompt_content="prompt",
+                status="running",
+                owner_pod="old-worker",
+                lease_expires_at=stale_time,
+                started_at=now_local() - timedelta(minutes=1),
+            )
+            db.add(row)
+            db.commit()
+
+            claimed = self.service._claim_task_row_atomic(db, row.id)
+            self.assertIsNotNone(claimed)
+            timeline = self.service.get_task_timeline(db, claimed)
+            self.assertEqual(
+                ["task_dispatched", "task_lease_taken_over"],
+                [event["event_type"] for event in timeline["events"][:2]],
+            )
+            self.assertTrue(bool(timeline["events"][0]["payload"]["lease_takeover"]))
+            self.assertEqual("old-worker", timeline["events"][1]["payload"]["previous_owner_pod"])
         finally:
             db.close()
 
