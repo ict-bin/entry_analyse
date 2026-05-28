@@ -25,6 +25,13 @@ class SchedulerService:
         self._task: Optional[asyncio.Task] = None
 
     async def _reconcile_cluster_state(self) -> int:
+        from app.service.task_service import (
+            TASK_EVENT_SOURCE_SYSTEM,
+            _event_dedupe_key,
+            _record_abnormal_reason,
+            _safe_create_task_event,
+            _sync_task_abnormal_reason,
+        )
         from app.service.worker_slot_service import get_worker_slot_service
 
         db_gen = get_db()
@@ -64,12 +71,44 @@ class SchedulerService:
                 .all()
             )
             for row in cancelled_rows:
+                previous_owner = row.owner_pod
                 row.status = "cancelled"
                 row.finished_at = row.finished_at or now
                 row.owner_pod = None
                 row.lease_expires_at = None
                 row.cancel_requested = False
                 row.error = row.error or "任务已取消"
+                reason, changed_reason = _sync_task_abnormal_reason(row)
+                _record_abnormal_reason(row, reason, changed=changed_reason)
+                _safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="task_cancelled",
+                    message="任务因租约过期后取消请求未收尾，已由调度器兜底取消",
+                    source=TASK_EVENT_SOURCE_SYSTEM,
+                    level="warning",
+                    stage_key="entry_analysis",
+                    file_path=row.input_path,
+                    status=row.status,
+                    payload={"reason": "scheduler_reconcile_cancelled", "owner_pod": previous_owner},
+                    dedupe_key=_event_dedupe_key(row.task_id, "task_cancelled", row.finished_at, "scheduler_reconcile"),
+                )
+                if changed_reason and isinstance(reason, dict):
+                    _safe_create_task_event(
+                        db,
+                        task_id=row.task_id,
+                        project_id=row.project_id,
+                        event_type="abnormal_reason_recorded",
+                        message=str(reason.get("title") or "任务异常"),
+                        source=TASK_EVENT_SOURCE_SYSTEM,
+                        level="warning" if str(reason.get("status") or "") == "cancelled" else "error",
+                        status=str(reason.get("status") or row.status),
+                        stage_key=str(reason.get("stage_name") or "").strip() or None,
+                        file_path=row.input_path,
+                        payload={"reason": reason, "reconciled": True},
+                        dedupe_key=_event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message"), "scheduler_reconcile"),
+                    )
                 changed += 1
 
             pending_rows = (

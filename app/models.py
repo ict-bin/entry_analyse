@@ -21,6 +21,8 @@ MAX_CONCURRENT_TASKS_DEFAULT = 8
 MAX_CONCURRENT_TASKS_LIMIT = 128
 WORKER_PARALLELISM_DEFAULT = 128
 WORKER_PARALLELISM_LIMIT = 256
+PIPELINE_PARALLELISM_DEFAULT = 64
+PIPELINE_PARALLELISM_LIMIT = 256
 MASTER_SHARD_SIZE_DEFAULT = 10
 MASTER_SHARD_PARALLELISM_DEFAULT = 4
 MODEL_MAX_CONCURRENCY_DEFAULT = 32
@@ -51,6 +53,16 @@ def normalize_worker_parallelism(value: int | str | None) -> int:
     if candidate < 1:
         return 1
     return min(candidate, WORKER_PARALLELISM_LIMIT)
+
+
+def normalize_pipeline_parallelism(value: int | str | None) -> int:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return PIPELINE_PARALLELISM_DEFAULT
+    if candidate < 1:
+        return 1
+    return min(candidate, PIPELINE_PARALLELISM_LIMIT)
 
 
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
@@ -104,7 +116,7 @@ class ServiceConfig(BaseModel):
     model_max_concurrency: int = Field(default=MODEL_MAX_CONCURRENCY_DEFAULT)
 
     # 各阶段轮次配置（-1=无限，0=跳过，N=上限）
-    pipeline_parallelism: int = Field(default=64)
+    pipeline_parallelism: int = Field(default=PIPELINE_PARALLELISM_DEFAULT)
     r1_max_rounds: int = Field(default=-1)
     r2_max_rounds: int = Field(default=-1)
     r3_max_rounds: int = Field(default=-1)
@@ -188,7 +200,7 @@ class TaskConfig(BaseModel):
     result_dir: str = Field(default="/data/output")
 
     # ── 并发控制 ───────────────────────────────────────────────────────────────
-    pipeline_parallelism: int = Field(default=64,
+    pipeline_parallelism: int = Field(default=PIPELINE_PARALLELISM_DEFAULT,
         description="全局并行信号量大小（同时存在的 pi 进程上限）")
 
     # ── 每阶段最大重试轮次（-1=无限重试，0=跳过，正整数=上限）─────────────────────

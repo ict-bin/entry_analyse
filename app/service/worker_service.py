@@ -359,15 +359,8 @@ class WorkerService:
                 db.commit()
 
                 svc = task_mod._load_svc_config_from_db(db, row.project_id)
-                tcfg = dict(row.task_config_json or {})
-                # task_config_json 可通过 lean_mode / lean_file_max_rounds / lean_module_max_rounds
-                # 覆盖项目级配置，实现单任务精简模式
-                if "lean_mode" in tcfg:
-                    svc.lean_mode = bool(tcfg["lean_mode"])
-                if "lean_file_max_rounds" in tcfg:
-                    svc.lean_file_max_rounds = int(tcfg["lean_file_max_rounds"])
-                if "lean_module_max_rounds" in tcfg:
-                    svc.lean_module_max_rounds = int(tcfg["lean_module_max_rounds"])
+                tcfg = task_mod._parse_task_config(row.task_config_json)
+                svc = task_mod._apply_task_config_overrides(svc, tcfg)
                 if row.output_path:
                     svc.output_dir = row.output_path
                     svc.archive_dir = row.output_path

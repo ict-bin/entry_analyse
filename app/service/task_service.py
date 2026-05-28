@@ -1406,6 +1406,64 @@ def _load_svc_config_from_db(db: "Session", project_id: str):
         return _load_svc_config()
 
 
+_TASK_CONFIG_OVERRIDE_FIELDS = {
+    "max_rounds",
+    "max_rounds_exceeded_action",
+    "min_rounds",
+    "pass_threshold",
+    "max_concurrent_tasks",
+    "agent_max_retries",
+    "agent_retry_delay",
+    "agent_run_timeout_seconds",
+    "agent_timeout_retry_enabled",
+    "agent_timeout_max_retries",
+    "pi_max_retries",
+    "pi_retry_delay",
+    "max_consecutive_empty_responses",
+    "worker_parallel",
+    "worker_parallelism",
+    "pipeline_parallelism",
+    "r1_max_rounds",
+    "r2_max_rounds",
+    "r3_max_rounds",
+    "r3_j_max_rounds",
+    "r4_func_max_rounds",
+    "r4_func_j_max_rounds",
+    "r4_final_max_rounds",
+    "report_func_max_rounds",
+    "report_final_max_rounds",
+    "lean_mode",
+    "lean_file_max_rounds",
+    "lean_module_max_rounds",
+    "master_merge_mode",
+    "master_shard_size",
+    "master_shard_parallelism",
+    "model_capacity_enabled",
+    "model_max_concurrency",
+    "pipeline_prompts_dir",
+}
+
+
+def _apply_task_config_overrides(service_config: Any, task_config: dict[str, Any]) -> Any:
+    if not isinstance(task_config, dict):
+        return service_config
+    merged = service_config.model_dump(mode="python") if hasattr(service_config, "model_dump") else dict(service_config)
+    for key in _TASK_CONFIG_OVERRIDE_FIELDS:
+        if key in task_config:
+            merged[key] = task_config[key]
+    try:
+        from app.models import ServiceConfig as _ServiceConfig
+        from app.service.config_service import ConfigService as _ConfigService
+
+        normalized = _ConfigService._normalize_runtime_fields(merged)
+        return _ServiceConfig(**normalized)
+    except Exception:
+        for key in _TASK_CONFIG_OVERRIDE_FIELDS:
+            if key in task_config:
+                setattr(service_config, key, task_config[key])
+        return service_config
+
+
 def generate_prompt_from_path(input_path: str) -> str:
     """Generate a default entry-analysis prompt from the input path (legacy)."""
     return generate_prompt_from_module(os.path.basename(input_path.rstrip("/\\")) or input_path)

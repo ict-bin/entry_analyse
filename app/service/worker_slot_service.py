@@ -111,6 +111,9 @@ class WorkerSlotService:
                 AppEaTask.is_deleted.is_(False),
                 AppEaTask.status == "running",
                 AppEaTask.owner_pod.is_not(None),
+                AppEaTask.cancel_requested.is_(False),
+                AppEaTask.lease_expires_at.is_not(None),
+                AppEaTask.lease_expires_at >= now,
             )
             .all()
         )

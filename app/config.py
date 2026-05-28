@@ -17,6 +17,7 @@ from .models import (
     TaskConfig,
     normalize_max_concurrent_tasks,
     normalize_max_rounds_exceeded_action,
+    normalize_pipeline_parallelism,
     normalize_worker_parallelism,
 )
 
@@ -85,7 +86,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         result_dir=svc.result_dir,
         resume_task_id=resume_task_id,
         # 各阶段轮次配置（v3）
-        pipeline_parallelism=int(getattr(svc, 'pipeline_parallelism', 64) or 64),
+        pipeline_parallelism=normalize_pipeline_parallelism(getattr(svc, 'pipeline_parallelism', None)),
         r1_max_rounds=int(getattr(svc, 'r1_max_rounds', -1)),
         r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
         r3_max_rounds=int(getattr(svc, 'r3_max_rounds', -1)),

@@ -12,6 +12,7 @@ from app.db.models import AppEaModelsConfig, AppEaProjectConfig
 from app.models import (
     normalize_max_concurrent_tasks,
     normalize_max_rounds_exceeded_action,
+    normalize_pipeline_parallelism,
     normalize_worker_parallelism,
 )
 
@@ -118,9 +119,8 @@ class ConfigService:
         normalized["max_concurrent_tasks"] = normalize_max_concurrent_tasks(
             normalized.get("max_concurrent_tasks")
         )
-        normalized["worker_parallelism"] = normalize_worker_parallelism(
-            normalized.get("worker_parallelism")
-        )
+        normalized["worker_parallelism"] = normalize_worker_parallelism(normalized.get("worker_parallelism"))
+        normalized["pipeline_parallelism"] = normalize_pipeline_parallelism(normalized.get("pipeline_parallelism"))
         try:
             normalized["master_shard_size"] = max(2, min(int(normalized.get("master_shard_size", 10)), 100))
         except (TypeError, ValueError):
