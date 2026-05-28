@@ -3,6 +3,8 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from app.service import scheduler_service, task_service, worker_slot_service
+from app.api import tasks as tasks_api
+from app.service import agent_observability
 from app.service.scheduler_service import SchedulerService
 from app.service.worker_slot_service import WorkerSlotService
 from app.time_utils import now_local
@@ -166,3 +168,84 @@ def test_delete_task_is_idempotent_when_task_already_deleted() -> None:
     )
     result = task_service.TaskService().delete_task(_DeleteTaskDb(row), "eat_deleted", delete_files=True)
     assert result == {"deleted_event_count": 0}
+
+
+def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:
+    snapshot = {
+        "summary": {
+            "aggregate_partial": True,
+            "aggregate_sources": 2,
+            "aggregate_fanout_errors": 1,
+            "aggregate_failed_targets": ["pod-b"],
+            "scanned_at": 123.0,
+        },
+        "pods": [
+            {"pod_name": "pod-a", "healthy": True},
+            {"pod_name": "pod-b", "healthy": False},
+        ],
+        "processes": [
+            {"pid": 11, "owner_kind": "tracked", "kill_allowed": False},
+            {"pid": 22, "owner_kind": "orphan", "kill_allowed": True},
+            {"pid": 33, "owner_kind": "unknown", "kill_allowed": True},
+            {"pid": 44, "owner_kind": "unknown", "kill_allowed": False},
+        ],
+        "sessions": [
+            {"session_file": "s1", "orphan_session": True},
+            {"session_file": "s2", "orphan_session": False},
+        ],
+        "tasks": [{"task_id": "eat_1"}],
+    }
+
+    runtime = tasks_api._build_agent_runtime_aggregate(snapshot)
+
+    assert runtime["summary"]["total_pods"] == 2
+    assert runtime["summary"]["healthy_pods"] == 1
+    assert runtime["summary"]["tracked_processes"] == 1
+    assert runtime["summary"]["orphan_processes"] == 1
+    assert runtime["summary"]["suspected_orphan_processes"] == 2
+    assert runtime["summary"]["killable_suspected_orphan_processes"] == 1
+    assert runtime["summary"]["aggregate_partial"] is True
+    assert runtime["summary"]["aggregate_failed_targets"] == ["pod-b"]
+
+
+def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 1234,
+        "ppid": 1,
+        "pgid": 1234,
+        "command": "node /usr/bin/pi",
+        "cwd": "/tmp/orphan-agent",
+        "rss_bytes": 4096,
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return []
+
+        def count(self):
+            return 0
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+
+    assert len(snapshot["processes"]) == 1
+    row = snapshot["processes"][0]
+    assert row["owner_kind"] == "unknown"
+    assert row["kill_allowed"] is True
+    assert row["kill_block_reason"] is None
+    assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1

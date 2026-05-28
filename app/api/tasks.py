@@ -399,10 +399,18 @@ class AgentTaskOwnershipSnapshotResponse(BaseModel):
 
 class AgentPodSnapshotResponse(BaseModel):
     pod_name: str
+    worker_id: Optional[str] = None
+    healthy: bool = True
     process_count: int = 0
+    tracked_process_count: int = 0
     orphan_process_count: int = 0
+    suspected_orphan_process_count: int = 0
     session_count: int = 0
     orphan_session_count: int = 0
+    task_count: int = 0
+    active_task_count: int = 0
+    last_scanned_at: Optional[float] = None
+    scan_errors: int = 0
 
 
 class AgentObservabilitySummaryResponse(BaseModel):
@@ -411,6 +419,7 @@ class AgentObservabilitySummaryResponse(BaseModel):
     orphan_processes: int = 0
     unknown_processes: int = 0
     killable_orphan_processes: int = 0
+    killable_suspected_orphan_processes: int = 0
     orphan_sessions: int = 0
     scanned_at: Optional[float] = None
     scan_errors: int = 0
@@ -438,6 +447,30 @@ class AgentProcessKillResponse(BaseModel):
     failed: int
     skipped: int
     items: list[AgentProcessKillItemResponse] = Field(default_factory=list)
+
+
+class AgentRuntimeAggregateSummaryResponse(BaseModel):
+    total_pods: int = 0
+    healthy_pods: int = 0
+    total_processes: int = 0
+    tracked_processes: int = 0
+    orphan_processes: int = 0
+    suspected_orphan_processes: int = 0
+    killable_orphan_processes: int = 0
+    killable_suspected_orphan_processes: int = 0
+    orphan_sessions: int = 0
+    aggregate_partial: bool = False
+    aggregate_sources: int = 0
+    aggregate_fanout_errors: int = 0
+    aggregate_failed_targets: list[str] = Field(default_factory=list)
+    scanned_at: Optional[float] = None
+
+
+class AgentRuntimeAggregateResponse(BaseModel):
+    summary: AgentRuntimeAggregateSummaryResponse
+    pods: list[AgentPodSnapshotResponse] = Field(default_factory=list)
+    processes: list[AgentProcessSnapshotResponse] = Field(default_factory=list)
+    tasks: list[AgentTaskOwnershipSnapshotResponse] = Field(default_factory=list)
 
 
 def _auth_headers_from_token(token: str) -> dict[str, str]:
@@ -576,6 +609,7 @@ async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Sessi
         "orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "orphan"]),
         "unknown_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown"]),
         "killable_orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "orphan" and bool(item.get("kill_allowed"))]),
+        "killable_suspected_orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
         "orphan_sessions": len([item for item in merged_sessions if bool(item.get("orphan_session"))]),
         "scanned_at": time.time(),
         "scan_errors": 0,
@@ -611,6 +645,35 @@ async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Sessi
         "meta": dict(_LAST_AGENT_AGGREGATE_META),
     }
     return snapshot
+
+
+def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
+    pods = list(snapshot.get("pods") or [])
+    processes = list(snapshot.get("processes") or [])
+    tasks = list(snapshot.get("tasks") or [])
+    sessions = list(snapshot.get("sessions") or [])
+    summary = dict(snapshot.get("summary") or {})
+    return {
+        "summary": {
+            "total_pods": len(pods),
+            "healthy_pods": len([item for item in pods if bool(item.get("healthy", True))]),
+            "total_processes": len(processes),
+            "tracked_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "tracked"]),
+            "orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "orphan"]),
+            "suspected_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown"]),
+            "killable_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "orphan" and bool(item.get("kill_allowed"))]),
+            "killable_suspected_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
+            "orphan_sessions": len([item for item in sessions if bool(item.get("orphan_session"))]),
+            "aggregate_partial": bool(summary.get("aggregate_partial")),
+            "aggregate_sources": int(summary.get("aggregate_sources") or 0),
+            "aggregate_fanout_errors": int(summary.get("aggregate_fanout_errors") or 0),
+            "aggregate_failed_targets": list(summary.get("aggregate_failed_targets") or []),
+            "scanned_at": summary.get("scanned_at"),
+        },
+        "pods": pods,
+        "processes": processes,
+        "tasks": tasks,
+    }
 
 
 @router.post("/tasks", status_code=201)
@@ -886,6 +949,18 @@ async def list_agent_aggregate_pods(
     return (await _build_agent_aggregate_snapshot(project_id, token, db))["pods"]
 
 
+@router.get("/agent-observability/aggregate/runtime", response_model=AgentRuntimeAggregateResponse)
+async def get_agent_aggregate_runtime(
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    snapshot = await _build_agent_aggregate_snapshot(project_id, token, db)
+    return _build_agent_runtime_aggregate(snapshot)
+
+
 @router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse)
 async def kill_agent_process(
     pid: int,
@@ -995,6 +1070,75 @@ async def kill_all_orphan_processes(
         succeeded=succeeded,
         failed=failed,
         skipped=0,
+        items=[AgentProcessKillItemResponse(**item) for item in items],
+    )
+
+
+@router.post("/agent-observability/aggregate/processes/kill-all-suspected-orphans", response_model=AgentProcessKillResponse)
+async def kill_all_agent_aggregate_suspected_orphans(
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    user, token = user_and_token
+    ensure_admin_user(user)
+    await ensure_project_access(project_id, token)
+    snapshot = await _build_agent_aggregate_snapshot(project_id, token, db)
+    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "unknown" and row.get("kill_allowed")]
+    cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
+    worker_by_pod = {str(worker.get("pod_name") or ""): worker for worker in cluster_snapshot.get("workers") or []}
+    items: list[dict[str, Any]] = []
+
+    logger.warning(
+        "entry-agent-aggregate-bulk-kill-suspected operator=%s project_id=%s count=%s",
+        user.get("username") or user.get("name") or "unknown",
+        project_id,
+        len(killable),
+    )
+    for row in killable:
+        _audit_agent_kill_event(
+            db,
+            project_id=project_id,
+            operator=user.get("username") or user.get("name") or "unknown",
+            event_type="agent_process_bulk_manual_kill",
+            message=f"管理员跨 Pod 批量终止疑似孤儿智能体进程 pid={int(row.get('pid') or 0)}",
+            payload={
+                "pid": int(row.get("pid") or 0),
+                "pgid": row.get("pgid"),
+                "pod_name": row.get("pod_name"),
+                "session_file": row.get("session_file"),
+                "owner_reason": row.get("owner_reason"),
+                "owner_kind": row.get("owner_kind"),
+                "kill_mode": "aggregate_bulk_suspected",
+            },
+            task_id=row.get("task_id"),
+        )
+        target_worker = worker_by_pod.get(str(row.get("pod_name") or ""))
+        if target_worker is None:
+            items.append({"pid": int(row.get("pid") or 0), "pgid": row.get("pgid"), "status": "failed", "reason": "target pod not found in cluster snapshot"})
+            continue
+        result, _ = await _fanout_post_json(
+            _aggregate_base_urls(type("WorkerRef", (), target_worker)),
+            path=f"/agent-observability/processes/{int(row.get('pid') or 0)}/kill",
+            token=token,
+            params={"project_id": project_id},
+        )
+        if not result:
+            items.append({"pid": int(row.get("pid") or 0), "pgid": row.get("pgid"), "status": "failed", "reason": "fanout kill request failed"})
+            continue
+        for item in result.get("items") or []:
+            items.append(item)
+
+    succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
+    failed = sum(1 for item in items if item.get("status") == "failed")
+    skipped = sum(1 for item in items if item.get("status") == "skipped")
+    _invalidate_agent_aggregate_cache(project_id)
+    return AgentProcessKillResponse(
+        requested=len(killable),
+        matched=len(killable),
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
         items=[AgentProcessKillItemResponse(**item) for item in items],
     )
 
