@@ -72,6 +72,7 @@ grep -n 'parsed_http_message\|void \*arg\|recvfrom\|recvmsg\|MsgReceive' {source
 
 ## 原则
 
+- **函数声明（行尾以 `;` 结尾，无 `{...}` 函数体）不属于覆盖范围，不得要求补充**
 - **不要用 `grep '^int \|^void '` 仅检查非 static 函数**——这会漏掉所有 static 回调
 - 安全分析中 `static` 回调与公开函数同等重要（接收外部数据的 static 函数是真实攻击面）
 - 只审核 gap 区间和 static 覆盖情况，不需要验证整个文件
