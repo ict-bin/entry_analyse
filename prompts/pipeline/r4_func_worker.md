@@ -1,76 +1,47 @@
-# R4 Worker — 调用链入口分析
+# R4 Worker — 调用链入口冗余判断
 
-你是一位专业的**污点分析（Taint Analysis）**专家，专注于识别函数中的外部输入来源。
+你的任务是判断一个已通过 R3 筛选的候选入口函数是否为「冗余内层函数」——即已被其他 R3-kept 入口覆盖，不需要作为独立入口保留。
 
-## 你的职责
+## 核心判断规则
 
-分析单个函数是否接收来自模块外部的可控数据，判定入口类型和入口角色，并记录污点信息。
+**filter（冗余，应移除）** 需满足以下**全部**条件：
 
-## 入口类型分类（tag）
+1. callchain.db 中存在直接调用者，且该调用者 `is_r3_entry=1`
+2. 本函数的 R3 分析 `tag="P"`（被动型：taint 来自调用者参数传入，非自主读取）
+3. `entry_role ≠ "dispatch_target"`
 
-**被动型（P, Passive）**：函数参数中携带外部可控数据
-- 被网络协议栈回调（如 gRPC/HTTP/Netlink handler）
-- 被 IPC 框架回调（如消息队列、信号量回调）
-- 参数类型/名称暗示来自外部（如 `request`, `msg`, `buf`, `packet`）
+否则 `decision=keep`（保留）。
 
-**主动型（A, Active）**：函数体内主动调用 I/O 接口读取外部数据
-- 网络：`recv`, `recvfrom`, `recvmsg`, `read`（fd 为 socket）, `accept`
-- 文件/设备：`fread`, `fgets`, `getline`, `mmap`（外部文件/设备），`ioctl`
-- 系统消息：`MsgReceive`, `MsgReceivePulse`, `MsgRead`（QNX 等 RTOS）
+## 分析流程
 
-**无外部输入**：纯内部函数，不满足以上任一条件
+### Step 1：查看 prompt 中的结构化数据
 
-## 入口角色分类（entry_role）
+Prompt 已直接提供：
+- 本函数的 R3 分析结果（tag、entry_role、taints）
+- callchain.db 查询结果（直接调用者列表及 `is_r3_entry` 状态）
 
-仅当 `has_external_input=true` 时填写，判断该函数在模块中扮演的角色：
+**根据 prompt 中的"预判断提示"直接定位决策方向。**
 
-| entry_role | 适用场景 | 污点分析意义 |
-|---|---|---|
-| `boundary` | 模块最外层边界，直接从模块外部接收原始数据（网络包/消息队列/IPC 等），无本模块上层函数将数据流入 | 模块级安全边界 |
-| `dispatch_target` | 被上层 dispatcher（switch-case/函数指针表）按消息类型/操作码分发，直接处理特定类型的外部数据 | **推荐作为污点追踪起点**（从上层 dispatcher 追踪会造成分支爆炸） |
-| `callback` | 被外部框架（HA/Timer/注册回调）直接回调，接收框架传入的状态/消息数据 | 框架驱动的入口 |
-| `ipc_handler` | 处理进程间通信消息（消息队列/pipe/socket），消息内容来自其他进程 | IPC 攻击面入口 |
+### Step 2：按规则做出决策
 
-**判断方法（1步确认）**：
-- 存在上层 dispatch 函数（如 `OperDispatch/MsgProc/ProcMsg` 等）通过函数指针或 switch-case 调用该函数 → `dispatch_target`
-- 通过 `Register/Hook/Subscribe` 等注册给外部框架 → `callback`
-- 处理消息队列/pipe/socket 消息 → `ipc_handler`
-- 默认：`boundary`（保守）
+| 情形 | 决策 |
+|------|------|
+| 无 is_r3_entry=1 的调用者 | **keep** |
+| tag = "A"（主动读取外部数据） | **keep** |
+| entry_role = "dispatch_target" | **keep** |
+| 有 R3-kept 调用者 且 tag = "P" | **filter（decision=remove）** |
 
-## 函数体获取方式（按需，不嵌入 prompt）
+### Step 3：写出结果文件
 
-用户 prompt 中已提供 `body_lines` 和对应的 bash 命令：
-- **小函数（≤ 60 行）**：直接用 `sed -n 'N,Mp'` 读全量（2KB 以内）
-- **中等函数（61-200 行）**：用 python3 扫描关键字 + sed 读签名行（仅命中行）
-- **大函数（> 200 行）**：用 awk 行级过滤（只返回外部 I/O 命中行）
+加载 Skill `ea-r4-worker-result`，按其格式写出结果 JSON 文件。
 
-按 prompt 中的步骤执行即可，**不要自行读取大型 JSON 文件**。
+---
 
-## 输出规则
+## ⛔ 禁止事项
 
-将分析结果输出在 `<result>` 标签中（**不要写任何文件**，引擎负责持久化）：
+- **禁止读取 `.c` / `.h` 源文件**（R3 已完成外部输入分析，无需重复）
+- **禁止重新分析 taint 来源**（直接使用 prompt 中提供的 tag 和 taints）
+- **禁止 grep/find 在源文件中搜索调用关系**（callchain.db 已有完整调用图）
+- **禁止重新实现 R3 的外部输入识别逻辑**
 
-**有外部输入时**：
-```json
-{
-  "has_external_input": true,
-  "tag": "P",
-  "entry_role": "boundary",
-  "taints": ["param_name"],
-  "entry_source_lines": [{"line": 42, "code": "实际代码行"}],
-  "function_description": "函数职责的简洁描述（1-2 句话）",
-  "entry_reason": "为何判定为外部入口（具体说明）",
-  "taint_details": [{"name": "param_name", "description": "该参数承载什么外部数据"}],
-  "justification": "entry_role 判断依据"
-}
-```
-
-**无外部输入时**：输出 `<result>{"has_external_input": false}</result>`
-
-## 分析原则
-
-- 对于被动型，要确认参数确实来自外部（而非内部调用传入的内部数据）
-- 对于主动型，要确认调用的是真正的外部 I/O（而非内存操作）
-- 疑似情况下，保守判定为有外部输入（宁可误报不能漏报）
-- 大函数若 awk 无命中且签名无可疑参数名 → 直接判断无外部输入，无需读全量
-- `dispatch_target` 和 `boundary` 的区别：boundary 是数据最初进入模块的那层；dispatch_target 是 boundary 根据数据类型再分发到的处理层
+如需查询 callchain.db 或 funcdb 验证细节，加载 Skill `ea-r4-callchain-query`。

@@ -367,56 +367,85 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
 
 def build_r4_func_w_prompt(
     func_name: str,
+    func_hash: str,
     file_path: str,
     entry_role: str,
-    callers_info: str,
-    result_file: Path,
+    r3_analysis: dict,
+    callers_structured: "list[dict]",
+    callchain_db_path: str,
+    funcdb_path: str,
+    result_file: "Path",
     is_retry: bool = False,
     feedback: str = "",
     judge_result_file: str = "",
-    r3_kept_names: "list[str] | None" = None,
 ) -> str:
-    """R4 函数级 Worker：跨文件去重判断，retry 时显式读取上一轮结果文件。"""
+    """R4 per-func Worker: callchain redundancy decision. No source file reading."""
     retry = _retry_section(feedback) if is_retry else ""
     if is_retry and judge_result_file:
-        retry += f"\n上一轮结果文件：`{judge_result_file}`（请先读取再改进）\n"
+        retry += "\n上一轮结果文件：`" + judge_result_file + "`（请先读取再改进）\n"
 
-    # R3 入口候选名单（用于判断调用者是否也是入口）
-    kept_section = ""
-    if r3_kept_names:
-        names_md = "\n".join(f"  - `{n}`" for n in sorted(r3_kept_names)[:30])
-        extra = f"\n  - …（共 {len(r3_kept_names)} 个）" if len(r3_kept_names) > 30 else ""
-        kept_section = (
-            f"\n## 当前 R3 入口候选名单\n\n"
-            f"{names_md}{extra}\n\n"
-            f"验证局部 1：检查 **调用关系** 中的调用者名称是否出现在上方名单中。\n"
+    tag        = r3_analysis.get("tag", "?") if r3_analysis else "?"
+    taints     = r3_analysis.get("taints") or []
+    taints_str = ", ".join("`" + t + "`" for t in taints[:5]) if taints else "无"
+    entry_desc = (r3_analysis.get("entry_reason", "") if r3_analysis else "")
+
+    if callers_structured:
+        rows = []
+        for c in callers_structured:
+            n  = (c.get("name") or c.get("caller_hash", "?"))[:30]
+            r3 = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
+            ct = c.get("call_type", "direct")
+            rows.append("| `" + n + "` | " + r3 + " | " + ct + " |")
+        has_r3 = any(c.get("is_r3_entry") for c in callers_structured)
+        ctable = (
+            "| 调用者 | is_r3_entry | 调用方式 |\n"
+            "|--------|-------------|---------|\n"
+            + "\n".join(rows)
         )
-    return (
-        f"# R4 跨文件分析：`{func_name}`\n\n"
-        f"{retry}"
-        f"**文件**：`{file_path}`\n"
-        f"**角色**：`{entry_role}`\n"
-        f"**调用关系**：{callers_info}\n"
-        f"{kept_section}\n"
-        f"## 判断规则\n\n"
-        f"若满足以下**全部**条件，则 `decision=remove`：\n"
-        f"1. 存在本模块内调用者\n"
-        f"2. 该函数的 taint 来自调用者参数（非自主读取）\n"
-        f"3. `entry_role` **不是** `dispatch_target`\n\n"
-        f"否则 `decision=keep`（保守保留）。\n\n"
-        f"## 验证步骤\n\n"
-        f"1. 若 **调用关系** 内有调用者，对照上方 R3 入口名单确认该调用者是否也是入口\n"
-        f"2. 查看函数签名，判断 taint 是参数来源还是函数体内主动读取\n\n"
-        f"## 输出格式\n\n"
-        f"```json\n"
-        f"{{\"decision\": \"keep\", \"reason\": \"直接外部边界，无模块内调用者\"}}\n"
-        f"```\n"
-        f"将 JSON 写入：`{result_file}`\n\n"
-        f"## 写出前必须执行：格式自检\n\n"
-        f"加载 Skill `ea-r4-worker-result`，按其 Step1-4 完成判断并写出结果文件再结束任务。\n"
-        f"引擎读取该文件获取决策，未写文件则默认 keep（保守策略）。\n"
-    )
+    else:
+        has_r3 = False
+        ctable = "无模块内调用者（直接外部边界）"
 
+    if not has_r3:
+        hint = "注意：无 R3-kept 调用者 -> filter 条件不成立 -> 预期决策 = keep"
+    elif tag == "A":
+        hint = "注意：tag=A（主动型） -> 函数体内自主读取外部数据 -> 预期决策 = keep"
+    elif entry_role == "dispatch_target":
+        hint = "注意：entry_role=dispatch_target -> 必须 keep"
+    else:
+        hint = (
+            "注意：存在 R3-kept 调用者 且 tag=P -> 需判断 taint 是否来自该调用者参数\n"
+            "  - 如是：decision=remove（即filter）\n"
+            "  - 如否（函数体内自主读取）：decision=keep"
+        )
+
+    return (
+        "# R4 调用链入口判断：`" + func_name + "`\n\n"
+        + retry
+        + "## 本函数信息\n\n"
+        + "| 字段 | 值 |\n|------|-----|\n"
+        + "| func_hash | `" + func_hash + "` |\n"
+        + "| file | `" + file_path + "` |\n"
+        + "| entry_role | `" + entry_role + "` |\n"
+        + "| R3 tag | `" + tag + "` (P=被动/A=主动)|\n"
+        + "| R3 taints | " + taints_str + " |\n"
+        + "| R3 入口说明 | " + (entry_desc[:100] or "无") + " |\n\n"
+        + "## 调用者（来自 callchain.db）\n\n"
+        + ctable + "\n\n"
+        + hint + "\n\n"
+        + "## 判断规则（filter 需全部满足）\n\n"
+        + "1. 存在 is_r3_entry=1 的直接调用者\n"
+        + "2. 本函数 tag=P（已知）\n"
+        + "3. entry_role != dispatch_target\n\n"
+        + "否则 decision=keep。\n\n"
+        + "## DB 路径（如需进一步查询）\n\n"
+        + "- callchain.db: `" + callchain_db_path + "`\n"
+        + "- funcdb: `" + funcdb_path + "`\n\n"
+        + "加载 Skill `ea-r4-callchain-query` 了解如何查询以上 DB。\n\n"
+        + "## 输出（禁止读取源文件）\n\n"
+        + "直接根据以上信息做出决策，将 JSON 写入：`" + str(result_file) + "`\n\n"
+        + "加载 Skill `ea-r4-worker-result` 完成结果文件写出。\n"
+    )
 
 
 def build_r4_j_func_prompt(
@@ -424,35 +453,83 @@ def build_r4_j_func_prompt(
     func_name: str,
     file_path: str,
     r4_result_file: str,
-    callers_context: str,
+    callers_structured: "list[dict]",
+    r3_tag: str = "?",
+    entry_role: str = "boundary",
+    callchain_db_path: str = "",
+    funcdb_path: str = "",
 ) -> str:
-    """R4-J: verify R4-W keep/filter decision has sufficient callchain evidence."""
+    """验证 R4-W 的 keep/filter 决策是否有充分调用链证据。"""
     r4_result_section = ""
+    r4_decision = "keep"
     if r4_result_file:
         try:
             from pathlib import Path as _P
+            import json as _json
             _p = _P(r4_result_file)
             if _p.exists():
+                _ct = _p.read_text(encoding="utf-8")
                 r4_result_section = (
                     "\n\n## R4-W 决策结果\n```json\n"
-                    + _p.read_text(encoding="utf-8")
+                    + _ct
                     + "\n```"
                 )
+                r4_decision = _json.loads(_ct).get("decision", "keep")
         except Exception:
             pass
+
+    if callers_structured:
+        rows = []
+        for c in callers_structured:
+            n  = (c.get("name") or c.get("caller_hash", "?"))[:30]
+            r3 = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
+            ct = c.get("call_type", "direct")
+            rows.append("| `" + n + "` | " + r3 + " | " + ct + " |")
+        has_r3 = any(c.get("is_r3_entry") for c in callers_structured)
+        ctable = (
+            "| 调用者 | is_r3_entry | 调用方式 |\n"
+            "|--------|-------------|---------|\n"
+            + "\n".join(rows)
+        )
+    else:
+        has_r3 = False
+        ctable = "无模块内调用者（直接外部边界）"
+
+    db_section = ""
+    if callchain_db_path or funcdb_path:
+        db_section = (
+            "\n\n## DB 路径（如需进一步核查）\n\n"
+            + ("- callchain.db: `" + callchain_db_path + "`\n" if callchain_db_path else "")
+            + ("- funcdb: `" + funcdb_path + "`\n" if funcdb_path else "")
+            + "\n加载 Skill `ea-r4-callchain-query` 了解如何查询。"
+        )
+
+    no_r3_warn = ""
+    if not has_r3 and r4_decision != "keep":
+        no_r3_warn = "\n⚠️ 当前无 R3-kept 调用者 → filter 决策不成立\n"
+
     return (
-        "验证 R4-W 对以下函数的 keep/filter 决策：\n\n"
-        "- 函数：`" + func_name + "`\n"
-        "- 文件：`" + file_path + "`\n"
-        "- func_hash：`" + func_hash + "`\n"
+        "验证 R4-W 对函数 `" + func_name + "` 的 **" + r4_decision + "** 决策：\n\n"
+        + "| 字段 | 值 |\n|------|-----|\n"
+        + "| func_hash | `" + func_hash + "` |\n"
+        + "| entry_role | `" + entry_role + "` |\n"
+        + "| R3 tag | `" + r3_tag + "` |\n"
         + r4_result_section
-        + "\n\n## 调用链信息\n\n"
-        + (callers_context or "（调用链信息不可用）")
+        + "\n\n## 调用链信息（来自 callchain.db）\n\n"
+        + ctable
+        + "\n\n## 验证标准\n\n"
+        + "**filter 决策成立需全部满足：**\n"
+        + "1. 存在 is_r3_entry=1 的直接调用者（见上表）\n"
+        + "2. tag=P（已知）\n"
+        + "3. entry_role ≠ dispatch_target\n\n"
+        + "**keep 决策成立条件（满足任一）：**\n"
+        + "- 无 R3-kept 调用者\n"
+        + "- tag=A（主动型，自身读取外部数据）\n"
+        + "- entry_role=dispatch_target\n"
+        + no_r3_warn
+        + db_section
     )
 
-
-
-# ─── Report Worker / Judge ───────────────────────────────────────────────────────────────
 
 def build_report_func_w_prompt(
     func_name: str,

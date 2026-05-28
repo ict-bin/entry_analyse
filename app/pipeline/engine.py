@@ -54,6 +54,7 @@ _STAGE_SKILLS: dict[str, list[Path]] = {
                   _EA_SKILLS_DIR / "worker" / "ea-r3-worker-result"],
     "r3_j":      [],   # 无 skill
     "r4_func_w": [_EA_SKILLS_DIR / "worker" / "ea-r4-worker-result",
+                  _EA_SKILLS_DIR / "worker" / "ea-r4-callchain-query",
                   _EA_SKILLS_DIR / "worker" / "ea-output-format",
                   _EA_SKILLS_DIR / "shared" / "query-functions-db"],
     "r5_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
@@ -127,6 +128,50 @@ def _aggregate_session_tokens(sessions_dir: "Path") -> dict:
         except Exception as _e:
             logger.debug("token agg error %s: %s", jf.name, _e)
     return {k: int(v) if k != "cost" else round(v, 6) for k, v in totals.items()}
+
+
+def _r4_quick_path(
+    func_hash: str,
+    file_hash: str,
+    dirs: "PipelineDirs",
+    state: "PipelineState",
+) -> tuple[bool, str]:
+    """
+    Fix-A: R4 快速路径预判。
+
+    返回 (quick_keep, reason):
+      quick_keep=True  → 直接 keep，跳过 W+J
+      quick_keep=False → 需要 W+J 精细判断
+
+    快速 keep 条件（满足任一即可）：
+      1. callchain.db 中无 R3-kept 调用者（is_r3_entry=1）
+      2. 本函数 R3 分析 tag="A"（主动型：自身读取外部数据，独立入口）
+    """
+    # 查 callchain.db
+    try:
+        from .callchain_db import CallchainDB
+        r3_callers = CallchainDB.open(dirs.callchain).get_r3_callers(func_hash)
+        if not r3_callers:
+            return True, "快速路径：无R3-kept入口调用本函数"
+    except Exception:
+        # callchain.db 不可用时走 W+J（保守策略）
+        return False, ""
+
+    # 查 funcdb 中本函数的 tag
+    try:
+        from .funcdb import FunctionDB as _FDB
+        row = _FDB.open(dirs.r1, file_hash).get_function(func_hash)
+        if row:
+            analysis = row.get("analysis") or {}
+            if isinstance(analysis, str):
+                import json as _j
+                analysis = _j.loads(analysis)
+            if analysis.get("tag") == "A":
+                return True, "快速路径：主动型入口(tag=A)，独立读取外部数据"
+    except Exception:
+        pass
+
+    return False, ""
 
 
 def _should_continue(attempts: int, max_rounds: int, cancel: asyncio.Event) -> bool:
@@ -469,33 +514,54 @@ class PipelineEngine:
                             "entry_role": func_state.entry_role or "boundary",
                             "decision":   "keep",
                         }
-                    # R4 W+J 循环
-                    r4_func_max = int(getattr(self.cfg, "r4_func_max_rounds", -1))
-                    r4_j_max    = int(getattr(self.cfg, "r4_func_j_max_rounds", -1))
-                    while _should_continue(func_state.r4_attempts, r4_func_max, self._cancel):
-                        if func_state.r4_state == NodeState.PASSED:
-                            break
-                        # R4-W
-                        await self._run_r4_for_func(_r4_entry, dirs, state)
-                        if self._cancel.is_set():
-                            break
-                        # R4-J
-                        j_passed = await self._run_r4_j(_r4_entry, dirs, state)
-                        if j_passed:
-                            func_state.r4_state = NodeState.PASSED
-                            state.save(dirs.state_file)
-                            break
-                        # J 失败：重置 W 状态带反馈重跑
-                        if not _should_continue(func_state.r4_j_attempts, r4_j_max, self._cancel):
-                            # 超出 J 上限： force-pass（不允许漏报）
-                            func_state.r4_state = NodeState.PASSED
-                            state.save(dirs.state_file)
-                            break
-                        func_state.r4_j_state = NodeState.PENDING
-                    # 超出 W 上限： force-pass
-                    if func_state.r4_state != NodeState.PASSED:
-                        func_state.r4_state = NodeState.PASSED
+
+                    # ── Fix-A: R4 快速路径预判 ────────────────────────────
+                    # 若无 R3-kept 调用者，或本函数为主动型(tag=A)，直接 keep 跳过 W+J
+                    _r4_quick_keep, _r4_quick_reason = _r4_quick_path(
+                        func_hash, file_hash, dirs, state)
+                    if _r4_quick_keep:
+                        func_state.r4_decision = "keep"
+                        func_state.r4_state    = NodeState.PASSED
+                        func_state.r4_reason   = _r4_quick_reason
                         state.save(dirs.state_file)
+                        try:
+                            from .funcdb import FunctionDB as _FDB4
+                            _FDB4.open(dirs.r1, file_hash).update_r4_decision(func_hash, "keep")
+                        except Exception:
+                            pass
+                        _fn4 = _r4_entry.get("function", func_hash[:8])
+                        self._emit("r4_w_start", func_hash=func_hash,
+                                   function=_fn4, attempt=1, quick_path=True)
+                        self._emit("r4_w_done",  func_hash=func_hash,
+                                   function=_fn4, decision="keep", quick_path=True)
+                    else:
+                        # ── R4 W+J 循环（仅 tag=P 且有 R3-kept 调用者时执行）──
+                        r4_func_max = int(getattr(self.cfg, "r4_func_max_rounds", -1))
+                        r4_j_max    = int(getattr(self.cfg, "r4_func_j_max_rounds", -1))
+                        while _should_continue(func_state.r4_attempts, r4_func_max, self._cancel):
+                            if func_state.r4_state == NodeState.PASSED:
+                                break
+                            # R4-W
+                            await self._run_r4_for_func(_r4_entry, dirs, state)
+                            if self._cancel.is_set():
+                                break
+                            # R4-J
+                            j_passed = await self._run_r4_j(_r4_entry, dirs, state)
+                            if j_passed:
+                                func_state.r4_state = NodeState.PASSED
+                                state.save(dirs.state_file)
+                                break
+                            # J 失败：重置 W 状态带反馈重跑
+                            if not _should_continue(func_state.r4_j_attempts, r4_j_max, self._cancel):
+                                # 超出 J 上限： force-pass（不允许漏报）
+                                func_state.r4_state = NodeState.PASSED
+                                state.save(dirs.state_file)
+                                break
+                            func_state.r4_j_state = NodeState.PENDING
+                        # 超出 W 上限： force-pass
+                        if func_state.r4_state != NodeState.PASSED:
+                            func_state.r4_state = NodeState.PASSED
+                            state.save(dirs.state_file)
                 except Exception as _r4_exc:
                     logger.warning("R4-func error for %s: %s, force-keep", func_hash, _r4_exc)
                     func_state.r4_state = NodeState.PASSED
@@ -1396,9 +1462,11 @@ class PipelineEngine:
 
         # 找到对应的 file_hash + FunctionState
         func_state: FunctionState | None = None
-        for fs in state.files.values():
+        file_hash_for_func = ""
+        for _fh, fs in state.files.items():
             if func_hash in fs.functions:
                 func_state = fs.functions[func_hash]
+                file_hash_for_func = _fh
                 break
 
         if func_state and func_state.r4_state == NodeState.PASSED:
@@ -1420,49 +1488,56 @@ class PipelineEngine:
         result_file = dirs.r4_func_result_file(func_hash)
         session_file = str(dirs.r4_func_w_session(func_hash))
 
-        # 从 callchain.db 获取调用者信息
-        callers_info = ""
+        func_name  = entry.get("function", func_hash[:8])
+        entry_role = entry.get("entry_role", "boundary")
+        file_path  = entry.get("file", "")
+
+        # ── Fix-B2: 预查 DB，将结构化数据内联到 prompt ─────────────────
+        # 1. 从 funcdb 读取本函数的 R3 分析结果 (tag, entry_role, taints)
+        r3_analysis: dict = {}
+        try:
+            from .funcdb import FunctionDB as _FDB
+            if file_hash_for_func:
+                _row = _FDB.open(dirs.r1, file_hash_for_func).get_function(func_hash)
+                if _row:
+                    r3_analysis = _row.get("analysis") or {}
+                    if isinstance(r3_analysis, str):
+                        r3_analysis = json.loads(r3_analysis)
+                    if not r3_analysis:
+                        r3_analysis = {}
+        except Exception:
+            pass
+
+        # 2. 从 callchain.db 读取完整调用者列表（含 is_r3_entry）
+        callers_structured: list[dict] = []
         try:
             from .callchain_db import CallchainDB
-            cc_db = CallchainDB.open(dirs.callchain)
-            callers = cc_db.get_callers(func_hash)
-            if callers:
-                callers_info = f"模块内调用者（{len(callers)} 个）：" + ", ".join(
-                    c.get("name", c.get("caller_hash", ""))[:30] for c in callers[:10]
-                )
-            else:
-                callers_info = "无模块内调用者（直接外部边界）"
+            callers_structured = CallchainDB.open(dirs.callchain).get_callers(func_hash)
         except Exception:
-            callers_info = "调用链信息不可用"
+            pass
 
-        func_name   = entry.get("function", func_hash[:8])
-        entry_role  = entry.get("entry_role", "boundary")
-        file_path   = entry.get("file", "")
+        # 3. 提供 DB 真实路径，供 skill 指导 Agent 按需查询
+        callchain_db_path = str(dirs.callchain_db_path())
+        funcdb_path = str(dirs.r1_functions_db(file_hash_for_func)) if file_hash_for_func else ""
 
-        # 收集当前 R3-kept 入口名单，供 prompt 中对照调用者身份
-        r3_kept_names: list[str] = []
-        r3_func_dir = dirs.r3.parent / "r3_func"
-        if r3_func_dir.is_dir():
-            for _p in r3_func_dir.glob("*.json"):
-                try:
-                    _d = json.loads(_p.read_text(encoding="utf-8"))
-                    if _d.get("decision") != "filter" and _d.get("function"):
-                        r3_kept_names.append(_d["function"])
-                except Exception:
-                    pass
-
-        is_retry = bool(getattr(func_state, 'r4_attempts', 1) and getattr(func_state, 'r4_attempts', 1) > 1)
+        is_retry = bool(getattr(func_state, 'r4_attempts', 1) and
+                        getattr(func_state, 'r4_attempts', 1) > 1)
+        feedback = getattr(func_state, 'r4_reason', '') if is_retry else ''
         prev_result = result_file if is_retry and result_file.exists() else None
+
         prompt = P.build_r4_func_w_prompt(
             func_name=func_name,
+            func_hash=func_hash,
             file_path=file_path,
             entry_role=entry_role,
-            callers_info=callers_info,
+            r3_analysis=r3_analysis,
+            callers_structured=callers_structured,
+            callchain_db_path=callchain_db_path,
+            funcdb_path=funcdb_path,
             result_file=result_file,
             is_retry=is_retry,
-            feedback=getattr(func_state, 'r4_reason', '') if is_retry else '',
+            feedback=feedback,
             judge_result_file=str(prev_result) if prev_result else "",
-            r3_kept_names=r3_kept_names,
         )
 
         self._emit("r4_w_start", func_hash=func_hash,
@@ -1501,12 +1576,7 @@ class PipelineEngine:
             func_state.r4_reason   = reason
             # r4_state = PASSED 由 R4-J 通过后设置，此处不设
             state.save(dirs.state_file)
-            # 将 r4_decision 写入 FuncDB（权威来源）
-            file_hash_for_func = ""
-            for _fs in state.files.values():
-                if func_hash in _fs.functions:
-                    file_hash_for_func = _fs.file_hash
-                    break
+            # 将 r4_decision 写入 FuncDB（权威来源）——直接用已知的 file_hash_for_func
             if file_hash_for_func:
                 try:
                     from .funcdb import FunctionDB as _FDB
@@ -1543,34 +1613,41 @@ class PipelineEngine:
         session_file = str(dirs.r4_func_j_session(func_hash, func_state.r4_j_attempts))
         r4_result_file = dirs.r4_func_result_file(func_hash)
 
-        # 构建调用链上下文供 J 核验
-        callers_context = ""
+        # Fix-B2: 预查 callchain.db + funcdb，传结构化数据给 J
+        callers_structured: list[dict] = []
+        r3_tag = "?"
+        file_hash_j = ""
+        for _fh, _fs in state.files.items():
+            if func_hash in _fs.functions:
+                file_hash_j = _fh
+                break
         try:
             from .callchain_db import CallchainDB
-            cc_db = CallchainDB.open(dirs.callchain)
-            callers  = cc_db.get_callers(func_hash)
-            r3_callers = cc_db.get_r3_callers(func_hash)
-            lines = []
-            if callers:
-                lines.append(f"直接调用者（{len(callers)}个）："
-                             + ", ".join(c.get('name','?')[:30] for c in callers[:8]))
-            else:
-                lines.append("无模块内调用者（直接外部边界）")
-            if r3_callers:
-                lines.append(f"R3-kept 入口调用者（{len(r3_callers)}个）："
-                             + ", ".join(c.get('name','?')[:30] for c in r3_callers[:8]))
-            else:
-                lines.append("无 R3-kept 入口调用者")
-            callers_context = "\n".join(lines)
+            callers_structured = CallchainDB.open(dirs.callchain).get_callers(func_hash)
         except Exception as _cc_exc:
-            callers_context = f"调用链信息不可用：{_cc_exc}"
+            logger.debug("R4-J callers query failed: %s", _cc_exc)
+        try:
+            from .funcdb import FunctionDB as _FDBJ
+            if file_hash_j:
+                _row = _FDBJ.open(dirs.r1, file_hash_j).get_function(func_hash)
+                if _row:
+                    _ana = _row.get("analysis") or {}
+                    if isinstance(_ana, str):
+                        _ana = json.loads(_ana)
+                    r3_tag = _ana.get("tag", "?")
+        except Exception:
+            pass
 
         prompt = P.build_r4_j_func_prompt(
             func_hash=func_hash,
             func_name=func_name,
             file_path=entry.get("file", ""),
             r4_result_file=str(r4_result_file) if r4_result_file.exists() else "",
-            callers_context=callers_context,
+            callers_structured=callers_structured,
+            r3_tag=r3_tag,
+            entry_role=entry.get("entry_role", "boundary"),
+            callchain_db_path=str(dirs.callchain_db_path()),
+            funcdb_path=str(dirs.r1_functions_db(file_hash_j)) if file_hash_j else "",
         )
         self._emit("r4_j_start", func_hash=func_hash, function=func_name,
                    attempt=func_state.r4_j_attempts)
