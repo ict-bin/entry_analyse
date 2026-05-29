@@ -1189,20 +1189,33 @@ class PipelineEngine:
                 body_lines = max(
                     0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
                 )
-                prev_j_result = dirs.stage_result_file("r3_j", "judge", func_hash, max(1, func_state.r3_w_attempts - 1)) if is_retry else None
-                prompt = P.build_r3_w_prompt(
-                    func_hash=func_hash,
-                    func_name=func_state.name,
-                    signature=func_state.signature,
-                    start_line=func_state.start_line,
-                    end_line=func_state.end_line,
-                    body_lines=body_lines,
-                    file_path=file_path,
-                    db_path=db_path,
-                    is_retry=is_retry,
-                    feedback=r2_feedback,
-                    judge_result_file=str(prev_j_result) if prev_j_result and prev_j_result.exists() else "",
-                )
+                prev_j_result = dirs.stage_result_file("r3_j", "judge", func_hash,
+                    max(1, func_state.r3_w_attempts - 1)) if is_retry else None
+                j_result_path = str(prev_j_result) if prev_j_result and prev_j_result.exists() else ""
+
+                if is_retry:
+                    # 重试轮次：只发短消息（session 已有首轮分析上下文）
+                    prompt = P.build_r3_w_retry_prompt(
+                        judge_result_file=j_result_path,
+                        feedback=r2_feedback,
+                    )
+                else:
+                    body_lines = max(
+                        0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
+                    )
+                    prompt = P.build_r3_w_prompt(
+                        func_hash=func_hash,
+                        func_name=func_state.name,
+                        signature=func_state.signature,
+                        start_line=func_state.start_line,
+                        end_line=func_state.end_line,
+                        body_lines=body_lines,
+                        file_path=file_path,
+                        db_path=db_path,
+                        is_retry=False,
+                        feedback="",
+                        judge_result_file="",
+                    )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
@@ -1684,23 +1697,30 @@ class PipelineEngine:
 
         is_retry = bool(getattr(func_state, 'r4_attempts', 1) and
                         getattr(func_state, 'r4_attempts', 1) > 1)
-        feedback = getattr(func_state, 'r4_reason', '') if is_retry else ''
+        feedback = getattr(func_state, 'r4_j_feedback', '') if is_retry else ''
         prev_result = result_file if is_retry and result_file.exists() else None
 
-        prompt = P.build_r4_func_w_prompt(
-            func_name=func_name,
-            func_hash=func_hash,
-            file_path=file_path,
-            entry_role=entry_role,
-            r3_analysis=r3_analysis,
-            callers_structured=callers_structured,
-            callchain_db_path=callchain_db_path,
-            funcdb_path=funcdb_path,
-            result_file=result_file,
-            is_retry=is_retry,
-            feedback=feedback,
-            judge_result_file=str(prev_result) if prev_result else "",
-        )
+        if is_retry:
+            # 重试轮次：只发短消息（session 已有首轮调用链上下文）
+            prompt = P.build_r4_func_w_retry_prompt(
+                judge_result_file=str(prev_result) if prev_result else "",
+                feedback=feedback,
+            )
+        else:
+            prompt = P.build_r4_func_w_prompt(
+                func_name=func_name,
+                func_hash=func_hash,
+                file_path=file_path,
+                entry_role=entry_role,
+                r3_analysis=r3_analysis,
+                callers_structured=callers_structured,
+                callchain_db_path=callchain_db_path,
+                funcdb_path=funcdb_path,
+                result_file=result_file,
+                is_retry=False,
+                feedback="",
+                judge_result_file="",
+            )
 
         self._emit("r4_w_start", func_hash=func_hash,
                    function=func_name, attempt=getattr(func_state, 'r4_attempts', 1))

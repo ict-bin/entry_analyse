@@ -121,6 +121,28 @@ def build_r2_j_prompt(  # 正确命名：R2-J 行号准确性验证
 
 # ─── R3 Worker ──────────────────────────────────────────────────────────────
 
+def build_r3_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
+    """
+    R3-W 重试轮次的短消息。
+
+    Session 已包含首轮的完整分析上下文，无需重发分析指令和 sed 命令。
+    只重传“请阅读评审意见并改进”的短消息。
+    """
+    if judge_result_file:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 评审意见已写入：`{judge_result_file}`\n"
+            "请用 `read` 工具阅读该文件，然后修正并重新输出 `<result>...</result>`。\n"
+        )
+    if feedback:
+        return (
+            f"## 评审未通过，请修正\n\n"
+            f"Judge 意见：{feedback}\n\n"
+            "请根据以上意见修正并重新输出 `<result>...</result>`。\n"
+        )
+    return "评审未通过，请根据上一轮结果和分析历史修正并重新输出 `<result>...</result>`。\n"
+
+
 def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
     func_hash: str,
     func_name: str,
@@ -339,6 +361,25 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
 
 
 # ─── R4 Worker ────────────────────────────────────────────────────────────────
+
+def build_r4_func_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
+    """
+    R4-W 重试轮次的短消息。Session 已有首轮调用链分析上下文，无需重发完整 prompt。
+    """
+    if judge_result_file:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 评审意见已写入：`{judge_result_file}`\n"
+            "请用 `read` 工具阅读该文件，然后修正并用 `write` 工具更新结果文件。\n"
+        )
+    if feedback:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 意见：{feedback}\n\n"
+            "请根据以上意见修正并用 `write` 工具更新结果文件。\n"
+        )
+    return "评审未通过，请根据分析历史修正并用 `write` 工具更新结果文件。\n"
+
 
 def build_r4_func_w_prompt(
     func_name: str,
