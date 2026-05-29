@@ -2267,7 +2267,7 @@ class TaskService:
         if not run_root:
             raise _HTTPException(404, "任务运行目录不存在")
 
-        from app.pipeline.dirs import Dirs as _Dirs
+        from app.pipeline.dirs import PipelineDirs as _Dirs
         from app.pipeline.funcdb import FunctionDB as _FDB
         dirs = _Dirs(run_root)
         r1_dir = dirs.r1
@@ -2283,16 +2283,15 @@ class TaskService:
 
         # --- try provided file_hash first ---
         if file_hash:
-            db_path = dirs.r1_functions_db(file_hash)
-            if db_path.is_file():
-                fn_data = _FDB.open(db_path).get_function(func_hash)
+            fn_data = _FDB.open(r1_dir, file_hash).get_function(func_hash)
 
         # --- fallback: scan all funcdb files ---
         if fn_data is None and r1_dir.is_dir():
             for db_path in sorted(r1_dir.glob("*_functions.db")):
-                fn_data = _FDB.open(db_path).get_function(func_hash)
+                fh = db_path.stem.replace("_functions", "")
+                fn_data = _FDB.open(r1_dir, fh).get_function(func_hash)
                 if fn_data:
-                    found_file_hash = db_path.stem.replace("_functions", "")
+                    found_file_hash = fh
                     break
 
         if fn_data is None:
