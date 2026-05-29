@@ -381,6 +381,23 @@ class Orchestrator:
         if result.status == TaskStatus.PASSED:
             flag_path.write_text("1", encoding="utf-8")
 
+        # ── 复制 funcdb 到 output/funcdb/（供任务完成后函数详情查询）──────────
+        if result.status == TaskStatus.PASSED:
+            _funcdb_src = run_dir / "workspace" / "r1-functions"
+            _funcdb_dst = out_dir / "funcdb"
+            if _funcdb_src.is_dir():
+                try:
+                    import shutil as _shutil
+                    _funcdb_dst.mkdir(parents=True, exist_ok=True)
+                    for _db_file in _funcdb_src.glob("*_functions.db"):
+                        _dst_file = _funcdb_dst / _db_file.name
+                        if not _dst_file.exists():
+                            _shutil.copy2(str(_db_file), str(_dst_file))
+                except Exception as _fdb_exc:
+                    import logging as _log
+                    _log.getLogger("ea.orchestrator").warning(
+                        "funcdb copy to output failed: %s", _fdb_exc)
+
         self._emit("task_end", task_id,
                    status=result.status.value,
                    run_dir=str(run_dir),

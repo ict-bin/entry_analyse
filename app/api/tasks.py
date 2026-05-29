@@ -1189,6 +1189,18 @@ def get_task_function_catalog(task_id: str, db: Session = Depends(get_db), _=Dep
     return get_task_service().get_task_function_catalog(db, task_id)
 
 
+@router.get("/tasks/{task_id}/functions/{func_hash}", response_model=dict[str, Any])
+def get_task_function_detail(
+    task_id: str,
+    func_hash: str,
+    file_hash: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """Return full function detail: confidence, description, reason, taints, callers/callees."""
+    return get_task_service().get_task_function_detail(db, task_id, func_hash, file_hash=file_hash)
+
+
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
 def get_task_result(task_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return get_task_service().get_task_result(db, task_id)

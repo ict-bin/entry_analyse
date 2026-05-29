@@ -2258,6 +2258,87 @@ class TaskService:
         row = self._get_or_404(db, task_id)
         return _build_function_catalog(row)
 
+    def get_task_function_detail(self, db: Session, task_id: str, func_hash: str,
+                                  file_hash: str | None = None) -> dict:
+        """Return full function detail from funcdb: confidence, description, reason, taints, callers."""
+        from fastapi import HTTPException as _HTTPException
+        row = self._get_or_404(db, task_id)
+        run_root = _task_run_root(row)
+        if not run_root:
+            raise _HTTPException(404, "任务运行目录不存在")
+
+        from app.pipeline.dirs import Dirs as _Dirs
+        from app.pipeline.funcdb import FunctionDB as _FDB
+        dirs = _Dirs(run_root)
+        r1_dir = dirs.r1
+
+        # ── 优先从 output/funcdb 读取（任务完成后已复制到此处）──────────────
+        output_root = _task_output_root(row)
+        output_funcdb_dir = output_root / "funcdb" if output_root else None
+        if output_funcdb_dir and output_funcdb_dir.is_dir():
+            r1_dir = output_funcdb_dir
+
+        fn_data: dict | None = None
+        found_file_hash: str | None = file_hash
+
+        # --- try provided file_hash first ---
+        if file_hash:
+            db_path = dirs.r1_functions_db(file_hash)
+            if db_path.is_file():
+                fn_data = _FDB.open(db_path).get_function(func_hash)
+
+        # --- fallback: scan all funcdb files ---
+        if fn_data is None and r1_dir.is_dir():
+            for db_path in sorted(r1_dir.glob("*_functions.db")):
+                fn_data = _FDB.open(db_path).get_function(func_hash)
+                if fn_data:
+                    found_file_hash = db_path.stem.replace("_functions", "")
+                    break
+
+        if fn_data is None:
+            raise _HTTPException(404, f"函数 {func_hash} 不存在")
+
+        # --- parse analysis JSON ---
+        analysis = fn_data.get("analysis") or {}
+        if isinstance(analysis, str):
+            try:
+                analysis = json.loads(analysis)
+            except Exception:
+                analysis = {}
+
+        # --- callers / callees from callchain db ---
+        callers: list[dict] = []
+        callees: list[dict] = []
+        try:
+            from app.pipeline.callchain_db import CallchainDB as _CCDB
+            cc_db = _CCDB.open(dirs.callchain)
+            callers = cc_db.get_callers(func_hash) or []
+            callees = cc_db.get_callees(func_hash) or []
+        except Exception:
+            pass
+
+        return {
+            "func_hash": func_hash,
+            "file_hash": found_file_hash or "",
+            "name": fn_data.get("name") or "",
+            "signature": fn_data.get("signature") or "",
+            "start_line": fn_data.get("start_line"),
+            "end_line": fn_data.get("end_line"),
+            "file_path": fn_data.get("file_path") or fn_data.get("original_path") or "",
+            "entry_role": fn_data.get("entry_role") or "",
+            "entry_confidence": fn_data.get("entry_confidence"),
+            "entry_category": fn_data.get("entry_category") or "",
+            "r3_decision": fn_data.get("r3_decision") or "",
+            "r4_decision": fn_data.get("r4_decision") or "",
+            "has_external_input": bool(fn_data.get("has_external_input")),
+            "function_description": analysis.get("function_description") or "",
+            "entry_reason": analysis.get("entry_reason") or "",
+            "taint_details": analysis.get("taint_details") or [],
+            "tag": analysis.get("tag") or "",
+            "callers": [{"name": c.get("name",""), "func_hash": c.get("func_hash","")} for c in callers[:20]],
+            "callees": [{"name": c.get("name",""), "func_hash": c.get("func_hash","")} for c in callees[:20]],
+        }
+
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
         row = self._get_or_404(db, task_id)
         sessions_root = _task_sessions_root(row)
