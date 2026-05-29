@@ -86,6 +86,8 @@ def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
             "start_line":           e.get("start_line") or 0,
             "end_line":             e.get("end_line") or 0,
             "body_lines":           e.get("body_lines") or 0,
+            # R6 分类字段：必须拷贝，用于 functions.list vs handler.list 拆分
+            "entry_category":       e.get("entry_category") or "",
         }
         # entry_confidence：从 analysis 或顶层透传（若存在）
         entry_role = a.get("entry_role") or e.get("entry_role") or ""
