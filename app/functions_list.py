@@ -344,6 +344,10 @@ def generate_functions_list(entry_json: str) -> str:
             }
             if entry_role:
                 flat["entry_role"] = entry_role
+            # 入口分类：外部入口 / 处理入口
+            entry_category = str(item.get("entry_category") or "").strip()
+            if entry_category in ("外部入口", "处理入口"):
+                flat["entry_category"] = entry_category
             entry_confidence = item.get("entry_confidence")
             if entry_confidence is not None:
                 try:

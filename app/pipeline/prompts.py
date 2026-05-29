@@ -363,6 +363,7 @@ def build_r4_func_w_prompt(
     taints     = r3_analysis.get("taints") or []
     taints_str = ", ".join("`" + t + "`" for t in taints[:5]) if taints else "无"
     entry_desc = (r3_analysis.get("entry_reason", "") if r3_analysis else "")
+    func_desc  = (r3_analysis.get("function_description", "") if r3_analysis else "")
 
     if callers_structured:
         rows = []
@@ -370,11 +371,12 @@ def build_r4_func_w_prompt(
             n  = (c.get("name") or c.get("caller_hash", "?"))[:30]
             r3 = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
             ct = c.get("call_type", "direct")
-            rows.append("| `" + n + "` | " + r3 + " | " + ct + " |")
+            ch = c.get("caller_hash", "")[:12]
+            rows.append("| `" + n + "` | `" + ch + "` | " + r3 + " | " + ct + " |")
         has_r3 = any(c.get("is_r3_entry") for c in callers_structured)
         ctable = (
-            "| 调用者 | is_r3_entry | 调用方式 |\n"
-            "|--------|-------------|---------|\n"
+            "| 调用者名 | func_hash | R3状态 | 调用方式 |\n"
+            "|---------|-----------|--------|---------|\n"
             + "\n".join(rows)
         )
     else:
@@ -382,16 +384,13 @@ def build_r4_func_w_prompt(
         ctable = "无模块内调用者（直接外部边界）"
 
     if not has_r3:
-        hint = "注意：无 R3-kept 调用者 -> filter 条件不成立 -> 预期决策 = keep"
-    elif tag == "A":
-        hint = "注意：tag=A（主动型） -> 函数体内自主读取外部数据 -> 预期决策 = keep"
-    elif entry_role == "dispatch_target":
-        hint = "注意：entry_role=dispatch_target -> 必须 keep"
+        hint = "提示：无R3-kept调用者 → P类外部入口，quick-path已处理，此处不应出现"
     else:
         hint = (
-            "注意：存在 R3-kept 调用者 且 tag=P -> 需判断 taint 是否来自该调用者参数\n"
-            "  - 如是：decision=remove（即filter）\n"
-            "  - 如否（函数体内自主读取）：decision=keep"
+            "判断要点：\n"
+            "  - 保留(keep)：本函数处理调用者无法完全覆盖的外部数据子集，或可被独立触达\n"
+            "  - 过滤(filter)：本函数只是调用者处理逻辑的子步骤，调用者入口已完整覆盖本函数数据路径\n"
+            "  加载 Skill `ea-r4-callchain-query` 查询调用者的 R3 分析结果（taints/entry_reason）再做判断。"
         )
 
     return (
@@ -404,21 +403,17 @@ def build_r4_func_w_prompt(
         + "| entry_role | `" + entry_role + "` |\n"
         + "| R3 tag | `" + tag + "` (P=被动/A=主动)|\n"
         + "| R3 taints | " + taints_str + " |\n"
-        + "| R3 入口说明 | " + (entry_desc[:100] or "无") + " |\n\n"
+        + "| R3 入口说明 | " + (entry_desc[:120] or "无") + " |\n"
+        + "| R3 函数评述 | " + (func_desc[:100] or "无") + " |\n\n"
         + "## 调用者（来自 callchain.db）\n\n"
         + ctable + "\n\n"
         + hint + "\n\n"
-        + "## 判断规则（filter 需全部满足）\n\n"
-        + "1. 存在 is_r3_entry=1 的直接调用者\n"
-        + "2. 本函数 tag=P（已知）\n"
-        + "3. entry_role != dispatch_target\n\n"
-        + "否则 decision=keep。\n\n"
         + "## DB 路径（如需进一步查询）\n\n"
         + "- callchain.db: `" + callchain_db_path + "`\n"
         + "- funcdb: `" + funcdb_path + "`\n\n"
         + "加载 Skill `ea-r4-callchain-query` 了解如何查询以上 DB。\n\n"
-        + "## 输出（禁止读取源文件）\n\n"
-        + "直接根据以上信息做出决策，将 JSON 写入：`" + str(result_file) + "`\n\n"
+        + "## 输出\n\n"
+        + "查询调用者 R3 分析后做出决策，将 JSON 写入：`" + str(result_file) + "`\n\n"
         + "加载 Skill `ea-r4-worker-result` 完成结果文件写出。\n"
     )
 

@@ -1,47 +1,58 @@
-# R4 Worker — 调用链入口冗余判断
+# R4 Worker — 入口覆盖判断
 
-你的任务是判断一个已通过 R3 筛选的候选入口函数是否为「冗余内层函数」——即已被其他 R3-kept 入口覆盖，不需要作为独立入口保留。
+你的任务是判断一个已通过 R3 筛选的候选入口函数，是否需要作为**独立入口**保留在分析报告中。
 
-## 核心判断规则
+## 背景
 
-**filter（冗余，应移除）** 需满足以下**全部**条件：
+函数 `{func_name}` 已通过 R3（确认接收外部输入，P 类）。  
+其 R3-kept 直接调用者见 Prompt 中的调用者表格（含 func_hash）。
 
-1. callchain.db 中存在直接调用者，且该调用者 `is_r3_entry=1`
-2. 本函数的 R3 分析 `tag="P"`（被动型：taint 来自调用者参数传入，非自主读取）
-3. `entry_role ≠ "dispatch_target"`
+上述调用者已经是已知的候选入口。需要判断：在调用者已作为入口的情况下，
+将 `{func_name}` 单独列为一个入口是否还有**额外的安全分析价值**。
 
-否则 `decision=keep`（保留）。
+## 分析步骤
 
-## 分析流程
+### Step 1：查询本函数及 R3-kept 调用者的 R3 分析结果
 
-### Step 1：查看 prompt 中的结构化数据
+加载 Skill `ea-r4-callchain-query`，使用 funcdb 查询命令获取：
+- 本函数的 R3 分析：taints、entry_reason、function_description
+- 每个 R3-kept 调用者（is_r3_entry=1）的 R3 分析：taints、entry_reason
 
-Prompt 已直接提供：
-- 本函数的 R3 分析结果（tag、entry_role、taints）
-- callchain.db 查询结果（直接调用者列表及 `is_r3_entry` 状态）
+```bash
+# 查询本函数 R3 分析
+python3 /opt/entry_analyse/scripts/ea_db.py get {funcdb_path} {func_hash}
 
-**根据 prompt 中的"预判断提示"直接定位决策方向。**
+# 查询调用者 R3 分析（对每个 is_r3_entry=1 的 caller_hash 执行）
+python3 /opt/entry_analyse/scripts/ea_db.py get {funcdb_path} {caller_hash}
+```
 
-### Step 2：按规则做出决策
+> 注意：如果调用者属于不同文件，其 funcdb 路径不同，参见 Skill `ea-r4-callchain-query`
+> 中"查询不同文件的 funcdb"章节。
 
-| 情形 | 决策 |
-|------|------|
-| 无 is_r3_entry=1 的调用者 | **keep** |
-| tag = "A"（主动读取外部数据） | **keep** |
-| entry_role = "dispatch_target" | **keep** |
-| 有 R3-kept 调用者 且 tag = "P" | **filter（decision=remove）** |
+### Step 2：对照判断规则做出决策
 
-### Step 3：写出结果文件
+**保留（keep）— 满足任一即可**：
+1. 本函数的 `taints` 与所有 R3-kept 调用者的 `taints` **完全不重叠**（处理来自不同来源的外部数据）
+2. 本函数可被调用者**以外的其他路径**直接触达（callchain.db 中有其他直接调用者不含 is_r3_entry=1 的上层）
+3. 调用者的 `entry_reason`/`function_description` 表明它只做转发/路由，本函数才是实际处理者
 
-加载 Skill `ea-r4-worker-result`，按其格式写出结果 JSON 文件。
+**过滤（filter）— 须同时满足全部**：
+1. 本函数 `taints` 是调用者 `taints` 的子集（外部数据来源完全相同）
+2. 本函数只有一个（或一类）调用者，即已知入口，无其他独立触达路径
+3. 调用者的 `entry_reason` 已经完整描述了本函数处理的外部数据
+
+### Step 3：写出结果
+
+加载 Skill `ea-r4-worker-result`，按格式写出结果文件。
+
+`decision` 取值：
+- `keep`：需要独立保留（提供额外安全分析价值）
+- `filter`（写 `remove`）：可被调用者入口覆盖
 
 ---
 
 ## ⛔ 禁止事项
 
-- **禁止读取 `.c` / `.h` 源文件**（R3 已完成外部输入分析，无需重复）
-- **禁止重新分析 taint 来源**（直接使用 prompt 中提供的 tag 和 taints）
-- **禁止 grep/find 在源文件中搜索调用关系**（callchain.db 已有完整调用图）
-- **禁止重新实现 R3 的外部输入识别逻辑**
-
-如需查询 callchain.db 或 funcdb 验证细节，加载 Skill `ea-r4-callchain-query`。
+- **禁止读取 `.c` / `.h` 源文件**（R3 已完成外部输入分析，无需重读）
+- **禁止重新做 R3 的外部输入识别**（taints 和 entry_reason 已在 funcdb 中）
+- **禁止仅凭函数名做出判断**（必须查 funcdb 对比 taints）

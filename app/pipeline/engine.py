@@ -139,27 +139,20 @@ def _r4_quick_path(
     state: "PipelineState",
 ) -> tuple[bool, str]:
     """
-    Fix-A: R4 快速路径预判。
+    Fix-A: R4 快速路径预判（五路逻辑）。
 
     返回 (quick_keep, reason):
       quick_keep=True  → 直接 keep，跳过 W+J
       quick_keep=False → 需要 W+J 精细判断
 
-    快速 keep 条件（满足任一即可）：
-      1. callchain.db 中无 R3-kept 调用者（is_r3_entry=1）
-      2. 本函数 R3 分析 tag="A"（主动型：自身读取外部数据，独立入口）
+    五路逻辑：
+      ① tag=A （主动型）→ 外部入口，直接 keep
+      ② 无 R3-kept 且无 running 的直接调用者 → 外部入口，直接 keep
+      ③ 仅有 running 调用者，无 keep 调用者 → deferred keep（调用者 R3 未完成）
+      ④ 有 keep 调用者 → 需要 W+J（处理入口还是内部子步骤？）
+      ⑤ callchain 不可用 → 保守 keep
     """
-    # 查 callchain.db
-    try:
-        from .callchain_db import CallchainDB
-        r3_callers = CallchainDB.open(dirs.callchain).get_r3_callers(func_hash)
-        if not r3_callers:
-            return True, "快速路径：无R3-kept入口调用本函数"
-    except Exception:
-        # callchain.db 不可用时走 W+J（保守策略）
-        return False, ""
-
-    # 查 funcdb 中本函数的 tag
+    # ① A 类：主动读 I/O，始终为外部入口
     try:
         from .funcdb import FunctionDB as _FDB
         row = _FDB.open(dirs.r1, file_hash).get_function(func_hash)
@@ -169,10 +162,29 @@ def _r4_quick_path(
                 import json as _j
                 analysis = _j.loads(analysis)
             if analysis.get("tag") == "A":
-                return True, "快速路径：主动型入口(tag=A)，独立读取外部数据"
+                return True, "A类外部入口(主动读外部I/O)"
     except Exception:
         pass
 
+    # ②③④⑤ 查直接调用者的 r3_state
+    try:
+        from .callchain_db import CallchainDB
+        callers = CallchainDB.open(dirs.callchain).get_callers_r3_state(func_hash)
+    except Exception:
+        return True, "保守keep(callchain不可用)"
+
+    r3_kept    = [c for c in callers if c.get('r3_state') == 'keep']
+    r3_running = [c for c in callers if c.get('r3_state') == 'running']
+
+    if not r3_kept and not r3_running:
+        # ② 无任何 R3-relevant 调用者 → P 类外部入口
+        return True, "P类外部入口(无R3相关调用者)"
+
+    if r3_running and not r3_kept:
+        # ③ 调用者 R3 进行中，尚无确认的 keep 调用者 → deferred 保守 keep
+        return True, "deferred(调用者R3进行中,暂保留等待R6重分类)"
+
+    # ④ 有 keep 调用者（不管是否还有 running）→ 需要 W+J
     return False, ""
 
 
@@ -1157,6 +1169,16 @@ class PipelineEngine:
             func_state.r3_w_attempts += 1
             state.save(dirs.state_file)
 
+            # R3 开始时回写 callchain.db r3_state='running'（供 R4 quick-path 感知）
+            if func_state.r3_w_attempts == 1 and state.cc_state == NodeState.PASSED:
+                try:
+                    from .callchain_db import CallchainDB
+                    CallchainDB.open(dirs.callchain).update_node_r3_state(
+                        func_hash, 'running')
+                except Exception as _cc_run_exc:
+                    logger.debug("callchain r3_state=running write failed %s: %s",
+                                 func_hash, _cc_run_exc)
+
             self._emit("r3_w_start",
                        func_hash=func_hash, function=func_state.name)
             try:
@@ -1251,6 +1273,18 @@ class PipelineEngine:
                 except Exception as _fdb_exc:
                     logger.warning("R3 FuncDB r3_decision update failed %s: %s",
                                    func_hash, _fdb_exc)
+
+                # Fix-A: R3 完成后实时回写 callchain.db r3_state（'keep'或'filter'）
+                # 同时写 is_r3_entry（之前永远为 0 的 Bug）
+                if state.cc_state == NodeState.PASSED:
+                    try:
+                        from .callchain_db import CallchainDB
+                        _cc_r3_state = 'keep' if _r3_final_decision == 'keep' else 'filter'
+                        CallchainDB.open(dirs.callchain).update_node_r3_state(
+                            func_hash, _cc_r3_state)
+                    except Exception as _cc_fin_exc:
+                        logger.debug("callchain r3_state=%s write failed %s: %s",
+                                     _cc_r3_state, func_hash, _cc_fin_exc)
 
                 func_state.r3_w_state = NodeState.PASSED
                 state.save(dirs.state_file)
@@ -1469,6 +1503,69 @@ class PipelineEngine:
             state.save(dirs.state_file)
             self._emit("callchain_failed", error=str(exc)[:200])
 
+    async def _run_entry_classification(
+        self,
+        final_entries: list[dict],
+        dirs: "PipelineDirs",
+    ) -> None:
+        """
+        R6 分类步骤：对最终 keep 集合分类为「外部入口」和「处理入口」。
+
+        规则：
+          - tag=A 的函数 → 始终为外部入口
+          - P 类：在全量 closure 中存在属于 kept 集合的祖先 → 处理入口，否则外部入口
+          使用全量 closure（可跳过被 R4 filter 的中间节点）。
+
+        不阻断主流程：包含在 try/except 内，失败时论截为外部入口。
+        """
+        try:
+            from .callchain_db import CallchainDB
+            from .funcdb import FunctionDB as _FDB_CAT
+            import glob as _glob
+
+            if not (dirs.callchain / 'callchain.db').exists():
+                raise FileNotFoundError("callchain.db not found, skip classification")
+
+            cc_db = CallchainDB.open(dirs.callchain)
+
+            # 构建 kept_hashes 和 a_type_hashes
+            kept_hashes: set[str] = {e['func_hash'] for e in final_entries}
+            a_type_hashes: set[str] = {
+                e['func_hash'] for e in final_entries
+                if e.get('tag') == 'A'
+                or (isinstance(e.get('analysis'), dict) and e['analysis'].get('tag') == 'A')
+            }
+
+            # 批量分类，写入 callchain.db
+            result = cc_db.classify_entry_categories(kept_hashes, a_type_hashes)
+
+            # 回写各文件的 funcdb
+            for fdb_path in sorted(dirs.r1.glob('*_functions.db')):
+                _file_hash = fdb_path.stem.replace('_functions', '')
+                try:
+                    fdb = _FDB_CAT.open(dirs.r1, _file_hash)
+                    for fh, category in result['detail'].items():
+                        fdb.update_entry_category(fh, category)
+                except Exception as _fdb_exc:
+                    logger.debug("entry_category write to funcdb failed %s: %s",
+                                 _file_hash, _fdb_exc)
+
+            # 同步到 final_entries（供后续 R6 report 使用）
+            for entry in final_entries:
+                entry['entry_category'] = result['detail'].get(
+                    entry['func_hash'], '外部入口')
+
+            self._emit("entry_classification_done",
+                       external=result['外部入口'],
+                       processing=result['处理入口'])
+            logger.info("入口分类完成: 外部入口=%d 处理入口=%d",
+                        result['外部入口'], result['处理入口'])
+
+        except Exception as exc:
+            logger.warning("入口分类失败（全部论截为外部入口）: %s", exc)
+            for entry in final_entries:
+                entry.setdefault('entry_category', '外部入口')
+
     async def _run_r6_finalize(
         self, dirs: PipelineDirs, state: PipelineState
     ) -> list[dict]:
@@ -1500,6 +1597,9 @@ class PipelineEngine:
 
         if self._cancel.is_set():
             return final_entries
+
+        # 分类步骤：外部入口 vs 处理入口（在 R6 report 之前）
+        await self._run_entry_classification(final_entries, dirs)
 
         # R6 脚本化校验
         if state.r6_state != NodeState.PASSED:
@@ -1572,7 +1672,7 @@ class PipelineEngine:
         except Exception:
             pass
 
-        # 2. 从 callchain.db 读取完整调用者列表（含 is_r3_entry）
+        # 2. 从 callchain.db 读取直接调用者列表（含 is_r3_entry / r3_state）
         callers_structured: list[dict] = []
         try:
             from .callchain_db import CallchainDB

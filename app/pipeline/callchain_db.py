@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_external      INTEGER DEFAULT 0, -- 1 = 模块外部函数（unknown caller）
     entry_role       TEXT DEFAULT '',   -- 来自 R2/R3 分析（boundary/dispatch_target/…）
     entry_confidence REAL DEFAULT NULL, -- 置信度分数（0.0-1.0），由 confidence.py 计算
+    r3_state         TEXT DEFAULT 'pending', -- R3 生命周期: pending/running/keep/filter
+    entry_category   TEXT DEFAULT '',        -- R6 分类: 外部入口/处理入口
     created_at       REAL
 );
 
@@ -115,7 +117,9 @@ CREATE INDEX IF NOT EXISTS idx_closure_descendant ON closure(descendant);
 CREATE INDEX IF NOT EXISTS idx_trees_root ON entry_trees(root_hash);
 CREATE INDEX IF NOT EXISTS idx_trees_node ON entry_trees(node_hash);
 CREATE INDEX IF NOT EXISTS idx_nodes_r3 ON nodes(is_r3_entry);
+CREATE INDEX IF NOT EXISTS idx_nodes_r3_state ON nodes(r3_state);
 CREATE INDEX IF NOT EXISTS idx_nodes_external ON nodes(is_external);
+CREATE INDEX IF NOT EXISTS idx_nodes_category ON nodes(entry_category);
 """
 
 
@@ -157,6 +161,17 @@ class CallchainDB:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._get_conn() as conn:
             conn.executescript(_SCHEMA)
+            # 向前兼容迁移：补充新列
+            for _col, _dflt in [
+                ("r3_state",       "TEXT DEFAULT 'pending'"),
+                ("entry_category", "TEXT DEFAULT ''"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE nodes ADD COLUMN {_col} {_dflt}"
+                    )
+                except Exception:
+                    pass  # 列已存在
             # 确保 build_status 有且仅有 id=1 的行
             conn.execute("""
                 INSERT OR IGNORE INTO build_status (id, phase, built_at)
@@ -604,6 +619,106 @@ class CallchainDB:
                 "UPDATE nodes SET is_r3_entry=? WHERE func_hash=?",
                 (1 if is_entry else 0, func_hash),
             )
+
+    def update_node_r3_state(self, func_hash: str, r3_state: str) -> None:
+        """
+        R3 生命周期回写：设置 r3_state + 同步 is_r3_entry。
+
+        r3_state 取値：
+          'running' —— R3-W 第一轮开始时设置
+          'keep'    —— R3 完成，decision=keep；同时写 is_r3_entry=1
+          'filter'  —— R3 完成，decision=filter；同时写 is_r3_entry=0
+        """
+        is_entry = 1 if r3_state == 'keep' else 0
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE nodes SET r3_state=?, is_r3_entry=? WHERE func_hash=?",
+                (r3_state, is_entry, func_hash),
+            )
+
+    def get_callers_r3_state(self, func_hash: str) -> list[dict]:
+        """
+        返回直接调用者及其 r3_state（供 R4 quick-path 判断）。
+
+        Returns list of {caller_hash, name, r3_state, is_r3_entry}
+        包含未在 nodes 表中的外部调用者（r3_state 为 'pending'）。
+        """
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT e.caller_hash,
+                       COALESCE(n.name, e.caller_hash) AS name,
+                       COALESCE(n.r3_state, 'pending')  AS r3_state,
+                       COALESCE(n.is_r3_entry, 0)       AS is_r3_entry
+                FROM edges e
+                LEFT JOIN nodes n ON n.func_hash = e.caller_hash
+                WHERE e.callee_hash = ?
+            """, (func_hash,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def classify_entry_categories(
+        self,
+        kept_hashes: "set[str]",
+        a_type_hashes: "set[str]",
+    ) -> dict:
+        """
+        R6 分类步骤：将最终 keep 集合中每个函数分类为「外部入口」或「处理入口」。
+
+        规则：
+          1. tag=A 的函数 → 始终为「外部入口」（主动读 I/O，与调用链位置无关）
+          2. P 类函数：
+             - closure 中存在属于 kept_hashes 的祖先 → 「处理入口」
+             - 否则 → 「外部入口」
+
+        使用全量 closure 表（可跳过被 R4 filter 的中间节点）。
+
+        Args:
+            kept_hashes:  r4_decision=keep 的所有 func_hash 集合
+            a_type_hashes: tag='A' 的 func_hash 集合
+
+        Returns:
+            {'外部入口': N, '处理入口': M, 'detail': {func_hash: category}}
+        """
+        detail: dict[str, str] = {}
+        if not kept_hashes:
+            return {'外部入口': 0, '处理入口': 0, 'detail': detail}
+
+        placeholders = ','.join('?' * len(kept_hashes))
+        kept_list = list(kept_hashes)
+
+        with self._get_conn() as conn:
+            for fh in kept_hashes:
+                # A 类函数：始终外部入口
+                if fh in a_type_hashes:
+                    detail[fh] = '外部入口'
+                    conn.execute(
+                        "UPDATE nodes SET entry_category=? WHERE func_hash=?",
+                        ('外部入口', fh)
+                    )
+                    continue
+
+                # P 类：在全量 closure 中查找属于 kept_hashes 的祖先
+                # （可跳过被 filter 的中间节点，因为 closure 是全量传递闭包）
+                row = conn.execute(f"""
+                    SELECT COUNT(*) FROM closure c
+                    WHERE c.descendant = ?
+                      AND c.ancestor IN ({placeholders})
+                      AND c.ancestor != ?
+                """, (fh, *kept_list, fh)).fetchone()
+
+                has_kept_ancestor = (row[0] > 0) if row else False
+                category = '处理入口' if has_kept_ancestor else '外部入口'
+                detail[fh] = category
+                conn.execute(
+                    "UPDATE nodes SET entry_category=? WHERE func_hash=?",
+                    (category, fh)
+                )
+
+        stats = {
+            '外部入口': sum(1 for v in detail.values() if v == '外部入口'),
+            '处理入口': sum(1 for v in detail.values() if v == '处理入口'),
+            'detail': detail,
+        }
+        return stats
 
     def get_caller_context(self, func_hash: str) -> dict:
         """

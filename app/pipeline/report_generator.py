@@ -322,19 +322,46 @@ def generate_report(
     lines.append("## 入口详情")
     lines.append("")
 
-    global_index = 0
-    for role, group_entries in groups:
-        role_label = _ROLE_DISPLAY.get(role, role or "未分类")
-        role_count = len(group_entries)
-        lines.append(f"### 📋 {role_label}（{role_count} 个）")
-        lines.append("")
-        if role in _ROLE_DESC:
-            lines.append(f"*{_ROLE_DESC[role]}*")
-            lines.append("")
+    # 按 entry_category 分节：外部入口 / 处理入口
+    external_entries  = [e for e in entries if e.get("entry_category") != "处理入口"]
+    processing_entries = [e for e in entries if e.get("entry_category") == "处理入口"]
 
-        for entry in group_entries:
-            global_index += 1
-            lines.append(_render_entry_section(entry, global_index))
+    if external_entries:
+        lines.append("### 🌏 外部入口 External Entry（{} 个）".format(len(external_entries)))
+        lines.append("")
+        lines.append("> 调用链最顶端，直接暴露于外部，是安全分析的优先起点。")
+        lines.append("")
+        global_index = 0
+        ext_groups = _group_entries(external_entries)
+        for role, group_entries in ext_groups:
+            role_label = _ROLE_DISPLAY.get(role, role or "未分类")
+            lines.append(f"#### 📌 {role_label}（{len(group_entries)} 个）")
+            lines.append("")
+            if role in _ROLE_DESC:
+                lines.append(f"*{_ROLE_DESC[role]}*")
+                lines.append("")
+            for entry in group_entries:
+                global_index += 1
+                lines.append(_render_entry_section(entry, global_index))
+
+    if processing_entries:
+        lines.append("### 🔄 处理入口 Processing Entry（{} 个）".format(len(processing_entries)))
+        lines.append("")
+        lines.append("> 被外部入口通过 dispatch/callback 機制调用，负责处理特定类型请求。")
+        lines.append("> 在污点分析中，应同时跟踪从外部入口到处理入口的数据路径。")
+        lines.append("")
+        proc_start = global_index if external_entries else 0
+        proc_groups = _group_entries(processing_entries)
+        for role, group_entries in proc_groups:
+            role_label = _ROLE_DISPLAY.get(role, role or "未分类")
+            lines.append(f"#### 📌 {role_label}（{len(group_entries)} 个）")
+            lines.append("")
+            if role in _ROLE_DESC:
+                lines.append(f"*{_ROLE_DESC[role]}*")
+                lines.append("")
+            for entry in group_entries:
+                proc_start += 1
+                lines.append(_render_entry_section(entry, proc_start))
 
     # 尾注
     lines.append("")

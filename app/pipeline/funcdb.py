@@ -126,6 +126,11 @@ class FunctionDB:
                 conn.execute("ALTER TABLE functions ADD COLUMN r4_decision TEXT DEFAULT NULL")
             except Exception:
                 pass
+            # 入口分类：外部入口 / 处理入口
+            try:
+                conn.execute("ALTER TABLE functions ADD COLUMN entry_category TEXT DEFAULT ''")
+            except Exception:
+                pass
             # 向前兼容迁移：老 DB 可能没有 rel_path 列
             try:
                 conn.execute("ALTER TABLE file_meta ADD COLUMN rel_path TEXT NOT NULL DEFAULT ''")
@@ -264,6 +269,14 @@ class FunctionDB:
                 (decision, time.time(), func_hash),
             )
 
+    def update_entry_category(self, func_hash: str, category: str) -> None:
+        """R6 分类完成后：写 entry_category（外部入口/处理入口）到 FuncDB。"""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE functions SET entry_category=?, updated_at=? WHERE func_hash=?",
+                (category, time.time(), func_hash),
+            )
+
     def get_keep_entries(self) -> list[dict]:
         """R6 层叠自 FuncDB 读取： r3_decision=keep 且 (r4_decision IS NULL OR r4_decision=keep)。"""
         with self._get_conn() as conn:
@@ -272,6 +285,7 @@ class FunctionDB:
                           f.start_line, f.end_line, f.body_lines,
                           f.has_external_input, f.analysis, f.entry_role,
                           f.entry_confidence, f.r3_decision, f.r4_decision,
+                          f.entry_category,
                           fm.rel_path, fm.original_path
                    FROM functions f
                    LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
@@ -281,15 +295,21 @@ class FunctionDB:
             ).fetchall()
         cols = ["func_hash","file_hash","name","signature","start_line","end_line",
                 "body_lines","has_external_input","analysis","entry_role",
-                "entry_confidence","r3_decision","r4_decision","file_path","original_path"]
+                "entry_confidence","r3_decision","r4_decision",
+                "entry_category","file_path","original_path"]
         result = []
         for r in rows:
             d = dict(zip(cols, r))
             if d.get("analysis"):
                 try:
-                    d["analysis"] = json.loads(d["analysis"])
+                    an = json.loads(d["analysis"])
+                    d["analysis"] = an
+                    # 为 R6 分类局输出 tag 字段
+                    d["tag"] = an.get("tag", "") if isinstance(an, dict) else ""
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    d["tag"] = ""
+            else:
+                d["tag"] = ""
             result.append(d)
         return result
 
