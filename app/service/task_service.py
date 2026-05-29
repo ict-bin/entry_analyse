@@ -666,9 +666,29 @@ def _build_function_catalog(row: AppEaTask) -> list[dict]:
                 "rep_state": str(f.get("r5_state") or "pending"),
                 "has_external_input": has_input,
                 "entry_role": str(f.get("entry_role") or ""),
+                "entry_category": "",
                 "r4_decision": r4_decision,
                 "is_entry": r4_decision == "keep",
             })
+    # ── 从 callchain_db 补充 entry_category（R6 分类：外部入口/处理入口）────────
+    try:
+        from app.pipeline.dirs import PipelineDirs as _Dirs
+        from app.pipeline.callchain_db import CallchainDB as _CCDB
+        _dirs = _Dirs(run_root)
+        _cc_path = _dirs.callchain_db_path
+        if _cc_path.is_file():
+            _cc = _CCDB.open(_dirs.callchain)
+            _cat_map: dict[str, str] = {}
+            for _node in _cc.iter_nodes():
+                _fh = _node.get("func_hash", "")
+                _cat = _node.get("entry_category", "")
+                if _fh and _cat:
+                    _cat_map[_fh] = _cat
+            for _item in items:
+                if _item.get("func_hash") in _cat_map:
+                    _item["entry_category"] = _cat_map[_item["func_hash"]]
+    except Exception:
+        pass  # callchain_db 不存在或格式不对时静默降级
     items.sort(key=lambda x: (x.get("file") or "", int(x.get("start_line") or 0), x.get("name") or ""))
     return items
 
