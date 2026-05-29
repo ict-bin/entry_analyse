@@ -303,34 +303,28 @@ class Orchestrator:
         (run_dir / "result.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8")
 
-        # functions.list：pipeline 产出的 entries 已是正确格式
+        # functions.list / entry-details.json
+        # 权威来源：直接从 funcdb (r3_decision=keep 且 r4_decision=keep/NULL) 读取
+        # 不依赖 engine.run() 返回值，避免中间层格式问题导致输出为空
         func_list_path = str(out_dir / "functions.list")
-        _fl: list[dict] = _flatten_r4_entries(entries) if isinstance(entries, list) else []
+        _funcs_db_dir = run_dir / "workspace" / "r1-functions"
+        _fl: list[dict] = []
+        if _funcs_db_dir.exists():
+            from .pipeline.funcdb import FunctionDB as _FDBOut
+            for _db_file in sorted(_funcs_db_dir.glob("*_functions.db")):
+                _fh = _db_file.stem.replace("_functions", "")
+                try:
+                    _fl.extend(_FDBOut.open(_funcs_db_dir, _fh).get_keep_entries())
+                except Exception as _dbe:
+                    logger.warning("orchestrator: funcdb read failed %s: %s", _fh, _dbe)
 
-        # 补充空白的 file 字段：从 funcDB 构建 12位 func_hash -> 相对路径映射
-        # （funcdb.get_all_meta() 已返回 rel_path，_make_r3_entry 应该已填充，此处仅兑底）
-        if _fl:
-            _func_to_file: dict[str, str] = {}
-            _funcs_db_dir = run_dir / "workspace" / "r1-functions"
-            if _funcs_db_dir.exists():
-                import sqlite3 as _sqlite3
-                for _db_file in _funcs_db_dir.glob("*_functions.db"):
-                    try:
-                        _conn = _sqlite3.connect(str(_db_file))
-                        # rel_path 是相对路径，直接用。如果为空则兑底到 basename
-                        _fmap = {r[0]: r[1] or r[2]
-                                 for r in _conn.execute(
-                                     "SELECT file_hash, rel_path, basename FROM file_meta")}
-                        for _fhash, _fileh in _conn.execute(
-                                "SELECT func_hash, file_hash FROM functions"):
-                            _func_to_file[_fhash] = _fmap.get(_fileh, "")
-                        _conn.close()
-                    except Exception:
-                        pass
-            for _entry in _fl:
-                if not _entry.get("file"):
-                    _entry["file"] = _func_to_file.get(
-                        (_entry.get("func_hash") or "")[:12], "")
+        if not _fl:
+            # 兜底：funcdb 无数据（极少数情况），从 engine 返回值取
+            logger.warning("orchestrator: funcdb empty, falling back to engine return value")
+            _fl = _flatten_r4_entries(entries) if isinstance(entries, list) else []
+        else:
+            _fl = _flatten_r4_entries(_fl)
+
 
         if _fl:
             _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl)
