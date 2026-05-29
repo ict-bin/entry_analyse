@@ -8,6 +8,7 @@ description: >
            R3-W 外部输入分析输出、R4-W 调用链分析输出、R5-W 报告生成输出。
            所有需要输出 <result> 标签的 Worker 阶段。
   DO NOT USE FOR: Judge 阶段（使用固定「通过/否」格式）、读取源码、执行 grep 分析。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---

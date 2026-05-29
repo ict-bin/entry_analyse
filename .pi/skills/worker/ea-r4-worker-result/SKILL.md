@@ -5,6 +5,7 @@ description: >
   当判断单函数是否为跨文件冗余入口后，使用本 Skill 将决策写入指定 JSON 文件。
   USE FOR: R4 函数级 Worker 判断 keep/remove 后写出结果文件。
   DO NOT USE FOR: R3 分析、R5 报告、Judge 阶段。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---

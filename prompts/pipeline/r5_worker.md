@@ -47,3 +47,17 @@
 - ❌ 不要写"（待补充）"等占位符
 - ❌ 不要修改 functions.list 格式的数据
 - ❌ 不要删减任何字段
+
+---
+
+## ⚠️ 输出格式（ea-output-format）
+
+**结果必须包裹在 `<result>...</result>` 标签内。** 引擎只读标签内容，标签外内容被丢弃。
+
+```
+<result>
+[Markdown 报告内容]
+</result>
+```
+
+无内容时：`<result>NO_CORRECTIONS</result>`

@@ -56,3 +56,60 @@ python3 /opt/entry_analyse/scripts/ea_db.py get {funcdb_path} {caller_hash}
 - **禁止读取 `.c` / `.h` 源文件**（R3 已完成外部输入分析，无需重读）
 - **禁止重新做 R3 的外部输入识别**（taints 和 entry_reason 已在 funcdb 中）
 - **禁止仅凭函数名做出判断**（必须查 funcdb 对比 taints）
+
+---
+
+## 结果写出（ea-r4-worker-result）
+
+分析完成后，用 `write` 工具写入结果文件（路径在 Prompt 中给出）：
+
+```json
+{"decision": "keep", "reason": "无模块内调用者，直接外部边界"}
+```
+或：
+```json
+{"decision": "remove", "reason": "被 FuncX(R3-kept) 完全覆盖，taints 相同且无独立触达路径"}
+```
+
+- `decision` 只能是 `"keep"` 或 `"remove"`
+- `reason` 必须填写（50字以内）
+- **必须用 `write` 工具写入文件**，不能只在对话中输出
+
+---
+
+## DB 查询速查（ea-r4-callchain-query）
+
+**R4 判断只基于 DB 数据，禁止读源文件。**
+
+查本函数 R3 分析：
+```bash
+python3 /opt/entry_analyse/scripts/ea_db.py get {funcdb_path} {func_hash}
+```
+
+查调用者列表（含 file_hash）：
+```python
+import sqlite3, json
+conn = sqlite3.connect('{callchain_db_path}')
+rows = conn.execute('''
+    SELECT n.func_hash, n.name, n.is_r3_entry, n.file_hash, e.call_type
+    FROM edges e JOIN nodes n ON n.func_hash = e.caller_hash
+    WHERE e.callee_hash = ?
+''', ['{func_hash}']).fetchall()
+print(json.dumps([{'hash':r[0],'name':r[1],'is_r3_entry':r[2],'file_hash':r[3],'call_type':r[4]} for r in rows], indent=2))
+```
+
+查调用者 R3 分析（同文件）：
+```bash
+python3 /opt/entry_analyse/scripts/ea_db.py get {funcdb_path} {caller_hash}
+```
+
+**决策速查：**
+
+| 情形 | 决策 |
+|------|------|
+| 无 R3-kept 调用者 | keep（外部入口，quick-path已处理） |
+| tag=A | keep（quick-path已处理） |
+| 本函数 taints 与所有调用者 taints 完全不重叠 | keep |
+| 调用者只做路由/转发 | keep |
+| entry_role=dispatch_target | keep |
+| taints ⊆ 调用者 taints 且无独立触达路径 | remove |

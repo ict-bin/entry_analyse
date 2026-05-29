@@ -6,6 +6,7 @@ description: >
   确保 decision/taints/tag 字段完整且自洽后再结束任务。
   USE FOR: R3-W 在输出 <result> 标签前强制验证字段完整性。
   DO NOT USE FOR: Judge 阶段、R1/R2/R4/R5 Worker 阶段。
+disable-model-invocation: true
 metadata:
   version: "1.0.0"
 ---

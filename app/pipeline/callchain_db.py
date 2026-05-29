@@ -659,66 +659,85 @@ class CallchainDB:
         self,
         kept_hashes: "set[str]",
         a_type_hashes: "set[str]",
+        max_depth: int = 2,
     ) -> dict:
         """
-        R6 分类步骤：将最终 keep 集合中每个函数分类为「外部入口」或「处理入口」。
+        R6 分类步骤：将最终 keep 集合分类为「外部入口」「处理入口」「内部实现」。
 
         规则：
-          1. tag=A 的函数 → 始终为「外部入口」（主动读 I/O，与调用链位置无关）
-          2. P 类函数：
-             - closure 中存在属于 kept_hashes 的祖先 → 「处理入口」
-             - 否则 → 「外部入口」
+          1. tag=A → 始终「外部入口」
+          2. P 类无 kept 祖先 → 「外部入口」
+          3. P 类有 kept 祖先，且距最近外部入口 ≤ max_depth 跳 → 「处理入口」
+          4. P 类有 kept 祖先，但距离 > max_depth → 「内部实现」（不列入报告）
 
-        使用全量 closure 表（可跳过被 R4 filter 的中间节点）。
-
-        Args:
-            kept_hashes:  r4_decision=keep 的所有 func_hash 集合
-            a_type_hashes: tag='A' 的 func_hash 集合
-
-        Returns:
-            {'外部入口': N, '处理入口': M, 'detail': {func_hash: category}}
+        depth 通过 closure 表的 depth 列计算（最短路径步数）。
         """
         detail: dict[str, str] = {}
         if not kept_hashes:
-            return {'外部入口': 0, '处理入口': 0, 'detail': detail}
+            return {'外部入口': 0, '处理入口': 0, '内部实现': 0, 'detail': detail}
 
-        placeholders = ','.join('?' * len(kept_hashes))
-        kept_list = list(kept_hashes)
+        kept_list   = list(kept_hashes)
+        kept_ph     = ','.join('?' * len(kept_list))
+        external_hashes: set[str] = set()
 
         with self._get_conn() as conn:
+            # ── Pass 1：确定外部入口（A类 或 P类无 kept 祖先）──────────────────
             for fh in kept_hashes:
-                # A 类函数：始终外部入口
                 if fh in a_type_hashes:
                     detail[fh] = '外部入口'
+                    external_hashes.add(fh)
                     conn.execute(
                         "UPDATE nodes SET entry_category=? WHERE func_hash=?",
                         ('外部入口', fh)
                     )
                     continue
 
-                # P 类：在全量 closure 中查找属于 kept_hashes 的祖先
-                # （可跳过被 filter 的中间节点，因为 closure 是全量传递闭包）
                 row = conn.execute(f"""
                     SELECT COUNT(*) FROM closure c
                     WHERE c.descendant = ?
-                      AND c.ancestor IN ({placeholders})
+                      AND c.ancestor IN ({kept_ph})
                       AND c.ancestor != ?
                 """, (fh, *kept_list, fh)).fetchone()
 
-                has_kept_ancestor = (row[0] > 0) if row else False
-                category = '处理入口' if has_kept_ancestor else '外部入口'
+                if not (row and row[0] > 0):
+                    detail[fh] = '外部入口'
+                    external_hashes.add(fh)
+                    conn.execute(
+                        "UPDATE nodes SET entry_category=? WHERE func_hash=?",
+                        ('外部入口', fh)
+                    )
+
+            # ── Pass 2：对剩余 P 类按 depth 剪枝 ──────────────────────────────
+            ext_list = list(external_hashes)
+            ext_ph   = ','.join('?' * len(ext_list)) if ext_list else None
+
+            for fh in kept_hashes:
+                if fh in detail:
+                    continue  # 已在 Pass 1 确定
+
+                if ext_list and ext_ph:
+                    depth_row = conn.execute(f"""
+                        SELECT MIN(c.depth) FROM closure c
+                        WHERE c.ancestor IN ({ext_ph})
+                          AND c.descendant = ?
+                    """, (*ext_list, fh)).fetchone()
+                    min_depth = depth_row[0] if depth_row and depth_row[0] is not None else 999
+                else:
+                    min_depth = 999
+
+                category = '处理入口' if min_depth <= max_depth else '内部实现'
                 detail[fh] = category
                 conn.execute(
                     "UPDATE nodes SET entry_category=? WHERE func_hash=?",
                     (category, fh)
                 )
 
-        stats = {
+        return {
             '外部入口': sum(1 for v in detail.values() if v == '外部入口'),
             '处理入口': sum(1 for v in detail.values() if v == '处理入口'),
-            'detail': detail,
+            '内部实现': sum(1 for v in detail.values() if v == '内部实现'),
+            'detail':   detail,
         }
-        return stats
 
     def get_caller_context(self, func_hash: str) -> dict:
         """

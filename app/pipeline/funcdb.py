@@ -291,6 +291,8 @@ class FunctionDB:
                    LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
                    WHERE f.r3_decision = 'keep'
                      AND (f.r4_decision IS NULL OR f.r4_decision = 'keep')
+                     AND (f.entry_category IS NULL OR f.entry_category = ''
+                          OR f.entry_category != '\u5185\u90e8\u5b9e\u73b0')
                    ORDER BY fm.rel_path, f.start_line"""
             ).fetchall()
         cols = ["func_hash","file_hash","name","signature","start_line","end_line",

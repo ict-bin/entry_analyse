@@ -4,6 +4,7 @@ description: >
   R4 阶段查询 callchain.db 和 funcdb 的操作指南。
   USE FOR: R4-W/R4-J 验证调用链信息（is_r3_entry/r3_state）、查询本函数及调用者的 R3 分析结果（tag/taints/entry_reason）。
   DO NOT USE FOR: 读取源代码文件、R3 外部输入分析、R5 报告生成。
+disable-model-invocation: true
 metadata:
   version: "2.0.0"
 ---

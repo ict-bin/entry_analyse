@@ -51,15 +51,12 @@ _STAGE_SKILLS: dict[str, list[Path]] = {
     "r2_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
                   _EA_SKILLS_DIR / "shared" / "query-functions-db"],
     "r2_j":      [_EA_SKILLS_DIR / "shared" / "query-functions-db"],
-    "r3_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
-                  _EA_SKILLS_DIR / "worker" / "ea-r3-worker-result"],
+    "r3_w":      [],   # skills 内嵌到 r3_analysis_worker.md system prompt
     "r3_j":      [],   # 无 skill
-    "r4_func_w": [_EA_SKILLS_DIR / "worker" / "ea-r4-worker-result",
-                  _EA_SKILLS_DIR / "worker" / "ea-r4-callchain-query",
-                  _EA_SKILLS_DIR / "worker" / "ea-output-format",
-                  _EA_SKILLS_DIR / "shared" / "query-functions-db"],
-    "r5_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
-                  _EA_SKILLS_DIR / "shared" / "query-functions-db"],
+    "r4_func_w": [_EA_SKILLS_DIR / "shared" / "query-functions-db"],
+                       # 其余 skills 内嵌到 r4_func_worker.md system prompt
+    "r5_w":      [_EA_SKILLS_DIR / "shared" / "query-functions-db"],
+                       # ea-output-format 内嵌到 r5_worker.md system prompt
     "r5_j":      [],   # 无 skill
 }
 
@@ -1557,9 +1554,10 @@ class PipelineEngine:
 
             self._emit("entry_classification_done",
                        external=result['外部入口'],
-                       processing=result['处理入口'])
-            logger.info("入口分类完成: 外部入口=%d 处理入口=%d",
-                        result['外部入口'], result['处理入口'])
+                       processing=result['处理入口'],
+                       internal=result.get('内部实现', 0))
+            logger.info("入口分类完成: 外部入口=%d 处理入口=%d 内部实现=%d(屏蔽)",
+                        result['外部入口'], result['处理入口'], result.get('内部实现', 0))
 
         except Exception as exc:
             logger.warning("入口分类失败（全部论截为外部入口）: %s", exc)

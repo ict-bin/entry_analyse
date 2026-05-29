@@ -86,3 +86,19 @@
 - `callback`：通过注册机制（函数指针表/回调链）被动等待调用  
 - `boundary`：模块公开 API，调用者通过符号直接引用  
 同一注册框架内的所有回调函数使用相同 `entry_role`
+
+---
+
+## ⚠️ 输出前强制自检（来自 ea-r3-worker-result）
+
+在输出最终 `<result>` 标签前，**逐项核查**：
+
+| 检查项 | 要求 |
+|---|---|
+| `decision` | 必须是 `"keep"` 或 `"filter"`，不可省略 |
+| 自洽性 | `has_external_input=true` → `decision="keep"`；`has_external_input=false` → `decision="filter"` |
+| `taints` | `decision="keep"` 时必须是**非空数组**，元素为函数签名中真实存在的参数名 |
+| `tag` | `decision="keep"` 时必须是 `"P"` 或 `"A"` |
+| `entry_role` | `decision="keep"` 时必须是 `boundary`/`callback`/`dispatch_target`/`ipc_handler` 之一 |
+
+**结果必须包裹在 `<result>...</result>` 标签内**，标签外的任何内容引擎不读取。
