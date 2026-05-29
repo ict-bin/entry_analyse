@@ -50,14 +50,17 @@ def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
         {tag, file, line, function, taints, entry_role,
          function_description, entry_reason, taint_details, ...}
 
-    两种格式均兼容：若顶层已有 tag in ('P','A') 则直接透传。
+    两种格式均兼容：若顶层已有 tag in ('P','A') 且 taints 已是列表，则直接透传；
+    否则从嵌套 analysis 展开平铺。
     """
     result = []
     for e in entries:
         if not isinstance(e, dict):
             continue
-        # 已是平铺格式（顶层有合法 tag）
-        if e.get("tag") in ("P", "A"):
+        # 已是平铺格式（顶层有合法 tag 且 taints 已展开为列表）
+        # 注意：get_keep_entries() 会把 analysis.tag 提升到顶层，但 taints 仍在 analysis 内
+        # 因此必须同时检查 taints 是否已展开，否则会绕过 analysis 展开步骤
+        if e.get("tag") in ("P", "A") and isinstance(e.get("taints"), list):
             result.append(e)
             continue
         # 嵌套格式：从 analysis 子字典提取
