@@ -369,6 +369,25 @@ def build_r1_w_retry_prompt(
 
 # ─── R2-W Prompt 构建 ──────────────────────────────────────────────────────────
 
+def build_r2_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
+    """
+    R2-W 重试轮次短消息。Session 已有首轮 sed 验证上下文，无需重发全量提示。
+    """
+    if judge_result_file:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 评审意见已写入：`{judge_result_file}`\n"
+            "请用 `read` 工具阅读，然后修正并重新输出 `<result>...</result>`。\n"
+        )
+    if feedback:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 意见：{feedback}\n\n"
+            "请根据以上意见修正并重新输出 `<result>...</result>`。\n"
+        )
+    return "评审未通过，请修正并重新输出 `<result>...</result>`。\n"
+
+
 def build_r2_w_prompt(
     func_hash: str,
     func_name: str,
@@ -729,6 +748,7 @@ async def run_r2_w_worker(
     is_retry: bool = False,
     feedback: str = "",
     system_prompt: str = "",
+    w_attempt: int = 1,   # R2-W 调用次数（第 2 次起为 retry）
 ) -> TokenUsage:
     """
     执行 Round 1b Worker（函数级准确性校正）。
@@ -745,18 +765,27 @@ async def run_r2_w_worker(
     db = FunctionDB.open(dirs.r1, file_hash)
     session_f = str(dirs.r2_w_session(func_hash))
     workspace = str(dirs.stage_cwd("r2_w"))  # R2-W 专属 cwd（.pi/skills/ 已预置）
-    attempt_no = 2 if is_retry else 1
-    judge_result_file = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, attempt_no - 1)) if is_retry else None
-    prompt = build_r2_w_prompt(
-        func_hash=func_hash,
-        func_name=func_name,
-        start_line=start_line,
-        end_line=end_line,
-        file_path=file_path,
-        is_retry=is_retry,
-        feedback=feedback,
-        judge_result_file=str(judge_result_file) if judge_result_file and judge_result_file.exists() else "",
-    )
+    # 第 n 次 J 失败对应的 J 结果文件
+    j_result = dirs.stage_result_file("r2_j", "judge", func_hash, max(1, w_attempt - 1)) if is_retry else None
+    j_result_path = str(j_result) if j_result and j_result.exists() else ""
+
+    if w_attempt > 1:
+        # 重试轮次：只发短消息（session 已有首轮 sed 验证上下文）
+        prompt = build_r2_w_retry_prompt(
+            judge_result_file=j_result_path,
+            feedback=feedback,
+        )
+    else:
+        prompt = build_r2_w_prompt(
+            func_hash=func_hash,
+            func_name=func_name,
+            start_line=start_line,
+            end_line=end_line,
+            file_path=file_path,
+            is_retry=is_retry,
+            feedback=feedback,
+            judge_result_file=j_result_path,
+        )
 
     async with model_capacity_slot(
         acfg.model,

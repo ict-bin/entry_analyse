@@ -542,6 +542,25 @@ def build_r4_j_func_prompt(
     )
 
 
+def build_report_func_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
+    """
+    R5-W 重试轮次短消息。Session 已有首轮报告上下文，无需重发入口数据。
+    """
+    if judge_result_file:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 评审意见已写入：`{judge_result_file}`\n"
+            "请用 `read` 工具阅读，然后修正并重新将报告写入指定文件。\n"
+        )
+    if feedback:
+        return (
+            "## 评审未通过，请修正\n\n"
+            f"Judge 意见：{feedback}\n\n"
+            "请修正并重新将报告写入指定文件。\n"
+        )
+    return "评审未通过，请修正并重新将报告写入指定文件。\n"
+
+
 def build_report_func_w_prompt(
     func_name: str,
     entry_role: str,

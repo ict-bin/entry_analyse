@@ -996,6 +996,7 @@ class PipelineEngine:
                     is_retry=True,          # 永远在 J 失败后调用，必有反馈
                     feedback=func_state.r2_j_feedback or "",
                     system_prompt=self._stage_sys_prompt('r2_worker'),
+                    w_attempt=func_state.r2_w_attempts,  # 传入次数，>=2 时用短消息
                 )
             func_state.r2_w_state = NodeState.PASSED
             state.save(dirs.state_file)
@@ -2011,19 +2012,28 @@ class PipelineEngine:
                 pass
 
             prev_r5_j = dirs.stage_result_file("r5_j", "judge", func_hash, max(1, attempts - 1)) if attempts > 1 else None
-            w_prompt = P.build_report_func_w_prompt(
-                func_name=func_name,
-                entry_role=entry.get('entry_role','boundary'),
-                entry_file=entry.get('file',''),
-                entry_line=entry.get('line',0),
-                entry_tag=entry.get('tag'),
-                entry_json=json.dumps(entry_rich, ensure_ascii=False, indent=2)[:2000],
-                callers_str=callers_str,
-                report_out_path=report_out,
-                is_retry=attempts > 1,
-                feedback=feedback,
-                judge_result_file=str(prev_r5_j) if prev_r5_j and prev_r5_j.exists() else "",
-            )
+            j_result_path = str(prev_r5_j) if prev_r5_j and prev_r5_j.exists() else ""
+
+            if attempts > 1:
+                # 重试轮次：只发短消息（session 已有首轮入口数据和报告上下文）
+                w_prompt = P.build_report_func_w_retry_prompt(
+                    judge_result_file=j_result_path,
+                    feedback=feedback,
+                )
+            else:
+                w_prompt = P.build_report_func_w_prompt(
+                    func_name=func_name,
+                    entry_role=entry.get('entry_role','boundary'),
+                    entry_file=entry.get('file',''),
+                    entry_line=entry.get('line',0),
+                    entry_tag=entry.get('tag'),
+                    entry_json=json.dumps(entry_rich, ensure_ascii=False, indent=2)[:2000],
+                    callers_str=callers_str,
+                    report_out_path=report_out,
+                    is_retry=False,
+                    feedback="",
+                    judge_result_file="",
+                )
 
             try:
                 acfg = self.cfg.workers.agents[0]
