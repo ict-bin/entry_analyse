@@ -275,13 +275,17 @@ def generate_report(
 
     lines: list[str] = []
 
+    # 按 entry_category 统计
+    ext_count = sum(1 for e in entries if e.get("entry_category") != "处理入口")
+    hdl_count = sum(1 for e in entries if e.get("entry_category") == "处理入口")
+
     # 标题
     lines.append(f"# 外部入口分析报告 — `{module_name}`")
     lines.append("")
     lines.append(f"> **生成时间**: {now}")
     if file_count:
         lines.append(f"> **分析文件数**: {file_count}")
-    lines.append(f"> **外部入口总数**: {total_entries}")
+    lines.append(f"> **入口总数**: {total_entries}（外部入口 {ext_count} 个、处理入口 {hdl_count} 个）")
     if overall_avg is not None:
         lines.append(f"> **置信度均值**: {overall_avg:.2f} {confidence_to_bar(overall_avg, 10)} {confidence_label(overall_avg)}")
     if duration != "N/A":

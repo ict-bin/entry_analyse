@@ -303,52 +303,65 @@ class Orchestrator:
         (run_dir / "result.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8")
 
-        # functions.list / entry-details.json
+        # functions.list / handler.list / entry-details.json
         # 权威来源：直接从 funcdb (r3_decision=keep 且 r4_decision=keep/NULL) 读取
         # 不依赖 engine.run() 返回值，避免中间层格式问题导致输出为空
-        func_list_path = str(out_dir / "functions.list")
+        func_list_path    = str(out_dir / "functions.list")
+        handler_list_path = str(out_dir / "handler.list")
+        entry_details_path = str(out_dir / "entry-details.json")
         _funcs_db_dir = run_dir / "workspace" / "r1-functions"
-        _fl: list[dict] = []
+        _fl_all: list[dict] = []
         if _funcs_db_dir.exists():
             from .pipeline.funcdb import FunctionDB as _FDBOut
             for _db_file in sorted(_funcs_db_dir.glob("*_functions.db")):
                 _fh = _db_file.stem.replace("_functions", "")
                 try:
-                    _fl.extend(_FDBOut.open(_funcs_db_dir, _fh).get_keep_entries())
+                    _fl_all.extend(_FDBOut.open(_funcs_db_dir, _fh).get_keep_entries())
                 except Exception as _dbe:
                     logger.warning("orchestrator: funcdb read failed %s: %s", _fh, _dbe)
 
-        if not _fl:
+        if not _fl_all:
             # 兜底：funcdb 无数据（极少数情况），从 engine 返回值取
             logger.warning("orchestrator: funcdb empty, falling back to engine return value")
-            _fl = _flatten_r4_entries(entries) if isinstance(entries, list) else []
+            _fl_all = _flatten_r4_entries(entries) if isinstance(entries, list) else []
         else:
-            _fl = _flatten_r4_entries(_fl)
+            _fl_all = _flatten_r4_entries(_fl_all)
 
+        # 按 entry_category 拆分：functions.list=外部入口 / handler.list=处理入口
+        _fl_ext: list[dict] = []
+        _fl_hdl: list[dict] = []
+        for _e in _fl_all:
+            if _e.get("entry_category") == "处理入口":
+                _fl_hdl.append(_e)
+            else:  # "外部入口" 或未分类均归入 functions.list
+                _fl_ext.append(_e)
 
-        if _fl:
-            _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl)
+        # auto-fix + 校验（只针对 functions.list）
+        if _fl_ext:
+            _fl_fixed, _fl_fix_log = auto_fix_functions_list(_fl_ext)
             if _fl_fix_log:
                 self._emit("functions_list_autofix", task_id,
                            fixes=_fl_fix_log[:20],
-                           original_count=len(_fl),
+                           original_count=len(_fl_ext),
                            fixed_count=len(_fl_fixed))
-                _fl = _fl_fixed
-
-            _fl_errors = validate_functions_list(_fl)
+                _fl_ext = _fl_fixed
+            _fl_errors = validate_functions_list(_fl_ext)
             if _fl_errors:
                 self._emit("functions_list_error", task_id,
                            error="; ".join(_fl_errors[:5]))
 
+        # 写出三个文件
         Path(func_list_path).write_text(
-            json.dumps(_fl, ensure_ascii=False, indent=2),
-            encoding="utf-8")
-
-        # entry-details.json（与 functions.list 相同内容，供前端消费）
-        entry_details_path = str(out_dir / "entry-details.json")
+            json.dumps(_fl_ext, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(handler_list_path).write_text(
+            json.dumps(_fl_hdl, ensure_ascii=False, indent=2), encoding="utf-8")
+        # entry-details.json 包含全量（供前端消费）
         Path(entry_details_path).write_text(
-            json.dumps(_fl, ensure_ascii=False, indent=2),
-            encoding="utf-8")
+            json.dumps(_fl_all, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 兼容性别名（generate_final_report 等后续使用 _fl）
+        _fl = _fl_ext
+
 
         # final_report.md — 先由 Python 从 funcDB 提取完整草稿，再由 W+J 丰富化
         try:
@@ -364,7 +377,7 @@ class Orchestrator:
             }
             await engine.generate_final_report(
                 run_dir=run_dir,
-                fl_entries=_fl,
+                fl_entries=_fl_all,  # final_report 包含外部入口和处理入口
                 out_dir=out_dir,
                 module_name=cfg.module_name,
                 stats=_stats,
@@ -400,7 +413,10 @@ class Orchestrator:
                    run_dir=str(run_dir),
                    output_dir=str(out_dir),
                    functions_list=func_list_path,
+                   handler_list=handler_list_path,
                    entry_details=entry_details_path,
+                   external_count=len(_fl_ext),
+                   handler_count=len(_fl_hdl),
                    flag_file=str(flag_path))
 
         self._cancel_event = None
