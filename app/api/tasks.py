@@ -22,7 +22,9 @@ from .deps import ensure_admin_user, ensure_project_access, get_current_user, re
 logger = logging.getLogger(__name__)
 AGGREGATE_CACHE_TTL_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "5")))
 AGGREGATE_HTTP_TIMEOUT_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_TIMEOUT_SECONDS", "10")))
-AGGREGATE_HTTP_PORT = int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_PORT", "8080"))
+AGGREGATE_HTTP_PORT = int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_PORT", os.environ.get("PORT", "3000")))
+POD_DNS_SUFFIX = os.environ.get("K8S_POD_DNS_SUFFIX", "pod.cluster.local").strip() or "pod.cluster.local"
+POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "secflow-ns").strip() or "secflow-ns"
 
 _AGENT_AGGREGATE_CACHE: dict[str, dict[str, Any]] = {}
 _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
@@ -488,11 +490,34 @@ def _auth_headers_from_token(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _agent_cache_key() -> str:
+    return "__global__"
+
+
+def _snapshot_query_params() -> dict[str, Any]:
+    return {}
+
+
+def _project_id_from_snapshot_row(row: dict[str, Any]) -> str | None:
+    return str(row.get("project_id") or "").strip() or None
+
+
+def _resolve_worker_targets(*, pod_ip: str | None, pod_name: str | None) -> list[str]:
+    targets: list[str] = []
+    normalized_ip = str(pod_ip or "").strip()
+    normalized_name = str(pod_name or "").strip()
+    if normalized_ip:
+        targets.append(normalized_ip)
+    if normalized_name:
+        targets.append(f"{normalized_name}.{POD_NAMESPACE}.{POD_DNS_SUFFIX}")
+    return targets
+
+
 def _aggregate_base_urls(worker: Any) -> list[str]:
     targets: list[str] = []
     pod_ip = str(getattr(worker, "pod_ip", "") or "").strip()
     pod_name = str(getattr(worker, "pod_name", "") or "").strip()
-    for host in (pod_ip, pod_name):
+    for host in _resolve_worker_targets(pod_ip=pod_ip, pod_name=pod_name):
         if not host:
             continue
         targets.append(f"http://{host}:{AGGREGATE_HTTP_PORT}/api/app/entry-analyse")
@@ -515,20 +540,19 @@ async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: di
 
 @router.get("/agent-observability/snapshot")
 async def get_agent_observability_snapshot(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    _, token = user_and_token
-    await ensure_project_access(project_id, token)
+    _, _token = user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=project_id)
+    return get_agent_observability_service().build_snapshot(db, project_id=None)
 
 
-async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Session) -> dict[str, Any]:
+async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, Any]:
     now_ts = time.time()
-    cached = _AGENT_AGGREGATE_CACHE.get(project_id)
+    cache_key = _agent_cache_key()
+    cached = _AGENT_AGGREGATE_CACHE.get(cache_key)
     if cached and (now_ts - float(cached.get("created_at") or 0.0)) <= AGGREGATE_CACHE_TTL_SECONDS:
       cache_age = now_ts - float(cached.get("created_at") or 0.0)
       meta = cached.get("meta") or {}
@@ -547,8 +571,8 @@ async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Sessi
     started = time.perf_counter()
     from app.service.agent_observability import get_agent_observability_service
 
-    local = get_agent_observability_service().build_snapshot(db, project_id=project_id)
-    cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
+    local = get_agent_observability_service().build_snapshot(db, project_id=None)
+    cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.get("workers") or [] if bool(worker.get("healthy")) and str(worker.get("pod_name") or "").strip()]
 
     merged_processes: list[dict[str, Any]] = []
@@ -571,7 +595,7 @@ async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Sessi
             fanout_errors += 1
             failed_targets.append(str(worker.get("pod_name") or worker.get("worker_id") or "unknown"))
             continue
-        worker_snapshot, process_source = await _fanout_get_json(urls, path="/agent-observability/snapshot", token=token, params={"project_id": project_id})
+        worker_snapshot, process_source = await _fanout_get_json(urls, path="/agent-observability/snapshot", token=token, params=_snapshot_query_params())
         if worker_snapshot is None:
             partial = True
             fanout_errors += 1
@@ -653,7 +677,7 @@ async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Sessi
         "tasks": merged_tasks,
         "pods": pod_rows,
     }
-    _AGENT_AGGREGATE_CACHE[project_id] = {
+    _AGENT_AGGREGATE_CACHE[cache_key] = {
         "created_at": now_ts,
         "snapshot": snapshot,
         "meta": dict(_LAST_AGENT_AGGREGATE_META),
@@ -772,31 +796,28 @@ def get_global_slot_cluster(
 
 @router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse)
 def get_agent_observability_summary(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
-    _=Depends(require_project_access),
+    user_and_token=Depends(get_current_user),
 ):
+    del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    snapshot = get_agent_observability_service().build_snapshot(db, project_id=project_id)
+    snapshot = get_agent_observability_service().build_snapshot(db, project_id=None)
     return snapshot["summary"]
 
 
 @router.get("/agent-observability/aggregate/summary", response_model=AgentObservabilitySummaryResponse)
 async def get_agent_observability_aggregate_summary(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    await ensure_project_access(project_id, token)
-    snapshot = await _build_agent_aggregate_snapshot(project_id, token, db)
+    snapshot = await _build_agent_aggregate_snapshot(token, db)
     return snapshot["summary"]
 
 
 @router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse])
 def list_agent_processes(
-    project_id: str = Query(...),
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -805,11 +826,12 @@ def list_agent_processes(
     kill_allowed: Optional[bool] = Query(None),
     orphan_only: bool = Query(False),
     db: Session = Depends(get_db),
-    _=Depends(require_project_access),
+    user_and_token=Depends(get_current_user),
 ):
+    del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    rows = list(get_agent_observability_service().build_snapshot(db, project_id=project_id)["processes"])
+    rows = list(get_agent_observability_service().build_snapshot(db, project_id=None)["processes"])
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     if task_id:
@@ -829,7 +851,6 @@ def list_agent_processes(
 
 @router.get("/agent-observability/aggregate/processes", response_model=list[AgentProcessSnapshotResponse])
 async def list_agent_aggregate_processes(
-    project_id: str = Query(...),
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -841,8 +862,7 @@ async def list_agent_aggregate_processes(
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    await ensure_project_access(project_id, token)
-    rows = list((await _build_agent_aggregate_snapshot(project_id, token, db))["processes"])
+    rows = list((await _build_agent_aggregate_snapshot(token, db))["processes"])
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     if task_id:
@@ -862,7 +882,6 @@ async def list_agent_aggregate_processes(
 
 @router.get("/agent-observability/sessions", response_model=list[AgentSessionSnapshotResponse])
 def list_agent_sessions(
-    project_id: str = Query(...),
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -870,11 +889,12 @@ def list_agent_sessions(
     live_only: bool = Query(False),
     orphan_only: bool = Query(False),
     db: Session = Depends(get_db),
-    _=Depends(require_project_access),
+    user_and_token=Depends(get_current_user),
 ):
+    del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    rows = list(get_agent_observability_service().build_snapshot(db, project_id=project_id)["sessions"])
+    rows = list(get_agent_observability_service().build_snapshot(db, project_id=None)["sessions"])
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     if task_id:
@@ -892,7 +912,6 @@ def list_agent_sessions(
 
 @router.get("/agent-observability/aggregate/sessions", response_model=list[AgentSessionSnapshotResponse])
 async def list_agent_aggregate_sessions(
-    project_id: str = Query(...),
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -903,8 +922,7 @@ async def list_agent_aggregate_sessions(
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    await ensure_project_access(project_id, token)
-    rows = list((await _build_agent_aggregate_snapshot(project_id, token, db))["sessions"])
+    rows = list((await _build_agent_aggregate_snapshot(token, db))["sessions"])
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     if task_id:
@@ -933,73 +951,66 @@ def get_agent_session_content(
 
 @router.get("/agent-observability/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
 def list_agent_tasks(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
-    _=Depends(require_project_access),
+    user_and_token=Depends(get_current_user),
 ):
+    del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=project_id)["tasks"]
+    return get_agent_observability_service().build_snapshot(db, project_id=None)["tasks"]
 
 
 @router.get("/agent-observability/aggregate/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
 async def list_agent_aggregate_tasks(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    await ensure_project_access(project_id, token)
-    return (await _build_agent_aggregate_snapshot(project_id, token, db))["tasks"]
+    return (await _build_agent_aggregate_snapshot(token, db))["tasks"]
 
 
 @router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse])
 def list_agent_pods(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
-    _=Depends(require_project_access),
+    user_and_token=Depends(get_current_user),
 ):
+    del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=project_id)["pods"]
+    return get_agent_observability_service().build_snapshot(db, project_id=None)["pods"]
 
 
 @router.get("/agent-observability/aggregate/pods", response_model=list[AgentPodSnapshotResponse])
 async def list_agent_aggregate_pods(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    await ensure_project_access(project_id, token)
-    return (await _build_agent_aggregate_snapshot(project_id, token, db))["pods"]
+    return (await _build_agent_aggregate_snapshot(token, db))["pods"]
 
 
 @router.get("/agent-observability/aggregate/runtime", response_model=AgentRuntimeAggregateResponse)
 async def get_agent_aggregate_runtime(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    await ensure_project_access(project_id, token)
-    snapshot = await _build_agent_aggregate_snapshot(project_id, token, db)
+    snapshot = await _build_agent_aggregate_snapshot(token, db)
     return _build_agent_runtime_aggregate(snapshot)
 
 
 @router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse)
 async def kill_agent_process(
     pid: int,
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     user, token = user_and_token
     ensure_admin_user(user)
-    await ensure_project_access(project_id, token)
+    del token
     from app.service.agent_observability import get_agent_observability_service
 
-    snapshot = get_agent_observability_service().build_snapshot(db, project_id=project_id)
+    snapshot = get_agent_observability_service().build_snapshot(db, project_id=None)
     matched = [row for row in snapshot["processes"] if int(row.get("pid") or -1) == pid]
     if not matched:
         return AgentProcessKillResponse(requested=1, matched=0, succeeded=0, failed=0, skipped=1, items=[])
@@ -1014,9 +1025,8 @@ async def kill_agent_process(
             items=[AgentProcessKillItemResponse(pid=pid, pgid=row.get("pgid"), status="skipped", reason=row.get("kill_block_reason"))],
         )
     logger.warning(
-        "entry-agent-manual-kill operator=%s project_id=%s pid=%s pgid=%s task_id=%s session_file=%s owner_reason=%s",
+        "entry-agent-manual-kill operator=%s pid=%s pgid=%s task_id=%s session_file=%s owner_reason=%s",
         user.get("username") or user.get("name") or "unknown",
-        project_id,
         pid,
         row.get("pgid"),
         row.get("task_id"),
@@ -1025,7 +1035,7 @@ async def kill_agent_process(
     )
     _audit_agent_kill_event(
         db,
-        project_id=project_id,
+        project_id=_project_id_from_snapshot_row(row),
         operator=user.get("username") or user.get("name") or "unknown",
         event_type="agent_process_manual_kill",
         message=f"管理员手工终止孤儿智能体进程 pid={pid}",
@@ -1052,28 +1062,26 @@ async def kill_agent_process(
 
 @router.post("/agent-observability/processes/kill-all-orphans", response_model=AgentProcessKillResponse)
 async def kill_all_orphan_processes(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     user, token = user_and_token
     ensure_admin_user(user)
-    await ensure_project_access(project_id, token)
+    del token
     from app.service.agent_observability import get_agent_observability_service
 
-    snapshot = get_agent_observability_service().build_snapshot(db, project_id=project_id)
+    snapshot = get_agent_observability_service().build_snapshot(db, project_id=None)
     killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "orphan" and row.get("kill_allowed")]
     logger.warning(
-        "entry-agent-bulk-kill operator=%s project_id=%s count=%s pids=%s",
+        "entry-agent-bulk-kill operator=%s count=%s pids=%s",
         user.get("username") or user.get("name") or "unknown",
-        project_id,
         len(killable),
         [row.get("pid") for row in killable],
     )
     for row in killable:
         _audit_agent_kill_event(
             db,
-            project_id=project_id,
+            project_id=_project_id_from_snapshot_row(row),
             operator=user.get("username") or user.get("name") or "unknown",
             event_type="agent_process_bulk_manual_kill",
             message=f"管理员批量终止孤儿智能体进程 pid={int(row.get('pid') or 0)}",
@@ -1102,29 +1110,26 @@ async def kill_all_orphan_processes(
 
 @router.post("/agent-observability/aggregate/processes/kill-all-suspected-orphans", response_model=AgentProcessKillResponse)
 async def kill_all_agent_aggregate_suspected_orphans(
-    project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     user, token = user_and_token
     ensure_admin_user(user)
-    await ensure_project_access(project_id, token)
-    snapshot = await _build_agent_aggregate_snapshot(project_id, token, db)
+    snapshot = await _build_agent_aggregate_snapshot(token, db)
     killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "unknown" and row.get("kill_allowed")]
-    cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id)
+    cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
     worker_by_pod = {str(worker.get("pod_name") or ""): worker for worker in cluster_snapshot.get("workers") or []}
     items: list[dict[str, Any]] = []
 
     logger.warning(
-        "entry-agent-aggregate-bulk-kill-suspected operator=%s project_id=%s count=%s",
+        "entry-agent-aggregate-bulk-kill-suspected operator=%s count=%s",
         user.get("username") or user.get("name") or "unknown",
-        project_id,
         len(killable),
     )
     for row in killable:
         _audit_agent_kill_event(
             db,
-            project_id=project_id,
+            project_id=_project_id_from_snapshot_row(row),
             operator=user.get("username") or user.get("name") or "unknown",
             event_type="agent_process_bulk_manual_kill",
             message=f"管理员跨 Pod 批量终止疑似孤儿智能体进程 pid={int(row.get('pid') or 0)}",
@@ -1147,7 +1152,7 @@ async def kill_all_agent_aggregate_suspected_orphans(
             _aggregate_base_urls(type("WorkerRef", (), target_worker)),
             path=f"/agent-observability/processes/{int(row.get('pid') or 0)}/kill",
             token=token,
-            params={"project_id": project_id},
+            params=_snapshot_query_params(),
         )
         if not result:
             items.append({"pid": int(row.get("pid") or 0), "pgid": row.get("pgid"), "status": "failed", "reason": "fanout kill request failed"})
@@ -1158,7 +1163,7 @@ async def kill_all_agent_aggregate_suspected_orphans(
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
     skipped = sum(1 for item in items if item.get("status") == "skipped")
-    _invalidate_agent_aggregate_cache(project_id)
+    _invalidate_agent_aggregate_cache()
     return AgentProcessKillResponse(
         requested=len(killable),
         matched=len(killable),
