@@ -534,6 +534,13 @@ async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: di
     return None, None
 
 
+def _summary_with_meta(summary: dict[str, Any], *, cache_hit: bool, cache_age_seconds: float = 0.0) -> dict[str, Any]:
+    row = dict(summary or {})
+    row["aggregate_cache_hit"] = cache_hit
+    row["aggregate_cache_age_seconds"] = cache_age_seconds
+    return row
+
+
 @router.get("/agent-observability/snapshot")
 async def get_agent_observability_snapshot(
     db: Session = Depends(get_db),
@@ -562,7 +569,13 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
           "failed_targets": list(meta.get("failed_targets") or []),
           "cache_hits": int(_LAST_AGENT_AGGREGATE_META.get("cache_hits") or 0) + 1,
       })
-      return cached["snapshot"]
+      cached_snapshot = dict(cached["snapshot"])
+      cached_snapshot["summary"] = _summary_with_meta(
+          cached_snapshot.get("summary") or {},
+          cache_hit=True,
+          cache_age_seconds=cache_age,
+      )
+      return cached_snapshot
 
     started = time.perf_counter()
     from app.service.agent_observability import get_agent_observability_service
@@ -679,6 +692,105 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         "meta": dict(_LAST_AGENT_AGGREGATE_META),
     }
     return snapshot
+
+
+async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, Any]:
+    now_ts = time.time()
+    cache_key = _agent_cache_key()
+    cached = _AGENT_AGGREGATE_CACHE.get(cache_key)
+    if cached and (now_ts - float(cached.get("created_at") or 0.0)) <= AGGREGATE_CACHE_TTL_SECONDS:
+        cache_age = now_ts - float(cached.get("created_at") or 0.0)
+        meta = cached.get("meta") or {}
+        _LAST_AGENT_AGGREGATE_META.update({
+            "partial": bool(meta.get("partial")),
+            "sources": int(meta.get("sources") or 0),
+            "fanout_errors": int(meta.get("fanout_errors") or 0),
+            "duration_seconds": float(meta.get("duration_seconds") or 0.0),
+            "cache_hit": True,
+            "cache_age_seconds": cache_age,
+            "failed_targets": list(meta.get("failed_targets") or []),
+            "cache_hits": int(_LAST_AGENT_AGGREGATE_META.get("cache_hits") or 0) + 1,
+        })
+        return _summary_with_meta(cached.get("snapshot", {}).get("summary") or {}, cache_hit=True, cache_age_seconds=cache_age)
+
+    started = time.perf_counter()
+    from app.service.agent_observability import get_agent_observability_service
+
+    local_summary = dict(get_agent_observability_service().build_snapshot(db, project_id=None)["summary"])
+    cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
+    workers = [worker for worker in cluster_snapshot.get("workers") or [] if bool(worker.get("healthy")) and str(worker.get("pod_name") or "").strip()]
+
+    sources = 0
+    partial = False
+    fanout_errors = 0
+    failed_targets: list[str] = []
+    counters = {
+        "active_processes": 0,
+        "orphan_processes": 0,
+        "unknown_processes": 0,
+        "killable_orphan_processes": 0,
+        "killable_suspected_orphan_processes": 0,
+        "orphan_sessions": 0,
+        "scan_errors": 0,
+    }
+
+    for worker in workers:
+        urls = _aggregate_base_urls(type("WorkerRef", (), worker))
+        if not urls:
+            partial = True
+            fanout_errors += 1
+            failed_targets.append(str(worker.get("pod_name") or worker.get("worker_id") or "unknown"))
+            continue
+        worker_summary, _ = await _fanout_get_json(urls, path="/agent-observability/summary", token=token, params=_snapshot_query_params())
+        if worker_summary is None:
+            partial = True
+            fanout_errors += 1
+            failed_targets.append(str(worker.get("pod_name") or worker.get("worker_id") or "unknown"))
+            continue
+        sources += 1
+        for key in counters:
+            counters[key] += int(worker_summary.get(key) or 0)
+
+    all_sources_failed = bool(workers) and sources == 0 and fanout_errors > 0
+    if not workers:
+        summary = {
+            **local_summary,
+            "aggregate_mode": "local",
+            "aggregate_partial": False,
+            "aggregate_sources": 1,
+            "aggregate_fanout_errors": 0,
+            "aggregate_duration_seconds": time.perf_counter() - started,
+            "aggregate_cache_hit": False,
+            "aggregate_cache_age_seconds": 0.0,
+            "aggregate_failed_targets": [],
+            "aggregate_all_sources_failed": False,
+        }
+    else:
+        summary = {
+            "pod_name": "entry-analyse-aggregate",
+            **counters,
+            "scanned_at": time.time(),
+            "aggregate_mode": "fanout",
+            "aggregate_partial": partial,
+            "aggregate_sources": sources,
+            "aggregate_fanout_errors": fanout_errors,
+            "aggregate_duration_seconds": time.perf_counter() - started,
+            "aggregate_cache_hit": False,
+            "aggregate_cache_age_seconds": 0.0,
+            "aggregate_failed_targets": failed_targets,
+            "aggregate_all_sources_failed": all_sources_failed,
+        }
+
+    _LAST_AGENT_AGGREGATE_META.update({
+        "partial": bool(summary.get("aggregate_partial")),
+        "sources": int(summary.get("aggregate_sources") or 0),
+        "fanout_errors": int(summary.get("aggregate_fanout_errors") or 0),
+        "duration_seconds": float(summary.get("aggregate_duration_seconds") or 0.0),
+        "cache_hit": False,
+        "cache_age_seconds": 0.0,
+        "failed_targets": list(summary.get("aggregate_failed_targets") or []),
+    })
+    return summary
 
 
 def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -814,8 +926,7 @@ async def get_agent_observability_aggregate_summary(
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    snapshot = await _build_agent_aggregate_snapshot(token, db)
-    return snapshot["summary"]
+    return await _build_agent_aggregate_summary(token, db)
 
 
 @router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse])
