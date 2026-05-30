@@ -2,8 +2,11 @@ import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 
+from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import sessionmaker
 
+from app.db.models import AppEaTask, Base
 from app.service import scheduler_service, task_service, worker_slot_service
 from app.api import tasks as tasks_api
 from app.service import agent_observability
@@ -124,6 +127,48 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["available_slots"] == 3
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
+
+
+def test_active_running_count_excludes_binary_security_origin_tasks() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    db = SessionLocal()
+    now = now_local()
+    try:
+        db.add_all([
+            AppEaTask(
+                task_id="manual-running",
+                project_id="p1",
+                task_name="manual-running",
+                input_path="/tmp/manual",
+                module_name="manual-mod",
+                prompt_content="prompt",
+                status="running",
+                owner_pod="pod-a",
+                lease_expires_at=now + timedelta(seconds=60),
+                task_origin_type="manual",
+            ),
+            AppEaTask(
+                task_id="binary-child-running",
+                project_id="p1",
+                task_name="binary-child-running",
+                input_path="/tmp/binary",
+                module_name="binary-mod",
+                prompt_content="prompt",
+                status="running",
+                owner_pod="pod-b",
+                lease_expires_at=now + timedelta(seconds=60),
+                task_origin_type="binary_security",
+                parent_task_id="bst_1",
+                parent_stage_name="entry_analysis",
+            ),
+        ])
+        db.commit()
+
+        assert task_service.TaskService._active_running_count(db, "p1") == 1
+    finally:
+        db.close()
 
 
 class _DeleteTaskQuery:

@@ -118,6 +118,58 @@ class WorkerSlotServiceTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_cluster_snapshot_dispatch_running_excludes_binary_security_children(self):
+        db = self.SessionLocal()
+        try:
+            now = now_local()
+            db.add(
+                AppEaWorkerSlot(
+                    worker_id="worker-a",
+                    pod_name="pod-a",
+                    pod_ip="10.0.0.1",
+                    max_concurrent_tasks=4,
+                    last_seen_status="running",
+                    last_heartbeat_at=now,
+                )
+            )
+            db.add_all([
+                AppEaTask(
+                    task_id="manual-running",
+                    project_id="p1",
+                    task_name="manual-running",
+                    input_path="/tmp/manual",
+                    module_name="manual-mod",
+                    prompt_content="prompt",
+                    status="running",
+                    owner_pod="pod-a",
+                    lease_expires_at=now + timedelta(seconds=120),
+                    task_origin_type="manual",
+                ),
+                AppEaTask(
+                    task_id="binary-child-running",
+                    project_id="p1",
+                    task_name="binary-child-running",
+                    input_path="/tmp/binary",
+                    module_name="binary-mod",
+                    prompt_content="prompt",
+                    status="running",
+                    owner_pod="pod-a",
+                    lease_expires_at=now + timedelta(seconds=120),
+                    task_origin_type="binary_security",
+                    parent_task_id="bst_1",
+                    parent_stage_name="entry_analysis",
+                ),
+            ])
+            db.commit()
+
+            payload = self.service.get_cluster_snapshot(db, project_id="p1")
+
+            self.assertEqual(2, payload["busy_slots"])
+            self.assertEqual(1, payload["dispatch_running"])
+            self.assertEqual(7, payload["dispatch_available"])
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

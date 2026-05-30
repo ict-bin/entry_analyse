@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.db.models import AppEaTask, AppEaWorkerSlot
 from app.models import normalize_max_concurrent_tasks
 from app.time_utils import add_seconds_local, isoformat_local, now_local
-from app.service.task_service import _load_svc_config_from_db
+from app.service.task_service import _load_svc_config_from_db, _project_dispatch_limit_filter
 
 HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 STALE_AFTER_SECONDS = max(
@@ -43,6 +43,7 @@ class WorkerSlotService:
     def _active_running_count(self, db: Session, project_id: str | None) -> int:
         query = db.query(AppEaTask).filter(
             AppEaTask.is_deleted.is_(False),
+            _project_dispatch_limit_filter(),
             AppEaTask.status == "running",
             AppEaTask.cancel_requested.is_(False),
             AppEaTask.lease_expires_at.is_not(None),

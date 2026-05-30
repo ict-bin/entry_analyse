@@ -1442,6 +1442,13 @@ def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task
     return str(task_origin_type or "").strip() == "binary_security"
 
 
+def _project_dispatch_limit_filter():
+    return or_(
+        AppEaTask.task_origin_type.is_(None),
+        AppEaTask.task_origin_type != "binary_security",
+    )
+
+
 def _normalize_entry_input_contract(input_contract: Optional[dict[str, Any]]) -> dict[str, Any]:
     return dict(input_contract) if isinstance(input_contract, dict) else {}
 
@@ -1947,6 +1954,7 @@ class TaskService:
             .filter(
                 AppEaTask.project_id == project_id,
                 AppEaTask.is_deleted.is_(False),
+                _project_dispatch_limit_filter(),
                 AppEaTask.status == "running",
                 AppEaTask.cancel_requested.is_(False),
                 AppEaTask.lease_expires_at.is_not(None),
