@@ -62,6 +62,10 @@ def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
         # 注意：get_keep_entries() 会把 analysis.tag 提升到顶层，但 taints 仍在 analysis 内
         # 因此必须同时检查 taints 是否已展开，否则会绕过 analysis 展开步骤
         if e.get("tag") in ("P", "A") and isinstance(e.get("taints"), list):
+            # 直接透传，但补填 file 字段（get_keep_entries 返回 file_path 而非 file）
+            if not e.get("file"):
+                e = dict(e)
+                e["file"] = e.get("file_path") or e.get("original_path") or ""
             result.append(e)
             continue
         # 嵌套格式：从 analysis 子字典提取
