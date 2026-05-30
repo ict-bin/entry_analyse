@@ -2098,6 +2098,7 @@ class TaskService:
                 result_file_path = next(iter(sorted(output_root.glob("*.md"))), None)
 
         functions_list_path = output_root / "functions.list" if output_root else None
+        entry_details_path = output_root / "entry-details.json" if output_root else None
         # 优先读新格式的 final_report.md（如果存在），否则实验性地定位 run/report.md
         _final_report = output_root / "final_report.md" if output_root else None
         run_report_path = (
@@ -2121,6 +2122,16 @@ class TaskService:
             else:
                 functions_list_markdown = text
                 functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+        entry_details: list[dict] = []
+        if entry_details_path and entry_details_path.is_file():
+            try:
+                raw = entry_details_path.read_text(encoding="utf-8")
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    entry_details = [e for e in parsed if isinstance(e, dict)]
+            except Exception as _e:
+                warnings.append(f"entry-details.json 读取失败: {_e}")
 
         run_report_markdown: str | None = None
         if run_report_path:
@@ -2153,6 +2164,7 @@ class TaskService:
             "result_markdown": result_markdown,
             "functions_list_markdown": functions_list_markdown,
             "functions": functions_list,
+            "entry_details": entry_details,
             "run_report_markdown": run_report_markdown,
             "final_report_markdown": run_report_markdown if (_final_report and _final_report.is_file()) else None,
             "result_json": run_result_json,

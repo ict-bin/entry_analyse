@@ -157,6 +157,7 @@ class TaskResultResponse(BaseModel):
     result_markdown: Optional[str] = None
     functions_list_markdown: Optional[str] = None
     functions: list[str] = Field(default_factory=list)
+    entry_details: list[dict[str, Any]] = Field(default_factory=list)
     run_report_markdown: Optional[str] = None
     result_json: Optional[dict[str, Any]] = None
     summary: TaskResultSummaryResponse
