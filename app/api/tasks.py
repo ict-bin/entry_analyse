@@ -26,6 +26,7 @@ AGGREGATE_HTTP_PORT = int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_PORT", os.envi
 AGGREGATE_WORKER_FANOUT_ENABLED = str(os.environ.get("EA_AGENT_AGGREGATE_ENABLE_WORKER_FANOUT", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 _AGENT_AGGREGATE_CACHE: dict[str, dict[str, Any]] = {}
+_AGENT_AGGREGATE_SUMMARY_CACHE: dict[str, dict[str, Any]] = {}
 _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
     "partial": False,
     "sources": 0,
@@ -37,6 +38,11 @@ _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
     "cache_hits": 0,
     "cache_misses": 0,
 }
+
+
+def _invalidate_agent_aggregate_cache() -> None:
+    _AGENT_AGGREGATE_CACHE.clear()
+    _AGENT_AGGREGATE_SUMMARY_CACHE.clear()
 
 
 def _audit_agent_kill_event(
@@ -736,7 +742,7 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
 async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, Any]:
     now_ts = time.time()
     cache_key = _agent_cache_key()
-    cached = _AGENT_AGGREGATE_CACHE.get(cache_key)
+    cached = _AGENT_AGGREGATE_SUMMARY_CACHE.get(cache_key)
     if cached and (now_ts - float(cached.get("created_at") or 0.0)) <= AGGREGATE_CACHE_TTL_SECONDS:
         cache_age = now_ts - float(cached.get("created_at") or 0.0)
         meta = cached.get("meta") or {}
@@ -750,7 +756,7 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
             "failed_targets": list(meta.get("failed_targets") or []),
             "cache_hits": int(_LAST_AGENT_AGGREGATE_META.get("cache_hits") or 0) + 1,
         })
-        return _summary_with_meta(cached.get("snapshot", {}).get("summary") or {}, cache_hit=True, cache_age_seconds=cache_age)
+        return _summary_with_meta(cached.get("summary") or {}, cache_hit=True, cache_age_seconds=cache_age)
 
     started = time.perf_counter()
     from app.service.agent_observability import get_agent_observability_service
@@ -777,7 +783,13 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
             "cache_hit": False,
             "cache_age_seconds": 0.0,
             "failed_targets": [],
+            "cache_misses": int(_LAST_AGENT_AGGREGATE_META.get("cache_misses") or 0) + 1,
         })
+        _AGENT_AGGREGATE_SUMMARY_CACHE[cache_key] = {
+            "created_at": now_ts,
+            "summary": dict(summary),
+            "meta": dict(_LAST_AGENT_AGGREGATE_META),
+        }
         return summary
 
     cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
@@ -852,7 +864,13 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
         "cache_hit": False,
         "cache_age_seconds": 0.0,
         "failed_targets": list(summary.get("aggregate_failed_targets") or []),
+        "cache_misses": int(_LAST_AGENT_AGGREGATE_META.get("cache_misses") or 0) + 1,
     })
+    _AGENT_AGGREGATE_SUMMARY_CACHE[cache_key] = {
+        "created_at": now_ts,
+        "summary": dict(summary),
+        "meta": dict(_LAST_AGENT_AGGREGATE_META),
+    }
     return summary
 
 
