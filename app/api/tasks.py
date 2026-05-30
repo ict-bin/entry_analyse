@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 AGGREGATE_CACHE_TTL_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "5")))
 AGGREGATE_HTTP_TIMEOUT_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_TIMEOUT_SECONDS", "10")))
 AGGREGATE_HTTP_PORT = int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_PORT", os.environ.get("PORT", "3000")))
+AGGREGATE_WORKER_FANOUT_ENABLED = str(os.environ.get("EA_AGENT_AGGREGATE_ENABLE_WORKER_FANOUT", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 _AGENT_AGGREGATE_CACHE: dict[str, dict[str, Any]] = {}
 _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
@@ -581,6 +582,44 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
     from app.service.agent_observability import get_agent_observability_service
 
     local = get_agent_observability_service().build_snapshot(db, project_id=None)
+    if not AGGREGATE_WORKER_FANOUT_ENABLED:
+        summary = dict(local.get("summary") or {})
+        summary.update({
+            "pod_name": str(summary.get("pod_name") or "entry-analyse-local"),
+            "aggregate_mode": "local_no_worker_api",
+            "aggregate_partial": False,
+            "aggregate_sources": 1,
+            "aggregate_fanout_errors": 0,
+            "aggregate_duration_seconds": time.perf_counter() - started,
+            "aggregate_cache_hit": False,
+            "aggregate_cache_age_seconds": 0.0,
+            "aggregate_failed_targets": [],
+            "aggregate_all_sources_failed": False,
+        })
+        snapshot = {
+            "summary": summary,
+            "processes": list(local.get("processes") or []),
+            "sessions": list(local.get("sessions") or []),
+            "tasks": list(local.get("tasks") or []),
+            "pods": list(local.get("pods") or []),
+        }
+        _LAST_AGENT_AGGREGATE_META.update({
+            "partial": False,
+            "sources": 1,
+            "fanout_errors": 0,
+            "duration_seconds": summary["aggregate_duration_seconds"],
+            "cache_hit": False,
+            "cache_age_seconds": 0.0,
+            "failed_targets": [],
+            "cache_misses": int(_LAST_AGENT_AGGREGATE_META.get("cache_misses") or 0) + 1,
+        })
+        _AGENT_AGGREGATE_CACHE[cache_key] = {
+            "created_at": now_ts,
+            "snapshot": snapshot,
+            "meta": dict(_LAST_AGENT_AGGREGATE_META),
+        }
+        return snapshot
+
     cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.get("workers") or [] if bool(worker.get("healthy")) and str(worker.get("pod_name") or "").strip()]
 
@@ -717,6 +756,30 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
     from app.service.agent_observability import get_agent_observability_service
 
     local_summary = dict(get_agent_observability_service().build_snapshot(db, project_id=None)["summary"])
+    if not AGGREGATE_WORKER_FANOUT_ENABLED:
+        summary = {
+            **local_summary,
+            "aggregate_mode": "local_no_worker_api",
+            "aggregate_partial": False,
+            "aggregate_sources": 1,
+            "aggregate_fanout_errors": 0,
+            "aggregate_duration_seconds": time.perf_counter() - started,
+            "aggregate_cache_hit": False,
+            "aggregate_cache_age_seconds": 0.0,
+            "aggregate_failed_targets": [],
+            "aggregate_all_sources_failed": False,
+        }
+        _LAST_AGENT_AGGREGATE_META.update({
+            "partial": False,
+            "sources": 1,
+            "fanout_errors": 0,
+            "duration_seconds": float(summary.get("aggregate_duration_seconds") or 0.0),
+            "cache_hit": False,
+            "cache_age_seconds": 0.0,
+            "failed_targets": [],
+        })
+        return summary
+
     cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.get("workers") or [] if bool(worker.get("healthy")) and str(worker.get("pod_name") or "").strip()]
 
