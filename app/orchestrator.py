@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from datetime import datetime
@@ -109,6 +110,8 @@ from .module_loader import load_module, resolve_file_path
 from .runner import PiFatalError
 from .service.llm_provider_sync import sync_providers_to_pi
 from .service.svc_config import get_service_yaml
+
+logger = logging.getLogger("ea.orchestrator")
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
