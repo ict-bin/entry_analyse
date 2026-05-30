@@ -117,8 +117,10 @@ class ConfigService:
             normalized.get("max_rounds_exceeded_action")
         )
         # 强制所有 max_rounds 相关字段为 -1（前端不再展示，统一无限重试）
+        # min_rounds 不是“最大轮次”字段，不能被归一到 -1，否则会破坏
+        # ServiceConfig 的合法性并导致 worker 持续回退到文件配置。
         _MAX_ROUNDS_KEYS = [
-            "max_rounds", "min_rounds",
+            "max_rounds",
             "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",
             "r2_max_rounds", "r3_max_rounds", "r3_j_max_rounds",
             "r4_func_max_rounds", "r4_func_j_max_rounds", "r4_final_max_rounds",
@@ -127,6 +129,10 @@ class ConfigService:
         ]
         for _k in _MAX_ROUNDS_KEYS:
             normalized[_k] = -1
+        try:
+            normalized["min_rounds"] = max(1, min(int(normalized.get("min_rounds", 2)), 10))
+        except (TypeError, ValueError):
+            normalized["min_rounds"] = 2
         normalized["max_concurrent_tasks"] = normalize_max_concurrent_tasks(
             normalized.get("max_concurrent_tasks")
         )
@@ -190,7 +196,7 @@ class ConfigService:
     def migrate_max_rounds_to_unlimited(self, db: Session) -> int:
         """将所有项目配置中的 max_rounds 相关字段强制设为 -1。服务启动时调用一次。"""
         _MAX_ROUNDS_KEYS = [
-            "max_rounds", "min_rounds",
+            "max_rounds",
             "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",
             "r2_max_rounds", "r3_max_rounds", "r3_j_max_rounds",
             "r4_func_max_rounds", "r4_func_j_max_rounds", "r4_final_max_rounds",

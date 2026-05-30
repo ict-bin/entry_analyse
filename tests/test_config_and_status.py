@@ -1,5 +1,6 @@
 from app.config import build_task_config
 from app.models import ServiceConfig, TaskStatus
+from app.service.config_service import ConfigService
 from app.service.task_service import _apply_task_config_overrides
 
 
@@ -23,6 +24,7 @@ def test_task_config_overrides_are_filtered_and_normalized() -> None:
     svc = ServiceConfig(
         r3_j_max_rounds=2,
         r4_func_j_max_rounds=3,
+        min_rounds=4,
         pipeline_parallelism=8,
         max_consecutive_empty_responses=3,
     )
@@ -32,6 +34,7 @@ def test_task_config_overrides_are_filtered_and_normalized() -> None:
         {
             "r3_j_max_rounds": 11,
             "r4_func_j_max_rounds": 13,
+            "min_rounds": -3,
             "pipeline_parallelism": "-5",
             "max_consecutive_empty_responses": 6,
             "project_config_snapshot": {"r3_j_max_rounds": 999},
@@ -39,8 +42,9 @@ def test_task_config_overrides_are_filtered_and_normalized() -> None:
         },
     )
 
-    assert overridden.r3_j_max_rounds == 11
-    assert overridden.r4_func_j_max_rounds == 13
+    assert overridden.r3_j_max_rounds == -1
+    assert overridden.r4_func_j_max_rounds == -1
+    assert overridden.min_rounds == 1
     assert overridden.pipeline_parallelism == 1
     assert overridden.max_consecutive_empty_responses == 6
     assert not hasattr(overridden, "project_config_snapshot")
@@ -49,3 +53,17 @@ def test_task_config_overrides_are_filtered_and_normalized() -> None:
 
 def test_task_status_includes_cancelled() -> None:
     assert TaskStatus.CANCELLED.value == "cancelled"
+
+
+def test_normalize_runtime_fields_preserves_valid_min_rounds() -> None:
+    normalized = ConfigService._normalize_runtime_fields(
+        {
+            "min_rounds": -1,
+            "max_rounds": 4,
+            "r1_max_rounds": 3,
+        }
+    )
+
+    assert normalized["min_rounds"] == 1
+    assert normalized["max_rounds"] == -1
+    assert normalized["r1_max_rounds"] == -1
