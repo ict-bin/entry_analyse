@@ -71,6 +71,13 @@ class WorkerService:
             return False
         return True
 
+    def local_running_count(self) -> int:
+        """本 pod 当前正在运行的任务数（清理已完成的条目后统计）。"""
+        done = [tid for tid, t in _running_tasks.items() if t.done()]
+        for tid in done:
+            _running_tasks.pop(tid, None)
+        return len(_running_tasks)
+
     def start_task(self, task_id: str) -> asyncio.Task:
         existing = _running_tasks.get(task_id)
         if existing is not None and not existing.done():

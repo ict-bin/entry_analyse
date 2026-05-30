@@ -2020,6 +2020,9 @@ class TaskService:
                     worker_service = get_worker_service()
                     if worker_service.has_local_task(row.task_id):
                         continue
+                    # per-pod 限制：本 pod 已运行任务数 ≥ max_concurrent_tasks 则不再领取
+                    if worker_service.local_running_count() >= max_concurrent_tasks:
+                        break
                     claimed = self._claim_task_row_atomic(db, row.id)
                     if claimed is None:
                         continue
