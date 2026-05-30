@@ -1605,6 +1605,7 @@ class PipelineEngine:
             logger.info("R6: no keep entries, skipping")
             state.r6_state = NodeState.PASSED
             state.save(dirs.state_file)
+            self._r4_j_confirmed = True  # 正常分析结论：所有函数均被 R3 filter，模块无外部入口
             return []
 
         if self._cancel.is_set():
