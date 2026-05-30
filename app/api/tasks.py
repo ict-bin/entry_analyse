@@ -23,8 +23,6 @@ logger = logging.getLogger(__name__)
 AGGREGATE_CACHE_TTL_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "5")))
 AGGREGATE_HTTP_TIMEOUT_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_TIMEOUT_SECONDS", "10")))
 AGGREGATE_HTTP_PORT = int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_PORT", os.environ.get("PORT", "3000")))
-POD_DNS_SUFFIX = os.environ.get("K8S_POD_DNS_SUFFIX", "pod.cluster.local").strip() or "pod.cluster.local"
-POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "secflow-ns").strip() or "secflow-ns"
 
 _AGENT_AGGREGATE_CACHE: dict[str, dict[str, Any]] = {}
 _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
@@ -505,11 +503,8 @@ def _project_id_from_snapshot_row(row: dict[str, Any]) -> str | None:
 def _resolve_worker_targets(*, pod_ip: str | None, pod_name: str | None) -> list[str]:
     targets: list[str] = []
     normalized_ip = str(pod_ip or "").strip()
-    normalized_name = str(pod_name or "").strip()
     if normalized_ip:
         targets.append(normalized_ip)
-    if normalized_name:
-        targets.append(f"{normalized_name}.{POD_NAMESPACE}.{POD_DNS_SUFFIX}")
     return targets
 
 

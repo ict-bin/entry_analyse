@@ -321,3 +321,8 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
     assert snapshot["processes"][0]["runtime_kind"] == "codex"
     assert snapshot["processes"][0]["match_source"] == "session_path"
     assert snapshot["processes"][0]["task_id"] == "eat_1"
+
+
+def test_resolve_worker_targets_prefers_pod_ip_only() -> None:
+    assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.7", pod_name="ea-worker-1") == ["10.0.0.7"]
+    assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="ea-worker-1") == []
