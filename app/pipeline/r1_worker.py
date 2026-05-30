@@ -762,6 +762,7 @@ async def run_r2_w_worker(
     from .funcdb import FunctionDB
 
     file_hash = compute_file_hash(file_path)
+    attempt_no = max(1, int(w_attempt or 1))
     db = FunctionDB.open(dirs.r1, file_hash)
     session_f = str(dirs.r2_w_session(func_hash))
     workspace = str(dirs.stage_cwd("r2_w"))  # R2-W 专属 cwd（.pi/skills/ 已预置）
