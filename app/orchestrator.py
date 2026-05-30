@@ -74,7 +74,7 @@ def _flatten_r4_entries(entries: list[dict]) -> list[dict]:
                 a = {}
         flat: dict = {
             "tag":                  a.get("tag") or "P",
-            "file":                 e.get("file") or "",
+            "file":                 e.get("file") or e.get("file_path") or "",
             "line":                 e.get("start_line") or 0,
             "function":             e.get("name") or "",
             "taints":               a.get("taints") or [],
