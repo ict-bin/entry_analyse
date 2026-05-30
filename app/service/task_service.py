@@ -2231,7 +2231,8 @@ class TaskService:
             if isinstance(node, dict) and (round_number := _round_number_from_session_node(node))
         })
         latest_round = max(
-            (_round_number_from_session_node(node) or 0) for node in nodes if isinstance(node, dict)
+            ((_round_number_from_session_node(node) or 0) for node in nodes if isinstance(node, dict)),
+            default=0,
         ) or None
         latest_event_at = None
         if active_nodes:

@@ -326,3 +326,38 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
 def test_resolve_worker_targets_prefers_pod_ip_only() -> None:
     assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.7", pod_name="ea-worker-1") == ["10.0.0.7"]
     assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="ea-worker-1") == []
+
+
+def test_get_task_runtime_summary_tolerates_empty_session_nodes(monkeypatch) -> None:
+    row = SimpleNamespace(
+        task_id="eat_runtime_empty",
+        project_id="p1",
+        status="failed",
+        output_path="/tmp/out",
+        input_path="/tmp/in",
+        module_name="module-a",
+        result_json=None,
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return row
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    monkeypatch.setattr(task_service, "_task_run_root", lambda _row: None)
+    monkeypatch.setattr(task_service, "_task_sessions_root", lambda _row: None)
+    monkeypatch.setattr(task_service, "_build_task_event_summary", lambda _db, _task_id: {"recent_count": 0})
+
+    summary = task_service.TaskService().get_task_runtime_summary(_Db(), "eat_runtime_empty")
+
+    assert summary["task_id"] == "eat_runtime_empty"
+    assert summary["latest_round"] is None
+    assert summary["active_rounds"] == []
+    assert summary["session_count"] == 0
