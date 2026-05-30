@@ -442,16 +442,17 @@ def validate_functions_list(items: list) -> list[str]:
 
         # taints
         taints = item.get("taints")
-        if not isinstance(taints, list) or len(taints) == 0:
+        tag_val = str(item.get("tag") or "").strip()
+        # tag=A 主动型：taints 可以为空（主动读取外部数据，无入参污点）
+        if not isinstance(taints, list) or (len(taints) == 0 and tag_val != "A"):
             errors.append(f"{prefix} taints={json.dumps(taints, ensure_ascii=False)} 为空或非数组")
-        elif any(not isinstance(t, str) or not t.strip() for t in taints):
+        elif taints and any(not isinstance(t, str) or not t.strip() for t in taints):
             errors.append(f"{prefix} taints 含空字符串元素: {json.dumps(taints, ensure_ascii=False)}")
-        else:
+        elif taints:
             bad = [t for t in taints if not _TAINT_RE.match(t)]
             if bad:
                 errors.append(
-                    f"{prefix} taints 含非法元素（只允许参数名/成员访问/末尾()/"
-                    f"@return，不能含空格/中文/带参括号）: {json.dumps(bad, ensure_ascii=False)}"
+                    f"{prefix} taints 含非法元素（只允许参数名/成员访问/末尾()/@return，不能含空格/中文/带参括号）: {json.dumps(bad, ensure_ascii=False)}"
                 )
 
         # entry_role（可选，若存在则必须是合法值）
@@ -563,7 +564,11 @@ def auto_fix_functions_list(items: list) -> tuple[list[dict], list[str]]:
             preview = json.dumps(bad[:3], ensure_ascii=False)
             suffix = " ..." if len(bad) > 3 else ""
             log.append(f"{prefix} 过滤 {len(bad)} 个非法 taint: {preview}{suffix}")
-        if not good:
+        # tag=A 主动型函数：taints 为空是合法的（函数自己读外部数据，无入参污点）
+        tag_val_fix = str(item.get("tag") or "").strip()
+        if not good and tag_val_fix == "A":
+            item["taints"] = []
+        elif not good:
             # 尝试从每个非法 taint 中提取合法标识符前缀
             # 例如 "mbuf (received data)" → "mbuf"、"data[0] field" → "data"
             rescued = []
