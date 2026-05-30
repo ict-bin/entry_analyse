@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent
+from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent, AppEaStageResultIndex
 from app.logging_utils import log_event
 from app.models import normalize_max_concurrent_tasks
 from app.service.session_index import build_session_catalog
@@ -2670,6 +2670,14 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_restarted", row.updated_at, row.status),
         )
         db.commit(); db.refresh(row)
+        # 清空旧 run 的 stage_result_index，避免 restart 后历史记录污染
+        try:
+            db.query(AppEaStageResultIndex).filter(
+                AppEaStageResultIndex.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception as _sri_exc:
+            logger.warning("Failed to clear stage_result_index for %s: %s", task_id, _sri_exc)
         if row.output_path:
             import shutil as _shutil
             task_root = os.path.join(row.output_path, task_id)
