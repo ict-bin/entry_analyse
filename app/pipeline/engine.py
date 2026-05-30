@@ -370,19 +370,12 @@ class PipelineEngine:
             or getattr(cfg, "worker_parallelism", 64)
         )
         self._sem = PrioritySemaphore(parallelism)
-        # per-task model concurrency semaphore — 不使用全局 agent_capacity._buckets，
-        # 避免同一 pod 内多个任务共享同一个 bucket 导致并发上限被跨任务压缩。
-        model_concurrency = int(getattr(cfg, "model_max_concurrency", 32) or 32)
-        if model_concurrency < 1:
-            model_concurrency = 1
-        self._model_sem = asyncio.Semaphore(model_concurrency)
         self._r4_j_confirmed: bool = False
         logger.info(
-            "Task %s: pipeline_parallelism=%d, model_max_concurrency=%d (per-task) "
+            "Task %s: pipeline_parallelism=%d "
             "(sem J>W: R1_J=1<R1_W=2<R2_J=3<R2_W=4<R3_J=5<R3_W=6<R4_J=7<R4_W=8<R5_J=9<R5_W=10)",
             self.task_id,
             parallelism,
-            model_concurrency,
         )
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
@@ -2189,8 +2182,7 @@ class PipelineEngine:
         priority: int = SemPriority.R5_W,
     ) -> AgentResult:
         async with self._sem.with_priority(priority):
-            async with self._model_sem:
-                ar = await run_agent(
+            ar = await run_agent(
                     prompt=prompt,
                     model=acfg.model,
                     tools=acfg.tools or self.cfg.workers.default_tools,
