@@ -91,6 +91,97 @@ class EntryTaskDedupTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_list_tasks_filters_by_parent_stage_item_id(self):
+        db = self.SessionLocal()
+        try:
+            db.add_all([
+                AppEaTask(
+                    task_id="eat_old",
+                    project_id="p1",
+                    task_name="old",
+                    input_path="/src/module-a",
+                    module_name="module-a",
+                    prompt_content="prompt",
+                    status="pending",
+                    parent_task_id="parent-1",
+                    parent_stage_name="entry_analysis",
+                    parent_stage_item_id="item-old",
+                    parent_stage_item_key="module-a",
+                ),
+                AppEaTask(
+                    task_id="eat_new",
+                    project_id="p1",
+                    task_name="new",
+                    input_path="/src/module-a",
+                    module_name="module-a",
+                    prompt_content="prompt",
+                    status="pending",
+                    parent_task_id="parent-1",
+                    parent_stage_name="entry_analysis",
+                    parent_stage_item_id="item-new",
+                    parent_stage_item_key="module-a",
+                ),
+            ])
+            db.commit()
+
+            listed = self.service.list_tasks(
+                db,
+                project_id="p1",
+                parent_task_id="parent-1",
+                parent_stage_item_id="item-new",
+                parent_stage_item_key="module-a",
+            )
+
+            self.assertEqual(1, listed["total"])
+            self.assertEqual(["eat_new"], [row["task_id"] for row in listed["items"]])
+        finally:
+            db.close()
+
+    def test_list_tasks_falls_back_to_parent_stage_item_key_when_id_missing(self):
+        db = self.SessionLocal()
+        try:
+            db.add_all([
+                AppEaTask(
+                    task_id="eat_a",
+                    project_id="p1",
+                    task_name="a",
+                    input_path="/src/module-a",
+                    module_name="module-a",
+                    prompt_content="prompt",
+                    status="pending",
+                    parent_task_id="parent-1",
+                    parent_stage_name="entry_analysis",
+                    parent_stage_item_id=None,
+                    parent_stage_item_key="module-a",
+                ),
+                AppEaTask(
+                    task_id="eat_b",
+                    project_id="p1",
+                    task_name="b",
+                    input_path="/src/module-b",
+                    module_name="module-b",
+                    prompt_content="prompt",
+                    status="pending",
+                    parent_task_id="parent-1",
+                    parent_stage_name="entry_analysis",
+                    parent_stage_item_id=None,
+                    parent_stage_item_key="module-b",
+                ),
+            ])
+            db.commit()
+
+            listed = self.service.list_tasks(
+                db,
+                project_id="p1",
+                parent_task_id="parent-1",
+                parent_stage_item_key="module-a",
+            )
+
+            self.assertEqual(1, listed["total"])
+            self.assertEqual(["eat_a"], [row["task_id"] for row in listed["items"]])
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

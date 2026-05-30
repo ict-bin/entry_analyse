@@ -2007,6 +2007,9 @@ class TaskService:
         status: Optional[str] = None,
         mode: Optional[str] = None,
         parent_task_id: Optional[str] = None,
+        parent_stage_name: Optional[str] = None,
+        parent_stage_item_id: Optional[str] = None,
+        parent_stage_item_key: Optional[str] = None,
         sort_by: str = "created_at",
         sort_order: str = "desc",
     ) -> dict:
@@ -2034,6 +2037,15 @@ class TaskService:
         normalized_parent_task_id = str(parent_task_id or "").strip()
         if normalized_parent_task_id:
             query = query.filter(AppEaTask.parent_task_id == normalized_parent_task_id)
+        normalized_parent_stage_name = str(parent_stage_name or "").strip()
+        if normalized_parent_stage_name:
+            query = query.filter(AppEaTask.parent_stage_name == normalized_parent_stage_name)
+        normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
+        normalized_parent_stage_item_key = str(parent_stage_item_key or "").strip()
+        if normalized_parent_stage_item_id:
+            query = query.filter(AppEaTask.parent_stage_item_id == normalized_parent_stage_item_id)
+        elif normalized_parent_stage_item_key:
+            query = query.filter(AppEaTask.parent_stage_item_key == normalized_parent_stage_item_key)
         sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppEaTask.created_at)
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         total = query.count()
