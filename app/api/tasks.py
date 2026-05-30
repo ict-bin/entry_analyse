@@ -750,6 +750,9 @@ def list_tasks(
     status: Optional[str] = Query(None),
     mode: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),
+    parent_stage_name: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
+    parent_stage_item_key: Optional[str] = Query(None),
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
@@ -763,6 +766,9 @@ def list_tasks(
         status=status,
         mode=mode,
         parent_task_id=parent_task_id,
+        parent_stage_name=parent_stage_name,
+        parent_stage_item_id=parent_stage_item_id,
+        parent_stage_item_key=parent_stage_item_key,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -958,11 +964,15 @@ def list_agent_tasks(
 
 @router.get("/agent-observability/aggregate/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
 async def list_agent_aggregate_tasks(
+    pod: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    return (await _build_agent_aggregate_snapshot(token, db))["tasks"]
+    rows = list((await _build_agent_aggregate_snapshot(token, db))["tasks"])
+    if pod:
+        rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
+    return rows
 
 
 @router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse])
@@ -1046,6 +1056,7 @@ async def kill_agent_process(
         task_id=row.get("task_id"),
     )
     result = get_agent_observability_service().kill_process(pid)
+    _invalidate_agent_aggregate_cache()
     return AgentProcessKillResponse(
         requested=1,
         matched=1,
@@ -1092,6 +1103,7 @@ async def kill_all_orphan_processes(
             task_id=row.get("task_id"),
         )
     items = [get_agent_observability_service().kill_process(int(row["pid"])) for row in killable]
+    _invalidate_agent_aggregate_cache()
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
     return AgentProcessKillResponse(
