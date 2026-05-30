@@ -2,6 +2,8 @@ import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 
+from sqlalchemy.exc import OperationalError
+
 from app.service import scheduler_service, task_service, worker_slot_service
 from app.api import tasks as tasks_api
 from app.service import agent_observability
@@ -142,6 +144,7 @@ class _DeleteTaskDb:
     def __init__(self, row):
         self._row = row
         self.commits = 0
+        self.rollbacks = 0
 
     def query(self, model):
         del model
@@ -149,6 +152,9 @@ class _DeleteTaskDb:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 def test_delete_task_is_idempotent_when_task_missing() -> None:
@@ -168,6 +174,45 @@ def test_delete_task_is_idempotent_when_task_already_deleted() -> None:
     )
     result = task_service.TaskService().delete_task(_DeleteTaskDb(row), "eat_deleted", delete_files=True)
     assert result == {"deleted_event_count": 0}
+
+
+def test_delete_task_retries_retryable_timeline_clear_deadlock(monkeypatch) -> None:
+    row = SimpleNamespace(
+        task_id="eat_retry",
+        project_id="p1",
+        status="cancelled",
+        is_deleted=False,
+        output_path=None,
+        input_path="/tmp/not-used",
+        source_path=None,
+        updated_at=None,
+    )
+    db = _DeleteTaskDb(row)
+    attempts = {"count": 0}
+
+    class _DeadlockError(Exception):
+        pass
+
+    def _fake_clear_task_timeline(_db, _row):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            err = _DeadlockError()
+            err.args = (1213, "Deadlock found when trying to get lock; try restarting transaction")
+            raise OperationalError("DELETE FROM secflow_app_ea_task_event", {}, err)
+        return 7
+
+    monkeypatch.setattr(task_service, "clear_task_timeline", _fake_clear_task_timeline)
+    monkeypatch.setattr(task_service, "_safe_create_task_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(task_service, "cleanup_task_pi_processes", lambda *args, **kwargs: None)
+    monkeypatch.setattr(task_service._time, "sleep", lambda _seconds: None)
+
+    result = task_service.TaskService().delete_task(db, "eat_retry", delete_files=False)
+
+    assert result == {"deleted_event_count": 7}
+    assert attempts["count"] == 2
+    assert db.rollbacks == 1
+    assert db.commits == 1
+    assert row.is_deleted is True
 
 
 def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:

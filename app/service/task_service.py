@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import and_, or_, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -43,6 +43,11 @@ def _positive_int_env(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, value)
+
+
+DELETE_TASK_RETRYABLE_DB_ERROR_CODES = {1205, 1213}
+DELETE_TASK_MAX_DB_RETRIES = _positive_int_env("EA_DELETE_TASK_DB_RETRIES", 3)
+DELETE_TASK_DB_RETRY_DELAY_SECONDS = float(os.environ.get("EA_DELETE_TASK_DB_RETRY_DELAY_SECONDS", "0.2"))
 
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
@@ -399,6 +404,40 @@ def clear_task_timeline(db: Session, task: AppEaTask) -> int:
         .delete(synchronize_session=False)
     )
     return int(deleted or 0)
+
+
+def _is_retryable_delete_db_error(exc: OperationalError) -> bool:
+    original = getattr(exc, "orig", None)
+    if original is not None:
+        args = getattr(original, "args", ())
+        if args:
+            try:
+                code = int(args[0])
+            except (TypeError, ValueError):
+                code = None
+            if code in DELETE_TASK_RETRYABLE_DB_ERROR_CODES:
+                return True
+    message = str(exc).lower()
+    return "deadlock found" in message or "lock wait timeout" in message
+
+
+def _clear_task_timeline_with_retry(db: Session, task: AppEaTask) -> int:
+    attempt = 0
+    while True:
+        try:
+            return clear_task_timeline(db, task)
+        except OperationalError as exc:
+            attempt += 1
+            if not _is_retryable_delete_db_error(exc) or attempt >= DELETE_TASK_MAX_DB_RETRIES:
+                raise
+            db.rollback()
+            logger.warning(
+                "clear_task_timeline retrying after retryable db error: task_id=%s attempt=%s error=%s",
+                task.task_id,
+                attempt,
+                exc,
+            )
+            _time.sleep(max(0.0, DELETE_TASK_DB_RETRY_DELAY_SECONDS))
 
 
 def delete_task_timeline_event(db: Session, task: AppEaTask, event_id: str) -> int:
@@ -2865,7 +2904,7 @@ class TaskService:
             payload={"delete_files": bool(delete_files)},
             dedupe_key=_event_dedupe_key(row.task_id, "task_deleted", row.updated_at, delete_files),
         )
-        deleted_event_count = clear_task_timeline(db, row)
+        deleted_event_count = _clear_task_timeline_with_retry(db, row)
         row.is_deleted = True
         db.commit()
         return {"deleted_event_count": deleted_event_count}
