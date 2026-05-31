@@ -51,8 +51,6 @@ def test_run_r2_w_worker_uses_w_attempt_for_result_artifacts(tmp_path: Path) -> 
             dirs=dirs,
             acfg=SimpleNamespace(model="gpt", tools=[] , thinking_level=None),
             cfg=SimpleNamespace(
-                model_capacity_enabled=False,
-                model_max_concurrency=1,
                 workers=SimpleNamespace(default_tools=[], default_thinking_level=None),
                 agent_max_retries=0,
                 agent_retry_delay=0,

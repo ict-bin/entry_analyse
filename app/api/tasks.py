@@ -324,6 +324,15 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
     running_jobs: int = 0
     queued_jobs: int = 0
     available_slots: int = 0
+    agent_process_limit: int = 0
+    agent_process_in_use: int = 0
+    agent_process_available: int = 0
+    agent_waiting_requests: int = 0
+    agent_waiting_tasks: int = 0
+    agent_queue_oldest_wait_seconds: float = 0.0
+    agent_rss_total_bytes: int = 0
+    agent_rss_max_bytes: int = 0
+    agent_snapshot_at: Optional[str] = None
     last_heartbeat_at: Optional[str] = None
     source: str = "worker_registry"
     error: Optional[str] = None
@@ -342,6 +351,14 @@ class EntryAnalyseSlotClusterResponse(BaseModel):
     dispatch_limit: int = 0
     dispatch_running: int = 0
     dispatch_available: int = 0
+    agent_total_capacity: int = 0
+    agent_in_use: int = 0
+    agent_available: int = 0
+    agent_waiting_requests: int = 0
+    agent_waiting_tasks: int = 0
+    agent_queue_oldest_wait_seconds: float = 0.0
+    agent_rss_total_bytes: int = 0
+    agent_rss_max_bytes: int = 0
     queued_tasks: int = 0
     queued_jobs: int = 0
     updated_at: Optional[str] = None
@@ -424,6 +441,15 @@ class AgentPodSnapshotResponse(BaseModel):
     orphan_session_count: int = 0
     task_count: int = 0
     active_task_count: int = 0
+    agent_process_limit: int = 0
+    agent_process_in_use: int = 0
+    agent_process_available: int = 0
+    agent_waiting_requests: int = 0
+    agent_waiting_tasks: int = 0
+    agent_queue_oldest_wait_seconds: float = 0.0
+    agent_rss_total_bytes: int = 0
+    agent_rss_max_bytes: int = 0
+    runtime_counts: dict[str, int] = Field(default_factory=dict)
     last_scanned_at: Optional[float] = None
     scan_errors: int = 0
     processes: list[AgentProcessSnapshotResponse] = Field(default_factory=list)
@@ -439,6 +465,14 @@ class AgentObservabilitySummaryResponse(BaseModel):
     killable_orphan_processes: int = 0
     killable_suspected_orphan_processes: int = 0
     orphan_sessions: int = 0
+    agent_process_limit: int = 0
+    agent_process_in_use: int = 0
+    agent_process_available: int = 0
+    agent_waiting_requests: int = 0
+    agent_waiting_tasks: int = 0
+    agent_queue_oldest_wait_seconds: float = 0.0
+    agent_rss_total_bytes: int = 0
+    agent_rss_max_bytes: int = 0
     scanned_at: Optional[float] = None
     scan_errors: int = 0
     aggregate_mode: Optional[str] = None
@@ -477,6 +511,14 @@ class AgentRuntimeAggregateSummaryResponse(BaseModel):
     killable_orphan_processes: int = 0
     killable_suspected_orphan_processes: int = 0
     orphan_sessions: int = 0
+    agent_total_capacity: int = 0
+    agent_in_use: int = 0
+    agent_available: int = 0
+    agent_waiting_requests: int = 0
+    agent_waiting_tasks: int = 0
+    agent_queue_oldest_wait_seconds: float = 0.0
+    agent_rss_total_bytes: int = 0
+    agent_rss_max_bytes: int = 0
     aggregate_partial: bool = False
     aggregate_sources: int = 0
     aggregate_fanout_errors: int = 0
@@ -702,6 +744,14 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         "killable_orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "orphan" and bool(item.get("kill_allowed"))]),
         "killable_suspected_orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
         "orphan_sessions": len([item for item in merged_sessions if bool(item.get("orphan_session"))]),
+        "agent_process_limit": sum(int(item.get("agent_process_limit") or 0) for item in pod_rows),
+        "agent_process_in_use": sum(int(item.get("agent_process_in_use") or 0) for item in pod_rows),
+        "agent_process_available": sum(int(item.get("agent_process_available") or 0) for item in pod_rows),
+        "agent_waiting_requests": sum(int(item.get("agent_waiting_requests") or 0) for item in pod_rows),
+        "agent_waiting_tasks": sum(int(item.get("agent_waiting_tasks") or 0) for item in pod_rows),
+        "agent_queue_oldest_wait_seconds": max((float(item.get("agent_queue_oldest_wait_seconds") or 0.0) for item in pod_rows), default=0.0),
+        "agent_rss_total_bytes": sum(int(item.get("agent_rss_total_bytes") or 0) for item in pod_rows),
+        "agent_rss_max_bytes": max((int(item.get("agent_rss_max_bytes") or 0) for item in pod_rows), default=0),
         "scanned_at": time.time(),
         "scan_errors": 0,
         "aggregate_mode": "fanout",
@@ -891,6 +941,14 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
             "killable_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "orphan" and bool(item.get("kill_allowed"))]),
             "killable_suspected_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
             "orphan_sessions": len([item for item in sessions if bool(item.get("orphan_session"))]),
+            "agent_total_capacity": sum(int(item.get("agent_process_limit") or 0) for item in pods),
+            "agent_in_use": sum(int(item.get("agent_process_in_use") or 0) for item in pods),
+            "agent_available": sum(int(item.get("agent_process_available") or 0) for item in pods),
+            "agent_waiting_requests": sum(int(item.get("agent_waiting_requests") or 0) for item in pods),
+            "agent_waiting_tasks": sum(int(item.get("agent_waiting_tasks") or 0) for item in pods),
+            "agent_queue_oldest_wait_seconds": max((float(item.get("agent_queue_oldest_wait_seconds") or 0.0) for item in pods), default=0.0),
+            "agent_rss_total_bytes": sum(int(item.get("agent_rss_total_bytes") or 0) for item in pods),
+            "agent_rss_max_bytes": max((int(item.get("agent_rss_max_bytes") or 0) for item in pods), default=0),
             "aggregate_partial": bool(summary.get("aggregate_partial")),
             "aggregate_sources": int(summary.get("aggregate_sources") or 0),
             "aggregate_fanout_errors": int(summary.get("aggregate_fanout_errors") or 0),

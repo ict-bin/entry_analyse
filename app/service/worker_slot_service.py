@@ -33,6 +33,15 @@ class WorkerSlotSnapshot:
     max_concurrent_tasks: int
     running_tasks: int
     available_slots: int
+    agent_process_limit: int
+    agent_process_in_use: int
+    agent_process_available: int
+    agent_waiting_requests: int
+    agent_waiting_tasks: int
+    agent_queue_oldest_wait_seconds: float
+    agent_rss_total_bytes: int
+    agent_rss_max_bytes: int
+    agent_snapshot_at: str | None
     last_heartbeat_at: str | None
     source: str
     error: str | None
@@ -67,6 +76,15 @@ class WorkerSlotService:
         pod_name: str,
         pod_ip: str | None,
         max_concurrent_tasks: int,
+        agent_process_limit: int = 0,
+        agent_process_in_use: int = 0,
+        agent_process_available: int = 0,
+        agent_waiting_requests: int = 0,
+        agent_waiting_tasks: int = 0,
+        agent_queue_oldest_wait_seconds: float = 0.0,
+        agent_rss_total_bytes: int = 0,
+        agent_rss_max_bytes: int = 0,
+        agent_snapshot_at: str | None = None,
         status: str = "running",
     ) -> None:
         normalized_capacity = normalize_max_concurrent_tasks(max_concurrent_tasks)
@@ -78,6 +96,15 @@ class WorkerSlotService:
                 pod_name=pod_name,
                 pod_ip=pod_ip,
                 max_concurrent_tasks=normalized_capacity,
+                agent_process_limit=max(0, int(agent_process_limit or 0)),
+                agent_process_in_use=max(0, int(agent_process_in_use or 0)),
+                agent_process_available=max(0, int(agent_process_available or 0)),
+                agent_waiting_requests=max(0, int(agent_waiting_requests or 0)),
+                agent_waiting_tasks=max(0, int(agent_waiting_tasks or 0)),
+                agent_queue_oldest_wait_seconds=max(0.0, float(agent_queue_oldest_wait_seconds or 0.0)),
+                agent_rss_total_bytes=max(0, int(agent_rss_total_bytes or 0)),
+                agent_rss_max_bytes=max(0, int(agent_rss_max_bytes or 0)),
+                agent_snapshot_at=now if agent_snapshot_at else None,
                 last_seen_status=status,
                 last_heartbeat_at=now,
             )
@@ -86,6 +113,15 @@ class WorkerSlotService:
             row.pod_name = pod_name
             row.pod_ip = pod_ip
             row.max_concurrent_tasks = normalized_capacity
+            row.agent_process_limit = max(0, int(agent_process_limit or 0))
+            row.agent_process_in_use = max(0, int(agent_process_in_use or 0))
+            row.agent_process_available = max(0, int(agent_process_available or 0))
+            row.agent_waiting_requests = max(0, int(agent_waiting_requests or 0))
+            row.agent_waiting_tasks = max(0, int(agent_waiting_tasks or 0))
+            row.agent_queue_oldest_wait_seconds = max(0.0, float(agent_queue_oldest_wait_seconds or 0.0))
+            row.agent_rss_total_bytes = max(0, int(agent_rss_total_bytes or 0))
+            row.agent_rss_max_bytes = max(0, int(agent_rss_max_bytes or 0))
+            row.agent_snapshot_at = now if agent_snapshot_at else None
             row.last_seen_status = status
             row.last_heartbeat_at = now
         db.commit()
@@ -150,6 +186,15 @@ class WorkerSlotService:
                     max_concurrent_tasks=int(row.max_concurrent_tasks),
                     running_tasks=running_tasks,
                     available_slots=available_slots,
+                    agent_process_limit=int(row.agent_process_limit or 0),
+                    agent_process_in_use=int(row.agent_process_in_use or 0),
+                    agent_process_available=int(row.agent_process_available or 0),
+                    agent_waiting_requests=int(row.agent_waiting_requests or 0),
+                    agent_waiting_tasks=int(row.agent_waiting_tasks or 0),
+                    agent_queue_oldest_wait_seconds=float(row.agent_queue_oldest_wait_seconds or 0.0),
+                    agent_rss_total_bytes=int(row.agent_rss_total_bytes or 0),
+                    agent_rss_max_bytes=int(row.agent_rss_max_bytes or 0),
+                    agent_snapshot_at=isoformat_local(row.agent_snapshot_at),
                     last_heartbeat_at=isoformat_local(row.last_heartbeat_at),
                     source="worker_registry" if healthy else "stale_worker_registry",
                     error=None if healthy else "worker heartbeat stale",
@@ -167,6 +212,15 @@ class WorkerSlotService:
                     max_concurrent_tasks=len(active_tasks),
                     running_tasks=len(active_tasks),
                     available_slots=0,
+                    agent_process_limit=0,
+                    agent_process_in_use=0,
+                    agent_process_available=0,
+                    agent_waiting_requests=0,
+                    agent_waiting_tasks=0,
+                    agent_queue_oldest_wait_seconds=0.0,
+                    agent_rss_total_bytes=0,
+                    agent_rss_max_bytes=0,
+                    agent_snapshot_at=None,
                     last_heartbeat_at=None,
                     source="stale_owner",
                     error="owner pod has running tasks but no live worker heartbeat",
@@ -187,6 +241,15 @@ class WorkerSlotService:
                 "running_jobs": worker.running_tasks,
                 "queued_jobs": 0,
                 "available_slots": worker.available_slots,
+                "agent_process_limit": worker.agent_process_limit,
+                "agent_process_in_use": worker.agent_process_in_use,
+                "agent_process_available": worker.agent_process_available,
+                "agent_waiting_requests": worker.agent_waiting_requests,
+                "agent_waiting_tasks": worker.agent_waiting_tasks,
+                "agent_queue_oldest_wait_seconds": worker.agent_queue_oldest_wait_seconds,
+                "agent_rss_total_bytes": worker.agent_rss_total_bytes,
+                "agent_rss_max_bytes": worker.agent_rss_max_bytes,
+                "agent_snapshot_at": worker.agent_snapshot_at,
                 "last_heartbeat_at": worker.last_heartbeat_at,
                 "source": worker.source,
                 "error": worker.error,
@@ -218,6 +281,13 @@ class WorkerSlotService:
         ]
         total_capacity = sum(item["max_concurrent_tasks"] for item in workers_payload)
         busy_slots = sum(item["running_tasks"] for item in workers_payload)
+        agent_total_capacity = sum(int(item.get("agent_process_limit") or 0) for item in workers_payload)
+        agent_in_use = sum(int(item.get("agent_process_in_use") or 0) for item in workers_payload)
+        agent_waiting_requests = sum(int(item.get("agent_waiting_requests") or 0) for item in workers_payload)
+        agent_waiting_tasks = sum(int(item.get("agent_waiting_tasks") or 0) for item in workers_payload)
+        agent_rss_total_bytes = sum(int(item.get("agent_rss_total_bytes") or 0) for item in workers_payload)
+        agent_rss_max_bytes = max((int(item.get("agent_rss_max_bytes") or 0) for item in workers_payload), default=0)
+        agent_queue_oldest_wait_seconds = max((float(item.get("agent_queue_oldest_wait_seconds") or 0.0) for item in workers_payload), default=0.0)
         healthy_workers = sum(1 for item in workers_payload if item["healthy"])
         stale_workers = len(workers_payload) - healthy_workers
         dispatch_limit = self._configured_dispatch_limit(db, project_id)
@@ -234,6 +304,14 @@ class WorkerSlotService:
             "dispatch_limit": dispatch_limit,
             "dispatch_running": dispatch_running,
             "dispatch_available": dispatch_available,
+            "agent_total_capacity": agent_total_capacity,
+            "agent_in_use": agent_in_use,
+            "agent_available": max(0, agent_total_capacity - agent_in_use),
+            "agent_waiting_requests": agent_waiting_requests,
+            "agent_waiting_tasks": agent_waiting_tasks,
+            "agent_queue_oldest_wait_seconds": agent_queue_oldest_wait_seconds,
+            "agent_rss_total_bytes": agent_rss_total_bytes,
+            "agent_rss_max_bytes": agent_rss_max_bytes,
             "queued_tasks": queued_tasks,
             "queued_jobs": queued_tasks,
             "updated_at": isoformat_local(now),

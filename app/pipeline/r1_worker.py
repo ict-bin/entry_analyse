@@ -30,7 +30,6 @@ from typing import Callable
 
 from ..models import AgentInstanceConfig, TaskConfig, TokenUsage
 from ..runner import run_agent, AgentResult
-from ..agent_capacity import model_capacity_slot
 from .dirs import PipelineDirs
 from .result_index import write_stage_result_files, upsert_stage_result_index
 from .extractor import (
@@ -628,29 +627,27 @@ async def run_r1_worker(
 
     attempt_no = 2 if is_retry else 1
 
-    async with model_capacity_slot(
-        acfg.model,
-        enabled=cfg.model_capacity_enabled,
-        limit=cfg.model_max_concurrency,
-    ):
-        ar: AgentResult = await run_agent(
-            prompt=prompt,
-            model=acfg.model,
-            tools=acfg.tools or cfg.workers.default_tools,
-            system_prompt=system_prompt,
-            cwd=workspace,
-            thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
-            session_file=session_f,
-            cancel_event=cancel_event,
-            max_retries=cfg.agent_max_retries,
-            retry_delay=cfg.agent_retry_delay,
-            run_timeout_seconds=cfg.agent_run_timeout_seconds,
-            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
-            timeout_max_retries=cfg.agent_timeout_max_retries,
-            pi_max_retries=cfg.pi_max_retries,
-            pi_retry_delay=cfg.pi_retry_delay,
-            max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
-        )
+    ar: AgentResult = await run_agent(
+        prompt=prompt,
+        model=acfg.model,
+        tools=acfg.tools or cfg.workers.default_tools,
+        system_prompt=system_prompt,
+        cwd=workspace,
+        thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
+        session_file=session_f,
+        cancel_event=cancel_event,
+        max_retries=cfg.agent_max_retries,
+        retry_delay=cfg.agent_retry_delay,
+        run_timeout_seconds=cfg.agent_run_timeout_seconds,
+        timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+        timeout_max_retries=cfg.agent_timeout_max_retries,
+        pi_max_retries=cfg.pi_max_retries,
+        pi_retry_delay=cfg.pi_retry_delay,
+        max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
+        task_id=task_id,
+        stage_key="r1_w",
+        role_kind="worker",
+    )
 
     _safe_emit(on_event, "r1_w_done", task_id,
                file=basename, file_hash=file_hash,
@@ -788,29 +785,27 @@ async def run_r2_w_worker(
             judge_result_file=j_result_path,
         )
 
-    async with model_capacity_slot(
-        acfg.model,
-        enabled=cfg.model_capacity_enabled,
-        limit=cfg.model_max_concurrency,
-    ):
-        ar: AgentResult = await run_agent(
-            prompt=prompt,
-            model=acfg.model,
-            tools=acfg.tools or cfg.workers.default_tools,
-            system_prompt=system_prompt,
-            cwd=workspace,
-            thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
-            session_file=session_f,
-            cancel_event=cancel_event,
-            max_retries=cfg.agent_max_retries,
-            retry_delay=cfg.agent_retry_delay,
-            run_timeout_seconds=cfg.agent_run_timeout_seconds,
-            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
-            timeout_max_retries=cfg.agent_timeout_max_retries,
-            pi_max_retries=cfg.pi_max_retries,
-            pi_retry_delay=cfg.pi_retry_delay,
-            max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
-        )
+    ar: AgentResult = await run_agent(
+        prompt=prompt,
+        model=acfg.model,
+        tools=acfg.tools or cfg.workers.default_tools,
+        system_prompt=system_prompt,
+        cwd=workspace,
+        thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
+        session_file=session_f,
+        cancel_event=cancel_event,
+        max_retries=cfg.agent_max_retries,
+        retry_delay=cfg.agent_retry_delay,
+        run_timeout_seconds=cfg.agent_run_timeout_seconds,
+        timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+        timeout_max_retries=cfg.agent_timeout_max_retries,
+        pi_max_retries=cfg.pi_max_retries,
+        pi_retry_delay=cfg.pi_retry_delay,
+        max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
+        task_id=task_id,
+        stage_key="r2_w",
+        role_kind="worker",
+    )
 
     corrections = _parse_r1_corrections(ar.output)
     result_payload = {

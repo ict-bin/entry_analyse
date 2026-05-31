@@ -9,7 +9,6 @@ def test_build_task_config_preserves_judge_round_limits() -> None:
         r3_j_max_rounds=7,
         r4_func_j_max_rounds=9,
         max_consecutive_empty_responses=5,
-        pipeline_parallelism="0",
     )
 
     cfg = build_task_config(svc, prompt="analyse demo module", module_name="demo")
@@ -17,15 +16,13 @@ def test_build_task_config_preserves_judge_round_limits() -> None:
     assert cfg.r3_j_max_rounds == 7
     assert cfg.r4_func_j_max_rounds == 9
     assert cfg.max_consecutive_empty_responses == 5
-    assert cfg.pipeline_parallelism == 1
 
 
-def test_task_config_overrides_are_filtered_and_normalized() -> None:
+def test_task_config_overrides_ignore_removed_runtime_limit_fields() -> None:
     svc = ServiceConfig(
         r3_j_max_rounds=2,
         r4_func_j_max_rounds=3,
         min_rounds=4,
-        pipeline_parallelism=8,
         max_consecutive_empty_responses=3,
     )
 
@@ -36,6 +33,8 @@ def test_task_config_overrides_are_filtered_and_normalized() -> None:
             "r4_func_j_max_rounds": 13,
             "min_rounds": -3,
             "pipeline_parallelism": "-5",
+            "worker_parallelism": 64,
+            "model_max_concurrency": 32,
             "max_consecutive_empty_responses": 6,
             "project_config_snapshot": {"r3_j_max_rounds": 999},
             "input_contract": {"foo": "bar"},
@@ -45,8 +44,10 @@ def test_task_config_overrides_are_filtered_and_normalized() -> None:
     assert overridden.r3_j_max_rounds == -1
     assert overridden.r4_func_j_max_rounds == -1
     assert overridden.min_rounds == 1
-    assert overridden.pipeline_parallelism == 1
     assert overridden.max_consecutive_empty_responses == 6
+    assert not hasattr(overridden, "pipeline_parallelism")
+    assert not hasattr(overridden, "worker_parallelism")
+    assert not hasattr(overridden, "model_max_concurrency")
     assert not hasattr(overridden, "project_config_snapshot")
     assert not hasattr(overridden, "input_contract")
 

@@ -12,8 +12,6 @@ from app.db.models import AppEaModelsConfig, AppEaProjectConfig
 from app.models import (
     normalize_max_concurrent_tasks,
     normalize_max_rounds_exceeded_action,
-    normalize_pipeline_parallelism,
-    normalize_worker_parallelism,
 )
 
 logger = logging.getLogger("ea.config_service")
@@ -32,9 +30,6 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
     "max_consecutive_empty_responses": 3,
-    "worker_parallel": False,
-    "worker_parallelism": 128,
-    "pipeline_parallelism": 32,   # 与 model_max_concurrency 一致，避免过多 pi 会话积压导致排队延迟
     "r1_max_rounds": -1,
     "r2_max_rounds": -1,
     "r3_max_rounds": -1,
@@ -51,8 +46,6 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
-    "model_capacity_enabled": True,
-    "model_max_concurrency": 32,
     "workers": {
         "default_model": "",
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
@@ -136,8 +129,6 @@ class ConfigService:
         normalized["max_concurrent_tasks"] = normalize_max_concurrent_tasks(
             normalized.get("max_concurrent_tasks")
         )
-        normalized["worker_parallelism"] = normalize_worker_parallelism(normalized.get("worker_parallelism"))
-        normalized["pipeline_parallelism"] = normalize_pipeline_parallelism(normalized.get("pipeline_parallelism"))
         try:
             normalized["master_shard_size"] = max(2, min(int(normalized.get("master_shard_size", 10)), 100))
         except (TypeError, ValueError):
@@ -148,22 +139,15 @@ class ConfigService:
             normalized["master_shard_parallelism"] = 4
         mode = str(normalized.get("master_merge_mode") or "hierarchical").strip().lower()
         normalized["master_merge_mode"] = mode if mode in {"single", "hierarchical"} else "hierarchical"
-        try:
-            normalized["model_max_concurrency"] = max(1, min(int(normalized.get("model_max_concurrency", 32)), 512))
-        except (TypeError, ValueError):
-            normalized["model_max_concurrency"] = 32
-        normalized["model_capacity_enabled"] = bool(normalized.get("model_capacity_enabled", True))
         normalized["lean_mode"] = bool(normalized.get("lean_mode", False))
-        # 一致性警告：pipeline_parallelism 远超 model_max_concurrency 时会导致 model 側大量积压请求
-        _pp = normalized.get("pipeline_parallelism", 32)
-        _mc = normalized.get("model_max_concurrency", 32)
-        if isinstance(_pp, int) and isinstance(_mc, int) and _pp > _mc * 2:
-            import logging as _log
-            _log.getLogger("ea.config").warning(
-                "pipeline_parallelism=%d is more than 2x model_max_concurrency=%d; "
-                "this may cause model API queuing delays for concurrent tasks",
-                _pp, _mc,
-            )
+        for stale_key in (
+            "worker_parallel",
+            "worker_parallelism",
+            "pipeline_parallelism",
+            "model_capacity_enabled",
+            "model_max_concurrency",
+        ):
+            normalized.pop(stale_key, None)
         return normalized
 
     def get_config(self, db: Session, project_id: str) -> dict:

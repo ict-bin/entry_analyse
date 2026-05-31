@@ -664,6 +664,7 @@ def _fmt(value: float) -> str:
 
 def _render_agent_observability_metrics() -> list[str]:
     from .db import get_db
+    from .agent_slots import get_agent_process_slot_manager
     from .service.agent_observability import get_agent_observability_service
 
     try:
@@ -682,6 +683,7 @@ def _render_agent_observability_metrics() -> list[str]:
     processes = list(snapshot.get("processes") or [])
     sessions = list(snapshot.get("sessions") or [])
     tasks = list(snapshot.get("tasks") or [])
+    pods = list(snapshot.get("pods") or [])
     lines = [
         "# HELP secflow_ea_agent_process_total Agent process total grouped by owner state, pod and role.",
         "# TYPE secflow_ea_agent_process_total gauge",
@@ -699,6 +701,24 @@ def _render_agent_observability_metrics() -> list[str]:
         "# TYPE secflow_ea_agent_orphan_session_total gauge",
         "# HELP secflow_ea_agent_task_ownership_total Agent task ownership total by status.",
         "# TYPE secflow_ea_agent_task_ownership_total gauge",
+        "# HELP secflow_ea_agent_slot_capacity Pod-level agent process slot capacity by pod.",
+        "# TYPE secflow_ea_agent_slot_capacity gauge",
+        "# HELP secflow_ea_agent_slot_in_use Pod-level agent process slots currently in use by pod.",
+        "# TYPE secflow_ea_agent_slot_in_use gauge",
+        "# HELP secflow_ea_agent_slot_available Pod-level agent process slots currently available by pod.",
+        "# TYPE secflow_ea_agent_slot_available gauge",
+        "# HELP secflow_ea_agent_slot_waiting_requests Pending agent process slot requests by pod.",
+        "# TYPE secflow_ea_agent_slot_waiting_requests gauge",
+        "# HELP secflow_ea_agent_slot_waiting_tasks Tasks currently waiting for an agent process slot by pod.",
+        "# TYPE secflow_ea_agent_slot_waiting_tasks gauge",
+        "# HELP secflow_ea_agent_slot_oldest_wait_seconds Oldest active wait time for an agent process slot by pod.",
+        "# TYPE secflow_ea_agent_slot_oldest_wait_seconds gauge",
+        "# HELP secflow_ea_agent_process_rss_bytes Pod-level RSS summary of detected agent processes.",
+        "# TYPE secflow_ea_agent_process_rss_bytes gauge",
+        "# HELP secflow_ea_agent_slot_acquire_total Successful agent slot acquisitions by pod.",
+        "# TYPE secflow_ea_agent_slot_acquire_total counter",
+        "# HELP secflow_ea_agent_slot_wait_seconds Agent slot wait duration histogram by pod.",
+        "# TYPE secflow_ea_agent_slot_wait_seconds histogram",
     ]
     process_counts: dict[tuple[str, str, str], int] = defaultdict(int)
     session_counts: dict[tuple[str, str, str], int] = defaultdict(int)
@@ -743,6 +763,35 @@ def _render_agent_observability_metrics() -> list[str]:
         lines.append(f"secflow_ea_agent_orphan_session_total{_labels(pod=pod)} {value}")
     for ownership_status, value in sorted(ownership_counts.items()):
         lines.append(f"secflow_ea_agent_task_ownership_total{_labels(ownership_status=ownership_status)} {value}")
+    slot_snapshot = get_agent_process_slot_manager().snapshot()
+    for pod in pods:
+        pod_name = str(pod.get("pod_name") or "unknown")
+        lines.append(f"secflow_ea_agent_slot_capacity{_labels(pod=pod_name)} {int(pod.get('agent_process_limit') or 0)}")
+        lines.append(f"secflow_ea_agent_slot_in_use{_labels(pod=pod_name)} {int(pod.get('agent_process_in_use') or 0)}")
+        lines.append(f"secflow_ea_agent_slot_available{_labels(pod=pod_name)} {int(pod.get('agent_process_available') or 0)}")
+        lines.append(f"secflow_ea_agent_slot_waiting_requests{_labels(pod=pod_name)} {int(pod.get('agent_waiting_requests') or 0)}")
+        lines.append(f"secflow_ea_agent_slot_waiting_tasks{_labels(pod=pod_name)} {int(pod.get('agent_waiting_tasks') or 0)}")
+        lines.append(f"secflow_ea_agent_slot_oldest_wait_seconds{_labels(pod=pod_name)} {_fmt(float(pod.get('agent_queue_oldest_wait_seconds') or 0.0))}")
+        lines.append(f"secflow_ea_agent_process_rss_bytes{_labels(pod=pod_name,kind='total')} {int(pod.get('agent_rss_total_bytes') or 0)}")
+        lines.append(f"secflow_ea_agent_process_rss_bytes{_labels(pod=pod_name,kind='max')} {int(pod.get('agent_rss_max_bytes') or 0)}")
+        lines.append(f"secflow_ea_agent_slot_acquire_total{_labels(pod=pod_name)} {int(slot_snapshot.get('total_acquires') or 0)}")
+        wait_summary = slot_snapshot.get("wait_summary") or {}
+        histogram = wait_summary.get("histogram") or {}
+        cumulative = 0
+        for bucket in sorted((float(key) for key in histogram.keys())):
+            cumulative += int(histogram.get(str(bucket)) or 0)
+            lines.append(
+                f"secflow_ea_agent_slot_wait_seconds_bucket{_labels(pod=pod_name,le=bucket)} {cumulative}"
+            )
+        lines.append(
+            f"secflow_ea_agent_slot_wait_seconds_bucket{_labels(pod=pod_name,le='+Inf')} {int(wait_summary.get('samples') or 0)}"
+        )
+        lines.append(
+            f"secflow_ea_agent_slot_wait_seconds_count{_labels(pod=pod_name)} {int(wait_summary.get('samples') or 0)}"
+        )
+        lines.append(
+            f"secflow_ea_agent_slot_wait_seconds_sum{_labels(pod=pod_name)} {_fmt(float(wait_summary.get('total_seconds') or 0.0))}"
+        )
     return lines
 
 

@@ -1535,9 +1535,6 @@ _TASK_CONFIG_OVERRIDE_FIELDS = {
     "pi_max_retries",
     "pi_retry_delay",
     "max_consecutive_empty_responses",
-    "worker_parallel",
-    "worker_parallelism",
-    "pipeline_parallelism",
     "r1_max_rounds",
     "r2_max_rounds",
     "r3_max_rounds",
@@ -1553,8 +1550,6 @@ _TASK_CONFIG_OVERRIDE_FIELDS = {
     "master_merge_mode",
     "master_shard_size",
     "master_shard_parallelism",
-    "model_capacity_enabled",
-    "model_max_concurrency",
     "pipeline_prompts_dir",
 }
 

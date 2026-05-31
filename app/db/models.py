@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import json
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -146,6 +146,15 @@ class AppEaWorkerSlot(Base):
     pod_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     pod_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     max_concurrent_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    agent_process_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_process_in_use: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_process_available: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_waiting_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_waiting_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_queue_oldest_wait_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    agent_rss_total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    agent_rss_max_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    agent_snapshot_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_seen_status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local)

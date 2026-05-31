@@ -17,8 +17,6 @@ from .models import (
     TaskConfig,
     normalize_max_concurrent_tasks,
     normalize_max_rounds_exceeded_action,
-    normalize_pipeline_parallelism,
-    normalize_worker_parallelism,
 )
 
 # 容器内固定挂载路径（可通过环境变量覆盖）
@@ -63,13 +61,9 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,
         max_concurrent_tasks=normalize_max_concurrent_tasks(getattr(svc, "max_concurrent_tasks", None)),
-        worker_parallel=svc.worker_parallel,
-        worker_parallelism=normalize_worker_parallelism(getattr(svc, "worker_parallelism", None)),
         master_merge_mode=str(getattr(svc, "master_merge_mode", "hierarchical") or "hierarchical"),
         master_shard_size=max(2, min(int(getattr(svc, "master_shard_size", 10) or 10), 100)),
         master_shard_parallelism=max(1, min(int(getattr(svc, "master_shard_parallelism", 4) or 4), 64)),
-        model_capacity_enabled=bool(getattr(svc, "model_capacity_enabled", True)),
-        model_max_concurrency=max(1, min(int(getattr(svc, "model_max_concurrency", 32) or 32), 512)),
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
         agent_run_timeout_seconds=svc.agent_run_timeout_seconds,
@@ -85,8 +79,6 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,
         resume_task_id=resume_task_id,
-        # 各阶段轮次配置（v3）
-        pipeline_parallelism=normalize_pipeline_parallelism(getattr(svc, 'pipeline_parallelism', None)),
         r1_max_rounds=int(getattr(svc, 'r1_max_rounds', -1)),
         r2_max_rounds=int(getattr(svc, 'r2_max_rounds', -1)),
         r3_max_rounds=int(getattr(svc, 'r3_max_rounds', -1)),

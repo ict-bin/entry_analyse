@@ -27,9 +27,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .agent_process import AgentProcessHandle, find_pi_command, process_group_id
+from .agent_slots import agent_process_slot
 from .models import TokenUsage
 
 logger = logging.getLogger("ea.runner")
@@ -505,6 +506,10 @@ async def _run_with_context_overflow_recovery(
     pi_max_retries: int,
     pi_retry_delay: float,
     max_consecutive_empty_responses: int = 3,
+    task_id: str | None = None,
+    stage_key: str | None = None,
+    role_kind: str | None = None,
+    on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     result = await _run_with_pi_retry(
         args=args,
@@ -517,6 +522,10 @@ async def _run_with_context_overflow_recovery(
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
         max_consecutive_empty_responses=max_consecutive_empty_responses,
+        task_id=task_id,
+        stage_key=stage_key,
+        role_kind=role_kind,
+        on_slot_event=on_slot_event,
     )
     if not _is_context_overflow_error(result.error):
         return result
@@ -548,6 +557,10 @@ async def _run_with_context_overflow_recovery(
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
             max_consecutive_empty_responses=max_consecutive_empty_responses,
+            task_id=task_id,
+            stage_key=stage_key,
+            role_kind=role_kind,
+            on_slot_event=on_slot_event,
         )
 
     if single_input_tokens > single_input_limit:
@@ -601,6 +614,10 @@ async def run_agent(
     pi_retry_delay: float = 5.0,
     timeout_continue_prompt: str = "",
     max_consecutive_empty_responses: int = 3,
+    task_id: str | None = None,
+    stage_key: str | None = None,
+    role_kind: str | None = None,
+    on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
@@ -669,6 +686,10 @@ async def run_agent(
                     pi_max_retries=pi_max_retries,
                     pi_retry_delay=pi_retry_delay,
                     max_consecutive_empty_responses=max_consecutive_empty_responses,
+                    task_id=task_id,
+                    stage_key=stage_key,
+                    role_kind=role_kind,
+                    on_slot_event=on_slot_event,
                 )
                 return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
             except asyncio.TimeoutError:
@@ -719,6 +740,10 @@ async def _run_with_pi_retry(
     max_retries: int, retry_delay: float,
     pi_max_retries: int, pi_retry_delay: float,
     max_consecutive_empty_responses: int = 3,
+    task_id: str | None = None,
+    stage_key: str | None = None,
+    role_kind: str | None = None,
+    on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     pi_attempt = 0
@@ -736,6 +761,10 @@ async def _run_with_pi_retry(
                 cancel_event=cancel_event, on_stream=on_stream,
                 max_retries=max_retries, retry_delay=retry_delay,
                 max_consecutive_empty_responses=max_consecutive_empty_responses,
+                task_id=task_id,
+                stage_key=stage_key,
+                role_kind=role_kind,
+                on_slot_event=on_slot_event,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -803,6 +832,10 @@ async def _run_with_api_retry(
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
     max_consecutive_empty_responses: int = 3,
+    task_id: str | None = None,
+    stage_key: str | None = None,
+    role_kind: str | None = None,
+    on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
     api_attempt = 0
@@ -817,112 +850,120 @@ async def _run_with_api_retry(
         # 避免将大 prompt 拼入命令行参数超出 Linux ARG_MAX 限制。
         # 根据 WORKER_ISOLATION_MODE 可选包裹文件系统隔离层。
         _spawn_args = _build_isolated_args(args, cwd)
-        handle = await AgentProcessHandle.spawn(
-            *_spawn_args,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
-            logger=_log_warn,
-            label="entry-agent",
-        )
-        proc = handle.proc
+        stderr_text = ""
+        async with agent_process_slot(
+            task_id=task_id,
+            stage_key=stage_key,
+            role_kind=role_kind,
+            cancel_event=cancel_event,
+            on_event=on_slot_event,
+        ) as slot_lease:
+            handle = await AgentProcessHandle.spawn(
+                *_spawn_args,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+                logger=_log_warn,
+                label="entry-agent",
+            )
+            proc = handle.proc
+            slot_lease.bind_pid(getattr(proc, "pid", None))
 
-        # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
-        if stdin_data and proc.stdin:
-            try:
-                proc.stdin.write(stdin_data)
-                await proc.stdin.drain()
-                proc.stdin.close()
-            except (BrokenPipeError, ConnectionResetError):
-                # 进程已退出，忽略管道写入错误
-                pass
-
-        cancel_task = None
-        if cancel_event:
-            async def _cancel_monitor():
-                await cancel_event.wait()
-                # 在 kill 前先记录 pgid，防止 pi 退出后无法获取
-                pgid: int | None = None
+            # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
+            if stdin_data and proc.stdin:
                 try:
-                    pgid = process_group_id(proc)
-                except (ProcessLookupError, OSError):
+                    proc.stdin.write(stdin_data)
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+                except (BrokenPipeError, ConnectionResetError):
+                    # 进程已退出，忽略管道写入错误
                     pass
-                # Step1：向整个 process group 发 SIGTERM（杀 pi 及其工具子进程）
-                if pgid is not None:
+
+            cancel_task = None
+            if cancel_event:
+                async def _cancel_monitor():
+                    await cancel_event.wait()
+                    # 在 kill 前先记录 pgid，防止 pi 退出后无法获取
+                    pgid: int | None = None
                     try:
-                        os.killpg(pgid, signal.SIGTERM)
+                        pgid = process_group_id(proc)
                     except (ProcessLookupError, OSError):
                         pass
-                # Step2：等待 pi 进程退出（最多 0.3 秒，原 3s 太长导致取消感知慢）
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=0.3)
-                except asyncio.TimeoutError:
-                    pass
-                # Step3：无论 pi 是否已退出，对整个 group 强制 SIGKILL
-                # 关键：SIGTERM 后 pi 已死，但 bash/工具子进程可能存活并持有 stdout pipe
-                # 必须 SIGKILL 才能迎强关闭 pipe，否则 proc.stdout.read() 永久阻塞
-                if pgid is not None:
+                    # Step1：向整个 process group 发 SIGTERM（杀 pi 及其工具子进程）
+                    if pgid is not None:
+                        try:
+                            os.killpg(pgid, signal.SIGTERM)
+                        except (ProcessLookupError, OSError):
+                            pass
+                    # Step2：等待 pi 进程退出（最多 0.3 秒，原 3s 太长导致取消感知慢）
                     try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        pass  # group 已全部退出，正常
-            cancel_task = asyncio.create_task(_cancel_monitor())
+                        await asyncio.wait_for(proc.wait(), timeout=0.3)
+                    except asyncio.TimeoutError:
+                        pass
+                    # Step3：无论 pi 是否已退出，对整个 group 强制 SIGKILL
+                    # 关键：SIGTERM 后 pi 已死，但 bash/工具子进程可能存活并持有 stdout pipe
+                    # 必须 SIGKILL 才能强关闭 pipe，否则 proc.stdout.read() 永久阻塞
+                    if pgid is not None:
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass  # group 已全部退出，正常
+                cancel_task = asyncio.create_task(_cancel_monitor())
 
-        # ── 读取 JSON Lines 输出（try/except 保护管道断裂）──
-        stderr_text = ""
-        try:
-            assert proc.stdout is not None
-            buffer = b""
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
+            # ── 读取 JSON Lines 输出（try/except 保护管道断裂）──
+            try:
+                assert proc.stdout is not None
+                buffer = b""
+                while True:
+                    chunk = await proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        _process_line(
+                            line.decode("utf-8", errors="replace"),
+                            result, on_stream)
+                if buffer.strip():
                     _process_line(
-                        line.decode("utf-8", errors="replace"),
+                        buffer.decode("utf-8", errors="replace"),
                         result, on_stream)
-            if buffer.strip():
-                _process_line(
-                    buffer.decode("utf-8", errors="replace"),
-                    result, on_stream)
 
-            assert proc.stderr is not None
-            stderr_data = await proc.stderr.read()
-            stderr_text = stderr_data.decode(
-                "utf-8", errors="replace").strip()
-            if stderr_text:
-                _check_stderr_for_fatal(stderr_text, result)
-                if not result.error:
-                    result.error = stderr_text
+                assert proc.stderr is not None
+                stderr_data = await proc.stderr.read()
+                stderr_text = stderr_data.decode(
+                    "utf-8", errors="replace").strip()
+                if stderr_text:
+                    _check_stderr_for_fatal(stderr_text, result)
+                    if not result.error:
+                        result.error = stderr_text
 
-            await proc.wait()
-            result.exit_code = proc.returncode or 0
+                await proc.wait()
+                result.exit_code = proc.returncode or 0
 
-        except asyncio.CancelledError:
-            await handle.terminate_tree(reason="task_cancelled")
-            raise
-        except Exception as e:
-            # 管道断裂、进程被杀等
-            _log_warn(f"pi 进程读取异常: {e}")
-            result.error = f"pi process read error: {e}"
-            result.exit_code = -1
-            await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
+            except asyncio.CancelledError:
+                await handle.terminate_tree(reason="task_cancelled")
+                raise
+            except Exception as e:
+                # 管道断裂、进程被杀等
+                _log_warn(f"pi 进程读取异常: {e}")
+                result.error = f"pi process read error: {e}"
+                result.exit_code = -1
+                await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
 
-        finally:
-            if cancel_task:
-                cancel_task.cancel()
-                try:
-                    await cancel_task
-                except asyncio.CancelledError:
-                    pass
-            await handle.terminate_tree(
-                reason="finally_cleanup",
-                term_timeout=2.0,
-                kill_timeout=2.0,
-            )
+            finally:
+                if cancel_task:
+                    cancel_task.cancel()
+                    try:
+                        await cancel_task
+                    except asyncio.CancelledError:
+                        pass
+                await handle.terminate_tree(
+                    reason="finally_cleanup",
+                    term_timeout=2.0,
+                    kill_timeout=2.0,
+                )
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):

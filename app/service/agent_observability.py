@@ -288,6 +288,10 @@ class AgentObservabilityService:
         task_rows = tasks_query.all()
         task_by_id = {row.task_id: row for row in task_rows}
         cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=project_id or "")
+        cluster_by_pod = {
+            str(worker.get("pod_name") or ""): worker
+            for worker in cluster_snapshot.get("workers") or []
+        }
         active_owner_pods = {
             str(worker.get("pod_name") or "")
             for worker in cluster_snapshot.get("workers") or []
@@ -473,6 +477,14 @@ class AgentObservabilityService:
                 "killable_orphan_processes": len([item for item in orphan_processes if item.kill_allowed]),
                 "killable_suspected_orphan_processes": len([item for item in unknown_processes if item.kill_allowed]),
                 "orphan_sessions": len(orphan_sessions),
+                "agent_process_limit": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_process_limit") or 0),
+                "agent_process_in_use": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_process_in_use") or 0),
+                "agent_process_available": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_process_available") or 0),
+                "agent_waiting_requests": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_waiting_requests") or 0),
+                "agent_waiting_tasks": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_waiting_tasks") or 0),
+                "agent_queue_oldest_wait_seconds": float((cluster_by_pod.get(POD_NAME) or {}).get("agent_queue_oldest_wait_seconds") or 0.0),
+                "agent_rss_total_bytes": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_rss_total_bytes") or 0),
+                "agent_rss_max_bytes": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_rss_max_bytes") or 0),
                 "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
@@ -491,6 +503,18 @@ class AgentObservabilityService:
                 "orphan_session_count": len(orphan_sessions),
                 "task_count": len(ownership_rows),
                 "active_task_count": len([item for item in ownership_rows if str(item.task_status or "") in _ACTIVE_TASK_STATUSES]),
+                "agent_process_limit": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_process_limit") or 0),
+                "agent_process_in_use": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_process_in_use") or 0),
+                "agent_process_available": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_process_available") or 0),
+                "agent_waiting_requests": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_waiting_requests") or 0),
+                "agent_waiting_tasks": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_waiting_tasks") or 0),
+                "agent_queue_oldest_wait_seconds": float((cluster_by_pod.get(POD_NAME) or {}).get("agent_queue_oldest_wait_seconds") or 0.0),
+                "agent_rss_total_bytes": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_rss_total_bytes") or 0),
+                "agent_rss_max_bytes": int((cluster_by_pod.get(POD_NAME) or {}).get("agent_rss_max_bytes") or 0),
+                "runtime_counts": {
+                    runtime_kind: len([item for item in process_rows if str(item.runtime_kind or "unknown") == runtime_kind])
+                    for runtime_kind in sorted({str(item.runtime_kind or "unknown") for item in process_rows})
+                },
                 "last_scanned_at": scanned_at,
                 "scan_errors": 0,
                 "processes": [item.__dict__ for item in process_rows],

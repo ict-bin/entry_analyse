@@ -11,6 +11,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_pi_processes
+from app.agent_slots import get_agent_process_slot_manager
 from app.config import build_task_config
 from app.db import get_db
 from app.db.models import AppEaTask
@@ -166,12 +167,22 @@ class WorkerService:
                     if project_id:
                         svc = task_mod._load_svc_config_from_db(db, project_id)
                         max_concurrent_tasks = getattr(svc, "max_concurrent_tasks", 1)
+                    agent_snapshot = get_agent_process_slot_manager().snapshot()
                     get_worker_slot_service().upsert_heartbeat(
                         db,
                         worker_id=task_mod.POD_NAME,
                         pod_name=task_mod.POD_NAME,
                         pod_ip=task_mod.POD_IP or None,
                         max_concurrent_tasks=max_concurrent_tasks,
+                        agent_process_limit=int(agent_snapshot.get("capacity") or 0),
+                        agent_process_in_use=int(agent_snapshot.get("in_use") or 0),
+                        agent_process_available=int(agent_snapshot.get("available") or 0),
+                        agent_waiting_requests=int(agent_snapshot.get("waiting_requests") or 0),
+                        agent_waiting_tasks=int(agent_snapshot.get("waiting_tasks") or 0),
+                        agent_queue_oldest_wait_seconds=float(agent_snapshot.get("oldest_wait_seconds") or 0.0),
+                        agent_rss_total_bytes=int(agent_snapshot.get("rss_total_bytes") or 0),
+                        agent_rss_max_bytes=int(agent_snapshot.get("rss_max_bytes") or 0),
+                        agent_snapshot_at=str(agent_snapshot.get("snapshot_at") or ""),
                         status="running",
                     )
                 finally:

@@ -13,8 +13,8 @@ entry_analyse — Pipeline DAG 调度引擎（v5）
     R6（最终产物聚合，脚本化）
 
 并发控制：
-  PrioritySemaphore(pipeline_parallelism) 限制所有 pi 进程数量。
-  优先级：R1(1) > R2(2) > R3(3) > R4(4) > R5(5)，低编号阶段优先获得槽位。
+  真实智能体进程并发统一由 worker Pod 级槽位管理器控制。
+  本文件仅保留阶段优先级常量用于上下文标识，不再承担任务内并发限流。
   -1 表示无限重试（_should_continue 统一控制各阶段 while 循环）。
 """
 
@@ -27,7 +27,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ..config import load_system_prompts, resolve_system_prompt
 from ..models import AgentInstanceConfig, SwarmEvent, TaskConfig, TokenUsage
@@ -84,13 +84,25 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
 
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
-from .priority_semaphore import PrioritySemaphore, SemPriority
+from .priority_semaphore import SemPriority
 from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
 
 # 函数数超过此阈值时跳过 R2-J（ctags 对大文件整体可靠）
 R2J_SKIP_THRESHOLD = int(os.getenv("EA_R2J_SKIP_THRESHOLD", "80"))
+
+
+class _NoopPriorityGate:
+    class _Ctx:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def with_priority(self, _priority: int):
+        return self._Ctx()
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -365,18 +377,9 @@ class PipelineEngine:
         self._cancel = cancel_event or asyncio.Event()
         self._source_dir: str = ""
         self._out_dir: Path | None = None  # 输出目录（per-func report 使用）
-        parallelism = int(
-            getattr(cfg, "pipeline_parallelism", None)
-            or getattr(cfg, "worker_parallelism", 64)
-        )
-        self._sem = PrioritySemaphore(parallelism)
+        self._sem = _NoopPriorityGate()
         self._r4_j_confirmed: bool = False
-        logger.info(
-            "Task %s: pipeline_parallelism=%d "
-            "(sem J>W: R1_J=1<R1_W=2<R2_J=3<R2_W=4<R3_J=5<R3_W=6<R4_J=7<R4_W=8<R5_J=9<R5_W=10)",
-            self.task_id,
-            parallelism,
-        )
+        logger.info("Task %s: agent process scheduling delegated to pod-level slot manager", self.task_id)
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -2181,6 +2184,29 @@ class PipelineEngine:
         acfg: AgentInstanceConfig,
         priority: int = SemPriority.R5_W,
     ) -> AgentResult:
+        stage_key = {
+            SemPriority.R1_W: "r1_w",
+            SemPriority.R1_J: "r1_j",
+            SemPriority.R2_W: "r2_w",
+            SemPriority.R2_J: "r2_j",
+            SemPriority.R3_W: "r3_w",
+            SemPriority.R3_J: "r3_j",
+            SemPriority.R4_W: "r4_w",
+            SemPriority.R4_J: "r4_j",
+            SemPriority.R5_W: "report_w",
+            SemPriority.R5_J: "report_j",
+        }.get(priority, "agent")
+        role_kind = "judge" if priority in {
+            SemPriority.R1_J,
+            SemPriority.R2_J,
+            SemPriority.R3_J,
+            SemPriority.R4_J,
+            SemPriority.R5_J,
+        } else "worker"
+
+        def _emit_slot_event(event_type: str, payload: dict[str, Any]) -> None:
+            self._emit(event_type, **payload)
+
         async with self._sem.with_priority(priority):
             ar = await run_agent(
                     prompt=prompt,
@@ -2201,6 +2227,10 @@ class PipelineEngine:
                     pi_max_retries=self.cfg.pi_max_retries,
                     pi_retry_delay=self.cfg.pi_retry_delay,
                     max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
+                    task_id=self.task_id,
+                    stage_key=stage_key,
+                    role_kind=role_kind,
+                    on_slot_event=_emit_slot_event,
                 )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Pipeline fatal error [{context}]: {ar.error}")

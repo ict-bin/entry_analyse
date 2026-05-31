@@ -48,6 +48,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                     prompt_content="prompt",
                     status="running",
                     owner_pod="pod-a",
+                    lease_expires_at=now + timedelta(seconds=120),
                 ),
                 AppEaTask(
                     task_id="task-2",
@@ -58,6 +59,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                     prompt_content="prompt",
                     status="running",
                     owner_pod="ghost-pod",
+                    lease_expires_at=now + timedelta(seconds=120),
                 ),
                 AppEaTask(
                     task_id="task-3",
@@ -81,8 +83,8 @@ class WorkerSlotServiceTests(unittest.TestCase):
             self.assertEqual(2, payload["running_jobs"])
             self.assertEqual(4, payload["available_slots"])
             self.assertEqual(8, payload["dispatch_limit"])
-            self.assertEqual(0, payload["dispatch_running"])
-            self.assertEqual(8, payload["dispatch_available"])
+            self.assertEqual(2, payload["dispatch_running"])
+            self.assertEqual(6, payload["dispatch_available"])
             self.assertEqual(1, payload["queued_tasks"])
             self.assertEqual(1, payload["queued_jobs"])
             stale_owner = next(item for item in payload["workers"] if item["source"] == "stale_owner")

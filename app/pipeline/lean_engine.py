@@ -42,11 +42,18 @@ from . import lean_prompts as P
 from .funcdb import FunctionDB
 from .extractor import extract_functions_static, compute_file_hash, compute_func_hash
 from ..runner import run_agent, AgentResult, PiFatalError
-from ..agent_capacity import model_capacity_slot
 from ..models import AgentInstanceConfig, SwarmEvent, TaskConfig
 from ..config import load_system_prompts, resolve_system_prompt
 
 logger = logging.getLogger("ea.lean.engine")
+
+
+class _NoopAsyncSemaphore:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 # ─── 工具函数（独立实现，不从 engine.py import）────────────────────────────────
@@ -116,11 +123,7 @@ class LeanPipelineEngine:
         self._on_event = on_event or (lambda e: None)
         self._cancel = cancel_event or asyncio.Event()
         self._source_dir: str = ""
-        parallelism = int(
-            getattr(cfg, "pipeline_parallelism", None)
-            or getattr(cfg, "worker_parallelism", 64)
-        )
-        self._sem = asyncio.Semaphore(parallelism)
+        self._sem = _NoopAsyncSemaphore()
         # duck typing 兼容 orchestrator.py
         self._r4_j_confirmed: bool = False
 
@@ -658,30 +661,40 @@ class LeanPipelineEngine:
         effective_tools = tools if tools is not None else (
             acfg.tools or self.cfg.workers.default_tools
         )
+
+        lower_context = context.lower()
+        role_kind = "judge" if "judge" in lower_context else "worker"
+        if "module" in lower_context:
+            stage_key = "lean_module"
+        else:
+            stage_key = "lean_file"
+
+        def _emit_slot_event(event_type: str, payload: dict[str, object]) -> None:
+            self._emit(event_type, **payload)
+
         async with self._sem:
-            async with model_capacity_slot(
-                acfg.model,
-                enabled=self.cfg.model_capacity_enabled,
-                limit=self.cfg.model_max_concurrency,
-            ):
-                ar = await run_agent(
-                    prompt=prompt,
-                    model=acfg.model,
-                    tools=effective_tools,
-                    system_prompt=system_prompt,
-                    cwd=cwd,
-                    thinking_level=acfg.thinking_level or self.cfg.workers.default_thinking_level,
-                    session_file=session_file,
-                    cancel_event=self._cancel,
-                    max_retries=self.cfg.agent_max_retries,
-                    retry_delay=self.cfg.agent_retry_delay,
-                    run_timeout_seconds=self.cfg.agent_run_timeout_seconds,
-                    timeout_retry_enabled=self.cfg.agent_timeout_retry_enabled,
-                    timeout_max_retries=self.cfg.agent_timeout_max_retries,
-                    pi_max_retries=self.cfg.pi_max_retries,
-                    pi_retry_delay=self.cfg.pi_retry_delay,
-                    max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
-                )
+            ar = await run_agent(
+                prompt=prompt,
+                model=acfg.model,
+                tools=effective_tools,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                thinking_level=acfg.thinking_level or self.cfg.workers.default_thinking_level,
+                session_file=session_file,
+                cancel_event=self._cancel,
+                max_retries=self.cfg.agent_max_retries,
+                retry_delay=self.cfg.agent_retry_delay,
+                run_timeout_seconds=self.cfg.agent_run_timeout_seconds,
+                timeout_retry_enabled=self.cfg.agent_timeout_retry_enabled,
+                timeout_max_retries=self.cfg.agent_timeout_max_retries,
+                pi_max_retries=self.cfg.pi_max_retries,
+                pi_retry_delay=self.cfg.pi_retry_delay,
+                max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
+                task_id=self.task_id,
+                stage_key=stage_key,
+                role_kind=role_kind,
+                on_slot_event=_emit_slot_event,
+            )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Lean pipeline fatal error [{context}]: {ar.error}")
         return ar
