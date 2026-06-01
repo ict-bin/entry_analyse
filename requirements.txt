@@ -9,3 +9,5 @@ python-dotenv
 sqlalchemy
 pymysql
 cryptography
+tree-sitter>=0.21
+tree-sitter-c>=0.21

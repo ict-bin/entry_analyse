@@ -3,12 +3,15 @@ entry_analyse — 静态函数提取器
 
 无 LLM，纯工具链 + Python 实现，为 Round 1 提供初始函数清单。
 
-两步策略：
-  1. ctags --output-format=json  →  name / start_line / signature
-  2. Python bracket-counter       →  end_line（从 start_line 向后找配对 }）
-  3. 读取 start_line~end_line 行  →  body 原文
+主策略（tree-sitter）：
+  tree-sitter 增量 GLR 解析器，支持错误恢复，可处理损坏/反编译合并文件。
+  直接从 AST 节点获取 start_line/end_line/body，无需 bracket-counter。
 
-ctags 不可用时自动降级为 regex 提取（准确度略低，但覆盖大多数 C/C++ 场景）。
+降级策略（regex）：
+  tree-sitter 不可用时自动降级为 regex 提取（准确度略低，但覆盖大多数场景）。
+
+宏函数补充：
+  _scan_macro_functions 正则扫描宏展开函数，与主提取结果合并。
 
 公开接口：
     extract_functions_static(file_path)  →  list[FunctionExtract]
@@ -24,8 +27,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import logging
 from pathlib import Path
 from typing import NamedTuple
@@ -55,109 +56,155 @@ def compute_func_hash(file_path: str, func_name: str, start_line: int) -> str:
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
 
-# ─── ctags 调用 ────────────────────────────────────────────────────────────────
+# ─── tree-sitter 提取 ────────────────────────────────────────────────────────
 
-_CTAGS_CMD = shutil.which("ctags") or shutil.which("universal-ctags") or "ctags"
-
-# ctags kinds for C/C++:
-#   f = function definition   m = member function
-_CTAGS_KINDS = "fm"   # ctags 多种 kind 格式为拼接，不加逗号（'f,m' 会触发 warning 且被忽略）
-
-_CTAGS_AVAILABLE: bool | None = None   # None = 未检测
+_TS_AVAILABLE: bool | None = None   # None = 未检测
+_TS_PARSER = None                   # 全局 Parser 实例，复用避免重复初始化
 
 
-def _check_ctags() -> bool:
-    global _CTAGS_AVAILABLE
-    if _CTAGS_AVAILABLE is not None:
-        return _CTAGS_AVAILABLE
+def _check_tree_sitter() -> bool:
+    """检测 tree-sitter + tree-sitter-c 是否可用，结果缓存。"""
+    global _TS_AVAILABLE, _TS_PARSER
+    if _TS_AVAILABLE is not None:
+        return _TS_AVAILABLE
     try:
-        result = subprocess.run(
-            [_CTAGS_CMD, "--version"],
-            capture_output=True, timeout=5,
-        )
-        _CTAGS_AVAILABLE = result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        _CTAGS_AVAILABLE = False
-    if not _CTAGS_AVAILABLE:
+        from tree_sitter import Language, Parser  # type: ignore
+        import tree_sitter_c  # type: ignore
+        _TS_PARSER = Parser(Language(tree_sitter_c.language()))
+        _TS_AVAILABLE = True
+    except Exception as exc:
+        _TS_AVAILABLE = False
         logger.warning(
-            "ctags not found (%s). Falling back to regex-based extraction. "
-            "Install universal-ctags for better accuracy.",
-            _CTAGS_CMD,
+            "tree-sitter not available, falling back to regex extraction: %s. "
+            "Install with: pip install tree-sitter tree-sitter-c",
+            exc,
         )
-    return _CTAGS_AVAILABLE
+    return _TS_AVAILABLE
 
 
-def _run_ctags(file_path: str) -> list[dict]:
+def _ts_extract_name(node) -> str:
     """
-    调用 ctags --output-format=json，返回函数类型条目列表。
-
-    过滤规则：
-        - kind=="function": 直接保留（C 自由函数 / C++ 非成员函数）
-        - kind=="member" 且 signature 非空：保留（类方法/成员函数）
-        - kind=="member" 且 signature 为空：丢弃（结构体数据字段，非函数）
+    从 tree-sitter function_definition 节点提取函数名。
+    处理 C 普通函数和 C++ 限定名（scope::name）。
     """
-    cmd = [
-        _CTAGS_CMD,
-        "--output-format=json",
-        f"--kinds-C={_CTAGS_KINDS}",
-        f"--kinds-C++={_CTAGS_KINDS}",
-        "--fields=+nSsZ",     # n=行号, S=签名, s=scope名称, Z=scopeKind
-        "--extras=-F",        # 不输出 fileScope
-        file_path,
-    ]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=30, encoding="utf-8", errors="replace",
+    # function_definition → declarator → [pointer_declarator →] ... → function_declarator → identifier
+    def find_func_declarator(n):
+        if n.type == "function_declarator":
+            return n
+        for child in n.children:
+            r = find_func_declarator(child)
+            if r:
+                return r
+        return None
+
+    def find_identifier(n) -> str:
+        # 优先找 qualified_identifier（C++ scope::name）
+        if n.type == "qualified_identifier":
+            return n.text.decode("utf-8", "replace")
+        if n.type == "identifier":
+            return n.text.decode("utf-8", "replace")
+        # 递归找第一个 identifier（不深入 parameter_list）
+        for child in n.children:
+            if child.type == "parameter_list":
+                continue
+            r = find_identifier(child)
+            if r:
+                return r
+        return ""
+
+    declarator = None
+    for child in node.children:
+        if child.type in (
+            "function_declarator", "pointer_declarator",
+            "reference_declarator", "abstract_declarator",
+        ):
+            declarator = child
+            break
+
+    fd = find_func_declarator(node) if declarator is None else find_func_declarator(declarator)
+    if fd is None:
+        return ""
+    return find_identifier(fd)
+
+
+def _ts_build_signature(node, lines: list[str]) -> str:
+    """
+    从 function_definition 节点重建签名字符串（返回类型 + 函数名 + 参数列表）。
+    取 start_line 所在行去掉行尾注释，再去掉函数体部分。
+    """
+    start_row = node.start_point[0]   # 0-indexed
+    # 取签名所在行（start_row）到函数体 { 之前的内容
+    sig_lines = []
+    for i in range(start_row, min(start_row + 20, len(lines))):
+        line = lines[i].rstrip()
+        # 去掉行尾 // 注释
+        if "//" in line:
+            line = line[:line.index("/")].rstrip()
+        sig_lines.append(line)
+        if "{" in line:
+            # 截断到 { 之前
+            last = sig_lines[-1]
+            sig_lines[-1] = last[:last.index("{")].rstrip()
+            break
+    sig = " ".join(part.strip() for part in sig_lines if part.strip())
+    # 去掉尾部多余空白和分号
+    sig = sig.rstrip("; ").strip()
+    return sig
+
+
+def _extract_functions_tree_sitter(
+    file_path: str, lines: list[str]
+) -> list[dict]:
+    """
+    用 tree-sitter 提取所有 function_definition 节点，返回统一 dict 格式：
+        {"name": str, "line": int (1-indexed), "end_line": int, "signature": str}
+
+    支持错误恢复：损坏内容被标记为 ERROR 节点后，后续正常函数仍可提取。
+    """
+    parser = _TS_PARSER
+    content = "\n".join(lines)
+    tree = parser.parse(bytes(content, "utf-8"))
+
+    results: list[dict] = []
+
+    def walk(node) -> None:
+        if node.type == "function_definition":
+            name = _ts_extract_name(node)
+            if not name:
+                # 无法提取名字，跳过（通常是 ERROR 恢复节点）
+                for child in node.children:
+                    walk(child)
+                return
+            start_line = node.start_point[0] + 1   # 1-indexed
+            end_line   = node.end_point[0]   + 1   # 1-indexed
+            signature  = _ts_build_signature(node, lines)
+            results.append({
+                "name":     name,
+                "line":     start_line,
+                "end_line": end_line,
+                "signature": signature,
+                "_ts": True,    # 标记来源，供 _scan_macro_functions 去重用
+            })
+            # 不递归进 function_definition 内部（避免嵌套函数重复）
+            return
+        for child in node.children:
+            walk(child)
+
+    walk(tree.root_node)
+
+    # 统计 ERROR 节点数量（便于日志诊断）
+    error_count = sum(
+        1 for child in tree.root_node.children
+        if child.is_error or child.type == "ERROR"
+    )
+    if error_count:
+        logger.info(
+            "%s: tree-sitter parsed with %d top-level ERROR nodes "
+            "(damaged/decompiled content), extracted %d functions",
+            Path(file_path).name, error_count, len(results),
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("ctags failed for %s: %s", file_path, exc)
-        return []
 
-    entries = []
-    for raw_line in result.stdout.splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        try:
-            obj = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        kind = obj.get("kind", "")
-        if kind == "function":
-            entries.append(obj)
-        elif kind == "member":
-            if obj.get("signature", "").strip():
-                entries.append(obj)
-
-    return entries
-
-
-def _build_qualified_name(entry: dict) -> str:
-    """从 ctags 条目构建限定名称（Class::method 形式）。"""
-    name = entry.get("name", "")
-    scope = entry.get("scope", "")
-    scope_kind = entry.get("scopeKind", "")
-    if scope and scope_kind in ("class", "struct", "union", "namespace"):
-        return f"{scope}::{name}"
-    return name
-
-
-def _build_signature(entry: dict) -> str:
-    """从 ctags 条目提取完整函数签名。"""
-    sig_params = entry.get("signature", "")
-    name = _build_qualified_name(entry)
-    pattern = entry.get("pattern", "")
-    if pattern:
-        m = re.match(r"^/\^(.+?)\$?/;?$", pattern)
-        if m:
-            full = m.group(1).strip()
-            full = re.sub(r"\{.*$", "", full).strip()
-            if name in full:
-                return full
-    return f"{name}{sig_params}" if sig_params else name
+    return results
 
 
 # ─── bracket-counter ──────────────────────────────────────────────────────────
@@ -456,6 +503,10 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
     """
     静态提取文件中所有函数的定义（无 LLM）。
 
+    优先用 tree-sitter （支持错误恢复，可处理损坏/反编译文件），
+    不可用时降级为 regex 提取。
+    宏展开函数始终通过 _scan_macro_functions 补充。
+
     Returns:
         list[FunctionExtract]，按 start_line 升序排列。
         若文件不可读则返回空列表。
@@ -468,22 +519,31 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
 
     lines = raw.splitlines()
 
-    ctags_ok = _check_ctags()
-    if ctags_ok:
-        raw_entries = _run_ctags(file_path)
+    # 主策略： tree-sitter
+    ts_ok = _check_tree_sitter()
+    if ts_ok:
+        raw_entries = _extract_functions_tree_sitter(file_path, lines)
+        logger.debug(
+            "tree-sitter extracted %d functions from %s",
+            len(raw_entries), Path(file_path).name,
+        )
     else:
         raw_entries = _extract_functions_regex(file_path, lines)
-        logger.debug("ctags not available, using regex for %s", Path(file_path).name)
+        logger.debug("tree-sitter unavailable, using regex for %s", Path(file_path).name)
 
-    # 步骤 1.5：为 ctags/regex 提取到的常规函数计算函数体行号区间
-    # 用于将宏扫描器过滤掉「函数体内的宏调用」（调用点而非定义点）
+    # 宏函数补充：找富宏展开定义的函数（tree-sitter 无法解析宏展开地址）
+    # 需要先把已提取的函数行号区间传入，避免把函数体内的宏调用误当定义
     func_ranges: list[tuple[int, int]] = []
     for _entry in raw_entries:
         _sl = _entry.get("line", 0)
-        if _sl > 0:
-            _el = _find_function_end(lines, _sl)
-            if _el > _sl:
-                func_ranges.append((_sl, _el))
+        _el = _entry.get("end_line") or 0
+        if _sl > 0 and _el >= _sl:
+            func_ranges.append((_sl, _el))
+        elif _sl > 0:
+            # tree-sitter 应该始终有 end_line；这个路径只对 regex 降级生效
+            _el_fallback = _find_function_end(lines, _sl)
+            if _el_fallback > _sl:
+                func_ranges.append((_sl, _el_fallback))
 
     macro_entries = _scan_macro_functions(file_path, lines, func_ranges=func_ranges)
     if macro_entries:
@@ -492,8 +552,10 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
             if me["line"] not in existing_lines:
                 raw_entries.append(me)
                 existing_lines.add(me["line"])
-        logger.info("%s: found %d macro-defined functions (after in-body filtering)",
-                    Path(file_path).name, len(macro_entries))
+        logger.info(
+            "%s: found %d macro-defined functions (after in-body filtering)",
+            Path(file_path).name, len(macro_entries),
+        )
 
     results: list[FunctionExtract] = []
 
@@ -502,13 +564,17 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
         if start_line <= 0 or start_line > len(lines):
             continue
 
-        qualified = _build_qualified_name(entry)
+        name = entry.get("name", "")
+        signature = entry.get("signature", "") or name
+
+        # 对于 regex 降级路径，保持兼容
         if "_regex_signature" in entry:
             signature = entry["_regex_signature"]
-        else:
-            signature = _build_signature(entry)
 
-        end_line = _find_function_end(lines, start_line)
+        # end_line： tree-sitter 直接提供； regex 降级则用 bracket-counter
+        end_line: int = entry.get("end_line") or 0
+        if not end_line or end_line < start_line:
+            end_line = _find_function_end(lines, start_line)
 
         if end_line > 0 and end_line >= start_line:
             body = "\n".join(lines[start_line - 1 : end_line])
@@ -523,7 +589,7 @@ def extract_functions_static(file_path: str) -> list[FunctionExtract]:
             body = "\n".join(lines[start_line - 1 : start_line - 1 + 150])
 
         results.append(FunctionExtract(
-            name=qualified,
+            name=name,
             signature=signature,
             start_line=start_line,
             end_line=end_line,
