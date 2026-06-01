@@ -42,6 +42,7 @@ from .build_info import build_service_meta
 from .config import build_task_config, load_service_config
 from .logging_utils import configure_container_logging
 from .metrics import normalize_http_route, observe_http_request as observe_metrics_request, observe_http_request_inflight, render_metrics
+from .metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .module_loader import list_modules
 from .orchestrator import Orchestrator
@@ -234,6 +235,24 @@ def ready():
 @app.get("/api/app/entry-analyse/metrics", include_in_schema=False)
 async def metrics():
     return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/app/entry-analyse/metrics/summary", include_in_schema=False)
+async def metrics_summary():
+    rows = parse_prometheus_metrics(render_metrics())
+    return build_generic_observability_summary(rows, title="入口分析")
+
+
+@app.get("/api/app/entry-analyse/metrics/rest-api-summary", include_in_schema=False)
+async def metrics_rest_api_summary():
+    rows = parse_prometheus_metrics(render_metrics())
+    return build_rest_api_summary(rows)
+
+
+@app.get("/api/app/entry-analyse/metrics/ai-summary", include_in_schema=False)
+async def metrics_ai_summary():
+    rows = parse_prometheus_metrics(render_metrics())
+    return build_ai_summary(rows, coverage_text="入口分析 AI 指标覆盖 worker / judge / round 相关调用。")
 
 
 @app.get("/modules")
