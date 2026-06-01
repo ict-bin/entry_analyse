@@ -109,6 +109,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                 worker_id="worker-a",
                 pod_name="pod-a",
                 pod_ip="10.0.0.1",
+                http_port=3000,
                 max_concurrent_tasks=2,
             )
             self.service.upsert_heartbeat(
@@ -116,6 +117,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                 worker_id="worker-a",
                 pod_name="pod-a-renamed",
                 pod_ip="10.0.0.8",
+                http_port=3000,
                 max_concurrent_tasks=4,
                 agent_process_limit=9,
                 status="running",
@@ -180,6 +182,9 @@ class WorkerSlotServiceTests(unittest.TestCase):
             self.assertEqual(7, payload["dispatch_available"])
         finally:
             db.close()
+
+    def test_stale_after_seconds_default_is_180(self):
+        self.assertEqual(180, STALE_AFTER_SECONDS)
 
 
 if __name__ == "__main__":
