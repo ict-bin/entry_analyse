@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .agent_process import AgentProcessHandle, find_pi_command, process_group_id
-from .agent_slots import agent_process_slot
+from .agent_slots import agent_process_slot, SemPriority
 from .models import TokenUsage
 
 logger = logging.getLogger("ea.runner")
@@ -506,6 +506,7 @@ async def _run_with_context_overflow_recovery(
     pi_max_retries: int,
     pi_retry_delay: float,
     max_consecutive_empty_responses: int = 3,
+    priority: int = SemPriority.DEFAULT,
     task_id: str | None = None,
     stage_key: str | None = None,
     role_kind: str | None = None,
@@ -522,6 +523,7 @@ async def _run_with_context_overflow_recovery(
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
         max_consecutive_empty_responses=max_consecutive_empty_responses,
+        priority=priority,
         task_id=task_id,
         stage_key=stage_key,
         role_kind=role_kind,
@@ -557,6 +559,7 @@ async def _run_with_context_overflow_recovery(
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
             max_consecutive_empty_responses=max_consecutive_empty_responses,
+            priority=priority,
             task_id=task_id,
             stage_key=stage_key,
             role_kind=role_kind,
@@ -587,6 +590,7 @@ async def _run_with_context_overflow_recovery(
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
         max_consecutive_empty_responses=max_consecutive_empty_responses,
+        priority=priority,
     )
 
 
@@ -617,6 +621,7 @@ async def run_agent(
     task_id: str | None = None,
     stage_key: str | None = None,
     role_kind: str | None = None,
+    priority: int = SemPriority.DEFAULT,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     """
@@ -686,6 +691,7 @@ async def run_agent(
                     pi_max_retries=pi_max_retries,
                     pi_retry_delay=pi_retry_delay,
                     max_consecutive_empty_responses=max_consecutive_empty_responses,
+                    priority=priority,
                     task_id=task_id,
                     stage_key=stage_key,
                     role_kind=role_kind,
@@ -740,6 +746,7 @@ async def _run_with_pi_retry(
     max_retries: int, retry_delay: float,
     pi_max_retries: int, pi_retry_delay: float,
     max_consecutive_empty_responses: int = 3,
+    priority: int = SemPriority.DEFAULT,
     task_id: str | None = None,
     stage_key: str | None = None,
     role_kind: str | None = None,
@@ -761,6 +768,7 @@ async def _run_with_pi_retry(
                 cancel_event=cancel_event, on_stream=on_stream,
                 max_retries=max_retries, retry_delay=retry_delay,
                 max_consecutive_empty_responses=max_consecutive_empty_responses,
+                priority=priority,
                 task_id=task_id,
                 stage_key=stage_key,
                 role_kind=role_kind,
@@ -832,6 +840,7 @@ async def _run_with_api_retry(
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
     max_consecutive_empty_responses: int = 3,
+    priority: int = SemPriority.DEFAULT,
     task_id: str | None = None,
     stage_key: str | None = None,
     role_kind: str | None = None,
@@ -852,6 +861,7 @@ async def _run_with_api_retry(
         _spawn_args = _build_isolated_args(args, cwd)
         stderr_text = ""
         async with agent_process_slot(
+            priority=priority,
             task_id=task_id,
             stage_key=stage_key,
             role_kind=role_kind,

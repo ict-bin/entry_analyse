@@ -94,6 +94,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         lean_mode=bool(getattr(svc, 'lean_mode', False)),
         lean_file_max_rounds=int(getattr(svc, 'lean_file_max_rounds', -1)),
         lean_module_max_rounds=int(getattr(svc, 'lean_module_max_rounds', -1)),
+        agent_process_limit=max(1, int(getattr(svc, 'agent_process_limit', 8) or 8)),
     )
 
     _backfill_role(cfg.workers)

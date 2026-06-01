@@ -84,25 +84,13 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
 
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
-from .priority_semaphore import SemPriority
+from ..agent_slots import SemPriority, get_agent_process_slot_manager
 from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
 
 # 函数数超过此阈值时跳过 R2-J（ctags 对大文件整体可靠）
 R2J_SKIP_THRESHOLD = int(os.getenv("EA_R2J_SKIP_THRESHOLD", "80"))
-
-
-class _NoopPriorityGate:
-    class _Ctx:
-        async def __aenter__(self):
-            return None
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    def with_priority(self, _priority: int):
-        return self._Ctx()
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -377,9 +365,7 @@ class PipelineEngine:
         self._cancel = cancel_event or asyncio.Event()
         self._source_dir: str = ""
         self._out_dir: Path | None = None  # 输出目录（per-func report 使用）
-        self._sem = _NoopPriorityGate()
         self._r4_j_confirmed: bool = False
-        logger.info("Task %s: agent process scheduling delegated to pod-level slot manager", self.task_id)
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -405,6 +391,10 @@ class PipelineEngine:
 
         self._source_dir = str(Path(source_dir).resolve())
         self._out_dir = out_dir
+
+        # 动态调整 pod 级 agent 进程槽位数（受 EA_AGENT_PROCESS_LIMIT 硬限制）
+        _agent_limit = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
+        await get_agent_process_slot_manager().set_capacity(_agent_limit)
 
         from ..module_loader import ModuleInfo, prepare_workspace
         mi = ModuleInfo(module_name=self.cfg.module_name, files=module_files)
@@ -864,8 +854,7 @@ class PipelineEngine:
             try:
                 acfg = self.cfg.workers.agents[0]
                 is_retry = fs.r1_attempts > 1
-                async with self._sem.with_priority(SemPriority.R1_W):
-                    token_usage, funcs, func_hashes = await run_r1_worker(
+                token_usage, funcs, func_hashes = await run_r1_worker(
                         file_path=file_path,
                         dirs=dirs,
                         acfg=acfg,
@@ -877,6 +866,7 @@ class PipelineEngine:
                         is_retry=is_retry,
                         feedback=fs.r1_feedback if is_retry else "",
                         system_prompt=self._stage_sys_prompt('r1_worker'),
+                        priority=SemPriority.R1_W,
                     )
 
                 state.register_functions(
@@ -981,8 +971,7 @@ class PipelineEngine:
 
         try:
             acfg = self.cfg.workers.agents[0]
-            async with self._sem.with_priority(SemPriority.R2_W):
-                await run_r2_w_worker(
+            await run_r2_w_worker(
                     file_path=file_path,
                     func_hash=func_hash,
                     func_name=func_state.name,
@@ -998,6 +987,7 @@ class PipelineEngine:
                     feedback=func_state.r2_j_feedback or "",
                     system_prompt=self._stage_sys_prompt('r2_worker'),
                     w_attempt=func_state.r2_w_attempts,  # 传入次数，>=2 时用短消息
+                    priority=SemPriority.R2_W,
                 )
             func_state.r2_w_state = NodeState.PASSED
             state.save(dirs.state_file)
@@ -2207,8 +2197,7 @@ class PipelineEngine:
         def _emit_slot_event(event_type: str, payload: dict[str, Any]) -> None:
             self._emit(event_type, **payload)
 
-        async with self._sem.with_priority(priority):
-            ar = await run_agent(
+        ar = await run_agent(
                     prompt=prompt,
                     model=acfg.model,
                     tools=acfg.tools or self.cfg.workers.default_tools,
@@ -2230,6 +2219,7 @@ class PipelineEngine:
                     task_id=self.task_id,
                     stage_key=stage_key,
                     role_kind=role_kind,
+                    priority=priority,
                     on_slot_event=_emit_slot_event,
                 )
         if getattr(ar, "fatal", False):

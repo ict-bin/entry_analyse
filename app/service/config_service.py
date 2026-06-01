@@ -41,6 +41,8 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,
+    # 并发控制
+    "agent_process_limit": 8,
     # 精简模式（与完整模式配置并列，互不影响）
     "lean_mode": False,
     "lean_file_max_rounds": -1,

@@ -30,6 +30,7 @@ from typing import Callable
 
 from ..models import AgentInstanceConfig, TaskConfig, TokenUsage
 from ..runner import run_agent, AgentResult
+from ..agent_slots import SemPriority
 from .dirs import PipelineDirs
 from .result_index import write_stage_result_files, upsert_stage_result_index
 from .extractor import (
@@ -451,6 +452,7 @@ async def run_r1_worker(
     is_retry: bool = False,
     feedback: str = "",
     system_prompt: str = "",
+    priority: int = SemPriority.R1_W,
 ) -> tuple[TokenUsage, list[FunctionExtract], list[str]]:
     """
     执行 Round 1a Worker（文件级覆盖率）。
@@ -647,6 +649,7 @@ async def run_r1_worker(
         task_id=task_id,
         stage_key="r1_w",
         role_kind="worker",
+        priority=priority,
     )
 
     _safe_emit(on_event, "r1_w_done", task_id,
@@ -746,6 +749,7 @@ async def run_r2_w_worker(
     feedback: str = "",
     system_prompt: str = "",
     w_attempt: int = 1,   # R2-W 调用次数（第 2 次起为 retry）
+    priority: int = SemPriority.R2_W,
 ) -> TokenUsage:
     """
     执行 Round 1b Worker（函数级准确性校正）。
@@ -805,6 +809,7 @@ async def run_r2_w_worker(
         task_id=task_id,
         stage_key="r2_w",
         role_kind="worker",
+        priority=priority,
     )
 
     corrections = _parse_r1_corrections(ar.output)
