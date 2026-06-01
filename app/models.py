@@ -135,12 +135,6 @@ class ServiceConfig(BaseModel):
         description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
     )
 
-    # ── 并发控制 ─────────────────────────────────────────────────────────────
-    agent_process_limit: int = Field(
-        default=8,
-        description="每个 worker pod 最多同时运行的 agent 进程数（受 EA_AGENT_PROCESS_LIMIT 硬限制）",
-    )
-
 
 # ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
 
@@ -204,12 +198,6 @@ class TaskConfig(BaseModel):
         description="Report per-func W+J 最大轮次（-1=无限）")
     report_final_max_rounds: int = Field(default=-1,
         description="Report final W+J 最大轮次（-1=无限）")
-
-    # ── 并发控制 ─────────────────────────────────────────────────────────────
-    agent_process_limit: int = Field(
-        default=8,
-        description="每个 worker pod 最多同时运行的 agent 进程数（受 EA_AGENT_PROCESS_LIMIT 硬限制）",
-    )
 
     # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
     lean_mode: bool = Field(
