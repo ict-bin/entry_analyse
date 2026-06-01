@@ -713,6 +713,10 @@ class PipelineEngine:
                 func_state.r2_j_state    = NodeState.PASSED
                 func_state.r2_j_attempts = 1
                 state.save(dirs.state_file)
+                # 兼容前端：emit 标准 r2_j_done 保证进度统计正常
+                self._emit("r2_j_done", func_hash=func_hash,
+                           function=func_state.name, passed=True,
+                           feedback="script fast-path: body matched", attempt=1)
                 self._emit("r2_script_pass", func_hash=func_hash,
                            function=func_state.name, detail=_sr.detail)
                 upsert_stage_result_index(
@@ -1163,6 +1167,11 @@ class PipelineEngine:
                            func_hash=func_hash, function=func_state.name,
                            file=Path(file_path).name,
                            feedback=real_feedback[:200], attempt=attempt)
+                # 兼容前端：emit r2_j_done 让前端感知该函数 R2 已结束（此函数迟早进入永久失败态）
+                self._emit("r2_j_done", func_hash=func_hash,
+                           function=func_state.name, passed=False,
+                           source_incomplete=True,
+                           feedback=("[SKIP] " + real_feedback)[:200], attempt=attempt)
                 return True  # 让外层 while 循环 break，不再重试
             result_payload = {
                 "stage": "r2_j",

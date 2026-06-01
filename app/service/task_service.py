@@ -698,6 +698,7 @@ def _build_function_catalog(row: AppEaTask) -> list[dict]:
                 "start_line": int(f.get("start_line") or 0),
                 "end_line": int(f.get("end_line") or 0),
                 "r2j_state": str(f.get("r2_j_state") or "pending"),   # R2 ctags 准确性 Judge
+                "r2_source_incomplete": bool(f.get("r2_source_incomplete")),
                 "r3w_state": str(f.get("r3_w_state") or "pending"),   # R3-W 外部输入 Worker
                 "r3j_state": str(f.get("r3_j_state") or "pending"),   # R3-J 外部输入 Judge
                 "r3_state": r3_state,
