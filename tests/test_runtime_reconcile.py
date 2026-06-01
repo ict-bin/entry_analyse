@@ -450,6 +450,67 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
     assert snapshot["processes"][0]["task_id"] == "eat_1"
 
 
+def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 189,
+        "ppid": 1,
+        "pgid": 189,
+        "command": "pi",
+        "cwd": "/data/files/p1/app/secflow-app-entry-analyse/eat_new/run/workspace/stage_cwd/r1_j",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+
+    running_row = SimpleNamespace(
+        task_id="eat_new",
+        project_id="p1",
+        task_name="new task",
+        input_path="/data/files/p1/app/secflow-app-binary-security/current/modules/IPSEC",
+        source_path="/data/files/p1/app/secflow-app-binary-security/current",
+        output_path="/data/files/p1/app/secflow-app-entry-analyse",
+        status="running",
+        stages_json={},
+        updated_at=None,
+    )
+    old_row = SimpleNamespace(
+        task_id="eat_old",
+        project_id="p1",
+        task_name="old task",
+        input_path="/data/files/p1/app/secflow-app-binary-security/old/modules/IPSEC",
+        source_path="/data/files/p1/app/secflow-app-binary-security/old",
+        output_path="/data/files/p1/app/secflow-app-entry-analyse",
+        status="passed",
+        stages_json={},
+        updated_at=None,
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [old_row, running_row]
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    assert snapshot["processes"][0]["task_id"] == "eat_new"
+    assert snapshot["processes"][0]["owner_kind"] == "tracked"
+    assert snapshot["summary"]["active_processes"] == 1
+    assert snapshot["summary"]["residual_processes"] == 0
+
+
 def test_resolve_worker_targets_prefers_pod_ip_only() -> None:
     assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.7", pod_name="ea-worker-1") == ["10.0.0.7"]
     assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="ea-worker-1") == []

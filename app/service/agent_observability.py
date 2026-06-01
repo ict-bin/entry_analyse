@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime
 import os
 import pathlib
 import shlex
@@ -210,7 +211,18 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
 
 def _task_roots(row: AppEaTask) -> list[str]:
     roots: list[str] = []
-    for item in [getattr(row, "output_path", None), getattr(row, "input_path", None)]:
+    output_root = _normalize_path(getattr(row, "output_path", None))
+    task_id = str(getattr(row, "task_id", "") or "").strip()
+    if output_root and task_id:
+        roots.extend(
+            [
+                os.path.join(output_root, task_id),
+                os.path.join(output_root, task_id, "run"),
+                os.path.join(output_root, task_id, "run", "workspace"),
+                os.path.join(output_root, task_id, "output"),
+            ]
+        )
+    for item in [getattr(row, "input_path", None), getattr(row, "source_path", None), output_root]:
         normalized = _normalize_path(item)
         if normalized:
             roots.append(normalized)
@@ -249,23 +261,41 @@ def _belongs_to_any_root(proc: dict[str, Any], root: str) -> bool:
     return bool(normalized_root and normalized_root in command)
 
 
-def _match_task(proc: dict[str, Any], task_roots_by_id: dict[str, list[str]]) -> tuple[str | None, str | None, str | None]:
+def _task_sort_key(row: AppEaTask) -> tuple[int, float]:
+    status = str(getattr(row, "status", "") or "").strip().lower()
+    status_rank = 2 if status == "running" else 1 if status else 0
+    updated_at = getattr(row, "updated_at", None)
+    updated_ts = updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
+    return status_rank, updated_ts
+
+
+def _match_task(proc: dict[str, Any], task_rows: list[AppEaTask], task_roots_by_id: dict[str, list[str]]) -> tuple[str | None, str | None, str | None]:
+    matches: list[tuple[tuple[int, int, int, float], str, str, str]] = []
+
+    def _record_matches(path_value: str | None, source: str, source_rank: int) -> None:
+        normalized_path = _normalize_path(path_value)
+        if not normalized_path:
+            return
+        for row in task_rows:
+            task_id = str(row.task_id or "")
+            status_rank, updated_ts = _task_sort_key(row)
+            for root in task_roots_by_id.get(task_id, []):
+                if _path_belongs_to_root(normalized_path, root):
+                    matches.append(((source_rank, len(root), status_rank, updated_ts), task_id, source, root))
+
     session_arg_path = _normalize_path(proc.get("session_arg_path"))
-    if session_arg_path:
-        for task_id, roots in task_roots_by_id.items():
-            for root in roots:
-                if _path_belongs_to_root(session_arg_path, root):
-                    return task_id, "session_arg_path", root
+    _record_matches(session_arg_path, "session_arg_path", 3)
     cwd = _normalize_path(proc.get("cwd"))
-    if cwd:
-        for task_id, roots in task_roots_by_id.items():
-            for root in roots:
-                if _path_belongs_to_root(cwd, root):
-                    return task_id, "cwd", root
-    for task_id, roots in task_roots_by_id.items():
-        for root in roots:
+    _record_matches(cwd, "cwd", 2)
+    for row in task_rows:
+        task_id = str(row.task_id or "")
+        status_rank, updated_ts = _task_sort_key(row)
+        for root in task_roots_by_id.get(task_id, []):
             if _belongs_to_any_root(proc, root):
-                return task_id, "task_root", root
+                matches.append(((1, len(root), status_rank, updated_ts), task_id, "task_root", root))
+    if matches:
+        _, task_id, match_source, workspace_root = max(matches, key=lambda item: item[0])
+        return task_id, match_source, workspace_root
     return None, None, None
 
 
@@ -285,7 +315,7 @@ class AgentObservabilityService:
 
         process_rows: list[AgentProcessSnapshot] = []
         for proc in _iter_agent_processes():
-            task_id, match_source, workspace_root = _match_task(proc, task_roots_by_id)
+            task_id, match_source, workspace_root = _match_task(proc, task_rows, task_roots_by_id)
             task_row = task_by_id.get(task_id or "")
             task_name = task_row.task_name if task_row is not None else None
             task_status = str(task_row.status or "") if task_row is not None else None
