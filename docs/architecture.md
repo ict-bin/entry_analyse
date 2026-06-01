@@ -119,9 +119,10 @@ _func_pipeline(func):
 
 ### 3.5 并发控制
 
-- 全局单一 `asyncio.Semaphore(pipeline_parallelism)`，所有 LLM 调用共享
-- `model_capacity_slot` 额外限制单模型并发数（`model_max_concurrency`）
-- R2-J、R3-W、R4-W、R5-W 等所有 LLM 调用均受信号量约束
+- 任务领取由 `max_concurrent_tasks` 控制，语义为单个 Worker Pod 可并发运行的任务数
+- 智能体进程由 `agent_process_limit` 控制，语义为单个 Worker Pod 可同时运行的智能体进程总数
+- 两个上限均来自入口分析配置页，并由 Worker 心跳热生效
+- 单任务可吃满所在 Pod 的全部智能体槽位；多任务共享同一 Pod 级 FIFO 智能体槽位队列
 
 ---
 
@@ -445,4 +446,3 @@ Session 文件记录 LLM 对话历史，支持断点续跑继承上下文。
 | `sessions/r4-func-j-{func}-a{n}.jsonl` | R4-J | 每次新建 |
 | `sessions/r5-w-{func}.jsonl` | R5-W | 跨重试复用 |
 | `sessions/r5-j-{func}-a{n}.jsonl` | R5-J | 每次新建 |
-

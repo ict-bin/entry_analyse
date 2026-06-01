@@ -162,12 +162,22 @@ class WorkerService:
                         cleanup_orphan_pi_processes(logger.warning, label="ea_worker_heartbeat")
                         last_orphan_sweep = now_ts
                     project_ids = await self._discover_active_projects()
-                    project_id = project_ids[0] if project_ids else ""
-                    max_concurrent_tasks = getattr(task_mod._load_svc_config(), "max_concurrent_tasks", 1)
-                    if project_id:
-                        svc = task_mod._load_svc_config_from_db(db, project_id)
-                        max_concurrent_tasks = getattr(svc, "max_concurrent_tasks", 1)
-                    agent_snapshot = get_agent_process_slot_manager().snapshot()
+                    max_concurrent_tasks_values: list[int] = []
+                    agent_process_limit_values: list[int] = []
+                    if project_ids:
+                        for project_id in project_ids:
+                            svc = task_mod._load_svc_config_from_db(db, project_id)
+                            max_concurrent_tasks_values.append(int(getattr(svc, "max_concurrent_tasks", 1) or 1))
+                            agent_process_limit_values.append(int(getattr(svc, "agent_process_limit", 8) or 8))
+                    else:
+                        svc = task_mod._load_svc_config()
+                        max_concurrent_tasks_values.append(int(getattr(svc, "max_concurrent_tasks", 1) or 1))
+                        agent_process_limit_values.append(int(getattr(svc, "agent_process_limit", 8) or 8))
+                    max_concurrent_tasks = max(1, min(max_concurrent_tasks_values))
+                    agent_process_limit = max(1, min(agent_process_limit_values))
+                    agent_manager = get_agent_process_slot_manager()
+                    await agent_manager.set_capacity(agent_process_limit)
+                    agent_snapshot = agent_manager.snapshot()
                     get_worker_slot_service().upsert_heartbeat(
                         db,
                         worker_id=task_mod.POD_NAME,

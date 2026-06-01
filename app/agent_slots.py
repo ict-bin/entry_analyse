@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -9,10 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
-EA_AGENT_PROCESS_LIMIT_DEFAULT = max(
-    1,
-    int(os.environ.get("EA_AGENT_PROCESS_LIMIT", "8") or "8"),
-)
+from app.models import AGENT_PROCESS_LIMIT_DEFAULT, normalize_agent_process_limit
 
 _WAIT_HISTOGRAM_BUCKETS = (0.01, 0.1, 0.5, 1.0, 3.0, 10.0, 30.0, 60.0, 300.0)
 
@@ -70,7 +66,7 @@ class AgentSlotLease:
 
 class AgentProcessSlotManager:
     def __init__(self, capacity: int):
-        self.capacity = max(1, int(capacity or 1))
+        self.capacity = normalize_agent_process_limit(capacity)
         self._lock = asyncio.Lock()
         self._queue: deque[AgentSlotTicket] = deque()
         self._in_use = 0
@@ -81,6 +77,20 @@ class AgentProcessSlotManager:
         self._total_wait_seconds = 0.0
         self._max_wait_seconds = 0.0
         self._histogram: dict[float, int] = {bucket: 0 for bucket in _WAIT_HISTOGRAM_BUCKETS}
+
+    async def set_capacity(self, capacity: int) -> int:
+        normalized = normalize_agent_process_limit(capacity)
+        async with self._lock:
+            if normalized == self.capacity:
+                return self.capacity
+            self.capacity = normalized
+            if self._in_use < self.capacity:
+                for ticket in self._queue:
+                    if ticket.cancelled:
+                        continue
+                    ticket.event.set()
+                    break
+            return self.capacity
 
     def _record_wait(self, wait_seconds: float) -> None:
         self._wait_samples += 1
@@ -248,7 +258,7 @@ _manager: AgentProcessSlotManager | None = None
 def get_agent_process_slot_manager() -> AgentProcessSlotManager:
     global _manager
     if _manager is None:
-        _manager = AgentProcessSlotManager(EA_AGENT_PROCESS_LIMIT_DEFAULT)
+        _manager = AgentProcessSlotManager(AGENT_PROCESS_LIMIT_DEFAULT)
     return _manager
 
 

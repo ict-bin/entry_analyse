@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaModelsConfig, AppEaProjectConfig
 from app.models import (
+    normalize_agent_process_limit,
     normalize_max_concurrent_tasks,
     normalize_max_rounds_exceeded_action,
 )
@@ -22,6 +23,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "min_rounds": 2,
     "pass_threshold": 0,
     "max_concurrent_tasks": 8,
+    "agent_process_limit": 8,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "agent_run_timeout_seconds": 3600,
@@ -128,6 +130,9 @@ class ConfigService:
             normalized["min_rounds"] = 2
         normalized["max_concurrent_tasks"] = normalize_max_concurrent_tasks(
             normalized.get("max_concurrent_tasks")
+        )
+        normalized["agent_process_limit"] = normalize_agent_process_limit(
+            normalized.get("agent_process_limit")
         )
         try:
             normalized["master_shard_size"] = max(2, min(int(normalized.get("master_shard_size", 10)), 100))

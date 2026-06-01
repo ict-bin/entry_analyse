@@ -19,6 +19,8 @@ MAX_ROUNDS_EXCEEDED_ACTIONS = {
 
 MAX_CONCURRENT_TASKS_DEFAULT = 8
 MAX_CONCURRENT_TASKS_LIMIT = 128
+AGENT_PROCESS_LIMIT_DEFAULT = 8
+AGENT_PROCESS_LIMIT_LIMIT = 128
 MASTER_SHARD_SIZE_DEFAULT = 10
 MASTER_SHARD_PARALLELISM_DEFAULT = 4
 
@@ -38,6 +40,16 @@ def normalize_max_concurrent_tasks(value: int | str | None) -> int:
     if candidate < 1:
         return 1
     return min(candidate, MAX_CONCURRENT_TASKS_LIMIT)
+
+
+def normalize_agent_process_limit(value: int | str | None) -> int:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return AGENT_PROCESS_LIMIT_DEFAULT
+    if candidate < 1:
+        return 1
+    return min(candidate, AGENT_PROCESS_LIMIT_LIMIT)
 
 
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
@@ -70,7 +82,8 @@ class ServiceConfig(BaseModel):
     )
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[int] = Field(default=None)
-    max_concurrent_tasks: int = Field(default=MAX_CONCURRENT_TASKS_DEFAULT, description="任务间最大并发数")
+    max_concurrent_tasks: int = Field(default=MAX_CONCURRENT_TASKS_DEFAULT, description="单个 Worker Pod 任务并发上限")
+    agent_process_limit: int = Field(default=AGENT_PROCESS_LIMIT_DEFAULT, description="单个 Worker Pod 智能体进程上限")
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
     agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")
@@ -141,6 +154,7 @@ class TaskConfig(BaseModel):
     min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
     max_concurrent_tasks: int = Field(default=MAX_CONCURRENT_TASKS_DEFAULT)
+    agent_process_limit: int = Field(default=AGENT_PROCESS_LIMIT_DEFAULT)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
     agent_run_timeout_seconds: int = Field(default=3600)

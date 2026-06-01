@@ -1526,7 +1526,6 @@ _TASK_CONFIG_OVERRIDE_FIELDS = {
     "max_rounds_exceeded_action",
     "min_rounds",
     "pass_threshold",
-    "max_concurrent_tasks",
     "agent_max_retries",
     "agent_retry_delay",
     "agent_run_timeout_seconds",
@@ -1986,10 +1985,12 @@ class TaskService:
                 max_concurrent_tasks = normalize_max_concurrent_tasks(
                     getattr(svc, "max_concurrent_tasks", None)
                 )
-                running_count = self._active_running_count(db, project_id)
-                if running_count >= max_concurrent_tasks:
+                from app.service.worker_service import get_worker_service
+                worker_service = get_worker_service()
+                local_running_count = worker_service.local_running_count()
+                if local_running_count >= max_concurrent_tasks:
                     return
-                claim_slots = min(max_concurrent_tasks - running_count, DISPATCH_CLAIM_BATCH_SIZE)
+                claim_slots = min(max_concurrent_tasks - local_running_count, DISPATCH_CLAIM_BATCH_SIZE)
                 if claim_slots <= 0:
                     return
                 candidate_rows = (
@@ -2009,10 +2010,8 @@ class TaskService:
                 )
                 claimed_count = 0
                 for row in candidate_rows:
-                    if running_count >= max_concurrent_tasks or claimed_count >= claim_slots:
+                    if local_running_count >= max_concurrent_tasks or claimed_count >= claim_slots:
                         break
-                    from app.service.worker_service import get_worker_service
-                    worker_service = get_worker_service()
                     if worker_service.has_local_task(row.task_id):
                         continue
                     # per-pod 限制：本 pod 已运行任务数 ≥ max_concurrent_tasks 则不再领取
@@ -2022,7 +2021,7 @@ class TaskService:
                     if claimed is None:
                         continue
                     worker_service.start_task(claimed.task_id)
-                    running_count += 1
+                    local_running_count += 1
                     claimed_count += 1
             except Exception as exc:
                 logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)

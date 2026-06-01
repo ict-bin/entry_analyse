@@ -26,6 +26,8 @@ class WorkerSlotServiceTests(unittest.TestCase):
                     pod_name="pod-a",
                     pod_ip="10.0.0.1",
                     max_concurrent_tasks=2,
+                    agent_process_limit=5,
+                    agent_process_in_use=2,
                     last_seen_status="running",
                     last_heartbeat_at=now,
                 ),
@@ -82,6 +84,9 @@ class WorkerSlotServiceTests(unittest.TestCase):
             self.assertEqual(2, payload["busy_slots"])
             self.assertEqual(2, payload["running_jobs"])
             self.assertEqual(4, payload["available_slots"])
+            self.assertEqual(5, payload["agent_total_capacity"])
+            self.assertEqual(2, payload["agent_in_use"])
+            self.assertEqual(3, payload["agent_available"])
             self.assertEqual(8, payload["dispatch_limit"])
             self.assertEqual(2, payload["dispatch_running"])
             self.assertEqual(6, payload["dispatch_available"])
@@ -110,6 +115,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                 pod_name="pod-a-renamed",
                 pod_ip="10.0.0.8",
                 max_concurrent_tasks=4,
+                agent_process_limit=9,
                 status="running",
             )
 
@@ -117,6 +123,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
             self.assertEqual("pod-a-renamed", row.pod_name)
             self.assertEqual("10.0.0.8", row.pod_ip)
             self.assertEqual(4, row.max_concurrent_tasks)
+            self.assertEqual(9, row.agent_process_limit)
         finally:
             db.close()
 

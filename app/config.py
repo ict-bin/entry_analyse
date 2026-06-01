@@ -16,6 +16,7 @@ from .models import (
     ServiceConfig,
     TaskConfig,
     normalize_max_concurrent_tasks,
+    normalize_agent_process_limit,
     normalize_max_rounds_exceeded_action,
 )
 
@@ -61,6 +62,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,
         max_concurrent_tasks=normalize_max_concurrent_tasks(getattr(svc, "max_concurrent_tasks", None)),
+        agent_process_limit=normalize_agent_process_limit(getattr(svc, "agent_process_limit", None)),
         master_merge_mode=str(getattr(svc, "master_merge_mode", "hierarchical") or "hierarchical"),
         master_shard_size=max(2, min(int(getattr(svc, "master_shard_size", 10) or 10), 100)),
         master_shard_parallelism=max(1, min(int(getattr(svc, "master_shard_parallelism", 4) or 4), 64)),
