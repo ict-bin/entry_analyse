@@ -466,6 +466,9 @@ class AgentObservabilitySummaryResponse(BaseModel):
     aggregate_cache_hit: Optional[bool] = None
     aggregate_cache_age_seconds: Optional[float] = None
     aggregate_failed_targets: list[str] = Field(default_factory=list)
+    aggregate_all_sources_failed: Optional[bool] = None
+    total_pods: Optional[int] = None
+    healthy_pods: Optional[int] = None
 
 
 class AgentProcessKillItemResponse(BaseModel):
@@ -537,6 +540,9 @@ def _resolve_worker_targets(*, pod_ip: str | None, pod_name: str | None) -> list
     normalized_ip = str(pod_ip or "").strip()
     if normalized_ip:
         targets.append(normalized_ip)
+    normalized_name = str(pod_name or "").strip()
+    if normalized_name and normalized_name not in targets:
+        targets.append(normalized_name)
     return targets
 
 
@@ -644,6 +650,8 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
 
     cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.get("workers") or [] if bool(worker.get("healthy")) and str(worker.get("pod_name") or "").strip()]
+    total_target_pods = len(workers)
+    total_healthy_pods = sum(1 for worker in workers if bool(worker.get("healthy")))
 
     merged_processes: list[dict[str, Any]] = []
     merged_tasks: list[dict[str, Any]] = []
@@ -700,6 +708,8 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         sources = 1
         partial = False
         all_sources_failed = False
+        total_target_pods = len(pod_rows)
+        total_healthy_pods = len([row for row in pod_rows if bool(row.get("healthy", True))])
 
     summary = {
         "pod_name": "entry-analyse-aggregate",
@@ -727,6 +737,8 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         "aggregate_cache_age_seconds": 0.0,
         "aggregate_failed_targets": failed_targets,
         "aggregate_all_sources_failed": all_sources_failed,
+        "total_pods": total_target_pods,
+        "healthy_pods": total_healthy_pods,
     }
     _LAST_AGENT_AGGREGATE_META.update({
         "partial": partial,
@@ -863,8 +875,8 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
     summary = dict(snapshot.get("summary") or {})
     return {
         "summary": {
-            "total_pods": len(pods),
-            "healthy_pods": len([item for item in pods if bool(item.get("healthy", True))]),
+            "total_pods": int(summary.get("total_pods") or len(pods)),
+            "healthy_pods": int(summary.get("healthy_pods") or len([item for item in pods if bool(item.get("healthy", True))])),
             "total_processes": len(processes),
             "tracked_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "tracked"]),
             "residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual"]),

@@ -333,6 +333,8 @@ def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:
     assert runtime["summary"]["killable_suspected_orphan_processes"] == 1
     assert runtime["summary"]["aggregate_partial"] is True
     assert runtime["summary"]["aggregate_failed_targets"] == ["pod-b"]
+    assert runtime["summary"]["total_pods"] == 2
+    assert runtime["summary"]["healthy_pods"] == 1
 
 
 def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch) -> None:
