@@ -448,6 +448,24 @@ class WorkerService:
         self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ea_worker_slot_heartbeat")
         self._maintenance_task = asyncio.create_task(self._maintenance_loop(), name="ea_worker_maintenance")
+        # 内存自适应容量循环（需 EA_ADAPTIVE_MEMORY_ENABLED=true）
+        import os as _os
+        if _os.environ.get("EA_ADAPTIVE_MEMORY_ENABLED", "").lower() in ("1", "true", "yes"):
+            from app.agent_slots import get_agent_process_slot_manager, MemoryAdaptiveLoop
+            _grow_pct  = float(_os.environ.get("EA_ADAPTIVE_GROW_THRESHOLD",      "88")) / 100
+            _emerg_pct = float(_os.environ.get("EA_ADAPTIVE_EMERGENCY_THRESHOLD", "98")) / 100
+            _interval  = float(_os.environ.get("EA_ADAPTIVE_INTERVAL_SEC",        "2"))
+            _adaptive_loop = MemoryAdaptiveLoop(
+                get_agent_process_slot_manager(),
+                grow_threshold=_grow_pct,
+                emergency_threshold=_emerg_pct,
+                interval_sec=_interval,
+            )
+            asyncio.create_task(_adaptive_loop.run(), name="ea_memory_adaptive_loop")
+            logger.info(
+                "MemoryAdaptiveLoop started: grow=%.0f%% emergency=%.0f%% interval=%.1fs",
+                _grow_pct * 100, _emerg_pct * 100, _interval,
+            )
         logger.info("Entry-analysis worker started (poll=%ss)", WORKER_POLL_SECONDS)
 
     def stop(self) -> None:

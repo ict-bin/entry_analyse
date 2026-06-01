@@ -104,26 +104,6 @@ async def lifespan(app: FastAPI):
 
     await get_runtime_bootstrap().start(app)
 
-    # ── 内存自适应容量循环（仅 worker 角色，需 EA_ADAPTIVE_MEMORY_ENABLED=true）──
-    import os as _os
-    if role_enabled("worker") and _os.environ.get("EA_ADAPTIVE_MEMORY_ENABLED", "").lower() in ("1", "true", "yes"):
-        import logging as _logging
-        from .agent_slots import get_agent_process_slot_manager, MemoryAdaptiveLoop
-        _adaptive_log = _logging.getLogger("ea.server")
-        _grow_pct     = float(_os.environ.get("EA_ADAPTIVE_GROW_THRESHOLD",      "88")) / 100
-        _emerg_pct    = float(_os.environ.get("EA_ADAPTIVE_EMERGENCY_THRESHOLD", "98")) / 100
-        _interval     = float(_os.environ.get("EA_ADAPTIVE_INTERVAL_SEC",        "2"))
-        _adaptive_loop = MemoryAdaptiveLoop(
-            get_agent_process_slot_manager(),
-            grow_threshold=_grow_pct,
-            emergency_threshold=_emerg_pct,
-            interval_sec=_interval,
-        )
-        asyncio.create_task(_adaptive_loop.run())
-        _adaptive_log.info(
-            "MemoryAdaptiveLoop started: grow=%.0f%% emergency=%.0f%% interval=%.1fs",
-            _grow_pct * 100, _emerg_pct * 100, _interval,
-        )
 
     # 迁移现有 DB 配置：将所有 max_rounds 字段强制设为 -1
     if role_enabled("api"):
