@@ -253,11 +253,48 @@ def test_delete_task_retries_retryable_timeline_clear_deadlock(monkeypatch) -> N
 
     result = task_service.TaskService().delete_task(db, "eat_retry", delete_files=False)
 
-    assert result == {"deleted_event_count": 7}
+    assert result["deleted_event_count"] == 7
+    assert result["timeline_cleanup_status"] == "deleted"
+    assert result["task_visibility"] == "deleted"
     assert attempts["count"] == 2
     assert db.rollbacks == 1
-    assert db.commits == 1
+    assert db.commits == 2
     assert row.is_deleted is True
+
+
+def test_delete_task_ignores_timeline_clear_deadlock_after_retry_exhausted(monkeypatch) -> None:
+    row = SimpleNamespace(
+        task_id="eat_deadlock",
+        project_id="p1",
+        status="cancelled",
+        is_deleted=False,
+        output_path=None,
+        input_path="/tmp/not-used",
+        source_path=None,
+        updated_at=None,
+    )
+    db = _DeleteTaskDb(row)
+    attempts = {"count": 0}
+
+    def _always_deadlock(_db, _row):
+        attempts["count"] += 1
+        err = Exception()
+        err.args = (1213, "Deadlock found when trying to get lock; try restarting transaction")
+        raise OperationalError("DELETE FROM secflow_app_ea_task_event", {}, err)
+
+    monkeypatch.setattr(task_service, "clear_task_timeline", _always_deadlock)
+    monkeypatch.setattr(task_service, "_safe_create_task_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(task_service, "cleanup_task_pi_processes", lambda *args, **kwargs: None)
+    monkeypatch.setattr(task_service._time, "sleep", lambda _seconds: None)
+
+    result = task_service.TaskService().delete_task(db, "eat_deadlock", delete_files=False)
+
+    assert result["deleted_event_count"] == 0
+    assert result["timeline_cleanup_status"] == "failed_ignored"
+    assert result["task_visibility"] == "deleted"
+    assert attempts["count"] == task_service.DELETE_TASK_MAX_DB_RETRIES
+    assert row.is_deleted is True
+    assert db.commits == 2
 
 
 def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:

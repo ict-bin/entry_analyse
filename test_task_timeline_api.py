@@ -128,7 +128,7 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         self.assertEqual(4, payload["deleted_event_count"])
         self.assertEqual("任务已删除", payload["message"])
 
-    def test_delete_task_fails_when_workspace_remove_fails(self):
+    def test_delete_task_marks_invisible_when_workspace_remove_fails(self):
         self._insert_task(task_id="eat_delete_fail", status="failed")
         db = self.SessionLocal()
         try:
@@ -144,14 +144,14 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         ):
             response = self.client.delete("/api/app/entry-analyse/tasks/eat_delete_fail?delete_files=true")
 
-        self.assertEqual(409, response.status_code)
-        self.assertIn("任务目录删除失败", response.json()["detail"])
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("任务已删除", response.json()["message"])
 
         db = self.SessionLocal()
         try:
             row = db.query(AppEaTask).filter(AppEaTask.task_id == "eat_delete_fail").first()
             self.assertIsNotNone(row)
-            self.assertFalse(bool(row.is_deleted))
+            self.assertTrue(bool(row.is_deleted))
         finally:
             db.close()
 

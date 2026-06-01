@@ -2878,6 +2878,14 @@ class TaskService:
             return {"deleted_event_count": 0}
         if row.status == "running":
             raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+        row.is_deleted = True
+        db.commit()
+        cleanup: dict[str, Any] = {
+            "deleted_event_count": 0,
+            "timeline_cleanup_status": "skipped",
+            "file_cleanup_status": "skipped",
+            "task_visibility": "deleted",
+        }
         try:
             cleanup_task_pi_processes(
                 logger.warning,
@@ -2893,11 +2901,14 @@ class TaskService:
                 try:
                     _shutil.rmtree(task_dir)
                     logger.info("delete_task: removed task dir %s", task_dir)
+                    cleanup["file_cleanup_status"] = "deleted"
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
-                    raise HTTPException(status_code=409, detail=f"任务目录删除失败: {task_dir}: {_e}") from _e
+                    cleanup["file_cleanup_status"] = "failed"
+                    cleanup["file_cleanup_error"] = str(_e)
                 if os.path.exists(task_dir):
-                    raise HTTPException(status_code=409, detail=f"任务目录删除失败，目录仍然存在: {task_dir}")
+                    cleanup["file_cleanup_status"] = "failed"
+                    cleanup["file_cleanup_error"] = f"任务目录删除失败，目录仍然存在: {task_dir}"
         _safe_create_task_event(
             db,
             task_id=row.task_id,
@@ -2909,10 +2920,17 @@ class TaskService:
             payload={"delete_files": bool(delete_files)},
             dedupe_key=_event_dedupe_key(row.task_id, "task_deleted", row.updated_at, delete_files),
         )
-        deleted_event_count = _clear_task_timeline_with_retry(db, row)
-        row.is_deleted = True
+        try:
+            deleted_event_count = _clear_task_timeline_with_retry(db, row)
+            cleanup["deleted_event_count"] = deleted_event_count
+            cleanup["timeline_cleanup_status"] = "deleted"
+        except OperationalError as exc:
+            db.rollback()
+            cleanup["timeline_cleanup_status"] = "failed_ignored"
+            cleanup["timeline_cleanup_error"] = str(exc)
+            logger.warning("delete_task: timeline cleanup failed but task is already invisible: task_id=%s error=%s", row.task_id, exc)
         db.commit()
-        return {"deleted_event_count": deleted_event_count}
+        return cleanup
 
     def _get_or_404(self, db: Session, task_id: str) -> AppEaTask:
         row = db.query(AppEaTask).filter(
