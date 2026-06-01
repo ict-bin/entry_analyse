@@ -5,7 +5,6 @@ import heapq
 import os
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -93,8 +92,6 @@ class AgentSlotLease:
     waited: bool
     pid: int | None = None
     released: bool = False
-    eviction_event: asyncio.Event = field(default_factory=asyncio.Event)
-    evicted: bool = False   # True: 被内存驱逐，runner 层应重新排队等槽
 
     def bind_pid(self, pid: int | None) -> None:
         self.pid = int(pid) if pid else None
@@ -340,31 +337,6 @@ class AgentProcessSlotManager:
             # 无有效 waiter，归还槽位
             self._in_use = max(0, self._in_use - 1)
 
-    # ── evict_victim ─────────────────────────────────────────────────────────
-
-    async def evict_victim(self) -> bool:
-        """
-        从当前活跃 lease 中选择驱逐目标：priority 最大（优先级最低）且
-        acquired_at 最晚（运行时间最短），以最小化工作量损失。
-
-        触发驱逐后：
-          - 设置 lease.eviction_event（通知 runner 的 _cancel_monitor）
-          - lease.evicted = True（让 runner 层识别驱逐并重新排队）
-          - capacity -= 1（不低于 1，等内存恢复后 MemoryAdaptiveLoop 再扩容）
-
-        返回 True 表示成功触发驱逐，False 表示无可驱逐的 lease。
-        """
-        async with self._lock:
-            active = [l for l in self._leases.values() if not l.evicted]
-            if not active:
-                return False
-            # 选 victim：priority 最大（优先级最低）→ acquired_at 最晚（运行最短）
-            victim = max(active, key=lambda l: (l.ticket.priority, l.acquired_at))
-            victim.evicted = True
-            victim.eviction_event.set()
-            self.capacity = max(1, self.capacity - 1)
-        return True
-
     # ── snapshot ──────────────────────────────────────────────────────────────
 
     def snapshot(self) -> dict[str, Any]:
@@ -413,84 +385,6 @@ def get_agent_process_slot_manager() -> AgentProcessSlotManager:
 
 
 # ─── 上下文管理器（公开入口）─────────────────────────────────────────────────
-
-# ─── 内存自适应容量控制循环 ────────────────────────────────────────────────────
-
-class MemoryAdaptiveLoop:
-    """
-    Pod 级后台协程：实时读取 cgroup memory，驱动 AgentProcessSlotManager 容量自适应。
-
-    - usage >= emergency_threshold（默认 98%）：
-        驱逐最低优先级、运行时间最短的 agent（capacity -= 1）
-    - usage <  grow_threshold（默认 88%）且有等待者：
-        capacity += 1
-
-    通过 EA_ADAPTIVE_MEMORY_ENABLED=true 环境变量启用（worker pod 启动时）。
-    阈值通过环境变量配置，无需改代码。
-    """
-
-    _CGROUP_CURRENT = Path("/sys/fs/cgroup/memory.current")
-    _CGROUP_MAX     = Path("/sys/fs/cgroup/memory.max")
-
-    def __init__(
-        self,
-        manager: AgentProcessSlotManager,
-        grow_threshold: float = 0.88,
-        emergency_threshold: float = 0.98,
-        interval_sec: float = 2.0,
-    ) -> None:
-        if not (0 < grow_threshold < emergency_threshold <= 1.0):
-            raise ValueError(
-                f"threshold 顺序必须满足 0 < grow({grow_threshold}) "
-                f"< emergency({emergency_threshold}) <= 1.0"
-            )
-        self._mgr = manager
-        self._grow = grow_threshold
-        self._emergency = emergency_threshold
-        self._interval = interval_sec
-        self._logger = __import__("logging").getLogger("ea.agent_slots.adaptive")
-
-    def _read_usage_pct(self) -> float | None:
-        """读取当前 cgroup 内存使用百分比。max='max'（无限制）时返回 None。"""
-        try:
-            current = int(self._CGROUP_CURRENT.read_text().strip())
-            max_text = self._CGROUP_MAX.read_text().strip()
-            if max_text == "max":
-                return None
-            limit = int(max_text)
-            return current / limit if limit > 0 else None
-        except Exception:
-            return None
-
-    async def run(self) -> None:
-        self._logger.info(
-            "MemoryAdaptiveLoop started  grow=%.0f%%  emergency=%.0f%%  interval=%.1fs",
-            self._grow * 100, self._emergency * 100, self._interval,
-        )
-        while True:
-            try:
-                pct = self._read_usage_pct()
-                if pct is not None:
-                    if pct >= self._emergency:
-                        evicted = await self._mgr.evict_victim()
-                        if evicted:
-                            self._logger.warning(
-                                "Memory emergency %.1f%% >= %.0f%%: "
-                                "evicted 1 agent, capacity → %d",
-                                pct * 100, self._emergency * 100, self._mgr.capacity,
-                            )
-                    elif pct < self._grow:
-                        # 有等待者时扩容（非锁检查，可能短暂陈旧，可接受）
-                        if self._mgr._waiters:
-                            await self._mgr.set_capacity(self._mgr.capacity + 1)
-                            self._logger.debug(
-                                "Memory comfortable %.1f%% < %.0f%%: capacity → %d",
-                                pct * 100, self._grow * 100, self._mgr.capacity,
-                            )
-            except Exception as exc:
-                self._logger.warning("MemoryAdaptiveLoop iteration error: %s", exc)
-            await asyncio.sleep(self._interval)
-
 
 @asynccontextmanager
 async def agent_process_slot(

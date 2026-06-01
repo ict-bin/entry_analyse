@@ -104,7 +104,6 @@ async def lifespan(app: FastAPI):
 
     await get_runtime_bootstrap().start(app)
 
-
     # 迁移现有 DB 配置：将所有 max_rounds 字段强制设为 -1
     if role_enabled("api"):
         try:

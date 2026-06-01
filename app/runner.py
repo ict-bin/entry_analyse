@@ -132,7 +132,6 @@ class AgentResult:
         self.exit_code: int = 0
         self.error: str | None = None
         self.fatal: bool = False  # 致命错误（配置/环境问题，不可重试）
-        self.evicted: bool = False  # 被内存驱逐，runner 层应重新排队等槽
 
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
@@ -698,11 +697,7 @@ async def run_agent(
                     role_kind=role_kind,
                     on_slot_event=on_slot_event,
                 )
-                _result = await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
-                # 内存驱逐：重新排队等槽，下轮用 continue_stdin（session 保留上下文）
-                if _result.evicted:
-                    continue
-                return _result
+                return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
             except asyncio.TimeoutError:
                 timeout_failures += 1
                 result = AgentResult()
@@ -779,10 +774,6 @@ async def _run_with_pi_retry(
                 role_kind=role_kind,
                 on_slot_event=on_slot_event,
             )
-
-            # ── 驱逐冒泡：不计 pi_attempt，直接返回让 run_agent 用 continue_stdin 重试 ──
-            if result.evicted:
-                return result
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
             if _is_fatal_error(result):
@@ -899,60 +890,36 @@ async def _run_with_api_retry(
                     # 进程已退出，忽略管道写入错误
                     pass
 
-            # _cancel_monitor 始终创建（监听任务取消 + 驱逐两路信号）
-            async def _cancel_monitor():
-                """
-                监听两路终止信号：
-                  1. cancel_event（任务取消）：0.3s grace → SIGKILL
-                  2. slot_lease.eviction_event（内存驱逐）：5s grace → SIGKILL
-                两路竞速，先到的触发 kill；结束后 slot_lease.evicted 标记已由
-                evict_victim() 提前设置，runner 层凭此判断是否重新排队。
-                """
-                _wait_tasks: list[asyncio.Task] = []
-                _cancel_inner: asyncio.Task | None = None
-                _evict_inner: asyncio.Task | None = None
-                if cancel_event is not None:
-                    _cancel_inner = asyncio.create_task(cancel_event.wait())
-                    _wait_tasks.append(_cancel_inner)
-                _evict_inner = asyncio.create_task(slot_lease.eviction_event.wait())
-                _wait_tasks.append(_evict_inner)
-                try:
-                    _, _pending = await asyncio.wait(
-                        _wait_tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for _t in _pending:
-                        _t.cancel()
-                except asyncio.CancelledError:
-                    # _cancel_monitor 本身被 cancel（finally 清理时），取消所有子任务
-                    for _t in _wait_tasks:
-                        _t.cancel()
-                    raise
-
-                # 驱逐给 5s grace（保存 session），任务取消保持原来的 0.3s
-                _grace = 5.0 if slot_lease.evicted else 0.3
-                pgid: int | None = None
-                try:
-                    pgid = process_group_id(proc)
-                except (ProcessLookupError, OSError):
-                    pass
-                # Step1：SIGTERM 整个进程组
-                if pgid is not None:
+            cancel_task = None
+            if cancel_event:
+                async def _cancel_monitor():
+                    await cancel_event.wait()
+                    # 在 kill 前先记录 pgid，防止 pi 退出后无法获取
+                    pgid: int | None = None
                     try:
-                        os.killpg(pgid, signal.SIGTERM)
+                        pgid = process_group_id(proc)
                     except (ProcessLookupError, OSError):
                         pass
-                # Step2：等待 pi 退出（grace 时长后再强杀）
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=_grace)
-                except asyncio.TimeoutError:
-                    pass
-                # Step3：SIGKILL 确保整个进程组已死（防止工具子进程持有 stdout pipe）
-                if pgid is not None:
+                    # Step1：向整个 process group 发 SIGTERM（杀 pi 及其工具子进程）
+                    if pgid is not None:
+                        try:
+                            os.killpg(pgid, signal.SIGTERM)
+                        except (ProcessLookupError, OSError):
+                            pass
+                    # Step2：等待 pi 进程退出（最多 0.3 秒，原 3s 太长导致取消感知慢）
                     try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
+                        await asyncio.wait_for(proc.wait(), timeout=0.3)
+                    except asyncio.TimeoutError:
                         pass
-            cancel_task = asyncio.create_task(_cancel_monitor())
+                    # Step3：无论 pi 是否已退出，对整个 group 强制 SIGKILL
+                    # 关键：SIGTERM 后 pi 已死，但 bash/工具子进程可能存活并持有 stdout pipe
+                    # 必须 SIGKILL 才能强关闭 pipe，否则 proc.stdout.read() 永久阻塞
+                    if pgid is not None:
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass  # group 已全部退出，正常
+                cancel_task = asyncio.create_task(_cancel_monitor())
 
             # ── 读取 JSON Lines 输出（try/except 保护管道断裂）──
             try:
@@ -984,9 +951,6 @@ async def _run_with_api_retry(
 
                 await proc.wait()
                 result.exit_code = proc.returncode or 0
-                # 驱逐标记（evict_victim 已设置 slot_lease.evicted）
-                if slot_lease.evicted:
-                    result.evicted = True
 
             except asyncio.CancelledError:
                 await handle.terminate_tree(reason="task_cancelled")
