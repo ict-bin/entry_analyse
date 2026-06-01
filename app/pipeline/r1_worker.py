@@ -196,10 +196,18 @@ def _compute_gaps(
 
 # ─── 修正解析（共用）─────────────────────────────────────────────────────────
 
-def _parse_r1_corrections(output: str) -> list[dict] | None:
+# 哨兵值：W 判定源文件函数体不完整，无法修复
+_R2W_SOURCE_INCOMPLETE = "SOURCE_INCOMPLETE"
+
+
+def _parse_r1_corrections(output: str) -> list[dict] | None | str:
     """
     从 LLM 输出中提取 <result>[...] </result> 里的修正列表。
-    返回 None 表示 LLM 认为不需要修正（输出 NO_CORRECTIONS）。
+
+    返回值：
+      None                     — LLM 认为不需要修正（NO_CORRECTIONS）
+      _R2W_SOURCE_INCOMPLETE   — W 判定源文件函数体不完整，无法修复
+      list[dict]               — 修正列表（可为空列表表示解析失败）
     """
     m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
     if not m:
@@ -207,6 +215,8 @@ def _parse_r1_corrections(output: str) -> list[dict] | None:
     text = m.group(1).strip()
     if re.search(r"NO_CORRECTIONS|no_corrections|无需修正", text, re.IGNORECASE):
         return None
+    if re.search(r"SOURCE_INCOMPLETE", text, re.IGNORECASE):
+        return _R2W_SOURCE_INCOMPLETE
     text = re.sub(r"^```(?:json)?\s*", "", text).strip()
     text = re.sub(r"\s*```$", "", text).strip()
     try:
@@ -750,15 +760,16 @@ async def run_r2_w_worker(
     system_prompt: str = "",
     w_attempt: int = 1,   # R2-W 调用次数（第 2 次起为 retry）
     priority: int = SemPriority.R2_W,
-) -> TokenUsage:
+) -> tuple[TokenUsage, bool]:
     """
-    执行 Round 1b Worker（函数级准确性校正）。
+    执行 Round 2 Worker（函数级准确性校正）。
 
-    用 bash sed 验证单函数的 start_line/end_line/name/signature，
+    用 bash sed/awk 验证单函数的 start_line/end_line/name/signature，
     将修正直接写入 funcdb。
 
     Returns:
-        token_usage
+        (token_usage, source_incomplete)
+        source_incomplete=True 表示 W 判定源文件函数体不完整，无法修复
     """
     from .funcdb import FunctionDB
 
@@ -813,6 +824,8 @@ async def run_r2_w_worker(
     )
 
     corrections = _parse_r1_corrections(ar.output)
+    source_incomplete = (corrections == _R2W_SOURCE_INCOMPLETE)
+
     result_payload = {
         "stage": "r2_w",
         "attempt": attempt_no,
@@ -820,9 +833,11 @@ async def run_r2_w_worker(
         "func_hash": func_hash,
         "file_hash": file_hash,
         "source_file": os.path.abspath(file_path),
-        "status": "ok" if (corrections is None or isinstance(corrections, list)) else "parse_failed",
-        "result_type": "corrections",
-        "result": [] if corrections is None else (corrections or []),
+        "source_incomplete": source_incomplete,
+        "status": "source_incomplete" if source_incomplete
+                  else ("ok" if (corrections is None or isinstance(corrections, list)) else "parse_failed"),
+        "result_type": "source_incomplete" if source_incomplete else "corrections",
+        "result": [] if (corrections is None or source_incomplete) else (corrections or []),
     }
     result_file = dirs.stage_result_file("r2_w", "worker", func_hash, attempt_no)
     raw_file = dirs.stage_raw_file("r2_w", "worker", func_hash, attempt_no)
@@ -830,10 +845,12 @@ async def run_r2_w_worker(
     upsert_stage_result_index(
         task_id=task_id, stage_key="r2_w", role_kind="worker", scope_kind="func",
         attempt=attempt_no, file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
-        summary=f"corrections={len(result_payload['result'])}",
+        summary="source_incomplete" if source_incomplete else f"corrections={len(result_payload['result'])}",
         result_file_path=str(result_file), raw_file_path=str(raw_file),
     )
-    if corrections is None:
+    if source_incomplete:
+        logger.info("R2-W: SOURCE_INCOMPLETE for %s (%s), skipping apply_corrections", func_hash, func_name)
+    elif corrections is None:
         logger.debug("R2-W: no corrections needed for %s", func_hash)
     elif corrections:
         logger.info("R2-W: applying %d corrections for %s", len(corrections), func_hash)
@@ -841,7 +858,7 @@ async def run_r2_w_worker(
     else:
         logger.warning("R2-W: could not parse corrections for %s", func_hash)
 
-    return ar.token_usage
+    return ar.token_usage, source_incomplete
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────

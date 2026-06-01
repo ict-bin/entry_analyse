@@ -53,6 +53,7 @@ class FunctionState:
     r2_j_attempts: int = 0
     r2_j_feedback: str = ""
     r2_j_feedback_path: str = ""
+    r2_source_incomplete: bool = False  # agent 判定源文件函数体不完整，永久跳过后续阶段
 
     # ── R3：外部输入分析（原 R2）─────────────────────────────────────────────
     r3_w_state:    NodeState = NodeState.PENDING

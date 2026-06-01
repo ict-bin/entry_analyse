@@ -396,6 +396,15 @@ class Orchestrator:
             _log.getLogger("ea.orchestrator").warning(
                 "final_report.md generation failed: %s", _rep_exc)
 
+        # incomplete_functions.json（R2 判定源文件不完整的函数，跳过了后续分析）
+        _inc_src = run_dir / "workspace" / "r1-functions" / "incomplete_functions.json"
+        _inc_dst = out_dir / "incomplete_functions.json"
+        if _inc_src.exists():
+            import shutil as _shutil
+            _shutil.copy2(str(_inc_src), str(_inc_dst))
+        else:
+            _inc_dst.write_text("[]", encoding="utf-8")
+
         # flag：成功写 1
         if result.status == TaskStatus.PASSED:
             flag_path.write_text("1", encoding="utf-8")

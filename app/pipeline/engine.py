@@ -209,6 +209,7 @@ def _extract_result(output: str) -> str:
 
 # R2-J 特殊裁定：函数不存在，应从 funcdb 删除
 J_VERDICT_DELETE = "__DELETE__"
+J_VERDICT_SKIP   = "__SKIP__"   # 源文件函数体不完整，永久跳过
 
 
 def _parse_j_result(output: str) -> tuple[bool, str]:
@@ -222,13 +223,21 @@ def _parse_j_result(output: str) -> tuple[bool, str]:
     clean = re.sub(r"<think>.*?</think>", "", output, flags=re.DOTALL).strip()
     text = clean or output
 
-    # 检查 R2-J 特殊裁定：通过: 删除（函数不存在，如宏定义）
+    # R2-J 特殊裁定：通过: 删除（函数不存在，如宏定义）
     if re.search(r"通过[：:]\s*删除|verdict[：:]\s*delete", text, re.IGNORECASE):
         m = re.search(r"反馈[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
         if not m:
             m = re.search(r"feedback[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
         feedback = (m.group(1).strip() if m else text[:500])
         return False, J_VERDICT_DELETE + feedback
+
+    # R2-J 特殊裁定：通过: 跳过（源文件函数体不完整，无法修复）
+    if re.search(r"通过[：:]\s*跳过|verdict[：:]\s*skip", text, re.IGNORECASE):
+        m = re.search(r"反馈[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if not m:
+            m = re.search(r"feedback[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        feedback = (m.group(1).strip() if m else text[:500])
+        return False, J_VERDICT_SKIP + feedback
 
     passed = False
     # BUG-R2C Fix: 支持模型输出的多种变体格式
@@ -675,13 +684,50 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2: J 先行评审 ctags 行号；失败则 W 带 J 反馈修正，再循环评审，直到通过或达到上限。"""
+        """R2: 脚本快速路径先行；不一致则 J 先行评审，失败则 W 带 J 反馈修正，再循环评审直到通过。"""
         fs = state.files[file_hash]
         func_state = fs.functions.get(func_hash)
         if func_state is None:
             return
         if func_state.r2_j_state == NodeState.PASSED:
             return
+        # 已被判定为源文件不完整，不重入循环
+        if func_state.r2_source_incomplete:
+            return
+
+        # ── 脚本快速路径：body 比对 ───────────────────────────────
+        try:
+            from .r2_script import r2_script_validate, R2Verdict
+            from .funcdb import FunctionDB as _FDB2
+            _source_lines = Path(file_path).read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            _rec = _FDB2.open(dirs.r1, file_hash).get_function(func_hash)
+            _stored_body = (_rec.get("body") or "") if _rec else ""
+            _sr = r2_script_validate(
+                start_line   = func_state.start_line,
+                end_line     = func_state.end_line,
+                stored_body  = _stored_body,
+                source_lines = _source_lines,
+            )
+            if _sr.verdict == R2Verdict.PASS:
+                func_state.r2_j_state    = NodeState.PASSED
+                func_state.r2_j_attempts = 1
+                state.save(dirs.state_file)
+                self._emit("r2_script_pass", func_hash=func_hash,
+                           function=func_state.name, detail=_sr.detail)
+                upsert_stage_result_index(
+                    task_id=self.task_id, stage_key="r2_j", role_kind="script",
+                    scope_kind="func", attempt=1,
+                    file_hash=file_hash, func_hash=func_hash,
+                    status="passed", passed=True,
+                    summary=_sr.detail,
+                    result_file_path="", raw_file_path="",
+                )
+                return
+            # MISMATCH → 继续走 agent
+        except Exception as _se:
+            logger.warning("r2_script_validate error %s: %s, falling back to agent",
+                           func_hash, _se)
 
         r2_max = int(getattr(self.cfg, "r2_max_rounds", -1))
 
@@ -971,7 +1017,7 @@ class PipelineEngine:
 
         try:
             acfg = self.cfg.workers.agents[0]
-            await run_r2_w_worker(
+            _tu, source_incomplete = await run_r2_w_worker(
                     file_path=file_path,
                     func_hash=func_hash,
                     func_name=func_state.name,
@@ -989,10 +1035,16 @@ class PipelineEngine:
                     w_attempt=func_state.r2_w_attempts,  # 传入次数，>=2 时用短消息
                     priority=SemPriority.R2_W,
                 )
+            if source_incomplete:
+                func_state.r2_source_incomplete = True
+                state.save(dirs.state_file)
+                self._emit("r2_w_source_incomplete", func_hash=func_hash,
+                           function=func_state.name, file=Path(file_path).name)
             func_state.r2_w_state = NodeState.PASSED
             state.save(dirs.state_file)
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
-                       file=Path(file_path).name, passed=True)
+                       file=Path(file_path).name, passed=True,
+                       source_incomplete=source_incomplete)
         except Exception as exc:
             logger.error("R2-W failed for %s: %s", func_hash, exc)
             func_state.r2_w_state = NodeState.FAILED
@@ -1048,15 +1100,70 @@ class PipelineEngine:
                 real_feedback = feedback[len(J_VERDICT_DELETE):]
                 logger.info("R2-J DELETE verdict for %s (%s): %s",
                             func_state.name, func_hash, real_feedback[:100])
-                # 从 funcdb 删除该函数
                 try:
-                    db_path = dirs.r1_functions_db(file_hash)
                     from .funcdb import FunctionDB
                     FunctionDB.open(dirs.r1, file_hash).delete_function(func_hash)
                 except Exception as del_exc:
                     logger.warning("R2-J DELETE: failed to remove %s from funcdb: %s", func_hash, del_exc)
-                passed = True  # force-pass （不需要 W 修正）
+                passed = True  # force-pass
                 feedback = "[DELETE] " + real_feedback
+
+            # SKIP 裁定：源文件函数体不完整，永久跳过后续阶段
+            skip_verdict = (not delete_verdict) and feedback.startswith(J_VERDICT_SKIP)
+            if skip_verdict:
+                real_feedback = feedback[len(J_VERDICT_SKIP):]
+                logger.info("R2-J SKIP verdict for %s (%s): %s",
+                            func_state.name, func_hash, real_feedback[:100])
+                func_state.r2_source_incomplete = True
+                func_state.r2_j_state    = NodeState.FAILED
+                func_state.r2_j_feedback = "[SKIP] " + real_feedback
+                state.save(dirs.state_file)
+                # 写 incomplete_functions.json（追加）
+                try:
+                    _inc_path = dirs.incomplete_functions_path()
+                    _inc_path.parent.mkdir(parents=True, exist_ok=True)
+                    _existing: list = json.loads(_inc_path.read_text(encoding="utf-8")) \
+                        if _inc_path.exists() else []
+                    # 去重（同一 func_hash 只记一次）
+                    if not any(e.get("func_hash") == func_hash for e in _existing):
+                        _existing.append({
+                            "func_hash":  func_hash,
+                            "name":       func_state.name,
+                            "file_path":  file_path,
+                            "start_line": func_state.start_line,
+                            "end_line":   func_state.end_line,
+                            "reason":     real_feedback[:300],
+                        })
+                        _inc_path.write_text(
+                            json.dumps(_existing, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+                except Exception as _ie:
+                    logger.warning("failed to write incomplete_functions.json: %s", _ie)
+                # 写 result_index
+                result_file = dirs.stage_result_file("r2_j", "judge", func_hash, attempt)
+                raw_file    = dirs.stage_raw_file("r2_j", "judge", func_hash, attempt)
+                _skip_payload = {
+                    "stage": "r2_j", "attempt": attempt, "scope": "func",
+                    "func_hash": func_hash, "file_hash": file_hash,
+                    "passed": False, "skip_verdict": True,
+                    "summary": ("[SKIP] " + real_feedback)[:200],
+                    "feedback": "[SKIP] " + real_feedback,
+                }
+                write_stage_result_files(result_file=result_file, raw_file=raw_file,
+                                         payload=_skip_payload, raw_text=ar.output or "")
+                upsert_stage_result_index(
+                    task_id=self.task_id, stage_key="r2_j", role_kind="judge",
+                    scope_kind="func", attempt=attempt,
+                    file_hash=file_hash, func_hash=func_hash,
+                    status="incomplete", passed=False,
+                    summary=("[SKIP] " + real_feedback)[:200],
+                    result_file_path=str(result_file), raw_file_path=str(raw_file),
+                )
+                self._emit("r2_source_incomplete",
+                           func_hash=func_hash, function=func_state.name,
+                           file=Path(file_path).name,
+                           feedback=real_feedback[:200], attempt=attempt)
+                return True  # 让外层 while 循环 break，不再重试
             result_payload = {
                 "stage": "r2_j",
                 "attempt": attempt,
@@ -1065,6 +1172,7 @@ class PipelineEngine:
                 "file_hash": file_hash,
                 "passed": passed,
                 "delete_verdict": delete_verdict,
+                "skip_verdict": False,
                 "summary": feedback[:200],
                 "feedback": feedback,
             }

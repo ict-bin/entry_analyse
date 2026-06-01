@@ -103,6 +103,10 @@ class PipelineDirs:
         """v4旧名（R1a → R1），新代码使用 r1_gaps_file"""
         return self.r1_gaps_file(file_hash)
 
+    def incomplete_functions_path(self) -> Path:
+        """R2 判定源文件不完整的函数列表（workspace 内，任务级）"""
+        return self.r1 / "incomplete_functions.json"
+
     def r3_file_path(self, file_hash: str) -> Path:
         return self.r3 / f"{file_hash}.json"
 
