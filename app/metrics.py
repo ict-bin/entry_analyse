@@ -93,6 +93,17 @@ def render_metrics() -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_summary_metrics() -> str:
+    lines = ["# HELP secflow_ea_up Service metrics scrape succeeded.", "# TYPE secflow_ea_up gauge"]
+    try:
+        lines.append("secflow_ea_up 1")
+        lines.extend(_render_request_metrics())
+        lines.extend(_render_agent_observability_metrics())
+    except Exception:
+        lines.append("secflow_ea_up 0")
+    return "\n".join(lines) + "\n"
+
+
 def _render_request_metrics() -> list[str]:
     lines = [
         "# HELP secflow_entry_analyse_http_requests_total Total normalized HTTP requests observed by this process.",
