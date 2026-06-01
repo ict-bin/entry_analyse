@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -35,7 +36,7 @@ WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS = max(1, int(os.environ.get("EA_WORKER_HEART
 WORKER_MAINTENANCE_TIMEOUT_SECONDS = max(5, int(os.environ.get("EA_WORKER_MAINTENANCE_TIMEOUT_SECONDS", "20")))
 WORKER_MAINTENANCE_MAX_STALE_TASKS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_STALE_TASKS", "50")))
 WORKER_MAINTENANCE_MAX_KILLS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_KILLS", "100")))
-WORKER_HTTP_PORT = max(1, int(os.environ.get("PORT", "3000")))
+WORKER_HTTP_PORT = max(1, int(os.environ.get("PORT", "8080")))
 
 
 @dataclass
@@ -116,6 +117,8 @@ class WorkerService:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_stop = threading.Event()
         self._maintenance_task: Optional[asyncio.Task] = None
         self._runtime_config_task: Optional[asyncio.Task] = None
         self._runtime_config = WorkerRuntimeConfigSnapshot()
@@ -344,50 +347,48 @@ class WorkerService:
                 logger.warning("worker runtime config refresh failed: %s", exc)
             await asyncio.sleep(RUNTIME_CONFIG_REFRESH_SECONDS)
 
-    async def _heartbeat_loop(self) -> None:
+    def _heartbeat_once(self) -> None:
         from app.service import task_service as task_mod
 
-        while self._running:
-            started = time.perf_counter()
+        started = time.perf_counter()
+        snapshot = self._runtime_config_snapshot()
+        agent_snapshot = get_agent_process_slot_manager().snapshot()
+        self._write_worker_heartbeat(
+            worker_id=task_mod.POD_NAME,
+            pod_name=task_mod.POD_NAME,
+            pod_ip=task_mod.POD_IP or None,
+            http_port=WORKER_HTTP_PORT,
+            max_concurrent_tasks=snapshot.max_concurrent_tasks,
+            agent_snapshot=agent_snapshot,
+            heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
+            heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
+        )
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        self._record_loop_success(self._heartbeat_health, phase="heartbeat_write", duration_ms=duration_ms)
+        logger.info(
+            "worker heartbeat ok worker_id=%s duration_ms=%.1f running_tasks=%s agent_in_use=%s agent_waiting_requests=%s max_concurrent_tasks=%s agent_process_limit=%s",
+            task_mod.POD_NAME,
+            duration_ms,
+            self.local_running_count(),
+            int(agent_snapshot.get("in_use") or 0),
+            int(agent_snapshot.get("waiting_requests") or 0),
+            snapshot.max_concurrent_tasks,
+            snapshot.agent_process_limit,
+        )
+
+    def _heartbeat_thread_main(self) -> None:
+        while self._running and not self._heartbeat_stop.is_set():
             try:
-                snapshot = self._runtime_config_snapshot()
-                agent_snapshot = get_agent_process_slot_manager().snapshot()
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._write_worker_heartbeat,
-                        worker_id=task_mod.POD_NAME,
-                        pod_name=task_mod.POD_NAME,
-                        pod_ip=task_mod.POD_IP or None,
-                        http_port=WORKER_HTTP_PORT,
-                        max_concurrent_tasks=snapshot.max_concurrent_tasks,
-                        agent_snapshot=agent_snapshot,
-                        heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
-                        heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
-                    ),
-                    timeout=WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS,
-                )
-                duration_ms = (time.perf_counter() - started) * 1000.0
-                self._record_loop_success(self._heartbeat_health, phase="heartbeat_write", duration_ms=duration_ms)
-                logger.info(
-                    "worker heartbeat ok worker_id=%s duration_ms=%.1f running_tasks=%s agent_in_use=%s agent_waiting_requests=%s max_concurrent_tasks=%s agent_process_limit=%s",
-                    task_mod.POD_NAME,
-                    duration_ms,
-                    self.local_running_count(),
-                    int(agent_snapshot.get("in_use") or 0),
-                    int(agent_snapshot.get("waiting_requests") or 0),
-                    snapshot.max_concurrent_tasks,
-                    snapshot.agent_process_limit,
-                )
+                self._heartbeat_once()
             except Exception as exc:
                 self._record_loop_failure(self._heartbeat_health, phase="heartbeat_write", exc=exc)
                 logger.warning(
-                    "worker slot heartbeat failed worker_id=%s phase=%s consecutive_failures=%s error=%s",
-                    task_mod.POD_NAME,
+                    "worker slot heartbeat failed phase=%s consecutive_failures=%s error=%s",
                     self._heartbeat_health.last_phase or "heartbeat_write",
                     self._heartbeat_health.consecutive_failures,
                     exc,
                 )
-            await asyncio.sleep(WORKER_SLOT_HEARTBEAT_SECONDS)
+            self._heartbeat_stop.wait(WORKER_SLOT_HEARTBEAT_SECONDS)
 
     async def _maintenance_loop(self) -> None:
         from app.service import task_service as task_mod
@@ -467,17 +468,27 @@ class WorkerService:
         if self._running:
             return
         self._running = True
+        self._heartbeat_stop.clear()
         self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
         self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ea_worker_slot_heartbeat")
         self._maintenance_task = asyncio.create_task(self._maintenance_loop(), name="ea_worker_maintenance")
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_thread_main,
+            name="ea_worker_slot_heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
         logger.info("Entry-analysis worker started (poll=%ss)", WORKER_POLL_SECONDS)
 
     def stop(self) -> None:
         self._running = False
-        for bg_task in (self._task, self._runtime_config_task, self._heartbeat_task, self._maintenance_task):
+        self._heartbeat_stop.set()
+        for bg_task in (self._task, self._runtime_config_task, self._maintenance_task):
             if bg_task and not bg_task.done():
                 bg_task.cancel()
+        heartbeat_thread = self._heartbeat_thread
+        if heartbeat_thread and heartbeat_thread.is_alive():
+            heartbeat_thread.join(timeout=1.0)
 
     def is_running(self) -> bool:
         return self._running

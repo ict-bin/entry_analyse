@@ -20,7 +20,7 @@ from app.service.task_service import _load_svc_config_from_db, _project_dispatch
 HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 STALE_AFTER_SECONDS = max(
     HEARTBEAT_INTERVAL_SECONDS,
-    int(os.environ.get("EA_WORKER_SLOT_STALE_AFTER_SECONDS", str(HEARTBEAT_INTERVAL_SECONDS * 3))),
+    int(os.environ.get("EA_WORKER_SLOT_STALE_AFTER_SECONDS", "180")),
 )
 RETENTION_SECONDS = max(
     STALE_AFTER_SECONDS,
@@ -157,7 +157,7 @@ class WorkerSlotService:
                 worker_id=worker_id,
                 pod_name=pod_name,
                 pod_ip=pod_ip,
-                http_port=max(1, int(http_port or 3000)),
+                http_port=max(1, int(http_port or 8080)),
                 max_concurrent_tasks=normalized_capacity,
                 agent_process_limit=max(0, int(agent_process_limit or 0)),
                 agent_process_in_use=max(0, int(agent_process_in_use or 0)),
@@ -178,7 +178,7 @@ class WorkerSlotService:
         else:
             row.pod_name = pod_name
             row.pod_ip = pod_ip
-            row.http_port = max(1, int(http_port or 3000))
+            row.http_port = max(1, int(http_port or 8080))
             row.max_concurrent_tasks = normalized_capacity
             row.agent_process_limit = max(0, int(agent_process_limit or 0))
             row.agent_process_in_use = max(0, int(agent_process_in_use or 0))
@@ -285,7 +285,7 @@ class WorkerSlotService:
                 worker_id=row.worker_id,
                 pod_name=row.pod_name,
                 pod_ip=row.pod_ip,
-                http_port=int(getattr(row, "http_port", 3000) or 3000),
+                http_port=int(getattr(row, "http_port", 8080) or 8080),
                 healthy=healthy,
                 max_concurrent_tasks=int(row.max_concurrent_tasks),
                 running_tasks=running_tasks,
@@ -318,7 +318,7 @@ class WorkerSlotService:
                 worker_id=f"stale-owner::{owner_pod}",
                 pod_name=owner_pod,
                 pod_ip=None,
-                http_port=3000,
+                http_port=8080,
                 healthy=False,
                 max_concurrent_tasks=len(active_tasks),
                 running_tasks=len(active_tasks),
