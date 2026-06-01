@@ -65,6 +65,9 @@ _MIGRATIONS = [
         agent_rss_max_bytes BIGINT NOT NULL DEFAULT 0,
         agent_snapshot_at DATETIME NULL,
         last_seen_status VARCHAR(32) NOT NULL DEFAULT 'running',
+        heartbeat_error TEXT NULL,
+        heartbeat_duration_ms DOUBLE NULL,
+        heartbeat_failure_count INTEGER NOT NULL DEFAULT 0,
         last_heartbeat_at DATETIME NOT NULL,
         created_at DATETIME NOT NULL,
         updated_at DATETIME NOT NULL
@@ -81,6 +84,9 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN agent_rss_total_bytes BIGINT NOT NULL DEFAULT 0",
     "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN agent_rss_max_bytes BIGINT NOT NULL DEFAULT 0",
     "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN agent_snapshot_at DATETIME NULL",
+    "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN heartbeat_error TEXT NULL",
+    "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN heartbeat_duration_ms DOUBLE NULL",
+    "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN heartbeat_failure_count INTEGER NOT NULL DEFAULT 0",
     """
     CREATE TABLE secflow_app_ea_dispatch_leases (
         id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,

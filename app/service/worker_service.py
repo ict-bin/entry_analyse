@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -27,6 +29,38 @@ _cancel_wake: dict[str, asyncio.Event] = {}
 WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
 WORKER_SLOT_HEARTBEAT_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 ORPHAN_PI_SWEEP_SECONDS = max(10, int(os.environ.get("EA_ORPHAN_PI_SWEEP_SECONDS", "30")))
+RUNTIME_CONFIG_REFRESH_SECONDS = max(5, int(os.environ.get("EA_WORKER_RUNTIME_CONFIG_REFRESH_SECONDS", "15")))
+WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS = max(1, int(os.environ.get("EA_WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS", "10")))
+WORKER_MAINTENANCE_TIMEOUT_SECONDS = max(5, int(os.environ.get("EA_WORKER_MAINTENANCE_TIMEOUT_SECONDS", "20")))
+WORKER_MAINTENANCE_MAX_STALE_TASKS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_STALE_TASKS", "50")))
+WORKER_MAINTENANCE_MAX_KILLS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_KILLS", "100")))
+
+
+@dataclass
+class WorkerRuntimeConfigSnapshot:
+    max_concurrent_tasks: int = 1
+    agent_process_limit: int = 8
+    active_projects: list[str] = field(default_factory=list)
+    refreshed_at: float = 0.0
+    refresh_duration_ms: float = 0.0
+    consecutive_failures: int = 0
+    last_error: str | None = None
+
+
+@dataclass
+class WorkerLoopHealthSnapshot:
+    last_success_at: float = 0.0
+    last_duration_ms: float = 0.0
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    last_phase: str | None = None
+    success_total: int = 0
+    failure_total: int = 0
+
+    def age_seconds(self) -> float | None:
+        if self.last_success_at <= 0:
+            return None
+        return max(0.0, time.time() - self.last_success_at)
 
 
 def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
@@ -62,6 +96,12 @@ class WorkerService:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self._runtime_config_task: Optional[asyncio.Task] = None
+        self._runtime_config = WorkerRuntimeConfigSnapshot()
+        self._heartbeat_health = WorkerLoopHealthSnapshot()
+        self._maintenance_health = WorkerLoopHealthSnapshot()
+        self._runtime_config_health = WorkerLoopHealthSnapshot()
 
     def has_local_task(self, task_id: str) -> bool:
         task = _running_tasks.get(task_id)
@@ -112,6 +152,114 @@ class WorkerService:
             except StopIteration:
                 pass
 
+    def _runtime_config_snapshot(self) -> WorkerRuntimeConfigSnapshot:
+        return WorkerRuntimeConfigSnapshot(
+            max_concurrent_tasks=max(1, int(self._runtime_config.max_concurrent_tasks or 1)),
+            agent_process_limit=max(1, int(self._runtime_config.agent_process_limit or 1)),
+            active_projects=list(self._runtime_config.active_projects),
+            refreshed_at=float(self._runtime_config.refreshed_at or 0.0),
+            refresh_duration_ms=float(self._runtime_config.refresh_duration_ms or 0.0),
+            consecutive_failures=int(self._runtime_config.consecutive_failures or 0),
+            last_error=self._runtime_config.last_error,
+        )
+
+    def runtime_health_snapshot(self) -> dict[str, Any]:
+        return {
+            "heartbeat": {
+                "last_success_at": self._heartbeat_health.last_success_at,
+                "last_duration_ms": self._heartbeat_health.last_duration_ms,
+                "consecutive_failures": self._heartbeat_health.consecutive_failures,
+                "last_error": self._heartbeat_health.last_error,
+                "last_phase": self._heartbeat_health.last_phase,
+                "success_total": self._heartbeat_health.success_total,
+                "failure_total": self._heartbeat_health.failure_total,
+                "age_seconds": self._heartbeat_health.age_seconds(),
+            },
+            "maintenance": {
+                "last_success_at": self._maintenance_health.last_success_at,
+                "last_duration_ms": self._maintenance_health.last_duration_ms,
+                "consecutive_failures": self._maintenance_health.consecutive_failures,
+                "last_error": self._maintenance_health.last_error,
+                "last_phase": self._maintenance_health.last_phase,
+                "success_total": self._maintenance_health.success_total,
+                "failure_total": self._maintenance_health.failure_total,
+                "age_seconds": self._maintenance_health.age_seconds(),
+            },
+            "runtime_config": {
+                "last_success_at": self._runtime_config_health.last_success_at,
+                "last_duration_ms": self._runtime_config_health.last_duration_ms,
+                "consecutive_failures": self._runtime_config_health.consecutive_failures,
+                "last_error": self._runtime_config_health.last_error,
+                "last_phase": self._runtime_config_health.last_phase,
+                "success_total": self._runtime_config_health.success_total,
+                "failure_total": self._runtime_config_health.failure_total,
+                "age_seconds": self._runtime_config_health.age_seconds(),
+            },
+            "effective_config": {
+                "max_concurrent_tasks": self._runtime_config.max_concurrent_tasks,
+                "agent_process_limit": self._runtime_config.agent_process_limit,
+                "active_projects": list(self._runtime_config.active_projects),
+                "refreshed_at": self._runtime_config.refreshed_at,
+                "refresh_duration_ms": self._runtime_config.refresh_duration_ms,
+            },
+        }
+
+    def _record_loop_success(self, health: WorkerLoopHealthSnapshot, *, phase: str, duration_ms: float) -> None:
+        health.last_success_at = time.time()
+        health.last_duration_ms = max(0.0, float(duration_ms))
+        health.last_phase = phase
+        health.last_error = None
+        health.consecutive_failures = 0
+        health.success_total += 1
+
+    def _record_loop_failure(self, health: WorkerLoopHealthSnapshot, *, phase: str, exc: Exception) -> None:
+        health.last_phase = phase
+        health.last_error = str(exc)
+        health.consecutive_failures += 1
+        health.failure_total += 1
+
+    def _write_worker_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        pod_name: str,
+        pod_ip: str | None,
+        max_concurrent_tasks: int,
+        agent_snapshot: dict[str, Any],
+        heartbeat_duration_ms: float,
+        heartbeat_failure_count: int,
+    ) -> None:
+        from app.service.worker_slot_service import get_worker_slot_service
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            get_worker_slot_service().upsert_heartbeat(
+                db,
+                worker_id=worker_id,
+                pod_name=pod_name,
+                pod_ip=pod_ip,
+                max_concurrent_tasks=max_concurrent_tasks,
+                agent_process_limit=int(agent_snapshot.get("capacity") or 0),
+                agent_process_in_use=int(agent_snapshot.get("in_use") or 0),
+                agent_process_available=int(agent_snapshot.get("available") or 0),
+                agent_waiting_requests=int(agent_snapshot.get("waiting_requests") or 0),
+                agent_waiting_tasks=int(agent_snapshot.get("waiting_tasks") or 0),
+                agent_queue_oldest_wait_seconds=float(agent_snapshot.get("oldest_wait_seconds") or 0.0),
+                agent_rss_total_bytes=int(agent_snapshot.get("rss_total_bytes") or 0),
+                agent_rss_max_bytes=int(agent_snapshot.get("rss_max_bytes") or 0),
+                agent_snapshot_at=str(agent_snapshot.get("snapshot_at") or ""),
+                status="running",
+                heartbeat_error=None,
+                heartbeat_duration_ms=heartbeat_duration_ms,
+                heartbeat_failure_count=heartbeat_failure_count,
+            )
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
     async def _loop(self) -> None:
         from app.service import task_service as task_mod
 
@@ -124,44 +272,15 @@ class WorkerService:
                 logger.warning("worker poll failed: %s", exc)
             await asyncio.sleep(WORKER_POLL_SECONDS)
 
-    async def _heartbeat_loop(self) -> None:
+    async def _runtime_config_loop(self) -> None:
         from app.service import task_service as task_mod
-        from app.service.worker_slot_service import get_worker_slot_service
-        last_orphan_sweep = 0.0
-
         while self._running:
+            started = time.perf_counter()
             try:
+                project_ids = await self._discover_active_projects()
                 db_gen = get_db()
                 db: Session = next(db_gen)
                 try:
-                    now_ts = now_local().timestamp()
-                    if now_ts - last_orphan_sweep >= ORPHAN_PI_SWEEP_SECONDS:
-                        stale_local_rows = (
-                            db.query(AppEaTask)
-                            .filter(
-                                AppEaTask.is_deleted.is_(False),
-                                AppEaTask.owner_pod == task_mod.POD_NAME,
-                                AppEaTask.status.in_(["failed", "error", "cancelled"]),
-                            )
-                            .all()
-                        )
-                        for stale_row in stale_local_rows:
-                            try:
-                                cleanup_task_pi_processes(
-                                    logger.warning,
-                                    label="ea_worker_heartbeat_task_scoped",
-                                    task_id=stale_row.task_id,
-                                    task_roots=_task_runtime_roots_from_row(stale_row),
-                                )
-                            except Exception as scoped_exc:
-                                logger.warning(
-                                    "task-scoped heartbeat cleanup failed for %s: %s",
-                                    stale_row.task_id,
-                                    scoped_exc,
-                                )
-                        cleanup_orphan_pi_processes(logger.warning, label="ea_worker_heartbeat")
-                        last_orphan_sweep = now_ts
-                    project_ids = await self._discover_active_projects()
                     max_concurrent_tasks_values: list[int] = []
                     agent_process_limit_values: list[int] = []
                     if project_ids:
@@ -173,51 +292,169 @@ class WorkerService:
                         svc = task_mod._load_svc_config()
                         max_concurrent_tasks_values.append(int(getattr(svc, "max_concurrent_tasks", 1) or 1))
                         agent_process_limit_values.append(int(getattr(svc, "agent_process_limit", 8) or 8))
-                    max_concurrent_tasks = max(1, min(max_concurrent_tasks_values))
-                    agent_process_limit = max(1, min(agent_process_limit_values))
-                    agent_manager = get_agent_process_slot_manager()
-                    await agent_manager.set_capacity(agent_process_limit)
-                    agent_snapshot = agent_manager.snapshot()
-                    get_worker_slot_service().upsert_heartbeat(
-                        db,
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
+                max_concurrent_tasks = max(1, min(max_concurrent_tasks_values))
+                agent_process_limit = max(1, min(agent_process_limit_values))
+                agent_manager = get_agent_process_slot_manager()
+                await agent_manager.set_capacity(agent_process_limit)
+                self._runtime_config = WorkerRuntimeConfigSnapshot(
+                    max_concurrent_tasks=max_concurrent_tasks,
+                    agent_process_limit=agent_process_limit,
+                    active_projects=project_ids,
+                    refreshed_at=time.time(),
+                    refresh_duration_ms=(time.perf_counter() - started) * 1000.0,
+                    consecutive_failures=0,
+                    last_error=None,
+                )
+                self._record_loop_success(
+                    self._runtime_config_health,
+                    phase="runtime_config_refresh",
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                )
+            except Exception as exc:
+                self._runtime_config.consecutive_failures += 1
+                self._runtime_config.last_error = str(exc)
+                self._record_loop_failure(self._runtime_config_health, phase="runtime_config_refresh", exc=exc)
+                logger.warning("worker runtime config refresh failed: %s", exc)
+            await asyncio.sleep(RUNTIME_CONFIG_REFRESH_SECONDS)
+
+    async def _heartbeat_loop(self) -> None:
+        from app.service import task_service as task_mod
+
+        while self._running:
+            started = time.perf_counter()
+            try:
+                snapshot = self._runtime_config_snapshot()
+                agent_snapshot = get_agent_process_slot_manager().snapshot()
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._write_worker_heartbeat,
                         worker_id=task_mod.POD_NAME,
                         pod_name=task_mod.POD_NAME,
                         pod_ip=task_mod.POD_IP or None,
-                        max_concurrent_tasks=max_concurrent_tasks,
-                        agent_process_limit=int(agent_snapshot.get("capacity") or 0),
-                        agent_process_in_use=int(agent_snapshot.get("in_use") or 0),
-                        agent_process_available=int(agent_snapshot.get("available") or 0),
-                        agent_waiting_requests=int(agent_snapshot.get("waiting_requests") or 0),
-                        agent_waiting_tasks=int(agent_snapshot.get("waiting_tasks") or 0),
-                        agent_queue_oldest_wait_seconds=float(agent_snapshot.get("oldest_wait_seconds") or 0.0),
-                        agent_rss_total_bytes=int(agent_snapshot.get("rss_total_bytes") or 0),
-                        agent_rss_max_bytes=int(agent_snapshot.get("rss_max_bytes") or 0),
-                        agent_snapshot_at=str(agent_snapshot.get("snapshot_at") or ""),
-                        status="running",
+                        max_concurrent_tasks=snapshot.max_concurrent_tasks,
+                        agent_snapshot=agent_snapshot,
+                        heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
+                        heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
+                    ),
+                    timeout=WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS,
+                )
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self._record_loop_success(self._heartbeat_health, phase="heartbeat_write", duration_ms=duration_ms)
+                logger.info(
+                    "worker heartbeat ok worker_id=%s duration_ms=%.1f running_tasks=%s agent_in_use=%s agent_waiting_requests=%s max_concurrent_tasks=%s agent_process_limit=%s",
+                    task_mod.POD_NAME,
+                    duration_ms,
+                    self.local_running_count(),
+                    int(agent_snapshot.get("in_use") or 0),
+                    int(agent_snapshot.get("waiting_requests") or 0),
+                    snapshot.max_concurrent_tasks,
+                    snapshot.agent_process_limit,
+                )
+            except Exception as exc:
+                self._record_loop_failure(self._heartbeat_health, phase="heartbeat_write", exc=exc)
+                logger.warning(
+                    "worker slot heartbeat failed worker_id=%s phase=%s consecutive_failures=%s error=%s",
+                    task_mod.POD_NAME,
+                    self._heartbeat_health.last_phase or "heartbeat_write",
+                    self._heartbeat_health.consecutive_failures,
+                    exc,
+                )
+            await asyncio.sleep(WORKER_SLOT_HEARTBEAT_SECONDS)
+
+    async def _maintenance_loop(self) -> None:
+        from app.service import task_service as task_mod
+
+        while self._running:
+            started = time.perf_counter()
+            candidate_task_count = 0
+            killed_processes = 0
+            maintenance_truncated = False
+            try:
+                db_gen = get_db()
+                db: Session = next(db_gen)
+                try:
+                    stale_local_rows = (
+                        db.query(AppEaTask)
+                        .filter(
+                            AppEaTask.is_deleted.is_(False),
+                            AppEaTask.owner_pod == task_mod.POD_NAME,
+                            AppEaTask.status.in_(["failed", "error", "cancelled"]),
+                        )
+                        .limit(WORKER_MAINTENANCE_MAX_STALE_TASKS + 1)
+                        .all()
                     )
                 finally:
                     try:
                         next(db_gen)
                     except StopIteration:
                         pass
+                candidate_task_count = len(stale_local_rows)
+                if candidate_task_count > WORKER_MAINTENANCE_MAX_STALE_TASKS:
+                    maintenance_truncated = True
+                    stale_local_rows = stale_local_rows[:WORKER_MAINTENANCE_MAX_STALE_TASKS]
+                for stale_row in stale_local_rows:
+                    if killed_processes >= WORKER_MAINTENANCE_MAX_KILLS:
+                        maintenance_truncated = True
+                        break
+                    try:
+                        killed_processes += cleanup_task_pi_processes(
+                            logger.warning,
+                            label="ea_worker_maintenance_task_scoped",
+                            task_id=stale_row.task_id,
+                            task_roots=_task_runtime_roots_from_row(stale_row),
+                        )
+                    except Exception as scoped_exc:
+                        logger.warning("task-scoped maintenance cleanup failed for %s: %s", stale_row.task_id, scoped_exc)
+                if killed_processes < WORKER_MAINTENANCE_MAX_KILLS:
+                    remaining_budget = WORKER_MAINTENANCE_MAX_KILLS - killed_processes
+                    orphan_killed = await asyncio.wait_for(
+                        asyncio.to_thread(cleanup_orphan_pi_processes, logger.warning, label="ea_worker_maintenance"),
+                        timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS,
+                    )
+                    killed_processes += min(orphan_killed, remaining_budget)
+                    maintenance_truncated = maintenance_truncated or orphan_killed > remaining_budget
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self._record_loop_success(self._maintenance_health, phase="maintenance", duration_ms=duration_ms)
+                if duration_ms > 3000 or maintenance_truncated:
+                    logger.warning(
+                        "worker maintenance slow phase=maintenance duration_ms=%.1f candidate_task_count=%s killed_processes=%s maintenance_truncated=%s",
+                        duration_ms,
+                        candidate_task_count,
+                        killed_processes,
+                        maintenance_truncated,
+                    )
             except Exception as exc:
-                logger.warning("worker slot heartbeat failed: %s", exc)
-            await asyncio.sleep(WORKER_SLOT_HEARTBEAT_SECONDS)
+                self._record_loop_failure(self._maintenance_health, phase="maintenance", exc=exc)
+                logger.warning(
+                    "worker maintenance failed phase=%s consecutive_failures=%s candidate_task_count=%s killed_processes=%s error=%s",
+                    self._maintenance_health.last_phase or "maintenance",
+                    self._maintenance_health.consecutive_failures,
+                    candidate_task_count,
+                    killed_processes,
+                    exc,
+                )
+            await asyncio.sleep(ORPHAN_PI_SWEEP_SECONDS)
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
+        self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ea_worker_slot_heartbeat")
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop(), name="ea_worker_maintenance")
         logger.info("Entry-analysis worker started (poll=%ss)", WORKER_POLL_SECONDS)
 
     def stop(self) -> None:
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
+        for bg_task in (self._task, self._runtime_config_task, self._heartbeat_task, self._maintenance_task):
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
 
     def is_running(self) -> bool:
         return self._running

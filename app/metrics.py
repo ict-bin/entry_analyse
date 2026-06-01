@@ -268,7 +268,13 @@ def _render_task_metrics() -> list[str]:
             failure_category_counts[classification] += 1
 
     scheduler_running = 1 if _safe_running(get_scheduler_service) else 0
-    worker_running = 1 if _safe_running(get_worker_service) else 0
+    worker_service = None
+    try:
+        worker_service = get_worker_service()
+    except Exception:
+        worker_service = None
+    worker_running = 1 if worker_service and worker_service.is_running() else 0
+    worker_runtime_health = worker_service.runtime_health_snapshot() if worker_service is not None else {}
     slot_total_capacity = 0
     slot_busy = 0
     slot_available = 0
@@ -346,6 +352,36 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_worker_service_running Worker service running flag.",
         "# TYPE secflow_ea_worker_service_running gauge",
         f"secflow_ea_worker_service_running {worker_running}",
+        "# HELP secflow_ea_worker_heartbeat_success_total Worker heartbeat successes observed by this process.",
+        "# TYPE secflow_ea_worker_heartbeat_success_total counter",
+        f"secflow_ea_worker_heartbeat_success_total {int((worker_runtime_health.get('heartbeat') or {}).get('success_total') or 0)}",
+        "# HELP secflow_ea_worker_heartbeat_failure_total Worker heartbeat failures observed by this process.",
+        "# TYPE secflow_ea_worker_heartbeat_failure_total counter",
+        f"secflow_ea_worker_heartbeat_failure_total {int((worker_runtime_health.get('heartbeat') or {}).get('failure_total') or 0)}",
+        "# HELP secflow_ea_worker_heartbeat_duration_seconds Last successful worker heartbeat duration.",
+        "# TYPE secflow_ea_worker_heartbeat_duration_seconds gauge",
+        f"secflow_ea_worker_heartbeat_duration_seconds {_fmt(float(((worker_runtime_health.get('heartbeat') or {}).get('last_duration_ms') or 0.0) / 1000.0))}",
+        "# HELP secflow_ea_worker_heartbeat_age_seconds Seconds since the last successful worker heartbeat.",
+        "# TYPE secflow_ea_worker_heartbeat_age_seconds gauge",
+        f"secflow_ea_worker_heartbeat_age_seconds {_fmt(float((worker_runtime_health.get('heartbeat') or {}).get('age_seconds') or 0.0))}",
+        "# HELP secflow_ea_worker_heartbeat_consecutive_failures Consecutive heartbeat failures for this worker process.",
+        "# TYPE secflow_ea_worker_heartbeat_consecutive_failures gauge",
+        f"secflow_ea_worker_heartbeat_consecutive_failures {int((worker_runtime_health.get('heartbeat') or {}).get('consecutive_failures') or 0)}",
+        "# HELP secflow_ea_worker_registry_last_success_timestamp Unix timestamp of last successful worker heartbeat.",
+        "# TYPE secflow_ea_worker_registry_last_success_timestamp gauge",
+        f"secflow_ea_worker_registry_last_success_timestamp {_fmt(float((worker_runtime_health.get('heartbeat') or {}).get('last_success_at') or 0.0))}",
+        "# HELP secflow_ea_worker_maintenance_duration_seconds Last successful worker maintenance duration.",
+        "# TYPE secflow_ea_worker_maintenance_duration_seconds gauge",
+        f"secflow_ea_worker_maintenance_duration_seconds {_fmt(float(((worker_runtime_health.get('maintenance') or {}).get('last_duration_ms') or 0.0) / 1000.0))}",
+        "# HELP secflow_ea_worker_maintenance_failure_total Worker maintenance failures observed by this process.",
+        "# TYPE secflow_ea_worker_maintenance_failure_total counter",
+        f"secflow_ea_worker_maintenance_failure_total {int((worker_runtime_health.get('maintenance') or {}).get('failure_total') or 0)}",
+        "# HELP secflow_ea_worker_runtime_config_refresh_duration_seconds Last successful runtime config refresh duration.",
+        "# TYPE secflow_ea_worker_runtime_config_refresh_duration_seconds gauge",
+        f"secflow_ea_worker_runtime_config_refresh_duration_seconds {_fmt(float(((worker_runtime_health.get('runtime_config') or {}).get('last_duration_ms') or 0.0) / 1000.0))}",
+        "# HELP secflow_ea_worker_runtime_config_refresh_failures_total Runtime config refresh failures observed by this process.",
+        "# TYPE secflow_ea_worker_runtime_config_refresh_failures_total counter",
+        f"secflow_ea_worker_runtime_config_refresh_failures_total {int((worker_runtime_health.get('runtime_config') or {}).get('failure_total') or 0)}",
         "# HELP secflow_ea_worker_slot_capacity Worker slot capacity summary.",
         "# TYPE secflow_ea_worker_slot_capacity gauge",
         f'{ "secflow_ea_worker_slot_capacity" }{{kind="total"}} {slot_total_capacity}',
@@ -802,6 +838,9 @@ def _render_agent_observability_metrics() -> list[str]:
         lines.append(
             f"secflow_ea_agent_slot_wait_seconds_sum{_labels(pod=pod_name)} {_fmt(float(wait_summary.get('total_seconds') or 0.0))}"
         )
+        lines.append(f"secflow_ea_worker_heartbeat_age_seconds{_labels(pod=pod_name)} {_fmt(float(pod.get('heartbeat_age_seconds') or 0.0))}")
+        lines.append(f"secflow_ea_worker_heartbeat_consecutive_failures{_labels(pod=pod_name)} {int(pod.get('consecutive_heartbeat_failures') or 0)}")
+        lines.append(f"secflow_ea_worker_heartbeat_duration_seconds{_labels(pod=pod_name)} {_fmt(float((pod.get('last_heartbeat_duration_ms') or 0.0) / 1000.0))}")
     return lines
 
 

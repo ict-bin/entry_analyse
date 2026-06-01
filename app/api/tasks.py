@@ -334,6 +334,11 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
     agent_rss_max_bytes: int = 0
     agent_snapshot_at: Optional[str] = None
     last_heartbeat_at: Optional[str] = None
+    heartbeat_age_seconds: Optional[float] = None
+    consecutive_heartbeat_failures: int = 0
+    last_heartbeat_error: Optional[str] = None
+    last_heartbeat_duration_ms: Optional[float] = None
+    worker_role_state: str = "healthy"
     source: str = "worker_registry"
     error: Optional[str] = None
     active_tasks: list[EntryAnalyseActiveTaskRefResponse] = Field(default_factory=list)
@@ -344,6 +349,9 @@ class EntryAnalyseSlotClusterResponse(BaseModel):
     worker_count: int = 0
     healthy_workers: int = 0
     stale_workers: int = 0
+    live_stale_workers: int = 0
+    retired_workers: int = 0
+    stale_owner_workers: int = 0
     total_capacity: int = 0
     busy_slots: int = 0
     running_jobs: int = 0
@@ -361,6 +369,8 @@ class EntryAnalyseSlotClusterResponse(BaseModel):
     agent_rss_max_bytes: int = 0
     queued_tasks: int = 0
     queued_jobs: int = 0
+    registry_cleanup_at: Optional[str] = None
+    registry_cleanup_deleted_rows: int = 0
     updated_at: Optional[str] = None
     workers: list[EntryAnalyseWorkerSlotResponse] = Field(default_factory=list)
 
