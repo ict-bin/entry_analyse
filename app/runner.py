@@ -120,6 +120,21 @@ def _bwrap_wrap_args(bwrap: str, cwd: str) -> list[str]:
     return wa
 
 
+async def _sleep_cancel_first(delay: float, cancel_event: asyncio.Event | None) -> bool:
+    if delay <= 0:
+        return bool(cancel_event and cancel_event.is_set())
+    if cancel_event is None:
+        await asyncio.sleep(delay)
+        return False
+    if cancel_event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+        return True
+    except asyncio.TimeoutError:
+        return cancel_event.is_set()
+
+
 # ─── 结果类 ───────────────────────────────────────────────────────────────────
 
 class AgentResult:
@@ -722,7 +737,8 @@ async def run_agent(
                         f"\n⏱️ 智能体执行超时，{delay:.0f}s 后重试 "
                         f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
                     )
-                await asyncio.sleep(delay)
+                if await _sleep_cancel_first(delay, cancel_event):
+                    return result
     finally:
         if tmp_file and os.path.exists(tmp_file):
             try:
@@ -820,7 +836,10 @@ async def _run_with_pi_retry(
                     on_stream(
                         f"\n❌ pi 进程失败，{delay:.0f}s 后重试 "
                         f"({label})...\n")
-                await asyncio.sleep(delay)
+                if await _sleep_cancel_first(delay, cancel_event):
+                    r = AgentResult()
+                    r.error = f"cancelled after pi error: {exc}"
+                    return r
                 continue
             else:
                 _log_error(f"pi 进程重试耗尽 [{label}]: {exc}")
@@ -1015,7 +1034,8 @@ async def _run_with_api_retry(
                     on_stream(
                         f"\n⚠️ 模型空回复，{delay:.0f}s 后重试 ({label})...\n"
                     )
-                await asyncio.sleep(delay)
+                if await _sleep_cancel_first(delay, cancel_event):
+                    return result
                 continue
             _log_error(
                 f"上游模型连续空回复超限 [{label}]，停止重试"
@@ -1044,7 +1064,8 @@ async def _run_with_api_retry(
                         f"\n⚠️ Query engine 连接失效，{delay:.0f}s 后重试 "
                         f"({label})...\n"
                     )
-                await asyncio.sleep(delay)
+                if await _sleep_cancel_first(delay, cancel_event):
+                    return result
                 continue
             _log_error(
                 f"query engine 401 重试耗尽 "
@@ -1070,7 +1091,8 @@ async def _run_with_api_retry(
                 if on_stream:
                     on_stream(f"\n⚠️ API 错误，{delay:.0f}s 后重试 "
                               f"({label})...\n")
-                await asyncio.sleep(delay)
+                if await _sleep_cancel_first(delay, cancel_event):
+                    return result
                 continue
             else:
                 _log_error(f"API 重试耗尽 [{api_attempt}/{max_retries}]: "

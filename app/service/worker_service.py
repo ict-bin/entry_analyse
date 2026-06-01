@@ -26,6 +26,7 @@ logger = logging.getLogger("ea.worker")
 _running_tasks: dict[str, asyncio.Task] = {}
 # task_id -> asyncio.Event: 外部信号立即唤醒 _watch_task_control，无需等待轮询间隔
 _cancel_wake: dict[str, asyncio.Event] = {}
+_local_cancel_events: dict[str, asyncio.Event] = {}
 WORKER_POLL_SECONDS = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
 WORKER_SLOT_HEARTBEAT_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 ORPHAN_PI_SWEEP_SECONDS = max(10, int(os.environ.get("EA_ORPHAN_PI_SWEEP_SECONDS", "30")))
@@ -85,11 +86,29 @@ def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
 
 def trigger_instant_cancel(task_id: str) -> bool:
     """由内置 cancel HTTP server 调用，立即唤醒 _watch_task_control。"""
+    cancel_ev = _local_cancel_events.get(task_id)
+    if cancel_ev is not None:
+        cancel_ev.set()
     ev = _cancel_wake.get(task_id)
     if ev:
         ev.set()
         return True
-    return False
+    return cancel_ev is not None
+
+
+async def _wait_cancel_first(delay: float, cancel_event: asyncio.Event | None) -> bool:
+    if delay <= 0:
+        return bool(cancel_event and cancel_event.is_set())
+    if cancel_event is None:
+        await asyncio.sleep(delay)
+        return False
+    if cancel_event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+        return True
+    except asyncio.TimeoutError:
+        return cancel_event.is_set()
 
 
 class WorkerService:
@@ -463,6 +482,183 @@ class WorkerService:
     def is_running(self) -> bool:
         return self._running
 
+    def _mark_cancel_acknowledged(self, task_id: str) -> None:
+        from app.service import task_service as task_mod
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            row = (
+                db.query(AppEaTask)
+                .filter(
+                    AppEaTask.task_id == task_id,
+                    AppEaTask.is_deleted.is_(False),
+                )
+                .first()
+            )
+            if row is None or row.owner_pod != task_mod.POD_NAME:
+                return
+            changed = False
+            now = now_local()
+            if not row.cancel_acknowledged:
+                row.cancel_acknowledged = True
+                row.cancel_acknowledged_at = row.cancel_acknowledged_at or now
+                row.cancel_owner_pod = task_mod.POD_NAME
+                changed = True
+            if changed:
+                task_mod._safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="task_cancel_acknowledged",
+                    message="worker 已收到取消请求并开始本地中断",
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    level="warning",
+                    stage_key="entry_analysis",
+                    file_path=str(row.input_path or "").strip() or None,
+                    status=row.status,
+                    payload={"cancel_phase": "acknowledged", "owner_pod": task_mod.POD_NAME},
+                    dedupe_key=task_mod._event_dedupe_key(row.task_id, "task_cancel_acknowledged", task_mod.POD_NAME),
+                )
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _mark_cancel_process_cleanup_done(self, task_id: str) -> None:
+        from app.service import task_service as task_mod
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            row = (
+                db.query(AppEaTask)
+                .filter(
+                    AppEaTask.task_id == task_id,
+                    AppEaTask.is_deleted.is_(False),
+                )
+                .first()
+            )
+            if row is None or row.owner_pod != task_mod.POD_NAME:
+                return
+            changed = False
+            now = now_local()
+            if not row.cancel_acknowledged:
+                row.cancel_acknowledged = True
+                row.cancel_acknowledged_at = row.cancel_acknowledged_at or now
+                row.cancel_owner_pod = task_mod.POD_NAME
+                changed = True
+            if not row.cancel_process_cleanup_done:
+                row.cancel_process_cleanup_done = True
+                row.cancel_process_cleanup_at = row.cancel_process_cleanup_at or now
+                changed = True
+            if changed:
+                task_mod._safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="task_cancel_process_cleanup_done",
+                    message="任务关联智能体进程已完成清理",
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    level="warning",
+                    stage_key="entry_analysis",
+                    file_path=str(row.input_path or "").strip() or None,
+                    status=row.status,
+                    payload={"cancel_phase": "process_cleanup_done", "owner_pod": task_mod.POD_NAME},
+                    dedupe_key=task_mod._event_dedupe_key(row.task_id, "task_cancel_process_cleanup_done", task_mod.POD_NAME),
+                )
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _finalize_cancelled_task(
+        self,
+        task_id: str,
+        *,
+        event_buffer: list[dict[str, Any]],
+        pre_run_events: list[dict[str, Any]],
+        reason: str,
+    ) -> bool:
+        from app.service import task_service as task_mod
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            row = (
+                db.query(AppEaTask)
+                .filter(
+                    AppEaTask.task_id == task_id,
+                    AppEaTask.is_deleted.is_(False),
+                )
+                .first()
+            )
+            if row is None or row.owner_pod != task_mod.POD_NAME:
+                return False
+            now = now_local()
+            row.status = "cancelled"
+            row.error = "任务已取消"
+            row.finished_at = now
+            row.owner_pod = None
+            row.owner_pod_ip = None
+            row.lease_expires_at = None
+            row.cancel_requested = False
+            row.cancel_acknowledged = True
+            row.cancel_process_cleanup_done = True
+            row.cancel_finalized = True
+            row.cancel_owner_pod = row.cancel_owner_pod or task_mod.POD_NAME
+            row.cancel_acknowledged_at = row.cancel_acknowledged_at or row.cancel_requested_at or now
+            row.cancel_process_cleanup_at = row.cancel_process_cleanup_at or now
+            row.cancel_finalized_at = now
+            row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
+            task_mod._sync_stage_events_to_timeline(db, row, pre_run_events + event_buffer)
+            reason_payload, changed = task_mod._sync_task_abnormal_reason(row)
+            task_mod._record_abnormal_reason(row, reason_payload, changed=changed)
+            task_mod._safe_create_task_event(
+                db,
+                task_id=row.task_id,
+                project_id=row.project_id,
+                event_type="task_cancelled",
+                message="任务已完成取消收尾",
+                source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                level="warning",
+                stage_key="entry_analysis",
+                file_path=row.input_path,
+                status=row.status,
+                payload={
+                    "owner_pod": task_mod.POD_NAME,
+                    "reason": reason,
+                    "cancel_phase": "finalized",
+                },
+                dedupe_key=task_mod._event_dedupe_key(row.task_id, "task_cancelled", row.finished_at, reason),
+            )
+            if changed and isinstance(reason_payload, dict):
+                task_mod._safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="abnormal_reason_recorded",
+                    message=str(reason_payload.get("title") or "任务异常"),
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    level="warning",
+                    status=str(reason_payload.get("status") or row.status),
+                    stage_key=str(reason_payload.get("stage_name") or "").strip() or None,
+                    file_path=row.input_path,
+                    payload={"reason": reason_payload},
+                    dedupe_key=task_mod._event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason_payload.get("code"), reason_payload.get("message")),
+                )
+            db.commit()
+            return True
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
     async def _renew_task_lease(self, task_id: str, stop_event: asyncio.Event) -> None:
         from app.service import task_service as task_mod
 
@@ -541,6 +737,7 @@ class WorkerService:
                             orch.abort()
                             return
                         if row.cancel_requested or row.status == "cancelled":
+                            self._mark_cancel_acknowledged(task_id)
                             cancel_event.set()
                             orch.abort()
                             return
@@ -562,9 +759,12 @@ class WorkerService:
         project_id: str | None = None
         lease_stop_event = asyncio.Event()
         control_cancel_event = asyncio.Event()
-        cancel_requested = False
+        _local_cancel_events[task_id] = control_cancel_event
         lease_task: asyncio.Task | None = None
         control_task: asyncio.Task | None = None
+        cancel_cleanup_task: asyncio.Task | None = None
+        task_roots: list[str] = []
+        pre_run_events: list[dict] = []
 
         def on_event(event) -> None:
             event_buffer.append({"ts": task_mod._time.time(), "type": event.type, "data": dict(event.data)})
@@ -607,6 +807,17 @@ class WorkerService:
             }
             if n == 1 or n % 3 == 0 or event.type in immediate_events:
                 task_mod._flush_stages(task_id, event_buffer)
+
+        async def _cancel_cleanup_monitor() -> None:
+            await control_cancel_event.wait()
+            await asyncio.to_thread(
+                cleanup_task_pi_processes,
+                logger.warning,
+                label="ea_worker_cancel_cleanup",
+                task_id=task_id,
+                task_roots=task_roots,
+            )
+            self._mark_cancel_process_cleanup_done(task_id)
 
         try:
             db_gen = get_db()
@@ -678,11 +889,18 @@ class WorkerService:
             )
 
             # 在任务启动时保存本轮前的历史事件快照（用于最终写入，避免与 _flush_stages 叠加翻倍）
-            pre_run_events: list[dict] = (
+            pre_run_events = (
                 task_snapshot.stages_json["events"]
                 if isinstance(task_snapshot.stages_json, dict)
                    and isinstance(task_snapshot.stages_json.get("events"), list)
                 else []
+            )
+            task_roots = _task_runtime_roots_from_row(
+                SimpleNamespace(
+                    task_id=task_snapshot.task_id,
+                    output_path=task_snapshot.output_path,
+                    input_path=task_snapshot.input_path,
+                )
             )
 
             # 新鲜启动检测： stages_json 为空表示 DB 已被重置（手动重置 / restart_task API）
@@ -747,9 +965,24 @@ class WorkerService:
                 self._watch_task_control(task_id, lease_stop_event, control_cancel_event, orch),
                 name=f"ea_control_{task_id}",
             )
+            cancel_cleanup_task = asyncio.create_task(
+                _cancel_cleanup_monitor(),
+                name=f"ea_cancel_cleanup_{task_id}",
+            )
             result = await orch.execute(task_id)
             cancel_requested = control_cancel_event.is_set()
             task_mod._flush_stages(task_id, event_buffer)
+
+            if cancel_requested:
+                await cancel_cleanup_task
+                finalized = self._finalize_cancelled_task(
+                    task_id,
+                    event_buffer=event_buffer,
+                    pre_run_events=pre_run_events,
+                    reason="cancel_fast_finalize",
+                )
+                if finalized:
+                    return
 
             db_gen = get_db()
             db = next(db_gen)
@@ -769,6 +1002,7 @@ class WorkerService:
                 row.status = "cancelled" if cancel_requested else (result.status.value if result else "error")
                 row.finished_at = now_local()
                 row.owner_pod = None
+                row.owner_pod_ip = None
                 row.lease_expires_at = None
                 row.cancel_requested = False
                 row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
@@ -781,6 +1015,13 @@ class WorkerService:
                         row.error = result.error
                 elif cancel_requested:
                     row.error = "任务已取消"
+                    row.cancel_acknowledged = True
+                    row.cancel_process_cleanup_done = True
+                    row.cancel_finalized = True
+                    row.cancel_owner_pod = row.cancel_owner_pod or task_mod.POD_NAME
+                    row.cancel_acknowledged_at = row.cancel_acknowledged_at or row.cancel_requested_at or row.finished_at
+                    row.cancel_process_cleanup_at = row.cancel_process_cleanup_at or row.finished_at
+                    row.cancel_finalized_at = row.finished_at
                 reason, changed = task_mod._sync_task_abnormal_reason(row)
                 task_mod._record_abnormal_reason(row, reason, changed=changed)
                 task_mod._safe_create_task_event(
@@ -819,9 +1060,29 @@ class WorkerService:
                 except StopIteration:
                     pass
         except asyncio.CancelledError:
-            cancel_requested = True
+            cancel_requested = control_cancel_event.is_set()
             # Pod 退出/worker stop 时，避免把仍可接管的 running 任务错误收口为 cancelled。
             # 若不是用户显式取消，则仅让租约过期，交给新 worker 走 lease takeover 重启。
+            if cancel_requested:
+                try:
+                    await asyncio.to_thread(
+                        cleanup_task_pi_processes,
+                        logger.warning,
+                        label="ea_worker_cancelled_error_cleanup",
+                        task_id=task_id,
+                        task_roots=task_roots,
+                    )
+                    self._mark_cancel_process_cleanup_done(task_id)
+                except Exception as cancel_cleanup_exc:
+                    logger.warning("cancel cleanup during CancelledError failed for %s: %s", task_id, cancel_cleanup_exc)
+                finalized = self._finalize_cancelled_task(
+                    task_id,
+                    event_buffer=event_buffer,
+                    pre_run_events=pre_run_events,
+                    reason="cancelled_error_fast_finalize",
+                )
+                if finalized:
+                    raise
             try:
                 _gen2 = get_db(); _db2 = next(_gen2)
                 try:
@@ -972,7 +1233,8 @@ class WorkerService:
                 pass
         finally:
             lease_stop_event.set()
-            for bg_task in (lease_task, control_task):
+            _local_cancel_events.pop(task_id, None)
+            for bg_task in (lease_task, control_task, cancel_cleanup_task):
                 if bg_task is not None:
                     bg_task.cancel()
                     try:

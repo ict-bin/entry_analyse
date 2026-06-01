@@ -601,6 +601,30 @@ def _task_runtime_roots(row: AppEaTask) -> list[str]:
     return roots
 
 
+def _reset_cancel_state(row: AppEaTask) -> None:
+    row.cancel_requested = False
+    row.cancel_acknowledged = False
+    row.cancel_process_cleanup_done = False
+    row.cancel_finalized = False
+    row.cancel_owner_pod = None
+    row.cancel_requested_at = None
+    row.cancel_acknowledged_at = None
+    row.cancel_process_cleanup_at = None
+    row.cancel_finalized_at = None
+
+
+def _cancel_phase(row: AppEaTask) -> str | None:
+    if bool(row.cancel_finalized):
+        return "finalized"
+    if bool(row.cancel_process_cleanup_done):
+        return "process_cleanup_done"
+    if bool(row.cancel_acknowledged):
+        return "acknowledged"
+    if bool(row.cancel_requested):
+        return "requested"
+    return None
+
+
 def _build_lean_file_catalog(lean_state_path: "Path") -> list[dict]:
     """精简模式下从 lean_pipeline_state.json 构建文件级目录（替代完整模式的函数级目录）。"""
     try:
@@ -1803,7 +1827,7 @@ class TaskService:
         row.status = "running"
         row.owner_pod = POD_NAME
         row.lease_expires_at = _lease_deadline()
-        row.cancel_requested = False
+        _reset_cancel_state(row)
         if row.started_at is None:
             row.started_at = now_local()
         _safe_create_task_event(
@@ -2671,7 +2695,7 @@ class TaskService:
             source_path=normalized_source_path, module_name=module_name or None,
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=effective_prompt, status="pending", created_by=created_by,
-            owner_pod=None, lease_expires_at=None, cancel_requested=False,
+            owner_pod=None, lease_expires_at=None,
             task_config_json=merged_task_config or None,
             task_origin_type=str(task_origin_type or "").strip() or "manual",
             parent_project_id=parent_project_id,
@@ -2720,7 +2744,7 @@ class TaskService:
         row.finished_at = None
         row.owner_pod = None
         row.lease_expires_at = None
-        row.cancel_requested = False
+        _reset_cancel_state(row)
         row.stages_json = None
         row.result_json = None
         row.error = None
@@ -2785,6 +2809,14 @@ class TaskService:
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row, db=db)
         row.cancel_requested = True
+        row.cancel_requested_at = row.cancel_requested_at or now_local()
+        row.cancel_acknowledged = False
+        row.cancel_process_cleanup_done = False
+        row.cancel_finalized = False
+        row.cancel_owner_pod = row.owner_pod
+        row.cancel_acknowledged_at = None
+        row.cancel_process_cleanup_at = None
+        row.cancel_finalized_at = None
         _safe_create_task_event(
             db,
             task_id=row.task_id,
@@ -2793,7 +2825,7 @@ class TaskService:
             message="任务已请求取消",
             source=TASK_EVENT_SOURCE_EA,
             status=row.status,
-            payload={"owner_pod_ip": row.owner_pod_ip},
+            payload={"owner_pod_ip": row.owner_pod_ip, "cancel_phase": "requested"},
             dedupe_key=_event_dedupe_key(row.task_id, "task_cancel_requested", row.updated_at, row.status),
         )
         owner_pod_ip = row.owner_pod_ip or ""
@@ -2803,6 +2835,12 @@ class TaskService:
             row.owner_pod = None
             row.owner_pod_ip = None
             row.lease_expires_at = None
+            row.cancel_acknowledged = True
+            row.cancel_process_cleanup_done = True
+            row.cancel_finalized = True
+            row.cancel_acknowledged_at = row.cancel_requested_at or row.finished_at
+            row.cancel_process_cleanup_at = row.finished_at
+            row.cancel_finalized_at = row.finished_at
             _safe_create_task_event(
                 db,
                 task_id=row.task_id,
@@ -2811,6 +2849,7 @@ class TaskService:
                 message="任务已在排队阶段取消",
                 source=TASK_EVENT_SOURCE_EA,
                 status=row.status,
+                payload={"reason": "pending_cancel", "cancel_phase": "finalized"},
                 dedupe_key=_event_dedupe_key(row.task_id, "task_cancelled", "pending"),
             )
         reason, changed = _sync_task_abnormal_reason(row)
@@ -2845,7 +2884,9 @@ class TaskService:
         if owner_pod_ip and row.status == "running":
             import asyncio as _asyncio
             _asyncio.create_task(self._notify_cancel(owner_pod_ip, task_id))
-        return self._row_to_dict(row, db=db)
+        result = self._row_to_dict(row, db=db)
+        result["cancel_phase"] = "requested"
+        return result
 
     @staticmethod
     async def _notify_cancel(pod_ip: str, task_id: str) -> None:
@@ -2968,6 +3009,14 @@ class TaskService:
                 AppEaTask.owner_pod,
                 AppEaTask.lease_expires_at,
                 AppEaTask.cancel_requested,
+                AppEaTask.cancel_acknowledged,
+                AppEaTask.cancel_process_cleanup_done,
+                AppEaTask.cancel_finalized,
+                AppEaTask.cancel_owner_pod,
+                AppEaTask.cancel_requested_at,
+                AppEaTask.cancel_acknowledged_at,
+                AppEaTask.cancel_process_cleanup_at,
+                AppEaTask.cancel_finalized_at,
                 AppEaTask.error,
                 AppEaTask.result_json,
                 AppEaTask.latest_abnormal_reason_json,
@@ -3025,6 +3074,15 @@ class TaskService:
             "owner_pod": row.owner_pod,
             "lease_expires_at": fmt(row.lease_expires_at),
             "cancel_requested": row.cancel_requested,
+            "cancel_acknowledged": row.cancel_acknowledged,
+            "cancel_process_cleanup_done": row.cancel_process_cleanup_done,
+            "cancel_finalized": row.cancel_finalized,
+            "cancel_phase": _cancel_phase(row),
+            "cancel_owner_pod": row.cancel_owner_pod,
+            "cancel_requested_at": fmt(row.cancel_requested_at),
+            "cancel_acknowledged_at": fmt(row.cancel_acknowledged_at),
+            "cancel_process_cleanup_at": fmt(row.cancel_process_cleanup_at),
+            "cancel_finalized_at": fmt(row.cancel_finalized_at),
             "error": row.error,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
