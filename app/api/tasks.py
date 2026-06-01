@@ -22,7 +22,7 @@ from .deps import ensure_admin_user, ensure_project_access, get_current_user, re
 logger = logging.getLogger(__name__)
 internal_observability_router = APIRouter(prefix="/api/app/entry-analyse")
 AGGREGATE_CACHE_TTL_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "5")))
-AGGREGATE_HTTP_TIMEOUT_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_TIMEOUT_SECONDS", "10")))
+AGGREGATE_HTTP_TIMEOUT_SECONDS = max(2, int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_TIMEOUT_SECONDS", "60")))
 AGGREGATE_HTTP_PORT = int(os.environ.get("EA_AGENT_AGGREGATE_HTTP_PORT", os.environ.get("PORT", "3000")))
 
 _AGENT_AGGREGATE_CACHE: dict[str, dict[str, Any]] = {}
