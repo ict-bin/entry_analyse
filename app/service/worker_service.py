@@ -34,6 +34,7 @@ WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS = max(1, int(os.environ.get("EA_WORKER_HEART
 WORKER_MAINTENANCE_TIMEOUT_SECONDS = max(5, int(os.environ.get("EA_WORKER_MAINTENANCE_TIMEOUT_SECONDS", "20")))
 WORKER_MAINTENANCE_MAX_STALE_TASKS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_STALE_TASKS", "50")))
 WORKER_MAINTENANCE_MAX_KILLS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_KILLS", "100")))
+WORKER_HTTP_PORT = max(1, int(os.environ.get("PORT", "3000")))
 
 
 @dataclass
@@ -224,6 +225,7 @@ class WorkerService:
         worker_id: str,
         pod_name: str,
         pod_ip: str | None,
+        http_port: int,
         max_concurrent_tasks: int,
         agent_snapshot: dict[str, Any],
         heartbeat_duration_ms: float,
@@ -239,6 +241,7 @@ class WorkerService:
                 worker_id=worker_id,
                 pod_name=pod_name,
                 pod_ip=pod_ip,
+                http_port=http_port,
                 max_concurrent_tasks=max_concurrent_tasks,
                 agent_process_limit=int(agent_snapshot.get("capacity") or 0),
                 agent_process_in_use=int(agent_snapshot.get("in_use") or 0),
@@ -336,6 +339,7 @@ class WorkerService:
                         worker_id=task_mod.POD_NAME,
                         pod_name=task_mod.POD_NAME,
                         pod_ip=task_mod.POD_IP or None,
+                        http_port=WORKER_HTTP_PORT,
                         max_concurrent_tasks=snapshot.max_concurrent_tasks,
                         agent_snapshot=agent_snapshot,
                         heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,

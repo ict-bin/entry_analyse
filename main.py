@@ -86,15 +86,14 @@ if __name__ == "__main__":
             port = int(sys.argv[idx + 1])
 
     role = get_runtime_role()
-    if role_enabled("api"):
+    if role_enabled("api") or role_enabled("worker"):
         print(f"""
 ╔═══════════════════════════════════════════════════════╗
-║              entry_analyse API Server                ║
+║         entry_analyse Runtime HTTP Server            ║
 ╠═══════════════════════════════════════════════════════╣
 ║  Role:   {role:<44}║
 ║  URL:    http://localhost:{port:<38}║
-║  POST /analyse  — 提交分析任务                        ║
-║  GET  /task/{{id}}/stream  — SSE 实时事件流            ║
+║  Health / observability / role-scoped API            ║
 ╚═══════════════════════════════════════════════════════╝
 """)
 
@@ -104,7 +103,7 @@ if __name__ == "__main__":
             port=port,
             reload=os.environ.get("DEV", "") == "1",
         )
-    else:
+    elif role_enabled("scheduler"):
         print(f"""
 ╔═══════════════════════════════════════════════════════╗
 ║           entry_analyse Background Runtime           ║

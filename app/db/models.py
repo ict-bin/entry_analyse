@@ -145,6 +145,7 @@ class AppEaWorkerSlot(Base):
     worker_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
     pod_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     pod_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    http_port: Mapped[int] = mapped_column(Integer, nullable=False, default=3000)
     max_concurrent_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     agent_process_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     agent_process_in_use: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

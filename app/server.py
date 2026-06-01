@@ -160,6 +160,15 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+try:
+    if role_enabled("worker"):
+        from .api.tasks import internal_observability_router as worker_internal_router
+
+        app.include_router(worker_internal_router)
+except Exception:
+    import logging
+    logging.getLogger("ea.server").exception("failed to include runtime router")
+
 
 @app.middleware("http")
 async def collect_request_metrics(request, call_next):

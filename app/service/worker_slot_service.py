@@ -42,6 +42,7 @@ class WorkerSlotSnapshot:
     worker_id: str
     pod_name: str
     pod_ip: str | None
+    http_port: int
     healthy: bool
     max_concurrent_tasks: int
     running_tasks: int
@@ -132,6 +133,7 @@ class WorkerSlotService:
         worker_id: str,
         pod_name: str,
         pod_ip: str | None,
+        http_port: int,
         max_concurrent_tasks: int,
         agent_process_limit: int = 0,
         agent_process_in_use: int = 0,
@@ -155,6 +157,7 @@ class WorkerSlotService:
                 worker_id=worker_id,
                 pod_name=pod_name,
                 pod_ip=pod_ip,
+                http_port=max(1, int(http_port or 3000)),
                 max_concurrent_tasks=normalized_capacity,
                 agent_process_limit=max(0, int(agent_process_limit or 0)),
                 agent_process_in_use=max(0, int(agent_process_in_use or 0)),
@@ -175,6 +178,7 @@ class WorkerSlotService:
         else:
             row.pod_name = pod_name
             row.pod_ip = pod_ip
+            row.http_port = max(1, int(http_port or 3000))
             row.max_concurrent_tasks = normalized_capacity
             row.agent_process_limit = max(0, int(agent_process_limit or 0))
             row.agent_process_in_use = max(0, int(agent_process_in_use or 0))
@@ -281,6 +285,7 @@ class WorkerSlotService:
                 worker_id=row.worker_id,
                 pod_name=row.pod_name,
                 pod_ip=row.pod_ip,
+                http_port=int(getattr(row, "http_port", 3000) or 3000),
                 healthy=healthy,
                 max_concurrent_tasks=int(row.max_concurrent_tasks),
                 running_tasks=running_tasks,
@@ -313,6 +318,7 @@ class WorkerSlotService:
                 worker_id=f"stale-owner::{owner_pod}",
                 pod_name=owner_pod,
                 pod_ip=None,
+                http_port=3000,
                 healthy=False,
                 max_concurrent_tasks=len(active_tasks),
                 running_tasks=len(active_tasks),
@@ -389,6 +395,7 @@ class WorkerSlotService:
             "url": worker.pod_ip or worker.pod_name,
             "pod_name": worker.pod_name,
             "pod_ip": worker.pod_ip,
+            "http_port": worker.http_port,
             "healthy": worker.healthy,
             "max_concurrent_tasks": worker.max_concurrent_tasks,
             "max_concurrent_jobs": worker.max_concurrent_tasks,
