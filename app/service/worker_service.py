@@ -820,7 +820,8 @@ class WorkerService:
                     pass
         except asyncio.CancelledError:
             cancel_requested = True
-            # Fix: CancelledError 也需要更新 DB 状态，否则 task 永远停在 running
+            # Pod 退出/worker stop 时，避免把仍可接管的 running 任务错误收口为 cancelled。
+            # 若不是用户显式取消，则仅让租约过期，交给新 worker 走 lease takeover 重启。
             try:
                 _gen2 = get_db(); _db2 = next(_gen2)
                 try:
@@ -828,29 +829,76 @@ class WorkerService:
                             .filter_by(task_id=task_id)
                             .first())
                     if _row and _row.status == "running":
-                        _row.status = "cancelled"
-                        _row.error = "任务已取消"
-                        _row.finished_at = now_local()
-                        _row.owner_pod = None
-                        _row.lease_expires_at = None
-                        _row.cancel_requested = False
-                        # 补 flush：将本轮已收集的事件写入 stages_json（避免 pod kill 导致事件丢失）
-                        _row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
-                        task_mod._sync_stage_events_to_timeline(_db2, _row, pre_run_events + event_buffer)
-                        task_mod._safe_create_task_event(
-                            _db2,
-                            task_id=_row.task_id,
-                            project_id=_row.project_id,
-                            event_type="task_cancelled",
-                            message="任务因 worker 取消而结束",
-                            source=task_mod.TASK_EVENT_SOURCE_WORKER,
-                            level="warning",
-                            stage_key="entry_analysis",
-                            file_path=_row.input_path,
-                            status=_row.status,
-                            payload={"owner_pod": task_mod.POD_NAME, "reason": "cancelled_error"},
-                            dedupe_key=task_mod._event_dedupe_key(_row.task_id, "task_cancelled", _row.finished_at, "cancelled_error"),
-                        )
+                        user_cancelled = bool(_row.cancel_requested)
+                        worker_stopping = not self._running
+                        if user_cancelled:
+                            _row.status = "cancelled"
+                            _row.error = "任务已取消"
+                            _row.finished_at = now_local()
+                            _row.owner_pod = None
+                            _row.lease_expires_at = None
+                            _row.cancel_requested = False
+                            _row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
+                            task_mod._sync_stage_events_to_timeline(_db2, _row, pre_run_events + event_buffer)
+                            task_mod._safe_create_task_event(
+                                _db2,
+                                task_id=_row.task_id,
+                                project_id=_row.project_id,
+                                event_type="task_cancelled",
+                                message="任务因 worker 取消而结束",
+                                source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                                level="warning",
+                                stage_key="entry_analysis",
+                                file_path=_row.input_path,
+                                status=_row.status,
+                                payload={"owner_pod": task_mod.POD_NAME, "reason": "cancelled_error"},
+                                dedupe_key=task_mod._event_dedupe_key(_row.task_id, "task_cancelled", _row.finished_at, "cancelled_error"),
+                            )
+                        elif worker_stopping:
+                            _row.status = "running"
+                            _row.error = "worker stopped before completion; awaiting lease takeover"
+                            _row.finished_at = None
+                            _row.lease_expires_at = now_local()
+                            _row.cancel_requested = False
+                            _row.stages_json = {"events": pre_run_events + event_buffer, "final": False}
+                            task_mod._sync_stage_events_to_timeline(_db2, _row, pre_run_events + event_buffer)
+                            task_mod._safe_create_task_event(
+                                _db2,
+                                task_id=_row.task_id,
+                                project_id=_row.project_id,
+                                event_type="task_worker_interrupted",
+                                message="worker 退出，等待新 worker 接管任务",
+                                source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                                level="warning",
+                                stage_key="entry_analysis",
+                                file_path=_row.input_path,
+                                status=_row.status,
+                                payload={"owner_pod": task_mod.POD_NAME, "reason": "worker_shutdown_takeover"},
+                                dedupe_key=task_mod._event_dedupe_key(_row.task_id, "task_worker_interrupted", task_mod.POD_NAME, "worker_shutdown_takeover"),
+                            )
+                        else:
+                            _row.status = "cancelled"
+                            _row.error = "任务已取消"
+                            _row.finished_at = now_local()
+                            _row.owner_pod = None
+                            _row.lease_expires_at = None
+                            _row.cancel_requested = False
+                            _row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
+                            task_mod._sync_stage_events_to_timeline(_db2, _row, pre_run_events + event_buffer)
+                            task_mod._safe_create_task_event(
+                                _db2,
+                                task_id=_row.task_id,
+                                project_id=_row.project_id,
+                                event_type="task_cancelled",
+                                message="任务因 worker 取消而结束",
+                                source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                                level="warning",
+                                stage_key="entry_analysis",
+                                file_path=_row.input_path,
+                                status=_row.status,
+                                payload={"owner_pod": task_mod.POD_NAME, "reason": "cancelled_error"},
+                                dedupe_key=task_mod._event_dedupe_key(_row.task_id, "task_cancelled", _row.finished_at, "cancelled_error"),
+                            )
                         _db2.commit()
                 finally:
                     try: next(_gen2)
