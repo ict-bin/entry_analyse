@@ -457,11 +457,22 @@ class WorkerService:
                             if _apl > 0:
                                 agent_process_limit_values.append(_apl)
                     else:
-                        svc = task_mod._load_svc_config()
-                        max_concurrent_tasks_values.append(int(getattr(svc, "max_concurrent_tasks", 1) or 1))
-                        _apl = int(getattr(svc, "agent_process_limit", 0) or 0)
-                        if _apl > 0:
-                            agent_process_limit_values.append(_apl)
+                        # 无活距任务时，仍从 DB 读取所有已配置 project 的配置（而非回退到 file config）
+                        # 避免 file config 默认展 8 排挤了 DB 里配置的正确限制
+                        from app.db.models import AppEaProjectConfig as _EaPC
+                        all_project_rows = db.query(_EaPC.project_id).all()
+                        all_project_ids = [str(r[0]) for r in all_project_rows if r and r[0]]
+                        for _pid in all_project_ids:
+                            try:
+                                _svc = task_mod._load_svc_config_from_db(db, _pid)
+                                max_concurrent_tasks_values.append(int(getattr(_svc, "max_concurrent_tasks", 1) or 1))
+                                _apl = int(getattr(_svc, "agent_process_limit", 0) or 0)
+                                if _apl > 0:
+                                    agent_process_limit_values.append(_apl)
+                            except Exception:
+                                pass
+                        if not max_concurrent_tasks_values:
+                            max_concurrent_tasks_values.append(1)  # 保底默认値
                 finally:
                     try:
                         next(db_gen)
