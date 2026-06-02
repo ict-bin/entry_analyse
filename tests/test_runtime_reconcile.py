@@ -7,9 +7,12 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import AppEaTask, Base
+import app.db as app_db
 from app.service import scheduler_service, task_service, worker_slot_service
 from app.api import tasks as tasks_api
 from app.service import agent_observability
+from app import metrics as metrics_mod
+from app import metrics_summary as metrics_summary_mod
 from app.service.scheduler_service import SchedulerService
 from app.service.worker_slot_service import WorkerSlotService
 from app.time_utils import now_local
@@ -77,6 +80,7 @@ def test_scheduler_reconcile_cancelled_task_records_events(monkeypatch) -> None:
         "get_worker_slot_service",
         lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
     )
+    monkeypatch.setattr(SchedulerService, "_reconcile_expired_running_tasks", lambda self, _db, _now: (0, 0))
     monkeypatch.setattr(task_service, "_sync_task_abnormal_reason", lambda current: ({"title": "任务已取消", "status": "cancelled", "code": "user_cancelled", "message": "任务已取消"}, True))
     monkeypatch.setattr(task_service, "_record_abnormal_reason", lambda current, reason, changed: setattr(current, "latest_abnormal_reason_json", reason if changed else current.latest_abnormal_reason_json))
     monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
@@ -91,6 +95,95 @@ def test_scheduler_reconcile_cancelled_task_records_events(monkeypatch) -> None:
     assert row.latest_abnormal_reason_json["status"] == "cancelled"
     assert {event["event_type"] for event in events} == {"task_cancelled", "abnormal_reason_recorded"}
     assert db.commits == 1
+
+
+def test_scheduler_reconcile_expired_running_requeues_owner_missing(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    db = SessionLocal()
+    now = now_local()
+    try:
+        row = AppEaTask(
+            task_id="eat_expired_missing",
+            project_id="p1",
+            task_name="expired",
+            input_path="/tmp/expired",
+            module_name="m1",
+            prompt_content="prompt",
+            status="running",
+            owner_pod="worker-dead",
+            owner_pod_ip="10.0.0.10",
+            lease_expires_at=now - timedelta(seconds=60),
+        )
+        db.add(row)
+        db.commit()
+
+        events = []
+        monkeypatch.setattr(scheduler_service, "get_db", lambda: _db_generator(db))
+        monkeypatch.setattr(
+            worker_slot_service,
+            "get_worker_slot_service",
+            lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
+        )
+        monkeypatch.setattr(SchedulerService, "_alive_owner_pods", lambda self, _db, _now: set())
+        monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
+
+        changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
+        db.refresh(row)
+
+        assert changed == 1
+        assert row.status == "pending"
+        assert row.owner_pod is None
+        assert row.owner_pod_ip is None
+        assert row.lease_expires_at is None
+        assert row.finished_at is None
+        assert events[0]["event_type"] == "task_requeued_after_expired_lease_reconcile"
+        assert events[0]["payload"]["previous_owner_pod"] == "worker-dead"
+    finally:
+        db.close()
+
+
+def test_scheduler_reconcile_expired_running_keeps_live_owner(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    db = SessionLocal()
+    now = now_local()
+    try:
+        row = AppEaTask(
+            task_id="eat_expired_alive",
+            project_id="p1",
+            task_name="expired-alive",
+            input_path="/tmp/expired",
+            module_name="m1",
+            prompt_content="prompt",
+            status="running",
+            owner_pod="worker-live",
+            lease_expires_at=now - timedelta(seconds=60),
+        )
+        db.add(row)
+        db.commit()
+
+        monkeypatch.setattr(scheduler_service, "get_db", lambda: _db_generator(db))
+        monkeypatch.setattr(
+            worker_slot_service,
+            "get_worker_slot_service",
+            lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
+        )
+        monkeypatch.setattr(SchedulerService, "_alive_owner_pods", lambda self, _db, _now: {"worker-live"})
+        events = []
+        monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
+
+        changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
+        db.refresh(row)
+
+        assert changed == 0
+        assert row.status == "running"
+        assert row.owner_pod == "worker-live"
+        assert events == []
+    finally:
+        db.close()
 
 
 def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeypatch) -> None:
@@ -130,6 +223,86 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["registry_missing_live_pods"] == 0
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
+
+
+def test_metrics_expose_expired_running_lease_diagnostics(monkeypatch) -> None:
+    now = now_local()
+    rows = [
+        SimpleNamespace(
+            status="running",
+            cancel_requested=False,
+            lease_expires_at=now - timedelta(seconds=30),
+            owner_pod="pod-dead",
+            started_at=None,
+            created_at=now,
+            finished_at=None,
+            error=None,
+            result_json=None,
+            stages_json={},
+            module_name="m1",
+        ),
+        SimpleNamespace(
+            status="running",
+            cancel_requested=False,
+            lease_expires_at=now + timedelta(seconds=30),
+            owner_pod="pod-live",
+            started_at=None,
+            created_at=now,
+            finished_at=None,
+            error=None,
+            result_json=None,
+            stages_json={},
+            module_name="m2",
+        ),
+    ]
+
+    class _MetricsDb:
+        def query(self, model):
+            del model
+            return _FakeQuery(rows)
+
+    monkeypatch.setattr(app_db, "get_db", lambda: _db_generator(_MetricsDb()))
+    monkeypatch.setattr(
+        worker_slot_service,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(
+            _list_live_worker_pods=lambda: {"pod-live"},
+            get_cluster_snapshot=lambda _db, project_id="": {
+                "total_capacity": 0,
+                "busy_slots": 0,
+                "available_slots": 0,
+                "dispatch_limit": 0,
+                "dispatch_running": 0,
+                "dispatch_available": 0,
+            },
+        ),
+    )
+    monkeypatch.setattr(metrics_mod, "get_scheduler_service", lambda: SimpleNamespace(runtime_reconcile_stats_snapshot=lambda: {"reconciled_total": 4}))
+
+    output = metrics_mod._render_task_metrics()
+    text = "\n".join(output)
+
+    assert "secflow_ea_tasks_running_expired_lease 1" in text
+    assert "secflow_ea_tasks_running_expired_lease_owner_alive 0" in text
+    assert "secflow_ea_tasks_running_expired_lease_reconciled_total 4" in text
+
+
+def test_metrics_summary_alerts_on_expired_running_lease() -> None:
+    rows = metrics_summary_mod.parse_prometheus_metrics(
+        "\n".join(
+            [
+                "secflow_ea_tasks_status{status=\"running\"} 10",
+                "secflow_ea_tasks_running_expired_lease 7",
+                "secflow_ea_tasks_running_expired_lease_owner_alive 2",
+            ]
+        )
+        + "\n"
+    )
+
+    summary = metrics_summary_mod.build_generic_observability_summary(rows, title="入口分析")
+
+    labels = {item["label"] for item in summary["alerts"]}
+    assert "存在过期运行任务" in labels
 
 
 def test_worker_slot_cleanup_keeps_live_stale_registry_row(monkeypatch) -> None:
@@ -395,9 +568,9 @@ def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:
     assert runtime["summary"]["total_pods"] == 2
     assert runtime["summary"]["healthy_pods"] == 1
     assert runtime["summary"]["tracked_processes"] == 1
-    assert runtime["summary"]["orphan_processes"] == 1
-    assert runtime["summary"]["suspected_orphan_processes"] == 2
-    assert runtime["summary"]["killable_suspected_orphan_processes"] == 1
+    assert runtime["summary"]["residual_processes"] == 0
+    assert runtime["summary"]["unknown_processes"] == 2
+    assert runtime["summary"]["killable_unknown_processes"] == 1
     assert runtime["summary"]["aggregate_partial"] is True
     assert runtime["summary"]["aggregate_failed_targets"] == ["pod-b"]
     assert runtime["summary"]["total_pods"] == 2
@@ -448,7 +621,7 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert row["owner_kind"] == "unknown"
     assert row["kill_allowed"] is True
     assert row["kill_block_reason"] is None
-    assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1
+    assert snapshot["summary"]["killable_unknown_processes"] == 1
 
 
 def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
@@ -469,21 +642,6 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
         "get_worker_slot_service",
         lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
     )
-    monkeypatch.setattr(
-        agent_observability,
-        "get_task_service",
-        lambda: SimpleNamespace(get_task_session_index=lambda _db, _task_id: {
-            "nodes": [{
-                "relative_path": "sessions/r1/agent.jsonl",
-                "session_name": "agent",
-                "display_name": "agent",
-                "is_active": True,
-                "stage_key": "R1",
-                "role": "worker",
-                "session_header": {"id": "sess-1"},
-            }]
-        }),
-    )
 
     class _TaskQuery:
         def filter(self, *args, **kwargs):
@@ -499,6 +657,7 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
                 task_name="entry task",
                 input_path="/tmp/in",
                 output_path="/tmp/out",
+                source_path="/tmp/src",
                 status="running",
                 owner_pod="",
                 lease_expires_at=None,
@@ -515,7 +674,7 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
 
     snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
     assert snapshot["processes"][0]["runtime_kind"] == "codex"
-    assert snapshot["processes"][0]["match_source"] == "session_path"
+    assert snapshot["processes"][0]["match_source"] == "session_arg_path"
     assert snapshot["processes"][0]["task_id"] == "eat_1"
 
 
@@ -581,8 +740,8 @@ def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch
 
 
 def test_resolve_worker_targets_prefers_pod_ip_only() -> None:
-    assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.7", pod_name="ea-worker-1") == ["10.0.0.7"]
-    assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="ea-worker-1") == []
+    assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.7", pod_name="ea-worker-1") == ["10.0.0.7", "ea-worker-1"]
+    assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="ea-worker-1") == ["ea-worker-1"]
 
 
 def test_get_task_runtime_summary_tolerates_empty_session_nodes(monkeypatch) -> None:

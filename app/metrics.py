@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .db.models import AppEaTask
 from .service.scheduler_service import get_scheduler_service
 from .service.worker_service import get_worker_service
+from .time_utils import now_local
 
 _REQUEST_LOCK = threading.Lock()
 _HTTP_REQUEST_TOTAL = defaultdict(int)
@@ -98,6 +99,7 @@ def render_summary_metrics() -> str:
     try:
         lines.append("secflow_ea_up 1")
         lines.extend(_render_request_metrics())
+        lines.extend(_render_task_metrics())
     except Exception:
         lines.append("secflow_ea_up 0")
     return "\n".join(lines) + "\n"
@@ -184,10 +186,29 @@ def _render_task_metrics() -> list[str]:
     stage_duration: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: {"count": 0, "sum": 0.0})
     stage_role_counts: dict[tuple[str, str], int] = defaultdict(int)
     stage_session_counts: dict[str, int] = defaultdict(int)
+    expired_running_count = 0
+    expired_running_owner_alive = 0
+    now = now_local()
+    live_owner_pods = set()
+    scheduler_stats = get_scheduler_service().runtime_reconcile_stats_snapshot()
+    if db_up:
+        try:
+            live_owner_pods = set(get_worker_slot_service()._list_live_worker_pods())
+        except Exception:
+            live_owner_pods = set()
 
     for row in rows:
         status = str(row.status or "unknown")
         status_counts[status] += 1
+        if (
+            status == "running"
+            and not bool(row.cancel_requested)
+            and (row.lease_expires_at is None or row.lease_expires_at < now)
+        ):
+            expired_running_count += 1
+            owner_pod = str(row.owner_pod or "").strip()
+            if owner_pod and owner_pod in live_owner_pods:
+                expired_running_owner_alive += 1
         if row.started_at and row.created_at:
             queue_sum += _seconds_between(row.created_at, row.started_at)
             queue_count += 1
@@ -417,6 +438,15 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_retry_total Aggregated retry count derived from extra rounds.",
         "# TYPE secflow_ea_retry_total counter",
         f"secflow_ea_retry_total {retry_total}",
+        "# HELP secflow_ea_tasks_running_expired_lease Running tasks whose lease is missing or expired.",
+        "# TYPE secflow_ea_tasks_running_expired_lease gauge",
+        f"secflow_ea_tasks_running_expired_lease {expired_running_count}",
+        "# HELP secflow_ea_tasks_running_expired_lease_owner_alive Running expired-lease tasks whose owner pod still appears alive.",
+        "# TYPE secflow_ea_tasks_running_expired_lease_owner_alive gauge",
+        f"secflow_ea_tasks_running_expired_lease_owner_alive {expired_running_owner_alive}",
+        "# HELP secflow_ea_tasks_running_expired_lease_reconciled_total Running expired-lease tasks requeued by scheduler reconcile.",
+        "# TYPE secflow_ea_tasks_running_expired_lease_reconciled_total counter",
+        f"secflow_ea_tasks_running_expired_lease_reconciled_total {int(scheduler_stats.get('reconciled_total') or 0)}",
         "# HELP secflow_ea_timeout_total Timeout-classified terminal tasks.",
         "# TYPE secflow_ea_timeout_total counter",
         f"secflow_ea_timeout_total {timeout_total}",

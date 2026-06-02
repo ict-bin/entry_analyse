@@ -209,11 +209,22 @@ def build_generic_observability_summary(rows: list[MetricRow], *, title: str) ->
     pending = status_counts.get("pending", 0.0) + status_counts.get("queued", 0.0)
     failed = status_counts.get("failed", 0.0) + status_counts.get("error", 0.0)
     passed = status_counts.get("passed", 0.0) + status_counts.get("success", 0.0) + status_counts.get("completed", 0.0)
+    expired_running = first_non_null(
+        metric_value(rows, "secflow_ea_tasks_running_expired_lease"),
+        0.0,
+    )
+    expired_running_owner_alive = first_non_null(
+        metric_value(rows, "secflow_ea_tasks_running_expired_lease_owner_alive"),
+        0.0,
+    )
     avg_http = first_non_null(histogram_average(rows, "http_request_duration_seconds"), histogram_average(rows, "api_request_duration_seconds"), histogram_average(rows, "secflow_http_request_duration_seconds"))
     p95_http = first_non_null(histogram_quantile(rows, "http_request_duration_seconds", 0.95), histogram_quantile(rows, "api_request_duration_seconds", 0.95), histogram_quantile(rows, "secflow_http_request_duration_seconds", 0.95))
     alerts: list[dict[str, str]] = []
     if queue_depth > 0 and pending > 0:
         alerts.append({"label": "存在等待堆积", "text": f"{title} 当前存在排队与待处理积压，请结合任务槽位与智能体视图继续排查。", "tone": "border-amber-200 bg-amber-50 text-amber-800"})
+    if expired_running > 0:
+        owner_alive_text = f"，其中 {int(expired_running_owner_alive)} 个 owner Pod 仍存活" if expired_running_owner_alive > 0 else ""
+        alerts.append({"label": "存在过期运行任务", "text": f"{title} 当前存在 {int(expired_running)} 个 running 任务租约已过期，控制面 running 与执行槽位可能不一致，后台正在回收或等待接管{owner_alive_text}。", "tone": "border-amber-200 bg-amber-50 text-amber-800"})
     if failed > 0:
         alerts.append({"label": "存在失败任务", "text": f"{title} 当前有失败或异常任务，需要继续结合详情与事件链判断是否可自动收口。", "tone": "border-rose-200 bg-rose-50 text-rose-800"})
     if not alerts:
@@ -267,6 +278,11 @@ def histogram_quantile(rows: list[MetricRow], family_name: str, quantile: float,
 
 def sum_metric(rows: list[MetricRow], predicate) -> float:
     return sum(float(row.value) for row in rows if predicate(row))
+
+
+def metric_value(rows: list[MetricRow], name: str, labels: dict[str, str] | None = None) -> float | None:
+    total = sum_metric(rows, lambda row: row.name == name and labels_match(row.labels, labels or {}))
+    return total if total != 0 else None
 
 
 def aggregate_by_label_suffix(rows: list[MetricRow], suffixes: tuple[str, ...], label: str) -> dict[str, float]:
