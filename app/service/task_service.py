@@ -2730,27 +2730,77 @@ class TaskService:
         return self._row_to_dict(row, db=db)
 
     def restart_task(self, db: Session, task_id: str) -> dict:
-        """Reset and restart an existing task in-place, reusing the same task ID."""
+        """Reset and restart an existing task in-place, reusing the same task ID.
+
+        清理内容（全量）：
+          DB： status/stages_json/result_json/error/latest_abnormal_reason_json
+               started_at/finished_at/owner_pod/owner_pod_ip/lease_expires_at
+               所有 cancel_* 字段
+          关联表： stage_result_index 全部行、task_event 全部行
+          磁盘： run/ 和 output/ 目录（保留 input/）
+        """
         row = self._get_or_404(db, task_id)
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
+
+        import shutil as _shutil
+        import errno as _errno
         from sqlalchemy.orm.attributes import flag_modified
+
+        # ── 1. DB 主表全量重置 ──
         clean_config = {k: v for k, v in (_parse_task_config(row.task_config_json) or {}).items()
                         if k not in ("start_stage", "resume_workspace")} or None
-        row.task_config_json = clean_config
-        row.status = "pending"
-        row.started_at = None
-        row.finished_at = None
-        row.owner_pod = None
-        row.lease_expires_at = None
-        _reset_cancel_state(row)
-        row.stages_json = None
-        row.result_json = None
-        row.error = None
+        row.task_config_json  = clean_config
+        row.status            = "pending"
+        row.started_at        = None
+        row.finished_at       = None
+        row.owner_pod         = None
+        row.owner_pod_ip      = None
+        row.lease_expires_at  = None
+        row.stages_json       = None
+        row.result_json       = None
+        row.error             = None
         row.latest_abnormal_reason_json = None
+        _reset_cancel_state(row)
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
+        db.commit()
+        db.refresh(row)
+
+        # ── 2. 清空 stage_result_index ──
+        try:
+            db.query(AppEaStageResultIndex).filter(
+                AppEaStageResultIndex.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception as _e:
+            logger.warning("restart: clear stage_result_index failed for %s: %s", task_id, _e)
+
+        # ── 3. 清空 task_event 时间线 ──
+        try:
+            db.query(AppEaTaskEvent).filter(
+                AppEaTaskEvent.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception as _e:
+            logger.warning("restart: clear task_event failed for %s: %s", task_id, _e)
+
+        # ── 4. 磁盘：删除 run/ 和 output/，保留 input/ ──
+        if row.output_path:
+            _task_dir = os.path.join(row.output_path, task_id)
+            for _sub in ("run", "output"):
+                _d = os.path.join(_task_dir, _sub)
+                try:
+                    _shutil.rmtree(_d)
+                    logger.info("restart: removed %s/ for %s", _sub, task_id)
+                except OSError as _e:
+                    if _e.errno != _errno.ENOENT:
+                        # 非「不存在」错误（如 NFS 问题）——记录并抛出，不静默吸收
+                        logger.error("restart: failed to remove %s/ for %s: %s", _sub, task_id, _e)
+                        raise
+
+        # ── 5. 写入 task_restarted 事件（新的第一条时间线记录）──
         _safe_create_task_event(
             db,
             task_id=row.task_id,
@@ -2759,49 +2809,19 @@ class TaskService:
             message="任务已重置并重新启动",
             source=TASK_EVENT_SOURCE_EA,
             status=row.status,
-            payload={"keep_history": True},
-            dedupe_key=_event_dedupe_key(row.task_id, "task_restarted", row.updated_at, row.status),
+            payload={},
+            dedupe_key=_event_dedupe_key(row.task_id, "task_restarted", now_local()),
         )
-        db.commit(); db.refresh(row)
-        # 清空旧 run 的 stage_result_index，避免 restart 后历史记录污染
-        try:
-            db.query(AppEaStageResultIndex).filter(
-                AppEaStageResultIndex.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.commit()
-        except Exception as _sri_exc:
-            logger.warning("Failed to clear stage_result_index for %s: %s", task_id, _sri_exc)
-        if row.output_path:
-            import shutil as _shutil
-            task_root = os.path.join(row.output_path, task_id)
-            if os.path.isdir(task_root):
-                try:
-                    _shutil.rmtree(task_root)
-                except Exception as _e:
-                    logger.warning("Failed to clean task dir %s: %s", task_root, _e)
+        db.commit()
+
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row, db=db)
 
     def resume_task(self, db: Session, task_id: str) -> dict:
-        """续跑（暂时禁用断点续跑，直接调用 restart_task）。"""
-        row = self._get_or_404(db, task_id)
-        result = self.restart_task(db, task_id)
-        row = self._get_or_404(db, task_id)
-        _safe_create_task_event(
-            db,
-            task_id=row.task_id,
-            project_id=row.project_id,
-            event_type="task_resumed",
-            message="任务已从续跑入口重新排队",
-            source=TASK_EVENT_SOURCE_EA,
-            status=row.status,
-            payload={"mode": "resume_via_restart"},
-            dedupe_key=_event_dedupe_key(row.task_id, "task_resumed", row.updated_at, row.status),
-        )
-        db.commit()
-        return result
+        """续跑（未实现，直接走 restart 全量重置逻辑）。"""
+        return self.restart_task(db, task_id)
 
     async def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)

@@ -1164,61 +1164,31 @@ class WorkerService:
                 )
             )
 
-            # 新鲜启动检测： stages_json 为空表示 DB 已被重置（手动重置 / restart_task API）
-            # 清除磁盘上的旧运行中间文件，并同步清理 DB 残余字段，确保新 run 不继承旧状态
-            is_fresh_start = not task_snapshot.stages_json  # None 或 {}
-            if is_fresh_start:
-                # ── 清理 DB 残余字段（error/result/异常原因）──────────────────────────────
-                # 无论是通过 restart_task API 还是手动 SQL 触发的重置，
-                # 都确保 error/result_json/latest_abnormal_reason_json 被清空，
-                # 否则前端任务列表仍会显示上一轮的错误信息
-                try:
-                    _db_gen2 = get_db()
-                    _db2 = next(_db_gen2)
-                    try:
-                        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
-                        _row2 = (
-                            _db2.query(AppEaTask)
-                            .filter(AppEaTask.task_id == task_id)
-                            .first()
-                        )
-                        if _row2 and (_row2.error or _row2.result_json
-                                      or _row2.latest_abnormal_reason_json):
-                            _row2.error = None
-                            _row2.result_json = None
-                            _row2.latest_abnormal_reason_json = None
-                            _flag_modified(_row2, "latest_abnormal_reason_json")
-                            _db2.commit()
-                            logger.info("Fresh start: cleared DB error fields for %s", task_id)
-                    finally:
-                        try:
-                            next(_db_gen2)
-                        except StopIteration:
-                            pass
-                except Exception as _dbe:
-                    logger.warning("Fresh start: failed to clear DB error fields for %s: %s",
-                                   task_id, _dbe)
-
-                # ── 清理磁盘中间文件 ───────────────────────────────────────────────────────
-            if is_fresh_start and task_snapshot.output_path:
+            # ── 始终清空磁盘中间状态（不依赖 stages_json 是否为空）──────────────────────
+            # 每次 worker 拾起任务（首次/手动重启/pod 接管）均从干净状态开始。
+            # ENOENT 正常忽略（目录不存在时直接重建）；其他错误（如 NFS 故障）显式抛出，
+            # 不允许静默吞掉——若磁盘清理失败，宁可让任务报错重排，也不能从脏状态执行。
+            if task_snapshot.output_path:
                 import pathlib as _pl
                 import shutil as _shutil
+                import errno as _errno
                 _task_dir = (
                     _pl.Path(task_snapshot.output_path)
                     / task_snapshot.task_id
                 )
-                # restart 时清空整个任务目录（run/ + output/）下的所有中间文件
-                # 保留 input/ 目录（任务元数据）不删除
-                # 注意：必须使用 ignore_errors=True 连同 强制重建空目录
-                # 防止 rmtree 因竞争条件（ENOENT）抛异常中止导致旧 session 文件残留
-                # （旧 session 残留会让 pi SDK resume 老会话→工作目录不存在→ fatal error）
                 for _subdir in ("run", "output"):
                     _d = _task_dir / _subdir
-                    if _d.exists():
-                        _shutil.rmtree(str(_d), ignore_errors=True)
-                    # 强制重建空目录：就算 rmtree 有部分文件删除失败，也能确保新 run 从干净目录开始
+                    try:
+                        _shutil.rmtree(str(_d))
+                    except OSError as _e:
+                        if _e.errno != _errno.ENOENT:
+                            logger.error(
+                                "worker: failed to clean %s/ for %s: %s",
+                                _subdir, task_id, _e,
+                            )
+                            raise
                     _d.mkdir(parents=True, exist_ok=True)
-                    logger.info("Fresh start: reset %s/ for %s", _subdir, task_id)
+                    logger.info("worker: reset %s/ for %s", _subdir, task_id)
 
             orch = Orchestrator(config=cfg, on_event=on_event)
             self._task_abort_callbacks[task_id] = orch.abort
