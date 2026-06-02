@@ -251,9 +251,29 @@ class AgentProcessSlotManager:
                 cancel_task = asyncio.create_task(cancel_event.wait())
                 tasks.add(cancel_task)
 
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
+            try:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+            except (asyncio.CancelledError, BaseException):
+                # 外层 asyncio.wait_for 超时注入 CancelledError：
+                # 必须在此清理孤儿 ticket，否则它留在 _waiters 堆里，
+                # 后续 release() 会把槽位转移给它（ticket.awarded=True），
+                # 但无协程等候 → slot 永久泏漏。
+                for t in tasks:
+                    t.cancel()
+                async with self._lock:
+                    if ticket.awarded:
+                        # slot 已被转移过来但我们要撤退：传递给下一个 waiter 或归还
+                        if not self._award_next_waiter():
+                            self._in_use = max(0, self._in_use - 1)
+                    else:
+                        ticket.cancelled = True
+                        self._waiters = [
+                            (p, s, t) for p, s, t in self._waiters if t is not ticket
+                        ]
+                        heapq.heapify(self._waiters)
+                raise
 
             # ── 外部取消 ──
             if (

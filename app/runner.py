@@ -507,6 +507,7 @@ async def _run_with_context_overflow_recovery(
     pi_cmd: list[str],
     args: list[str],
     stdin_data: bytes,
+    continue_stdin: bytes,
     prompt: str,
     system_prompt: str,
     model: str,
@@ -520,6 +521,9 @@ async def _run_with_context_overflow_recovery(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    timeout_seconds: float | None = None,
+    timeout_retry_enabled: bool = True,
+    timeout_max_retries: int = 3,
     max_consecutive_empty_responses: int = 3,
     priority: int = SemPriority.DEFAULT,
     task_id: str | None = None,
@@ -531,12 +535,16 @@ async def _run_with_context_overflow_recovery(
         args=args,
         cwd=cwd,
         stdin_data=stdin_data,
+        continue_stdin=continue_stdin,
         cancel_event=cancel_event,
         on_stream=on_stream,
         max_retries=max_retries,
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        timeout_seconds=timeout_seconds,
+        timeout_retry_enabled=timeout_retry_enabled,
+        timeout_max_retries=timeout_max_retries,
         max_consecutive_empty_responses=max_consecutive_empty_responses,
         priority=priority,
         task_id=task_id,
@@ -563,16 +571,21 @@ async def _run_with_context_overflow_recovery(
         if on_stream:
             on_stream(f"\n⚠️ {msg}\n")
         compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+        _comp_stdin = _COMPACTION_TRIGGER_PROMPT.encode("utf-8")
         await _run_with_pi_retry(
             args=compaction_args,
             cwd=cwd,
-            stdin_data=_COMPACTION_TRIGGER_PROMPT.encode("utf-8"),
+            stdin_data=_comp_stdin,
+            continue_stdin=_comp_stdin,
             cancel_event=cancel_event,
             on_stream=None,
             max_retries=max_retries,
             retry_delay=retry_delay,
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
+            timeout_seconds=timeout_seconds,
+            timeout_retry_enabled=timeout_retry_enabled,
+            timeout_max_retries=timeout_max_retries,
             max_consecutive_empty_responses=max_consecutive_empty_responses,
             priority=priority,
             task_id=task_id,
@@ -598,12 +611,16 @@ async def _run_with_context_overflow_recovery(
         args=args,
         cwd=cwd,
         stdin_data=stdin_data,
+        continue_stdin=continue_stdin,
         cancel_event=cancel_event,
         on_stream=on_stream,
         max_retries=max_retries,
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        timeout_seconds=timeout_seconds,
+        timeout_retry_enabled=timeout_retry_enabled,
+        timeout_max_retries=timeout_max_retries,
         max_consecutive_empty_responses=max_consecutive_empty_responses,
         priority=priority,
     )
@@ -681,64 +698,35 @@ async def run_agent(
     )
 
     timeout_seconds = _normalize_timeout_seconds(run_timeout_seconds)
-    timeout_failures = 0
-    first_attempt = True
     try:
-        while True:
-            current_stdin = stdin_data if first_attempt else continue_stdin
-            first_attempt = False
-            try:
-                coro = _run_with_context_overflow_recovery(
-                    pi_cmd=pi_cmd,
-                    args=args,
-                    stdin_data=current_stdin,
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    model=model,
-                    tools=tools,
-                    thinking_level=thinking_level,
-                    session_file=session_file,
-                    cwd=os.path.abspath(cwd),
-                    cancel_event=cancel_event,
-                    on_stream=on_stream,
-                    max_retries=max_retries,
-                    retry_delay=retry_delay,
-                    pi_max_retries=pi_max_retries,
-                    pi_retry_delay=pi_retry_delay,
-                    max_consecutive_empty_responses=max_consecutive_empty_responses,
-                    priority=priority,
-                    task_id=task_id,
-                    stage_key=stage_key,
-                    role_kind=role_kind,
-                    on_slot_event=on_slot_event,
-                )
-                return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
-            except asyncio.TimeoutError:
-                timeout_failures += 1
-                result = AgentResult()
-                result.error = (
-                    f"agent run timed out after {timeout_seconds:.0f}s"
-                    if timeout_seconds else
-                    "agent run timed out"
-                )
-                result.exit_code = -1
-                can_retry = timeout_retry_enabled and (
-                    timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
-                )
-                if not can_retry or (cancel_event and cancel_event.is_set()):
-                    return result
-                delay = _backoff(retry_delay, timeout_failures)
-                _log_warn(
-                    f"agent 单次输入超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
-                    f"{delay:.0f}s 后重试: {result.error}"
-                )
-                if on_stream:
-                    on_stream(
-                        f"\n⏱️ 智能体执行超时，{delay:.0f}s 后重试 "
-                        f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
-                    )
-                if await _sleep_cancel_first(delay, cancel_event):
-                    return result
+        return await _run_with_context_overflow_recovery(
+            pi_cmd=pi_cmd,
+            args=args,
+            stdin_data=stdin_data,
+            continue_stdin=continue_stdin,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model=model,
+            tools=tools,
+            thinking_level=thinking_level,
+            session_file=session_file,
+            cwd=os.path.abspath(cwd),
+            cancel_event=cancel_event,
+            on_stream=on_stream,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            pi_max_retries=pi_max_retries,
+            pi_retry_delay=pi_retry_delay,
+            timeout_seconds=timeout_seconds,
+            timeout_retry_enabled=timeout_retry_enabled,
+            timeout_max_retries=timeout_max_retries,
+            max_consecutive_empty_responses=max_consecutive_empty_responses,
+            priority=priority,
+            task_id=task_id,
+            stage_key=stage_key,
+            role_kind=role_kind,
+            on_slot_event=on_slot_event,
+        )
     finally:
         if tmp_file and os.path.exists(tmp_file):
             try:
@@ -757,10 +745,14 @@ async def run_agent(
 async def _run_with_pi_retry(
     *, args: list[str], cwd: str,
     stdin_data: bytes,
+    continue_stdin: bytes,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
     pi_max_retries: int, pi_retry_delay: float,
+    timeout_seconds: float | None = None,
+    timeout_retry_enabled: bool = True,
+    timeout_max_retries: int = 3,
     max_consecutive_empty_responses: int = 3,
     priority: int = SemPriority.DEFAULT,
     task_id: str | None = None,
@@ -781,8 +773,12 @@ async def _run_with_pi_retry(
             result = await _run_with_api_retry(
                 args=args, cwd=cwd,
                 stdin_data=stdin_data,
+                continue_stdin=continue_stdin,
                 cancel_event=cancel_event, on_stream=on_stream,
                 max_retries=max_retries, retry_delay=retry_delay,
+                timeout_seconds=timeout_seconds,
+                timeout_retry_enabled=timeout_retry_enabled,
+                timeout_max_retries=timeout_max_retries,
                 max_consecutive_empty_responses=max_consecutive_empty_responses,
                 priority=priority,
                 task_id=task_id,
@@ -855,9 +851,13 @@ async def _run_with_pi_retry(
 async def _run_with_api_retry(
     *, args: list[str], cwd: str,
     stdin_data: bytes,
+    continue_stdin: bytes,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
+    timeout_seconds: float | None = None,
+    timeout_retry_enabled: bool = True,
+    timeout_max_retries: int = 3,
     max_consecutive_empty_responses: int = 3,
     priority: int = SemPriority.DEFAULT,
     task_id: str | None = None,
@@ -865,12 +865,30 @@ async def _run_with_api_retry(
     role_kind: str | None = None,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
-    """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
+    """内层循环：启动 pi 子进程，处理 API 级错误重试。
+
+    核心设计：
+      - agent_process_slot 在循环外只获取一次（排队无超时，永久等候）
+      - asyncio.wait_for 只包裹实际执行部分，不包裹排队等候
+      - 超时重试在持有 slot 期间进行，不重新入队
+    """
     api_attempt = 0
+    timeout_failures = 0
     query_engine_401_failures = 0
     empty_response_failures = 0
+    current_stdin = stdin_data
 
-    while True:
+    # 排队无超时：永久等候，直到获得 slot
+    async with agent_process_slot(
+        priority=priority,
+        task_id=task_id,
+        stage_key=stage_key,
+        role_kind=role_kind,
+        cancel_event=cancel_event,
+        on_event=on_slot_event,
+    ) as slot_lease:
+      # slot 已获取，所有重试（超时/API错误）均在此作用域内进行
+      while True:
         result = AgentResult()
 
         # ── 拉起子进程（OSError 由外层 catch）──
@@ -879,14 +897,9 @@ async def _run_with_api_retry(
         # 根据 WORKER_ISOLATION_MODE 可选包裹文件系统隔离层。
         _spawn_args = _build_isolated_args(args, cwd)
         stderr_text = ""
-        async with agent_process_slot(
-            priority=priority,
-            task_id=task_id,
-            stage_key=stage_key,
-            role_kind=role_kind,
-            cancel_event=cancel_event,
-            on_event=on_slot_event,
-        ) as slot_lease:
+
+        async def _execute() -> AgentResult:
+            nonlocal stderr_text
             handle = await AgentProcessHandle.spawn(
                 *_spawn_args,
                 cwd=cwd,
@@ -900,47 +913,40 @@ async def _run_with_api_retry(
             slot_lease.bind_pid(getattr(proc, "pid", None))
 
             # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
-            if stdin_data and proc.stdin:
+            if current_stdin and proc.stdin:
                 try:
-                    proc.stdin.write(stdin_data)
+                    proc.stdin.write(current_stdin)
                     await proc.stdin.drain()
                     proc.stdin.close()
                 except (BrokenPipeError, ConnectionResetError):
-                    # 进程已退出，忽略管道写入错误
                     pass
 
-            cancel_task = None
+            _cancel_task: asyncio.Task[Any] | None = None
             if cancel_event:
-                async def _cancel_monitor():
+                async def _cancel_monitor() -> None:
                     await cancel_event.wait()
-                    # 在 kill 前先记录 pgid，防止 pi 退出后无法获取
                     pgid: int | None = None
                     try:
                         pgid = process_group_id(proc)
                     except (ProcessLookupError, OSError):
                         pass
-                    # Step1：向整个 process group 发 SIGTERM（杀 pi 及其工具子进程）
                     if pgid is not None:
                         try:
                             os.killpg(pgid, signal.SIGTERM)
                         except (ProcessLookupError, OSError):
                             pass
-                    # Step2：等待 pi 进程退出（最多 0.3 秒，原 3s 太长导致取消感知慢）
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=0.3)
                     except asyncio.TimeoutError:
                         pass
-                    # Step3：无论 pi 是否已退出，对整个 group 强制 SIGKILL
-                    # 关键：SIGTERM 后 pi 已死，但 bash/工具子进程可能存活并持有 stdout pipe
-                    # 必须 SIGKILL 才能强关闭 pipe，否则 proc.stdout.read() 永久阻塞
                     if pgid is not None:
                         try:
                             os.killpg(pgid, signal.SIGKILL)
                         except (ProcessLookupError, OSError):
-                            pass  # group 已全部退出，正常
-                cancel_task = asyncio.create_task(_cancel_monitor())
+                            pass
+                _cancel_task = asyncio.create_task(_cancel_monitor())
 
-            # ── 读取 JSON Lines 输出（try/except 保护管道断裂）──
+            exec_result = AgentResult()
             try:
                 assert proc.stdout is not None
                 buffer = b""
@@ -953,39 +959,37 @@ async def _run_with_api_retry(
                         line, buffer = buffer.split(b"\n", 1)
                         _process_line(
                             line.decode("utf-8", errors="replace"),
-                            result, on_stream)
+                            exec_result, on_stream)
                 if buffer.strip():
                     _process_line(
                         buffer.decode("utf-8", errors="replace"),
-                        result, on_stream)
+                        exec_result, on_stream)
 
                 assert proc.stderr is not None
-                stderr_data = await proc.stderr.read()
-                stderr_text = stderr_data.decode(
+                _stderr_data = await proc.stderr.read()
+                stderr_text = _stderr_data.decode(
                     "utf-8", errors="replace").strip()
                 if stderr_text:
-                    _check_stderr_for_fatal(stderr_text, result)
-                    if not result.error:
-                        result.error = stderr_text
+                    _check_stderr_for_fatal(stderr_text, exec_result)
+                    if not exec_result.error:
+                        exec_result.error = stderr_text
 
                 await proc.wait()
-                result.exit_code = proc.returncode or 0
+                exec_result.exit_code = proc.returncode or 0
 
             except asyncio.CancelledError:
                 await handle.terminate_tree(reason="task_cancelled")
                 raise
             except Exception as e:
-                # 管道断裂、进程被杀等
                 _log_warn(f"pi 进程读取异常: {e}")
-                result.error = f"pi process read error: {e}"
-                result.exit_code = -1
+                exec_result.error = f"pi process read error: {e}"
+                exec_result.exit_code = -1
                 await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
-
             finally:
-                if cancel_task:
-                    cancel_task.cancel()
+                if _cancel_task:
+                    _cancel_task.cancel()
                     try:
-                        await cancel_task
+                        await _cancel_task
                     except asyncio.CancelledError:
                         pass
                 await handle.terminate_tree(
@@ -993,6 +997,41 @@ async def _run_with_api_retry(
                     term_timeout=2.0,
                     kill_timeout=2.0,
                 )
+            return exec_result
+
+        # ── 执行（只对执行计时，不包括排队等候）──
+        try:
+            result = (
+                await asyncio.wait_for(_execute(), timeout=timeout_seconds)
+                if timeout_seconds else
+                await _execute()
+            )
+        except asyncio.TimeoutError:
+            timeout_failures += 1
+            result.error = (
+                f"agent run timed out after {timeout_seconds:.0f}s"
+                if timeout_seconds else "agent run timed out"
+            )
+            result.exit_code = -1
+            can_retry = timeout_retry_enabled and (
+                timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
+            )
+            if not can_retry or (cancel_event and cancel_event.is_set()):
+                return result
+            delay = _backoff(retry_delay, timeout_failures)
+            _log_warn(
+                f"agent 单次输入超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
+                f"{delay:.0f}s 后重试: {result.error}"
+            )
+            if on_stream:
+                on_stream(
+                    f"\n\u23f1\ufe0f 智能体执行超时，{delay:.0f}s 后重试 "
+                    f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
+                )
+            if await _sleep_cancel_first(delay, cancel_event):
+                return result
+            current_stdin = continue_stdin  # 超时重试用 continue 提示
+            continue
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
