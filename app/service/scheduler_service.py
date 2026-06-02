@@ -12,7 +12,7 @@ from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.db.models import AppEaTask, AppEaWorkerSlot
+from app.db.models import AppEaTask
 from app.time_utils import now_local
 
 logger = logging.getLogger("ea.scheduler")
@@ -63,110 +63,19 @@ class SchedulerService:
             ),
         ]
 
-    @staticmethod
-    def _alive_owner_pods(db: Session, now) -> set[str]:
-        from app.service.worker_slot_service import STALE_AFTER_SECONDS, get_worker_slot_service
-        from app.time_utils import add_seconds_local
-
-        live_pods = set(get_worker_slot_service()._list_live_worker_pods())
-        registry_cutoff = add_seconds_local(now, -STALE_AFTER_SECONDS)
-        registry_rows = (
-            db.query(AppEaWorkerSlot.pod_name)
-            .filter(AppEaWorkerSlot.last_heartbeat_at.is_not(None), AppEaWorkerSlot.last_heartbeat_at >= registry_cutoff)
-            .all()
-        )
-        for pod_name, in registry_rows:
-            pod = str(pod_name or "").strip()
-            if pod:
-                live_pods.add(pod)
-        return live_pods
-
     def _reconcile_expired_running_tasks(self, db: Session, now) -> tuple[int, int]:
         from app.service.task_service import (
-            TASK_EVENT_SOURCE_SYSTEM,
-            _event_dedupe_key,
-            _safe_create_task_event,
+            _alive_entry_analysis_owner_pods,
+            _requeue_expired_running_tasks,
         )
 
-        alive_owner_pods = self._alive_owner_pods(db, now)
-        candidates = (
-            db.query(AppEaTask)
-            .filter(*self._expired_running_candidate_filter(now))
-            .order_by(AppEaTask.updated_at.asc(), AppEaTask.id.asc())
-            .limit(EXPIRED_RUNNING_RECONCILE_BATCH_SIZE)
-            .all()
+        reconciled, owner_alive = _requeue_expired_running_tasks(
+            db,
+            now,
+            limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
+            scheduler_instance="scheduler",
+            alive_owner_pods=_alive_entry_analysis_owner_pods(db, now),
         )
-        reconciled = 0
-        owner_alive = 0
-        for row in candidates:
-            previous_owner = str(row.owner_pod or "").strip() or None
-            if previous_owner and previous_owner in alive_owner_pods:
-                owner_alive += 1
-                logger.info(
-                    "skip expired running reconcile task_id=%s owner_pod=%s reason=owner_alive",
-                    row.task_id,
-                    previous_owner,
-                )
-                continue
-            previous_owner_ip = row.owner_pod_ip
-            previous_lease_expires_at = row.lease_expires_at
-            update_filters = [
-                AppEaTask.id == row.id,
-                AppEaTask.status == "running",
-                AppEaTask.cancel_requested.is_(False),
-            ]
-            if previous_owner is None:
-                update_filters.append(AppEaTask.owner_pod.is_(None))
-            else:
-                update_filters.append(AppEaTask.owner_pod == previous_owner)
-            if previous_lease_expires_at is None:
-                update_filters.append(AppEaTask.lease_expires_at.is_(None))
-            else:
-                update_filters.append(AppEaTask.lease_expires_at == previous_lease_expires_at)
-            updated = db.execute(
-                update(AppEaTask)
-                .where(and_(*update_filters))
-                .values(
-                    status="pending",
-                    owner_pod=None,
-                    owner_pod_ip=None,
-                    lease_expires_at=None,
-                    cancel_requested=False,
-                    finished_at=None,
-                    updated_at=now_local(),
-                )
-            )
-            if int(getattr(updated, "rowcount", 0) or 0) != 1:
-                continue
-            refreshed = db.query(AppEaTask).filter(AppEaTask.id == row.id).first()
-            if refreshed is None:
-                continue
-            _safe_create_task_event(
-                db,
-                task_id=refreshed.task_id,
-                project_id=refreshed.project_id,
-                event_type="task_requeued_after_expired_lease_reconcile",
-                message="任务因过期租约且 owner 丢失，已由调度器重新放回队列",
-                source=TASK_EVENT_SOURCE_SYSTEM,
-                level="warning",
-                stage_key="entry_analysis",
-                file_path=refreshed.input_path,
-                status=refreshed.status,
-                payload={
-                    "previous_owner_pod": previous_owner,
-                    "previous_owner_pod_ip": previous_owner_ip,
-                    "previous_lease_expires_at": previous_lease_expires_at.isoformat() if previous_lease_expires_at else None,
-                    "reconcile_reason": "expired_lease_owner_missing",
-                    "scheduler_instance": "scheduler",
-                },
-                dedupe_key=_event_dedupe_key(
-                    refreshed.task_id,
-                    "task_requeued_after_expired_lease_reconcile",
-                    previous_owner,
-                    previous_lease_expires_at,
-                ),
-            )
-            reconciled += 1
         if reconciled or owner_alive:
             _expired_running_reconcile_stats.observe(reconciled=reconciled, owner_alive=owner_alive)
         return reconciled, owner_alive

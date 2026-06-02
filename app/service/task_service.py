@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent, AppEaStageResultIndex
+from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent, AppEaStageResultIndex, AppEaWorkerSlot
 from app.logging_utils import log_event
 from app.models import normalize_max_concurrent_tasks
 from app.service.session_index import build_session_catalog
@@ -51,7 +51,7 @@ DELETE_TASK_DB_RETRY_DELAY_SECONDS = float(os.environ.get("EA_DELETE_TASK_DB_RET
 
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
-LEASE_DURATION_SECONDS = int(os.environ.get("EA_TASK_LEASE_SECONDS", "120"))
+LEASE_DURATION_SECONDS = int(os.environ.get("EA_TASK_LEASE_SECONDS", "300"))
 LEASE_RENEW_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_LEASE_RENEW_INTERVAL_SECONDS", "30"))
 CANCEL_POLL_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_CANCEL_POLL_INTERVAL_SECONDS", "3"))
 DISPATCH_CLAIM_BATCH_SIZE = _positive_int_env("EA_WORKER_DISPATCH_CLAIM_BATCH_SIZE", 1)
@@ -573,6 +573,134 @@ def _lease_expired_expr():
 def _dispatch_lease_expired_expr():
     now = now_local()
     return or_(AppEaDispatchLease.lease_expires_at.is_(None), AppEaDispatchLease.lease_expires_at < now)
+
+
+def _alive_entry_analysis_owner_pods(db: Session, now: datetime | None = None) -> set[str]:
+    from app.service.worker_slot_service import STALE_AFTER_SECONDS, get_worker_slot_service
+
+    current = now or now_local()
+    live_pods = set(get_worker_slot_service()._list_live_worker_pods())
+    registry_cutoff = add_seconds_local(current, -STALE_AFTER_SECONDS)
+    registry_rows = (
+        db.query(AppEaWorkerSlot.pod_name)
+        .filter(
+            AppEaWorkerSlot.last_heartbeat_at.is_not(None),
+            AppEaWorkerSlot.last_heartbeat_at >= registry_cutoff,
+        )
+        .all()
+    )
+    for pod_name, in registry_rows:
+        pod = str(pod_name or "").strip()
+        if pod:
+            live_pods.add(pod)
+    return live_pods
+
+
+def _requeue_expired_running_tasks(
+    db: Session,
+    now: datetime | None = None,
+    *,
+    project_id: str | None = None,
+    limit: int | None = None,
+    scheduler_instance: str = "scheduler",
+    alive_owner_pods: set[str] | None = None,
+) -> tuple[int, int]:
+    current = now or now_local()
+    owner_pods = alive_owner_pods if alive_owner_pods is not None else _alive_entry_analysis_owner_pods(db, current)
+    query = (
+        db.query(AppEaTask)
+        .filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "running",
+            AppEaTask.cancel_requested.is_(False),
+            or_(
+                AppEaTask.lease_expires_at.is_(None),
+                AppEaTask.lease_expires_at < current,
+            ),
+        )
+        .order_by(AppEaTask.updated_at.asc(), AppEaTask.id.asc())
+    )
+    if project_id:
+        query = query.filter(AppEaTask.project_id == project_id)
+    if limit is not None and limit > 0:
+        query = query.limit(limit)
+    candidates = query.all()
+    requeued = 0
+    owner_alive_requeued = 0
+    for row in candidates:
+        previous_owner = str(row.owner_pod or "").strip() or None
+        owner_is_alive = bool(previous_owner and previous_owner in owner_pods)
+        previous_owner_ip = row.owner_pod_ip
+        previous_lease_expires_at = row.lease_expires_at
+        update_filters = [
+            AppEaTask.id == row.id,
+            AppEaTask.status == "running",
+            AppEaTask.cancel_requested.is_(False),
+        ]
+        if previous_owner is None:
+            update_filters.append(AppEaTask.owner_pod.is_(None))
+        else:
+            update_filters.append(AppEaTask.owner_pod == previous_owner)
+        if previous_lease_expires_at is None:
+            update_filters.append(AppEaTask.lease_expires_at.is_(None))
+        else:
+            update_filters.append(AppEaTask.lease_expires_at == previous_lease_expires_at)
+        updated = db.execute(
+            update(AppEaTask)
+            .where(and_(*update_filters))
+            .values(
+                status="pending",
+                owner_pod=None,
+                owner_pod_ip=None,
+                lease_expires_at=None,
+                cancel_requested=False,
+                finished_at=None,
+                stages_json=None,
+                error=None,
+                result_json=None,
+                latest_abnormal_reason_json=None,
+                updated_at=now_local(),
+            )
+        )
+        if int(getattr(updated, "rowcount", 0) or 0) != 1:
+            continue
+        refreshed = db.query(AppEaTask).filter(AppEaTask.id == row.id).first()
+        if refreshed is None:
+            continue
+        if owner_is_alive:
+            owner_alive_requeued += 1
+        _safe_create_task_event(
+            db,
+            task_id=refreshed.task_id,
+            project_id=refreshed.project_id,
+            event_type="task_requeued_after_expired_lease_reconcile",
+            message="任务因过期租约被收回并重新进入调度队列",
+            source=TASK_EVENT_SOURCE_SYSTEM,
+            level="warning",
+            stage_key="entry_analysis",
+            file_path=refreshed.input_path,
+            status=refreshed.status,
+            payload={
+                "previous_owner_pod": previous_owner,
+                "previous_owner_pod_ip": previous_owner_ip,
+                "previous_lease_expires_at": previous_lease_expires_at.isoformat() if previous_lease_expires_at else None,
+                "reconcile_reason": "expired_lease_owner_alive" if owner_is_alive else "expired_lease_owner_missing",
+                "owner_pod_alive": owner_is_alive,
+                "scheduler_instance": scheduler_instance,
+                "reset_to_schedulable": True,
+                "restart_mode": "fresh_start",
+            },
+            dedupe_key=_event_dedupe_key(
+                refreshed.task_id,
+                "task_requeued_after_expired_lease_reconcile",
+                previous_owner,
+                previous_lease_expires_at,
+                owner_is_alive,
+                scheduler_instance,
+            ),
+        )
+        requeued += 1
+    return requeued, owner_alive_requeued
 
 
 def _task_root(row: AppEaTask) -> Path | None:
@@ -2008,6 +2136,20 @@ class TaskService:
                 dispatch_token = self._acquire_dispatch_lease(db, project_id)
                 if not dispatch_token:
                     return
+                reclaimed_count, reclaimed_owner_alive = _requeue_expired_running_tasks(
+                    db,
+                    project_id=project_id,
+                    limit=DISPATCH_CLAIM_BATCH_SIZE * 4,
+                    scheduler_instance=f"dispatch:{POD_NAME}",
+                )
+                if reclaimed_count:
+                    db.commit()
+                    logger.warning(
+                        "dispatch reclaimed %s expired entry-analysis tasks before claiming new work project_id=%s owner_alive=%s",
+                        reclaimed_count,
+                        project_id,
+                        reclaimed_owner_alive,
+                    )
                 svc = _load_svc_config_from_db(db, project_id)
                 max_concurrent_tasks = normalize_max_concurrent_tasks(
                     getattr(svc, "max_concurrent_tasks", None)

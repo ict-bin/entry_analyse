@@ -126,7 +126,7 @@ def test_scheduler_reconcile_expired_running_requeues_owner_missing(monkeypatch)
             "get_worker_slot_service",
             lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
         )
-        monkeypatch.setattr(SchedulerService, "_alive_owner_pods", lambda self, _db, _now: set())
+        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: set())
         monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
 
         changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
@@ -138,13 +138,18 @@ def test_scheduler_reconcile_expired_running_requeues_owner_missing(monkeypatch)
         assert row.owner_pod_ip is None
         assert row.lease_expires_at is None
         assert row.finished_at is None
+        assert row.stages_json is None
+        assert row.result_json is None
+        assert row.error is None
         assert events[0]["event_type"] == "task_requeued_after_expired_lease_reconcile"
         assert events[0]["payload"]["previous_owner_pod"] == "worker-dead"
+        assert events[0]["payload"]["owner_pod_alive"] is False
+        assert events[0]["payload"]["reconcile_reason"] == "expired_lease_owner_missing"
     finally:
         db.close()
 
 
-def test_scheduler_reconcile_expired_running_keeps_live_owner(monkeypatch) -> None:
+def test_scheduler_reconcile_expired_running_requeues_live_owner(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -171,17 +176,20 @@ def test_scheduler_reconcile_expired_running_keeps_live_owner(monkeypatch) -> No
             "get_worker_slot_service",
             lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
         )
-        monkeypatch.setattr(SchedulerService, "_alive_owner_pods", lambda self, _db, _now: {"worker-live"})
+        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: {"worker-live"})
         events = []
         monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
 
         changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
         db.refresh(row)
 
-        assert changed == 0
-        assert row.status == "running"
-        assert row.owner_pod == "worker-live"
-        assert events == []
+        assert changed == 1
+        assert row.status == "pending"
+        assert row.owner_pod is None
+        assert row.lease_expires_at is None
+        assert events[0]["event_type"] == "task_requeued_after_expired_lease_reconcile"
+        assert events[0]["payload"]["owner_pod_alive"] is True
+        assert events[0]["payload"]["reconcile_reason"] == "expired_lease_owner_alive"
     finally:
         db.close()
 
