@@ -286,8 +286,6 @@ class WorkerService:
             snap = self._health_server_snapshot
             if not snap.bootstrapped:
                 return HTTPStatus.SERVICE_UNAVAILABLE
-            if snap.startup_phase not in {"ready", "running"}:
-                return HTTPStatus.SERVICE_UNAVAILABLE
             if not snap.worker_probe_safe_ready:
                 return HTTPStatus.SERVICE_UNAVAILABLE
             if self._guard_state.state == "unhealthy":
