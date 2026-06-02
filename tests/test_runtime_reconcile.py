@@ -125,8 +125,75 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["queued_jobs"] == 2
     assert snapshot["busy_slots"] == 1
     assert snapshot["available_slots"] == 3
+    assert snapshot["registry_visible_workers"] == 1
+    assert snapshot["live_pod_count"] == 0
+    assert snapshot["registry_missing_live_pods"] == 0
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
+
+
+def test_worker_slot_cleanup_keeps_live_stale_registry_row(monkeypatch) -> None:
+    now = now_local()
+    stale_row = SimpleNamespace(
+        worker_id="w-stale",
+        pod_name="pod-live",
+        last_heartbeat_at=now - timedelta(seconds=1000),
+    )
+
+    class _CleanupQuery:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+        def first(self):
+            return None
+
+    class _CleanupDb:
+        def __init__(self):
+            self.deleted = []
+            self.commits = 0
+            self._query_count = 0
+
+        def query(self, model):
+            del model
+            self._query_count += 1
+            if self._query_count == 1:
+                return _CleanupQuery([stale_row])
+            return _CleanupQuery([])
+
+        def delete(self, row):
+            self.deleted.append(row)
+
+        def commit(self):
+            self.commits += 1
+
+    db = _CleanupDb()
+    svc = WorkerSlotService()
+    monkeypatch.setattr(svc, "_list_live_worker_pods", lambda: {"pod-live"})
+
+    deleted = svc.cleanup_retired_workers(db)
+
+    assert deleted == 0
+    assert db.deleted == []
+    assert db.commits == 0
+
+
+def test_worker_runtime_health_snapshot_includes_lease_and_guard() -> None:
+    service = worker_slot_service  # keep import usage stable
+    del service
+    worker = __import__("app.service.worker_service", fromlist=["WorkerService"]).WorkerService()
+    snapshot = worker.runtime_health_snapshot()
+
+    assert "heartbeat" in snapshot
+    assert "lease" in snapshot
+    assert "maintenance" in snapshot
+    assert "guard" in snapshot
+    assert snapshot["guard"]["state"] == "healthy"
 
 
 def test_active_running_count_excludes_binary_security_origin_tasks() -> None:

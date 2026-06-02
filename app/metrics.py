@@ -305,6 +305,9 @@ def _render_task_metrics() -> list[str]:
                 pass
     except Exception:
         pass
+    heartbeat_failure_counts = (worker_runtime_health.get("heartbeat") or {}).get("failure_counts") or {}
+    lease_failure_counts = (worker_runtime_health.get("lease") or {}).get("failure_counts") or {}
+    maintenance_failure_counts = (worker_runtime_health.get("maintenance") or {}).get("failure_counts") or {}
     lines = [
         "# HELP secflow_ea_db_up Database query path for metrics is available.",
         "# TYPE secflow_ea_db_up gauge",
@@ -376,6 +379,25 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_worker_maintenance_failure_total Worker maintenance failures observed by this process.",
         "# TYPE secflow_ea_worker_maintenance_failure_total counter",
         f"secflow_ea_worker_maintenance_failure_total {int((worker_runtime_health.get('maintenance') or {}).get('failure_total') or 0)}",
+        "# HELP secflow_ea_worker_lease_duration_seconds Last successful worker lease renew duration.",
+        "# TYPE secflow_ea_worker_lease_duration_seconds gauge",
+        f"secflow_ea_worker_lease_duration_seconds {_fmt(float(((worker_runtime_health.get('lease') or {}).get('last_duration_ms') or 0.0) / 1000.0))}",
+        "# HELP secflow_ea_worker_lease_age_seconds Seconds since the last successful lease renew.",
+        "# TYPE secflow_ea_worker_lease_age_seconds gauge",
+        f"secflow_ea_worker_lease_age_seconds {_fmt(float((worker_runtime_health.get('lease') or {}).get('age_seconds') or 0.0))}",
+        "# HELP secflow_ea_worker_lease_failure_total Worker lease renewal failures observed by this process.",
+        "# TYPE secflow_ea_worker_lease_failure_total counter",
+        f"secflow_ea_worker_lease_failure_total {int((worker_runtime_health.get('lease') or {}).get('failure_total') or 0)}",
+        "# HELP secflow_ea_worker_guard_state Worker guard state encoded as healthy=0,degraded=1,unhealthy=2.",
+        "# TYPE secflow_ea_worker_guard_state gauge",
+        f"secflow_ea_worker_guard_state {1 if (worker_runtime_health.get('guard') or {}).get('state') == 'degraded' else 2 if (worker_runtime_health.get('guard') or {}).get('state') == 'unhealthy' else 0}",
+        "# HELP secflow_ea_worker_background_slow_total Total background loop slow executions.",
+        "# TYPE secflow_ea_worker_background_slow_total gauge",
+        f'{ "secflow_ea_worker_background_slow_total" }{{kind="heartbeat"}} {int((worker_runtime_health.get("heartbeat") or {}).get("slow_total") or 0)}',
+        f'{ "secflow_ea_worker_background_slow_total" }{{kind="lease"}} {int((worker_runtime_health.get("lease") or {}).get("slow_total") or 0)}',
+        f'{ "secflow_ea_worker_background_slow_total" }{{kind="maintenance"}} {int((worker_runtime_health.get("maintenance") or {}).get("slow_total") or 0)}',
+        "# HELP secflow_ea_worker_background_failure_total Total background loop failures by kind, phase and exception type.",
+        "# TYPE secflow_ea_worker_background_failure_total counter",
         "# HELP secflow_ea_worker_runtime_config_refresh_duration_seconds Last successful runtime config refresh duration.",
         "# TYPE secflow_ea_worker_runtime_config_refresh_duration_seconds gauge",
         f"secflow_ea_worker_runtime_config_refresh_duration_seconds {_fmt(float(((worker_runtime_health.get('runtime_config') or {}).get('last_duration_ms') or 0.0) / 1000.0))}",
@@ -404,6 +426,16 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_failure_category_total Terminal tasks classified by failure category.",
         "# TYPE secflow_ea_failure_category_total counter",
     ])
+    for kind, failure_counts in (
+        ("heartbeat", heartbeat_failure_counts),
+        ("lease", lease_failure_counts),
+        ("maintenance", maintenance_failure_counts),
+    ):
+        for key in sorted(failure_counts):
+            phase, exception_type = (str(key).split("|", 1) + ["unknown"])[:2]
+            lines.append(
+                f'secflow_ea_worker_background_failure_total{{kind="{kind}",phase="{phase}",exception_type="{exception_type}"}} {int(failure_counts[key])}'
+            )
     for category in sorted(failure_category_counts):
         lines.append(f"secflow_ea_failure_category_total{_labels(category=category)} {failure_category_counts[category]}")
     lines.extend([

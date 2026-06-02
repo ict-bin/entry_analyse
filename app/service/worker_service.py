@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -37,6 +38,13 @@ WORKER_MAINTENANCE_TIMEOUT_SECONDS = max(5, int(os.environ.get("EA_WORKER_MAINTE
 WORKER_MAINTENANCE_MAX_STALE_TASKS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_STALE_TASKS", "50")))
 WORKER_MAINTENANCE_MAX_KILLS = max(1, int(os.environ.get("EA_WORKER_MAINTENANCE_MAX_KILLS", "100")))
 WORKER_HTTP_PORT = max(1, int(os.environ.get("PORT", "8080")))
+WORKER_HEARTBEAT_SLOW_MS = max(1000, int(os.environ.get("EA_WORKER_HEARTBEAT_SLOW_MS", "10000")))
+WORKER_LEASE_SLOW_MS = max(1000, int(os.environ.get("EA_WORKER_LEASE_SLOW_MS", "10000")))
+WORKER_GUARD_GRACE_SECONDS = max(5, int(os.environ.get("EA_WORKER_GUARD_GRACE_SECONDS", "60")))
+WORKER_GUARD_LOOP_SECONDS = max(5, int(os.environ.get("EA_WORKER_GUARD_LOOP_SECONDS", "15")))
+WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD", "3")))
+WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD", "3")))
+WORKER_GUARD_LEASE_FAILURE_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_GUARD_LEASE_FAILURE_THRESHOLD", str(WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD))))
 
 
 @dataclass
@@ -59,11 +67,24 @@ class WorkerLoopHealthSnapshot:
     last_phase: str | None = None
     success_total: int = 0
     failure_total: int = 0
+    last_exception_type: str | None = None
+    phase_durations_ms: dict[str, float] = field(default_factory=dict)
+    slow_total: int = 0
+    failure_counts: dict[str, int] = field(default_factory=dict)
 
     def age_seconds(self) -> float | None:
         if self.last_success_at <= 0:
             return None
         return max(0.0, time.time() - self.last_success_at)
+
+
+@dataclass
+class WorkerGuardStateSnapshot:
+    state: str = "healthy"
+    reason: str | None = None
+    since: float = 0.0
+    transition_at: float = 0.0
+    degraded_task_id: str | None = None
 
 
 def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
@@ -121,10 +142,16 @@ class WorkerService:
         self._heartbeat_stop = threading.Event()
         self._maintenance_task: Optional[asyncio.Task] = None
         self._runtime_config_task: Optional[asyncio.Task] = None
+        self._guard_task: Optional[asyncio.Task] = None
         self._runtime_config = WorkerRuntimeConfigSnapshot()
         self._heartbeat_health = WorkerLoopHealthSnapshot()
+        self._lease_health = WorkerLoopHealthSnapshot()
         self._maintenance_health = WorkerLoopHealthSnapshot()
         self._runtime_config_health = WorkerLoopHealthSnapshot()
+        self._guard_state = WorkerGuardStateSnapshot()
+        self._task_abort_callbacks: dict[str, Any] = {}
+        self._task_guard_reasons: dict[str, str] = {}
+        self._task_lease_started_at: dict[str, float] = {}
 
     def has_local_task(self, task_id: str) -> bool:
         task = _running_tasks.get(task_id)
@@ -186,6 +213,9 @@ class WorkerService:
             last_error=self._runtime_config.last_error,
         )
 
+    def _record_phase_duration(self, health: WorkerLoopHealthSnapshot, *, phase: str, duration_ms: float) -> None:
+        health.phase_durations_ms[phase] = round(max(0.0, float(duration_ms)), 3)
+
     def runtime_health_snapshot(self) -> dict[str, Any]:
         return {
             "heartbeat": {
@@ -197,6 +227,24 @@ class WorkerService:
                 "success_total": self._heartbeat_health.success_total,
                 "failure_total": self._heartbeat_health.failure_total,
                 "age_seconds": self._heartbeat_health.age_seconds(),
+                "last_exception_type": self._heartbeat_health.last_exception_type,
+                "phase_durations_ms": dict(self._heartbeat_health.phase_durations_ms),
+                "slow_total": self._heartbeat_health.slow_total,
+                "failure_counts": dict(self._heartbeat_health.failure_counts),
+            },
+            "lease": {
+                "last_success_at": self._lease_health.last_success_at,
+                "last_duration_ms": self._lease_health.last_duration_ms,
+                "consecutive_failures": self._lease_health.consecutive_failures,
+                "last_error": self._lease_health.last_error,
+                "last_phase": self._lease_health.last_phase,
+                "success_total": self._lease_health.success_total,
+                "failure_total": self._lease_health.failure_total,
+                "age_seconds": self._lease_health.age_seconds(),
+                "last_exception_type": self._lease_health.last_exception_type,
+                "phase_durations_ms": dict(self._lease_health.phase_durations_ms),
+                "slow_total": self._lease_health.slow_total,
+                "failure_counts": dict(self._lease_health.failure_counts),
             },
             "maintenance": {
                 "last_success_at": self._maintenance_health.last_success_at,
@@ -207,6 +255,10 @@ class WorkerService:
                 "success_total": self._maintenance_health.success_total,
                 "failure_total": self._maintenance_health.failure_total,
                 "age_seconds": self._maintenance_health.age_seconds(),
+                "last_exception_type": self._maintenance_health.last_exception_type,
+                "phase_durations_ms": dict(self._maintenance_health.phase_durations_ms),
+                "slow_total": self._maintenance_health.slow_total,
+                "failure_counts": dict(self._maintenance_health.failure_counts),
             },
             "runtime_config": {
                 "last_success_at": self._runtime_config_health.last_success_at,
@@ -217,6 +269,21 @@ class WorkerService:
                 "success_total": self._runtime_config_health.success_total,
                 "failure_total": self._runtime_config_health.failure_total,
                 "age_seconds": self._runtime_config_health.age_seconds(),
+                "last_exception_type": self._runtime_config_health.last_exception_type,
+                "phase_durations_ms": dict(self._runtime_config_health.phase_durations_ms),
+                "slow_total": self._runtime_config_health.slow_total,
+                "failure_counts": dict(self._runtime_config_health.failure_counts),
+            },
+            "guard": {
+                "state": self._guard_state.state,
+                "reason": self._guard_state.reason,
+                "since": self._guard_state.since,
+                "transition_at": self._guard_state.transition_at,
+                "degraded_task_id": self._guard_state.degraded_task_id,
+                "local_running_task_count": self.local_running_count(),
+                "tracked_task_count": len(self._task_abort_callbacks),
+                "guarded_task_count": len(self._task_guard_reasons),
+                "oldest_running_task_lease_age_seconds": self._oldest_running_task_lease_age_seconds(),
             },
             "effective_config": {
                 "max_concurrent_tasks": self._runtime_config.max_concurrent_tasks,
@@ -227,19 +294,87 @@ class WorkerService:
             },
         }
 
+    def _oldest_running_task_lease_age_seconds(self) -> float:
+        now_ts = time.time()
+        ages: list[float] = []
+        for task_id in list(_running_tasks.keys()):
+            started_at = self._task_lease_started_at.get(task_id)
+            if isinstance(started_at, (int, float)) and started_at > 0:
+                ages.append(max(0.0, now_ts - float(started_at)))
+        return max(ages) if ages else 0.0
+
     def _record_loop_success(self, health: WorkerLoopHealthSnapshot, *, phase: str, duration_ms: float) -> None:
         health.last_success_at = time.time()
         health.last_duration_ms = max(0.0, float(duration_ms))
         health.last_phase = phase
         health.last_error = None
+        health.last_exception_type = None
         health.consecutive_failures = 0
         health.success_total += 1
 
     def _record_loop_failure(self, health: WorkerLoopHealthSnapshot, *, phase: str, exc: Exception) -> None:
         health.last_phase = phase
         health.last_error = str(exc)
+        health.last_exception_type = type(exc).__name__
         health.consecutive_failures += 1
         health.failure_total += 1
+        counter_key = f"{phase}|{type(exc).__name__}"
+        health.failure_counts[counter_key] = int(health.failure_counts.get(counter_key) or 0) + 1
+
+    def _record_loop_slow(self, health: WorkerLoopHealthSnapshot) -> None:
+        health.slow_total += 1
+
+    def _log_background_failure(
+        self,
+        *,
+        logger_message: str,
+        health: WorkerLoopHealthSnapshot,
+        phase: str,
+        exc: Exception,
+        worker_id: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        logger.warning(
+            "%s phase=%s consecutive_failures=%s worker_id=%s task_id=%s error_type=%s error_repr=%r traceback=%s",
+            logger_message,
+            phase,
+            health.consecutive_failures,
+            worker_id,
+            task_id,
+            type(exc).__name__,
+            exc,
+            traceback.format_exc(),
+        )
+
+    def _set_guard_state(self, *, state: str, reason: str | None, task_id: str | None = None) -> None:
+        now_ts = time.time()
+        if self._guard_state.state != state:
+            self._guard_state.transition_at = now_ts
+            self._guard_state.since = now_ts
+        elif self._guard_state.since <= 0:
+            self._guard_state.since = now_ts
+        self._guard_state.state = state
+        self._guard_state.reason = reason
+        self._guard_state.degraded_task_id = task_id
+
+    def _execute_with_timeout(self, func, *, timeout_seconds: int, timeout_message: str):
+        result: dict[str, Any] = {}
+        error: dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            try:
+                result["value"] = func()
+            except BaseException as exc:  # pragma: no cover - passthrough
+                error["exc"] = exc
+
+        thread = threading.Thread(target=_runner, name="ea_timeout_wrapper", daemon=True)
+        thread.start()
+        thread.join(timeout=max(1, int(timeout_seconds)))
+        if thread.is_alive():
+            raise TimeoutError(timeout_message)
+        if "exc" in error:
+            raise error["exc"]
+        return result.get("value")
 
     def _write_worker_heartbeat(
         self,
@@ -255,9 +390,12 @@ class WorkerService:
     ) -> None:
         from app.service.worker_slot_service import get_worker_slot_service
 
+        phase_started = time.perf_counter()
         db_gen = get_db()
+        self._record_phase_duration(self._heartbeat_health, phase="db_session_open", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
         db: Session = next(db_gen)
         try:
+            phase_started = time.perf_counter()
             get_worker_slot_service().upsert_heartbeat(
                 db,
                 worker_id=worker_id,
@@ -279,6 +417,7 @@ class WorkerService:
                 heartbeat_duration_ms=heartbeat_duration_ms,
                 heartbeat_failure_count=heartbeat_failure_count,
             )
+            self._record_phase_duration(self._heartbeat_health, phase="db_upsert_or_update", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
         finally:
             try:
                 next(db_gen)
@@ -352,19 +491,35 @@ class WorkerService:
 
         started = time.perf_counter()
         snapshot = self._runtime_config_snapshot()
+        phase_started = time.perf_counter()
         agent_snapshot = get_agent_process_slot_manager().snapshot()
-        self._write_worker_heartbeat(
-            worker_id=task_mod.POD_NAME,
-            pod_name=task_mod.POD_NAME,
-            pod_ip=task_mod.POD_IP or None,
-            http_port=WORKER_HTTP_PORT,
-            max_concurrent_tasks=snapshot.max_concurrent_tasks,
-            agent_snapshot=agent_snapshot,
-            heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
-            heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
+        self._record_phase_duration(self._heartbeat_health, phase="agent_snapshot", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
+        phase_started = time.perf_counter()
+        self._execute_with_timeout(
+            lambda: self._write_worker_heartbeat(
+                worker_id=task_mod.POD_NAME,
+                pod_name=task_mod.POD_NAME,
+                pod_ip=task_mod.POD_IP or None,
+                http_port=WORKER_HTTP_PORT,
+                max_concurrent_tasks=snapshot.max_concurrent_tasks,
+                agent_snapshot=agent_snapshot,
+                heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
+                heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
+            ),
+            timeout_seconds=WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS,
+            timeout_message="heartbeat db operation timeout",
         )
+        self._record_phase_duration(self._heartbeat_health, phase="db_commit", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
         duration_ms = (time.perf_counter() - started) * 1000.0
         self._record_loop_success(self._heartbeat_health, phase="heartbeat_write", duration_ms=duration_ms)
+        if duration_ms > WORKER_HEARTBEAT_SLOW_MS:
+            self._record_loop_slow(self._heartbeat_health)
+            logger.warning(
+                "worker heartbeat slow phase=heartbeat_write duration_ms=%.1f worker_id=%s phase_durations_ms=%s",
+                duration_ms,
+                task_mod.POD_NAME,
+                dict(self._heartbeat_health.phase_durations_ms),
+            )
         logger.info(
             "worker heartbeat ok worker_id=%s duration_ms=%.1f running_tasks=%s agent_in_use=%s agent_waiting_requests=%s max_concurrent_tasks=%s agent_process_limit=%s",
             task_mod.POD_NAME,
@@ -377,16 +532,19 @@ class WorkerService:
         )
 
     def _heartbeat_thread_main(self) -> None:
+        from app.service import task_service as task_mod
+
         while self._running and not self._heartbeat_stop.is_set():
             try:
                 self._heartbeat_once()
             except Exception as exc:
                 self._record_loop_failure(self._heartbeat_health, phase="heartbeat_write", exc=exc)
-                logger.warning(
-                    "worker slot heartbeat failed phase=%s consecutive_failures=%s error=%s",
-                    self._heartbeat_health.last_phase or "heartbeat_write",
-                    self._heartbeat_health.consecutive_failures,
-                    exc,
+                self._log_background_failure(
+                    logger_message="worker slot heartbeat failed",
+                    health=self._heartbeat_health,
+                    phase=self._heartbeat_health.last_phase or "heartbeat_write",
+                    exc=exc,
+                    worker_id=task_mod.POD_NAME,
                 )
             self._heartbeat_stop.wait(WORKER_SLOT_HEARTBEAT_SECONDS)
 
@@ -436,15 +594,18 @@ class WorkerService:
                         logger.warning("task-scoped maintenance cleanup failed for %s: %s", stale_row.task_id, scoped_exc)
                 if killed_processes < WORKER_MAINTENANCE_MAX_KILLS:
                     remaining_budget = WORKER_MAINTENANCE_MAX_KILLS - killed_processes
+                    phase_started = time.perf_counter()
                     orphan_killed = await asyncio.wait_for(
                         asyncio.to_thread(cleanup_orphan_pi_processes, logger.warning, label="ea_worker_maintenance"),
                         timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS,
                     )
+                    self._record_phase_duration(self._maintenance_health, phase="cleanup_call", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
                     killed_processes += min(orphan_killed, remaining_budget)
                     maintenance_truncated = maintenance_truncated or orphan_killed > remaining_budget
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 self._record_loop_success(self._maintenance_health, phase="maintenance", duration_ms=duration_ms)
-                if duration_ms > 3000 or maintenance_truncated:
+                if duration_ms > (WORKER_MAINTENANCE_TIMEOUT_SECONDS * 1000) or maintenance_truncated:
+                    self._record_loop_slow(self._maintenance_health)
                     logger.warning(
                         "worker maintenance slow phase=maintenance duration_ms=%.1f candidate_task_count=%s killed_processes=%s maintenance_truncated=%s",
                         duration_ms,
@@ -454,15 +615,69 @@ class WorkerService:
                     )
             except Exception as exc:
                 self._record_loop_failure(self._maintenance_health, phase="maintenance", exc=exc)
-                logger.warning(
-                    "worker maintenance failed phase=%s consecutive_failures=%s candidate_task_count=%s killed_processes=%s error=%s",
-                    self._maintenance_health.last_phase or "maintenance",
-                    self._maintenance_health.consecutive_failures,
-                    candidate_task_count,
-                    killed_processes,
-                    exc,
+                self._log_background_failure(
+                    logger_message=f"worker maintenance failed candidate_task_count={candidate_task_count} killed_processes={killed_processes}",
+                    health=self._maintenance_health,
+                    phase=self._maintenance_health.last_phase or "maintenance",
+                    exc=exc,
                 )
             await asyncio.sleep(ORPHAN_PI_SWEEP_SECONDS)
+
+    async def _guard_loop(self) -> None:
+        while self._running:
+            try:
+                await self._evaluate_guard_once()
+            except Exception as exc:
+                logger.warning(
+                    "worker guard evaluation failed error_type=%s error_repr=%r traceback=%s",
+                    type(exc).__name__,
+                    exc,
+                    traceback.format_exc(),
+                )
+            await asyncio.sleep(WORKER_GUARD_LOOP_SECONDS)
+
+    async def _evaluate_guard_once(self) -> None:
+        from app.service import task_service as task_mod
+
+        local_running = self.local_running_count()
+        heartbeat_age = float(self._heartbeat_health.age_seconds() or 0.0)
+        lease_age = float(self._lease_health.age_seconds() or 0.0)
+        degraded_task_id = next(iter(self._task_abort_callbacks.keys()), None)
+        reason = None
+        if local_running > 0:
+            if self._lease_health.consecutive_failures >= WORKER_GUARD_LEASE_FAILURE_THRESHOLD:
+                reason = f"lease failures={self._lease_health.consecutive_failures}"
+            elif self._heartbeat_health.consecutive_failures >= WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD:
+                reason = f"heartbeat failures={self._heartbeat_health.consecutive_failures}"
+            elif heartbeat_age > (2 * WORKER_SLOT_HEARTBEAT_SECONDS):
+                reason = f"heartbeat age={round(heartbeat_age, 1)}s"
+            elif lease_age > (2 * task_mod.LEASE_RENEW_INTERVAL_SECONDS):
+                reason = f"lease age={round(lease_age, 1)}s"
+        if not reason:
+            self._set_guard_state(state="healthy", reason=None, task_id=None)
+            self._task_guard_reasons.clear()
+            return
+        if self._guard_state.state == "healthy":
+            self._set_guard_state(state="degraded", reason=reason, task_id=degraded_task_id)
+            logger.warning("worker guard degraded worker_reason=%s task_id=%s", reason, degraded_task_id)
+            return
+        self._set_guard_state(state="degraded", reason=reason, task_id=degraded_task_id)
+        if (time.time() - float(self._guard_state.since or 0.0)) < WORKER_GUARD_GRACE_SECONDS:
+            return
+        self._set_guard_state(state="unhealthy", reason=reason, task_id=degraded_task_id)
+        self._task_guard_reasons.update({task_id: reason for task_id in self._task_abort_callbacks})
+        logger.warning("worker guard unhealthy worker_reason=%s task_ids=%s", reason, sorted(self._task_abort_callbacks))
+        for task_id, abort in list(self._task_abort_callbacks.items()):
+            try:
+                abort()
+            except Exception as abort_exc:
+                logger.warning(
+                    "worker guard abort callback failed task_id=%s error_type=%s error_repr=%r traceback=%s",
+                    task_id,
+                    type(abort_exc).__name__,
+                    abort_exc,
+                    traceback.format_exc(),
+                )
 
     def start(self) -> None:
         if self._running:
@@ -472,6 +687,7 @@ class WorkerService:
         self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
         self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
         self._maintenance_task = asyncio.create_task(self._maintenance_loop(), name="ea_worker_maintenance")
+        self._guard_task = asyncio.create_task(self._guard_loop(), name="ea_worker_guard")
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_thread_main,
             name="ea_worker_slot_heartbeat",
@@ -483,7 +699,7 @@ class WorkerService:
     def stop(self) -> None:
         self._running = False
         self._heartbeat_stop.set()
-        for bg_task in (self._task, self._runtime_config_task, self._maintenance_task):
+        for bg_task in (self._task, self._runtime_config_task, self._maintenance_task, self._guard_task):
             if bg_task and not bg_task.done():
                 bg_task.cancel()
         heartbeat_thread = self._heartbeat_thread
@@ -612,7 +828,7 @@ class WorkerService:
                 return False
             now = now_local()
             row.status = "cancelled"
-            row.error = "任务已取消"
+            row.error = str(reason or "任务已取消")
             row.finished_at = now
             row.owner_pod = None
             row.owner_pod_ip = None
@@ -678,9 +894,12 @@ class WorkerService:
             if stop_event.is_set():
                 break
             try:
+                started = time.perf_counter()
                 db_gen = get_db()
+                self._record_phase_duration(self._lease_health, phase="db_session_open", duration_ms=(time.perf_counter() - started) * 1000.0)
                 db: Session = next(db_gen)
                 try:
+                    phase_started = time.perf_counter()
                     row = (
                         db.query(AppEaTask)
                         .filter(
@@ -690,18 +909,49 @@ class WorkerService:
                         )
                         .first()
                     )
+                    self._record_phase_duration(self._lease_health, phase="db_query", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
                     if row is None or row.status != "running" or row.cancel_requested:
                         stop_event.set()
                         return
+                    phase_started = time.perf_counter()
                     row.lease_expires_at = task_mod._lease_deadline()
                     db.commit()
+                    self._record_phase_duration(self._lease_health, phase="db_commit", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
                 finally:
                     try:
                         next(db_gen)
                     except StopIteration:
                         pass
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self._record_loop_success(self._lease_health, phase="lease_renew", duration_ms=duration_ms)
+                if duration_ms > WORKER_LEASE_SLOW_MS:
+                    self._record_loop_slow(self._lease_health)
+                    logger.warning("lease renewal slow task_id=%s duration_ms=%.1f phase_durations_ms=%s", task_id, duration_ms, dict(self._lease_health.phase_durations_ms))
             except Exception as exc:
-                logger.warning("lease renewal DB error for %s: %s", task_id, exc)
+                self._record_loop_failure(self._lease_health, phase="lease_renew", exc=exc)
+                self._log_background_failure(
+                    logger_message="lease renewal failed",
+                    health=self._lease_health,
+                    phase=self._lease_health.last_phase or "lease_renew",
+                    exc=exc,
+                    task_id=task_id,
+                )
+                if self._lease_health.consecutive_failures >= WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD:
+                    self._task_guard_reasons[task_id] = f"lease renewal failures={self._lease_health.consecutive_failures}"
+                    stop_event.set()
+                    abort = self._task_abort_callbacks.get(task_id)
+                    if abort is not None:
+                        try:
+                            abort()
+                        except Exception as abort_exc:
+                            logger.warning(
+                                "lease renewal abort callback failed task_id=%s error_type=%s error_repr=%r traceback=%s",
+                                task_id,
+                                type(abort_exc).__name__,
+                                abort_exc,
+                                traceback.format_exc(),
+                            )
+                    return
 
     async def _watch_task_control(
         self,
@@ -971,6 +1221,9 @@ class WorkerService:
                     logger.info("Fresh start: reset %s/ for %s", _subdir, task_id)
 
             orch = Orchestrator(config=cfg, on_event=on_event)
+            self._task_abort_callbacks[task_id] = orch.abort
+            self._task_guard_reasons.pop(task_id, None)
+            self._task_lease_started_at[task_id] = time.time()
             lease_task = asyncio.create_task(self._renew_task_lease(task_id, lease_stop_event), name=f"ea_lease_{task_id}")
             control_task = asyncio.create_task(
                 self._watch_task_control(task_id, lease_stop_event, control_cancel_event, orch),
@@ -982,15 +1235,16 @@ class WorkerService:
             )
             result = await orch.execute(task_id)
             cancel_requested = control_cancel_event.is_set()
+            guard_reason = self._task_guard_reasons.get(task_id)
             task_mod._flush_stages(task_id, event_buffer)
 
-            if cancel_requested:
+            if cancel_requested or guard_reason:
                 await cancel_cleanup_task
                 finalized = self._finalize_cancelled_task(
                     task_id,
                     event_buffer=event_buffer,
                     pre_run_events=pre_run_events,
-                    reason="cancel_fast_finalize",
+                    reason=guard_reason or "cancel_fast_finalize",
                 )
                 if finalized:
                     return
@@ -1010,7 +1264,8 @@ class WorkerService:
                         task_id)
                     return
                 cancel_requested = cancel_requested or row.cancel_requested or row.status == "cancelled"
-                row.status = "cancelled" if cancel_requested else (result.status.value if result else "error")
+                guard_reason = self._task_guard_reasons.get(task_id)
+                row.status = "cancelled" if (cancel_requested or guard_reason) else (result.status.value if result else "error")
                 row.finished_at = now_local()
                 row.owner_pod = None
                 row.owner_pod_ip = None
@@ -1018,14 +1273,14 @@ class WorkerService:
                 row.cancel_requested = False
                 row.stages_json = {"events": pre_run_events + event_buffer, "final": True}
                 task_mod._sync_stage_events_to_timeline(db, row, pre_run_events + event_buffer)
-                if result and not cancel_requested:
+                if result and not cancel_requested and not guard_reason:
                     result_payload = result.model_dump(mode="json")
                     result_file = task_mod._write_task_result_json(task_snapshot, result_payload)
                     row.result_json = task_mod._lightweight_result_json(task_snapshot, result_payload, result_file)
                     if result.error:
                         row.error = result.error
-                elif cancel_requested:
-                    row.error = "任务已取消"
+                elif cancel_requested or guard_reason:
+                    row.error = str(guard_reason or "任务已取消")
                     row.cancel_acknowledged = True
                     row.cancel_process_cleanup_done = True
                     row.cancel_finalized = True
@@ -1039,14 +1294,14 @@ class WorkerService:
                     db,
                     task_id=row.task_id,
                     project_id=row.project_id,
-                    event_type="task_cancelled" if cancel_requested else ("task_finished" if row.status == "passed" else "task_failed"),
-                    message="任务已取消" if cancel_requested else ("任务执行完成" if row.status == "passed" else (row.error or "任务执行失败")),
+                    event_type="task_cancelled" if (cancel_requested or guard_reason) else ("task_finished" if row.status == "passed" else "task_failed"),
+                    message="worker guard 判定保活链路异常，任务已停止等待接管" if guard_reason else ("任务已取消" if cancel_requested else ("任务执行完成" if row.status == "passed" else (row.error or "任务执行失败"))),
                     source=task_mod.TASK_EVENT_SOURCE_WORKER,
-                    level="warning" if cancel_requested else ("error" if row.status in {"failed", "error"} else "info"),
+                    level="warning" if (cancel_requested or guard_reason) else ("error" if row.status in {"failed", "error"} else "info"),
                     stage_key="entry_analysis",
                     file_path=row.input_path,
                     status=row.status,
-                    payload={"owner_pod": task_mod.POD_NAME},
+                    payload={"owner_pod": task_mod.POD_NAME, "guard_reason": guard_reason},
                     dedupe_key=task_mod._event_dedupe_key(row.task_id, row.status, row.finished_at, "terminal"),
                 )
                 if changed and isinstance(reason, dict):
@@ -1245,6 +1500,9 @@ class WorkerService:
         finally:
             lease_stop_event.set()
             _local_cancel_events.pop(task_id, None)
+            self._task_abort_callbacks.pop(task_id, None)
+            self._task_guard_reasons.pop(task_id, None)
+            self._task_lease_started_at.pop(task_id, None)
             for bg_task in (lease_task, control_task, cancel_cleanup_task):
                 if bg_task is not None:
                     bg_task.cancel()

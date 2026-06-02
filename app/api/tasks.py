@@ -349,6 +349,9 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
 
 class EntryAnalyseSlotClusterResponse(BaseModel):
     worker_count: int = 0
+    registry_visible_workers: int = 0
+    live_pod_count: int = 0
+    registry_missing_live_pods: int = 0
     healthy_workers: int = 0
     stale_workers: int = 0
     live_stale_workers: int = 0

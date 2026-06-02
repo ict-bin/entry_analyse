@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import ssl
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,8 @@ from app.db.models import AppEaTask, AppEaWorkerSlot
 from app.models import normalize_max_concurrent_tasks
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 from app.service.task_service import _load_svc_config_from_db, _project_dispatch_limit_filter
+
+logger = logging.getLogger("ea.worker_slot")
 
 HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 STALE_AFTER_SECONDS = max(
@@ -212,7 +215,25 @@ class WorkerSlotService:
                 AppEaTask.lease_expires_at >= now_local(),
             ).first()
             if pod_name in live_pods or has_active_owner is not None:
+                logger.info(
+                    "skip worker slot cleanup worker_id=%s pod_name=%s last_heartbeat_at=%s live_pod_detected=%s has_active_owner=%s delete_reason=%s",
+                    row.worker_id,
+                    pod_name,
+                    isoformat_local(row.last_heartbeat_at),
+                    pod_name in live_pods,
+                    has_active_owner is not None,
+                    "stale_live_or_active_owner",
+                )
                 continue
+            logger.info(
+                "delete worker slot row worker_id=%s pod_name=%s last_heartbeat_at=%s live_pod_detected=%s has_active_owner=%s delete_reason=%s",
+                row.worker_id,
+                pod_name,
+                isoformat_local(row.last_heartbeat_at),
+                pod_name in live_pods,
+                has_active_owner is not None,
+                "retention_expired_no_live_pod_no_active_owner",
+            )
             db.delete(row)
             deleted += 1
         if deleted:
@@ -262,8 +283,11 @@ class WorkerSlotService:
         retired_workers_payload: list[dict[str, Any]] = []
         live_stale_workers = 0
         retired_workers = 0
+        registry_pods: set[str] = set()
         for row in worker_rows:
             pod_name = str(row.pod_name or "").strip()
+            if pod_name:
+                registry_pods.add(pod_name)
             active_tasks = sorted(active_by_owner.pop(pod_name, []), key=lambda item: item["task_id"])
             is_live_pod = pod_name in live_pods if live_pods else True
             heartbeat_age_seconds = max(0.0, (now - row.last_heartbeat_at).total_seconds()) if row.last_heartbeat_at else None
@@ -358,8 +382,14 @@ class WorkerSlotService:
         dispatch_limit = self._configured_dispatch_limit(db, project_id)
         dispatch_running = self._active_running_count(db, project_id) if dispatch_limit > 0 else 0
         dispatch_available = max(0, dispatch_limit - dispatch_running)
+        live_pod_count = len(live_pods)
+        registry_visible_workers = len(live_workers)
+        registry_missing_live_pods = max(0, live_pod_count - len(registry_pods.intersection(live_pods)))
         return {
             "worker_count": len(live_workers),
+            "registry_visible_workers": registry_visible_workers,
+            "live_pod_count": live_pod_count,
+            "registry_missing_live_pods": registry_missing_live_pods,
             "healthy_workers": healthy_workers,
             "stale_workers": live_stale_workers,
             "live_stale_workers": live_stale_workers,
