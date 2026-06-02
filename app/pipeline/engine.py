@@ -412,6 +412,10 @@ class PipelineEngine:
 
         all_r2_done_event: asyncio.Event = asyncio.Event()
         cc_done_event:      asyncio.Event = asyncio.Event()
+        # R2 并发信号量：只限制同时进入 R2 的函数数，R2完成后立即释放
+        # 防止 336 个函数同时提交 asyncio.to_thread 任务风暴导致 health probe 超时
+        # R3/CC/R4 不受此限制（不会造成死锁）
+        _r2_sem = asyncio.Semaphore(max(1, int(os.environ.get('EA_R2_CONCURRENCY', '32'))))
 
         # 无文件时直接解锁
         if total_files == 0:
@@ -459,11 +463,15 @@ class PipelineEngine:
                 return
 
             # ── R2: ctags 行号准确性验证 ──────────────────────────────────
-            if func_state.r2_j_state != NodeState.PASSED:
-                await self._run_r2(
-                    file_hash, func_hash, file_path, dirs, state)
-            r2_done_count += 1
-            _maybe_set_all_r2_done()   # 最后一个 R2 完成 → 可能触发 CC
+            # 用信号量限制同时进入 R2 的函数数（防止任务风暴）
+            # 关键：R2 完成后立即释放信号量，R3/CC/R4 不在信号量内
+            # 否则会死锁（持有槽的函数等 all_r2_done，但被槽阻拦的函数无法完成 R2）
+            async with _r2_sem:
+                if func_state.r2_j_state != NodeState.PASSED:
+                    await self._run_r2(
+                        file_hash, func_hash, file_path, dirs, state)
+                r2_done_count += 1
+                _maybe_set_all_r2_done()   # 最后一个 R2 完成 → 可能触发 CC
             if self._cancel.is_set():
                 return
 
@@ -612,14 +620,8 @@ class PipelineEngine:
             if self._cancel.is_set() or not func_hashes:
                 return
         # R1 完成后立即并行启动本文件所有函数的流水线
-            # 用信号量限制并发数，避免 336 个函数同时进入 asyncio 调度
-            # 引发 event loop 任务风暴 → health probe 超时 → K8s SIGKILL
-            _func_sem = asyncio.Semaphore(max(1, int(os.environ.get('EA_FUNC_PIPELINE_CONCURRENCY', '32'))))
-            async def _func_pipeline_with_sem(fh: str, fhash: str, fpath: str) -> None:
-                async with _func_sem:
-                    await _func_pipeline(fh, fhash, fpath)
             await asyncio.gather(*[
-                _func_pipeline_with_sem(fh, file_hash, file_path)
+                _func_pipeline(fh, file_hash, file_path)
                 for fh in func_hashes
             ])
 
