@@ -1796,7 +1796,9 @@ class TaskService:
         is_lease_takeover = (
             row.status == "running"
             and row.owner_pod is not None
-            and row.owner_pod != POD_NAME
+            # OOM 重启或其他同名 pod 接管：只要租约到期，无论是否同一 pod 名称都允许强制重启
+            # （租约未到期时不允许强制接管，避免冲突）
+            and (row.lease_expires_at is None or row.lease_expires_at < now_local())
         )
         if is_lease_takeover:
             previous_owner_pod = row.owner_pod
@@ -1869,7 +1871,7 @@ class TaskService:
         is_takeover = (
             row.status == "running"
             and row.owner_pod is not None
-            and row.owner_pod != POD_NAME
+            # OOM 重启或同名 pod 再启动：只要租约到期就允许接管（不强求 owner_pod != POD_NAME）
             and (row.lease_expires_at is None or row.lease_expires_at < now)
         )
         if row.status not in ("pending", "running"):
