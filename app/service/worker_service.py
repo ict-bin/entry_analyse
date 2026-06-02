@@ -446,23 +446,31 @@ class WorkerService:
                 db: Session = next(db_gen)
                 try:
                     max_concurrent_tasks_values: list[int] = []
+                    # agent_process_limit: None/0 表示“该 project 不限制”，不参与 min 计算
+                    # 只有明确配置了正整数的才参与
                     agent_process_limit_values: list[int] = []
                     if project_ids:
                         for project_id in project_ids:
                             svc = task_mod._load_svc_config_from_db(db, project_id)
                             max_concurrent_tasks_values.append(int(getattr(svc, "max_concurrent_tasks", 1) or 1))
-                            agent_process_limit_values.append(int(getattr(svc, "agent_process_limit", 8) or 8))
+                            _apl = int(getattr(svc, "agent_process_limit", 0) or 0)
+                            if _apl > 0:
+                                agent_process_limit_values.append(_apl)
                     else:
                         svc = task_mod._load_svc_config()
                         max_concurrent_tasks_values.append(int(getattr(svc, "max_concurrent_tasks", 1) or 1))
-                        agent_process_limit_values.append(int(getattr(svc, "agent_process_limit", 8) or 8))
+                        _apl = int(getattr(svc, "agent_process_limit", 0) or 0)
+                        if _apl > 0:
+                            agent_process_limit_values.append(_apl)
                 finally:
                     try:
                         next(db_gen)
                     except StopIteration:
                         pass
                 max_concurrent_tasks = max(1, min(max_concurrent_tasks_values))
-                agent_process_limit = max(1, min(agent_process_limit_values))
+                # 如果所有 project 都是 None/0（不限制），使用环境变量配置的默认值
+                _default_apl = int(os.environ.get("EA_AGENT_PROCESS_LIMIT", "8") or "8")
+                agent_process_limit = max(1, min(agent_process_limit_values)) if agent_process_limit_values else _default_apl
                 agent_manager = get_agent_process_slot_manager()
                 await agent_manager.set_capacity(agent_process_limit)
                 self._runtime_config = WorkerRuntimeConfigSnapshot(

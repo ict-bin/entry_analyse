@@ -1982,7 +1982,7 @@ class PipelineEngine:
             result_file = dirs.r4_func_result_file(func_hash)
             if result_file.exists():
                 try:
-                    d = await asyncio.to_thread(lambda: json.loads(result_file.read_text(encoding="utf-8")))
+                    d = json.loads(result_file.read_text(encoding="utf-8"))
                     if str(d.get("decision", "keep")).lower() == "filter":
                         continue
                 except Exception:
