@@ -322,32 +322,8 @@ def _aggregate_r3_entries(dirs: PipelineDirs) -> list[dict]:
     return result
 
 
-def _collect_r3_kept_from_state(state: "PipelineState") -> list[dict]:
-    """Layer3 fallback：直接从 pipeline_state 收集 r4_decision==keep 的函数。
-
-    当 r3_func/*.json 和 ModuleDB 均无数据时（旧任务断点续跑），用此兜底确保
-    R6 不因文件缺失而返回空列表。数据来源于 func_state，字段与 r3_func/*.json 一致。
-    """
-    entries: list[dict] = []
-    for file_hash, fs in state.files.items():
-        if not hasattr(fs, "functions"):
-            continue
-        original_path = getattr(fs, "original_path", "") or ""
-        for func_hash, func_st in fs.functions.items():
-            if getattr(func_st, "r4_decision", "") == "keep":
-                entries.append({
-                    "func_hash":          func_hash,
-                    "function":           getattr(func_st, "name", "") or func_hash[:8],
-                    "file":               original_path,
-                    "file_hash":          file_hash,
-                    "signature":          getattr(func_st, "signature", "") or "",
-                    "start_line":         getattr(func_st, "start_line", 0) or 0,
-                    "end_line":           getattr(func_st, "end_line", 0) or 0,
-                    "entry_role":         getattr(func_st, "entry_role", "boundary") or "boundary",
-                    "decision":           "keep",
-                    "has_external_input": bool(getattr(func_st, "has_external_input", True)),
-                })
-    return entries
+# _collect_r3_kept_from_state 已删除：本服务不支持断点续跑，
+# 不允许从 pipeline_state 兜底收集结果（旧行为会在脏磁盘状态下产生错误结论）。
 
 
 # ─── 引擎主体 ──────────────────────────────────────────────────────────────────
@@ -441,10 +417,8 @@ class PipelineEngine:
         if total_files == 0:
             all_r2_done_event.set()
 
-        # 断点续跑：CC 已建好，直接解锁
-        if (dirs.callchain / 'callchain.db').exists():
-            cc_done_event.set()
-            all_r2_done_event.set()
+        # 注意：本服务不支持断点续跑，每次运行必须从零开始。
+        # callchain.db 如果残留（异常情况）不得作为续跑信号，直接忽略。
 
         def _maybe_set_all_r2_done() -> None:
             if all_r1_done_flag and r2_done_count >= total_funcs:
@@ -1704,16 +1678,14 @@ class PipelineEngine:
                 logger.warning("R6 FuncDB read failed %s: %s", file_hash, _e)
 
         if not final_entries:
-            # 兜底：FuncDB 无数据（极端情况），从 state 收集
-            final_entries = _collect_r3_kept_from_state(state)
-            if final_entries:
-                logger.info("R6: FuncDB empty, using state fallback, %d entries", len(final_entries))
-
-        if not final_entries:
-            logger.info("R6: no keep entries, skipping")
+            # FuncDB 中无 keep 条目有两种情况：
+            #   1. 所有函数经 R3 分析后确认无外部入口（正常结论）
+            #   2. 流水线中途异常导致 keep 条目未写入（异常情况）
+            # 本服务不支持断点续跑，不兜底从 state 收集——若 FuncDB 为空则视为正常结论。
+            logger.info("R6: no keep entries in FuncDB, treating as fully-filtered result")
             state.r6_state = NodeState.PASSED
             state.save(dirs.state_file)
-            self._r4_j_confirmed = True  # 正常分析结论：所有函数均被 R3 filter，模块无外部入口
+            self._r4_j_confirmed = True
             return []
 
         if self._cancel.is_set():

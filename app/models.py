@@ -214,7 +214,7 @@ class TaskConfig(BaseModel):
     )
 
     # 断点续跑：填入已有任务 ID，自动检测上次完成的轮次并从下一轮继续
-    resume_task_id: str = Field(default="", description="断点续跑：已有任务 ID，从中断处继续")
+    resume_task_id: str = Field(default="", description="保留字段（未使用，续跑功能已废弃，重启请使用 restart API）")
 
     @property
     def worker_count(self) -> int:

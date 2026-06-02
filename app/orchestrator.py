@@ -15,7 +15,7 @@ entry_analyse — 编排引擎（四阶段流水线）
   │   │   ├── r3-entries/         ← R3 文件级过滤结果
   │   │   └── r4-module/          ← R4 最终入口 entries.json
   │   ├── sessions/               ← pi session 文件（每阶段每角色独立）
-  │   ├── pipeline_state.json     ← 断点续跑状态
+  │   ├── pipeline_state.json     ← 流水线运行状态（每次运行从零创建）
   │   └── result.json
   └── output/                     ← 最终产物
       ├── functions.list          ← 结构化入口列表（JSON）
