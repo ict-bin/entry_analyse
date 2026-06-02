@@ -46,6 +46,7 @@ class WorkerSlotSnapshot:
     pod_name: str
     pod_ip: str | None
     http_port: int
+    first_seen_at: str | None
     healthy: bool
     max_concurrent_tasks: int
     running_tasks: int
@@ -310,6 +311,7 @@ class WorkerSlotService:
                 pod_name=row.pod_name,
                 pod_ip=row.pod_ip,
                 http_port=int(getattr(row, "http_port", 8080) or 8080),
+                first_seen_at=isoformat_local(getattr(row, "created_at", None)),
                 healthy=healthy,
                 max_concurrent_tasks=int(row.max_concurrent_tasks),
                 running_tasks=running_tasks,
@@ -343,6 +345,7 @@ class WorkerSlotService:
                 pod_name=owner_pod,
                 pod_ip=None,
                 http_port=8080,
+                first_seen_at=None,
                 healthy=False,
                 max_concurrent_tasks=len(active_tasks),
                 running_tasks=len(active_tasks),
@@ -426,6 +429,7 @@ class WorkerSlotService:
             "pod_name": worker.pod_name,
             "pod_ip": worker.pod_ip,
             "http_port": worker.http_port,
+            "first_seen_at": worker.first_seen_at,
             "healthy": worker.healthy,
             "max_concurrent_tasks": worker.max_concurrent_tasks,
             "max_concurrent_jobs": worker.max_concurrent_tasks,

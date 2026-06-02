@@ -319,6 +319,7 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
     url: Optional[str] = None
     pod_name: str
     pod_ip: Optional[str] = None
+    first_seen_at: Optional[str] = None
     healthy: bool
     max_concurrent_tasks: int
     max_concurrent_jobs: int
