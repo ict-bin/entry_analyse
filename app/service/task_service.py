@@ -3163,6 +3163,19 @@ class TaskService:
         task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "workspace") if run_root else None
+        error_text = str(row.error or "").strip().lower()
+        awaiting_takeover = bool(
+            str(row.status or "") == "running"
+            and (
+                "awaiting lease takeover" in error_text
+                or "worker stopped before completion" in error_text
+            )
+        )
+        reconcile_pending = bool(
+            awaiting_takeover
+            and row.lease_expires_at is not None
+            and row.lease_expires_at < now_local()
+        )
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_safe_origin_payload(row),
@@ -3176,6 +3189,8 @@ class TaskService:
             "status": row.status,
             "owner_pod": row.owner_pod,
             "lease_expires_at": fmt(row.lease_expires_at),
+            "awaiting_takeover": awaiting_takeover,
+            "reconcile_pending": reconcile_pending,
             "cancel_requested": row.cancel_requested,
             "cancel_acknowledged": row.cancel_acknowledged,
             "cancel_process_cleanup_done": row.cancel_process_cleanup_done,

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -45,6 +48,9 @@ WORKER_GUARD_LOOP_SECONDS = max(5, int(os.environ.get("EA_WORKER_GUARD_LOOP_SECO
 WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD", "3")))
 WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD", "3")))
 WORKER_GUARD_LEASE_FAILURE_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_GUARD_LEASE_FAILURE_THRESHOLD", str(WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD))))
+WORKER_HEALTH_PORT = max(1, int(os.environ.get("EA_WORKER_HEALTH_PORT", "18080")))
+WORKER_MAIN_LOOP_STALE_SECONDS = max(5, int(os.environ.get("EA_WORKER_MAIN_LOOP_STALE_SECONDS", str(max(WORKER_POLL_SECONDS * 4, 20)))))
+WORKER_LEASE_EXPIRED_WARNING_SECONDS = max(5, int(os.environ.get("EA_WORKER_LEASE_EXPIRED_WARNING_SECONDS", "180")))
 
 
 @dataclass
@@ -85,6 +91,26 @@ class WorkerGuardStateSnapshot:
     since: float = 0.0
     transition_at: float = 0.0
     degraded_task_id: str | None = None
+
+
+@dataclass
+class WorkerHealthServerSnapshot:
+    bootstrapped: bool = False
+    main_loop_alive: bool = False
+    startup_phase: str = "booting"
+    startup_phase_started_at: float = 0.0
+    startup_phase_duration_seconds: float = 0.0
+    worker_probe_safe_ready: bool = False
+    health_server_last_success_at: float = 0.0
+    health_server_loop_age_seconds: float = 0.0
+    main_api_loop_age_seconds: float = 0.0
+    local_running_task_count: int = 0
+    heartbeat_age_seconds: float | None = None
+    lease_age_seconds: float | None = None
+    guard_state: str = "healthy"
+    guard_reason: str | None = None
+    last_error: str | None = None
+    shutting_down: bool = False
 
 
 def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
@@ -149,11 +175,192 @@ class WorkerService:
         self._maintenance_health = WorkerLoopHealthSnapshot()
         self._runtime_config_health = WorkerLoopHealthSnapshot()
         self._guard_state = WorkerGuardStateSnapshot()
+        self._health_server_snapshot = WorkerHealthServerSnapshot()
+        self._health_server_started = threading.Event()
+        self._health_server_stop = threading.Event()
+        self._health_server_thread: Optional[threading.Thread] = None
+        self._health_server_httpd: ThreadingHTTPServer | None = None
+        self._health_server_lock = threading.Lock()
         self._task_abort_callbacks: dict[str, Any] = {}
         self._task_guard_reasons: dict[str, str] = {}
         self._task_lease_started_at: dict[str, float] = {}
         self._startup_reconciled_expired_tasks: int = 0
         self._startup_reconciled_owner_alive_tasks: int = 0
+        self._main_loop_last_tick_at: float = 0.0
+        self._maintenance_task_started_at: float = 0.0
+        self._maintenance_task_ready = False
+        self._started_at: float = 0.0
+
+    def _set_startup_phase(self, phase: str, *, probe_safe_ready: bool | None = None) -> None:
+        now_ts = time.time()
+        with self._health_server_lock:
+            current_phase = str(self._health_server_snapshot.startup_phase or "")
+            if current_phase != phase:
+                self._health_server_snapshot.startup_phase = phase
+                self._health_server_snapshot.startup_phase_started_at = now_ts
+                self._health_server_snapshot.startup_phase_duration_seconds = 0.0
+                logger.info("worker startup phase changed phase=%s", phase)
+            else:
+                started_at = float(self._health_server_snapshot.startup_phase_started_at or now_ts)
+                self._health_server_snapshot.startup_phase_duration_seconds = max(0.0, now_ts - started_at)
+            if probe_safe_ready is not None:
+                previous = bool(self._health_server_snapshot.worker_probe_safe_ready)
+                self._health_server_snapshot.worker_probe_safe_ready = bool(probe_safe_ready)
+                if previous != bool(probe_safe_ready):
+                    if probe_safe_ready:
+                        logger.info("worker probe-safe readiness enabled phase=%s", phase)
+                    else:
+                        logger.warning("worker probe-safe readiness disabled phase=%s", phase)
+
+    def _update_health_server_snapshot(self) -> None:
+        now_ts = time.time()
+        with self._health_server_lock:
+            snap = self._health_server_snapshot
+            started_at = float(snap.startup_phase_started_at or now_ts)
+            snap.startup_phase_duration_seconds = max(0.0, now_ts - started_at)
+            snap.main_loop_alive = self._running and (now_ts - float(self._main_loop_last_tick_at or 0.0)) <= WORKER_MAIN_LOOP_STALE_SECONDS
+            snap.local_running_task_count = self.local_running_count()
+            snap.heartbeat_age_seconds = self._heartbeat_health.age_seconds()
+            snap.lease_age_seconds = self._lease_health.age_seconds()
+            snap.guard_state = self._guard_state.state
+            snap.guard_reason = self._guard_state.reason
+            snap.main_api_loop_age_seconds = max(0.0, now_ts - float(self._main_loop_last_tick_at or now_ts))
+            snap.health_server_loop_age_seconds = 0.0 if snap.health_server_last_success_at <= 0 else max(0.0, now_ts - snap.health_server_last_success_at)
+            snap.bootstrapped = bool(self._running and self._started_at > 0 and self._heartbeat_health.success_total > 0)
+            if snap.shutting_down:
+                snap.worker_probe_safe_ready = False
+            elif self._guard_state.state == "unhealthy":
+                snap.worker_probe_safe_ready = False
+            elif not self._maintenance_task_ready:
+                snap.worker_probe_safe_ready = False
+            else:
+                snap.worker_probe_safe_ready = True
+            if not self._running:
+                snap.last_error = snap.last_error or "worker stopped"
+
+    def _health_server_payload(self) -> dict[str, Any]:
+        self._update_health_server_snapshot()
+        with self._health_server_lock:
+            snap = self._health_server_snapshot
+            return {
+                "status": "ok",
+                "bootstrapped": bool(snap.bootstrapped),
+                "main_loop_alive": bool(snap.main_loop_alive),
+                "startup_phase": snap.startup_phase,
+                "startup_phase_duration_seconds": round(float(snap.startup_phase_duration_seconds or 0.0), 3),
+                "worker_probe_safe_ready": bool(snap.worker_probe_safe_ready),
+                "health_server_last_success_at": float(snap.health_server_last_success_at or 0.0),
+                "health_server_loop_age_seconds": round(float(snap.health_server_loop_age_seconds or 0.0), 3),
+                "main_api_loop_age_seconds": round(float(snap.main_api_loop_age_seconds or 0.0), 3),
+                "local_running_task_count": int(snap.local_running_task_count or 0),
+                "heartbeat_age_seconds": None if snap.heartbeat_age_seconds is None else round(float(snap.heartbeat_age_seconds), 3),
+                "lease_age_seconds": None if snap.lease_age_seconds is None else round(float(snap.lease_age_seconds), 3),
+                "guard_state": snap.guard_state,
+                "guard_reason": snap.guard_reason,
+                "last_error": snap.last_error,
+                "shutting_down": bool(snap.shutting_down),
+            }
+
+    def _healthz_status_code(self) -> int:
+        self._update_health_server_snapshot()
+        with self._health_server_lock:
+            snap = self._health_server_snapshot
+            if not self._running:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if snap.shutting_down:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if self._guard_state.state == "unhealthy":
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if not snap.main_loop_alive and self._started_at > 0:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if self._heartbeat_health.consecutive_failures >= WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if self._lease_health.consecutive_failures >= WORKER_GUARD_LEASE_FAILURE_THRESHOLD:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            return HTTPStatus.OK
+
+    def _readyz_status_code(self) -> int:
+        if self._healthz_status_code() != HTTPStatus.OK:
+            return HTTPStatus.SERVICE_UNAVAILABLE
+        with self._health_server_lock:
+            snap = self._health_server_snapshot
+            if not snap.bootstrapped:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if snap.startup_phase not in {"ready", "running"}:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if not snap.worker_probe_safe_ready:
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if self._guard_state.state == "unhealthy":
+                return HTTPStatus.SERVICE_UNAVAILABLE
+        return HTTPStatus.OK
+
+    def _run_health_server(self) -> None:
+        service = self
+
+        class _HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                payload = service._health_server_payload()
+                if self.path in ("/healthz", "/health"):
+                    code = service._healthz_status_code()
+                elif self.path in ("/readyz", "/ready"):
+                    code = service._readyz_status_code()
+                else:
+                    code = HTTPStatus.NOT_FOUND
+                    payload = {"status": "not_found"}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(int(code))
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                with service._health_server_lock:
+                    service._health_server_snapshot.health_server_last_success_at = time.time()
+
+            def log_message(self, format: str, *args):  # noqa: A003
+                return
+
+        httpd = ThreadingHTTPServer(("0.0.0.0", WORKER_HEALTH_PORT), _HealthHandler)
+        httpd.daemon_threads = True
+        httpd.timeout = 1
+        self._health_server_httpd = httpd
+        self._health_server_started.set()
+        logger.info("worker health server started port=%s", WORKER_HEALTH_PORT)
+        try:
+            while not self._health_server_stop.is_set():
+                httpd.handle_request()
+        except Exception as exc:
+            with self._health_server_lock:
+                self._health_server_snapshot.last_error = f"health_server: {exc}"
+            logger.warning("worker health server stopped with error: %s", exc)
+        finally:
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+
+    def _start_health_server(self) -> None:
+        if self._health_server_thread and self._health_server_thread.is_alive():
+            return
+        self._health_server_started.clear()
+        self._health_server_stop.clear()
+        self._health_server_thread = threading.Thread(
+            target=self._run_health_server,
+            name="ea_worker_health_server",
+            daemon=True,
+        )
+        self._health_server_thread.start()
+
+    def _stop_health_server(self) -> None:
+        self._health_server_stop.set()
+        httpd = self._health_server_httpd
+        if httpd is not None:
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+        health_thread = self._health_server_thread
+        if health_thread and health_thread.is_alive():
+            health_thread.join(timeout=1.0)
 
     def has_local_task(self, task_id: str) -> bool:
         task = _running_tasks.get(task_id)
@@ -276,6 +483,7 @@ class WorkerService:
         health.phase_durations_ms[phase] = round(max(0.0, float(duration_ms)), 3)
 
     def runtime_health_snapshot(self) -> dict[str, Any]:
+        self._update_health_server_snapshot()
         return {
             "heartbeat": {
                 "last_success_at": self._heartbeat_health.last_success_at,
@@ -344,6 +552,7 @@ class WorkerService:
                 "guarded_task_count": len(self._task_guard_reasons),
                 "oldest_running_task_lease_age_seconds": self._oldest_running_task_lease_age_seconds(),
             },
+            "health_server": self._health_server_payload(),
             "effective_config": {
                 "max_concurrent_tasks": self._runtime_config.max_concurrent_tasks,
                 "agent_process_limit": self._runtime_config.agent_process_limit,
@@ -487,11 +696,15 @@ class WorkerService:
         from app.service import task_service as task_mod
 
         while self._running:
+            self._main_loop_last_tick_at = time.time()
+            self._set_startup_phase("dispatch_polling")
             try:
                 project_ids = await self._discover_active_projects()
                 for project_id in project_ids:
                     task_mod.get_task_service().schedule_dispatch(project_id)
             except Exception as exc:
+                with self._health_server_lock:
+                    self._health_server_snapshot.last_error = f"worker_loop: {exc}"
                 logger.warning("worker poll failed: %s", exc)
             await asyncio.sleep(WORKER_POLL_SECONDS)
 
@@ -630,11 +843,13 @@ class WorkerService:
     async def _maintenance_loop(self) -> None:
         from app.service import task_service as task_mod
 
+        self._maintenance_task_started_at = time.time()
         while self._running:
             started = time.perf_counter()
             candidate_task_count = 0
             killed_processes = 0
             maintenance_truncated = False
+            self._set_startup_phase("maintenance_reconcile")
             try:
                 db_gen = get_db()
                 db: Session = next(db_gen)
@@ -683,6 +898,9 @@ class WorkerService:
                     maintenance_truncated = maintenance_truncated or orphan_killed > remaining_budget
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 self._record_loop_success(self._maintenance_health, phase="maintenance", duration_ms=duration_ms)
+                if not self._maintenance_task_ready:
+                    self._maintenance_task_ready = True
+                    self._set_startup_phase("ready", probe_safe_ready=True)
                 if duration_ms > (WORKER_MAINTENANCE_TIMEOUT_SECONDS * 1000) or maintenance_truncated:
                     self._record_loop_slow(self._maintenance_health)
                     logger.warning(
@@ -694,6 +912,8 @@ class WorkerService:
                     )
             except Exception as exc:
                 self._record_loop_failure(self._maintenance_health, phase="maintenance", exc=exc)
+                with self._health_server_lock:
+                    self._health_server_snapshot.last_error = f"maintenance: {exc}"
                 self._log_background_failure(
                     logger_message=f"worker maintenance failed candidate_task_count={candidate_task_count} killed_processes={killed_processes}",
                     health=self._maintenance_health,
@@ -762,7 +982,32 @@ class WorkerService:
         if self._running:
             return
         self._running = True
+        self._started_at = time.time()
+        self._main_loop_last_tick_at = self._started_at
+        self._maintenance_task_ready = False
+        self._set_guard_state(state="healthy", reason=None, task_id=None)
+        with self._health_server_lock:
+            self._health_server_snapshot = WorkerHealthServerSnapshot(
+                bootstrapped=False,
+                main_loop_alive=True,
+                startup_phase="booting",
+                startup_phase_started_at=self._started_at,
+                startup_phase_duration_seconds=0.0,
+                worker_probe_safe_ready=False,
+                health_server_last_success_at=0.0,
+                health_server_loop_age_seconds=0.0,
+                main_api_loop_age_seconds=0.0,
+                local_running_task_count=0,
+                heartbeat_age_seconds=None,
+                lease_age_seconds=None,
+                guard_state="healthy",
+                guard_reason=None,
+                last_error=None,
+                shutting_down=False,
+            )
+        self._start_health_server()
         self._reconcile_local_stale_owned_tasks()
+        self._set_startup_phase("startup_reconcile")
         self._heartbeat_stop.clear()
         self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
         self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
@@ -778,6 +1023,10 @@ class WorkerService:
 
     def stop(self) -> None:
         self._running = False
+        with self._health_server_lock:
+            self._health_server_snapshot.shutting_down = True
+            self._health_server_snapshot.worker_probe_safe_ready = False
+        self._set_startup_phase("stopping", probe_safe_ready=False)
         self._heartbeat_stop.set()
         for bg_task in (self._task, self._runtime_config_task, self._maintenance_task, self._guard_task):
             if bg_task and not bg_task.done():
@@ -785,6 +1034,7 @@ class WorkerService:
         heartbeat_thread = self._heartbeat_thread
         if heartbeat_thread and heartbeat_thread.is_alive():
             heartbeat_thread.join(timeout=1.0)
+        self._stop_health_server()
 
     def is_running(self) -> bool:
         return self._running

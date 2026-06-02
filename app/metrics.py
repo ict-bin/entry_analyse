@@ -329,6 +329,7 @@ def _render_task_metrics() -> list[str]:
     heartbeat_failure_counts = (worker_runtime_health.get("heartbeat") or {}).get("failure_counts") or {}
     lease_failure_counts = (worker_runtime_health.get("lease") or {}).get("failure_counts") or {}
     maintenance_failure_counts = (worker_runtime_health.get("maintenance") or {}).get("failure_counts") or {}
+    health_server = worker_runtime_health.get("health_server") or {}
     lines = [
         "# HELP secflow_ea_db_up Database query path for metrics is available.",
         "# TYPE secflow_ea_db_up gauge",
@@ -412,6 +413,21 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_worker_guard_state Worker guard state encoded as healthy=0,degraded=1,unhealthy=2.",
         "# TYPE secflow_ea_worker_guard_state gauge",
         f"secflow_ea_worker_guard_state {1 if (worker_runtime_health.get('guard') or {}).get('state') == 'degraded' else 2 if (worker_runtime_health.get('guard') or {}).get('state') == 'unhealthy' else 0}",
+        "# HELP secflow_ea_worker_health_server_last_success_timestamp Unix timestamp of last successful dedicated health server response.",
+        "# TYPE secflow_ea_worker_health_server_last_success_timestamp gauge",
+        f"secflow_ea_worker_health_server_last_success_timestamp {_fmt(float(health_server.get('health_server_last_success_at') or 0.0))}",
+        "# HELP secflow_ea_worker_health_server_age_seconds Seconds since last successful dedicated health server response.",
+        "# TYPE secflow_ea_worker_health_server_age_seconds gauge",
+        f"secflow_ea_worker_health_server_age_seconds {_fmt(float(health_server.get('health_server_loop_age_seconds') or 0.0))}",
+        "# HELP secflow_ea_worker_main_api_loop_age_seconds Seconds since worker main dispatch loop last tick.",
+        "# TYPE secflow_ea_worker_main_api_loop_age_seconds gauge",
+        f"secflow_ea_worker_main_api_loop_age_seconds {_fmt(float(health_server.get('main_api_loop_age_seconds') or 0.0))}",
+        "# HELP secflow_ea_worker_probe_safe_ready Worker dedicated readyz state encoded as false=0,true=1.",
+        "# TYPE secflow_ea_worker_probe_safe_ready gauge",
+        f"secflow_ea_worker_probe_safe_ready {1 if bool(health_server.get('worker_probe_safe_ready')) else 0}",
+        "# HELP secflow_ea_worker_startup_phase_duration_seconds Seconds spent in current worker startup phase.",
+        "# TYPE secflow_ea_worker_startup_phase_duration_seconds gauge",
+        f"secflow_ea_worker_startup_phase_duration_seconds {_fmt(float(health_server.get('startup_phase_duration_seconds') or 0.0))}",
         "# HELP secflow_ea_worker_background_slow_total Total background loop slow executions.",
         "# TYPE secflow_ea_worker_background_slow_total gauge",
         f'{ "secflow_ea_worker_background_slow_total" }{{kind="heartbeat"}} {int((worker_runtime_health.get("heartbeat") or {}).get("slow_total") or 0)}',
