@@ -2744,8 +2744,6 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
 
-        import shutil as _shutil
-        import errno as _errno
         from sqlalchemy.orm.attributes import flag_modified
 
         # ── 1. DB 主表全量重置 ──
@@ -2786,19 +2784,13 @@ class TaskService:
         except Exception as _e:
             logger.warning("restart: clear task_event failed for %s: %s", task_id, _e)
 
-        # ── 4. 磁盘：删除 run/ 和 output/，保留 input/ ──
-        if row.output_path:
-            _task_dir = os.path.join(row.output_path, task_id)
-            for _sub in ("run", "output"):
-                _d = os.path.join(_task_dir, _sub)
-                try:
-                    _shutil.rmtree(_d)
-                    logger.info("restart: removed %s/ for %s", _sub, task_id)
-                except OSError as _e:
-                    if _e.errno != _errno.ENOENT:
-                        # 非「不存在」错误（如 NFS 问题）——记录并抛出，不静默吸收
-                        logger.error("restart: failed to remove %s/ for %s: %s", _sub, task_id, _e)
-                        raise
+        # ── 4. 磁盘清理交给 worker ──
+        # restart_task() 不自行删除磁盘，磁盘清理由 worker 拾起任务时统一执行。
+        # 原因：restart_task() 可能在旧运行的 pi 子进程仍活跃时被调用，
+        # 立即 rmtree(run/) 会导致 pi 进程 cwd 被删（日志显示 "(deleted)"），
+        # funcdb 同时消失 → "no such table: functions" 错误。
+        # worker_service._execute_task() 始终在执行前清空 run/ 和 output/，
+        # 因此这里无需重复清理。
 
         # ── 5. 写入 task_restarted 事件（新的第一条时间线记录）──
         _safe_create_task_event(
