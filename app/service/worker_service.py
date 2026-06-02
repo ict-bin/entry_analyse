@@ -479,9 +479,10 @@ class WorkerService:
                     except StopIteration:
                         pass
                 max_concurrent_tasks = max(1, min(max_concurrent_tasks_values))
-                # 如果所有 project 都是 None/0（不限制），使用环境变量配置的默认值
+                # agent_process_limit 取 max：各 project 按自身需求，worker 满足最高需求
+                # 无 project 显式配置时回退到环境变量
                 _default_apl = int(os.environ.get("EA_AGENT_PROCESS_LIMIT", "8") or "8")
-                agent_process_limit = max(1, min(agent_process_limit_values)) if agent_process_limit_values else _default_apl
+                agent_process_limit = max(1, max(agent_process_limit_values)) if agent_process_limit_values else _default_apl
                 agent_manager = get_agent_process_slot_manager()
                 await agent_manager.set_capacity(agent_process_limit)
                 self._runtime_config = WorkerRuntimeConfigSnapshot(
