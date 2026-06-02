@@ -94,6 +94,7 @@ def _split_gap_at_blanks(
 _SKIPPABLE_KINDS = frozenset({
     "extern_block", "include_macro_block", "comment_block",
     "struct_enum_block", "forward_decl_block",
+    "no_function_body",   # gap 内无大括号，函数体不可能存在
 })
 
 
@@ -135,6 +136,11 @@ def _classify_gap(lines_data: list[str], start: int, end: int) -> str:
     if typedef_n > 0 and brace_open <= 2: return "struct_enum_block"
     if forward_n >= total * 0.4 and brace_open <= 2: return "forward_decl_block"
     if brace_open >= 2 and brace_close >= 2: return "likely_function"
+
+    # 无大括号 → 函数体不可能存在（只有声明/注释/宏/数据），可安全跳过
+    if brace_open == 0:
+        return "no_function_body"
+
     return "ambiguous"
 
 
