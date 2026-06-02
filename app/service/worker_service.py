@@ -18,7 +18,7 @@ from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_pi_proce
 from app.agent_slots import get_agent_process_slot_manager
 from app.config import build_task_config
 from app.db import get_db
-from app.db.models import AppEaTask
+from app.db.models import AppEaTask, AppEaStageResultIndex, AppEaTaskEvent
 from app.logging_utils import log_event
 from app.orchestrator import Orchestrator
 from app.time_utils import now_local
@@ -1164,11 +1164,43 @@ class WorkerService:
                 )
             )
 
-            # ── 始终清空磁盘中间状态（不依赖 stages_json 是否为空）──────────────────────
+            # ── 始终清空状态：DB + 磁盘（不依赖 stages_json 是否为空）─────────────────
             # 每次 worker 拾起任务（首次/手动重启/pod 接管）均从干净状态开始。
-            # ENOENT 正常忽略（目录不存在时直接重建）；其他错误（如 NFS 故障）显式抛出，
-            # 不允许静默吞掉——若磁盘清理失败，宁可让任务报错重排，也不能从脏状态执行。
-            if task_snapshot.output_path:
+
+            # step-A: DB 全量重置（运行时字段 + 关联表）
+            _db_gen2 = get_db()
+            _db2 = next(_db_gen2)
+            try:
+                from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+                _row2 = _db2.query(AppEaTask).filter_by(task_id=task_id).first()
+                if _row2:
+                    _row2.started_at       = now_local()
+                    _row2.finished_at      = None
+                    _row2.stages_json      = None
+                    _row2.result_json      = None
+                    _row2.error            = None
+                    _row2.latest_abnormal_reason_json = None
+                    _flag_modified(_row2, "latest_abnormal_reason_json")
+                    _db2.commit()
+                    logger.info("worker: cleared runtime DB fields for %s", task_id)
+                _db2.query(AppEaStageResultIndex).filter(
+                    AppEaStageResultIndex.task_id == task_id
+                ).delete(synchronize_session=False)
+                _db2.query(AppEaTaskEvent).filter(
+                    AppEaTaskEvent.task_id == task_id
+                ).delete(synchronize_session=False)
+                _db2.commit()
+                logger.info("worker: cleared stage_result_index + task_event for %s", task_id)
+            except Exception as _dbe:
+                logger.warning("worker: DB pre-run cleanup failed for %s: %s", task_id, _dbe)
+            finally:
+                try:
+                    next(_db_gen2)
+                except StopIteration:
+                    pass
+
+            # step-B: 磁盘清理
+            # ENOENT 正常忽略；其他错误（如 NFS 故障）显式抛出，不允许静默吸收。
                 import pathlib as _pl
                 import shutil as _shutil
                 import errno as _errno

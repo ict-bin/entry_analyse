@@ -2732,78 +2732,21 @@ class TaskService:
     def restart_task(self, db: Session, task_id: str) -> dict:
         """Reset and restart an existing task in-place, reusing the same task ID.
 
-        清理内容（全量）：
-          DB： status/stages_json/result_json/error/latest_abnormal_reason_json
-               started_at/finished_at/owner_pod/owner_pod_ip/lease_expires_at
-               所有 cancel_* 字段
-          关联表： stage_result_index 全部行、task_event 全部行
-          磁盘： run/ 和 output/ 目录（保留 input/）
+        restart_task() 只做最少量的事情：
+          - 检查状态（不允许 pending/running 时重启）
+          - 设置 status = pending
+          - 清除 cancel_* 字段（确保调度器能拾起任务）
+
+        其余所有清理（DB 字段、关联表、磁盘）全部由 worker 在拾起任务时执行。
+        这样可避免直接删除类操作与仍在运行的 pi 子进程发生竞争。
         """
         row = self._get_or_404(db, task_id)
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
 
-        from sqlalchemy.orm.attributes import flag_modified
-
-        # ── 1. DB 主表全量重置 ──
-        clean_config = {k: v for k, v in (_parse_task_config(row.task_config_json) or {}).items()
-                        if k not in ("start_stage", "resume_workspace")} or None
-        row.task_config_json  = clean_config
-        row.status            = "pending"
-        row.started_at        = None
-        row.finished_at       = None
-        row.owner_pod         = None
-        row.owner_pod_ip      = None
-        row.lease_expires_at  = None
-        row.stages_json       = None
-        row.result_json       = None
-        row.error             = None
-        row.latest_abnormal_reason_json = None
+        row.status = "pending"
         _reset_cancel_state(row)
-        flag_modified(row, "task_config_json")
-        flag_modified(row, "latest_abnormal_reason_json")
-        db.commit()
-        db.refresh(row)
-
-        # ── 2. 清空 stage_result_index ──
-        try:
-            db.query(AppEaStageResultIndex).filter(
-                AppEaStageResultIndex.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.commit()
-        except Exception as _e:
-            logger.warning("restart: clear stage_result_index failed for %s: %s", task_id, _e)
-
-        # ── 3. 清空 task_event 时间线 ──
-        try:
-            db.query(AppEaTaskEvent).filter(
-                AppEaTaskEvent.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.commit()
-        except Exception as _e:
-            logger.warning("restart: clear task_event failed for %s: %s", task_id, _e)
-
-        # ── 4. 磁盘清理交给 worker ──
-        # restart_task() 不自行删除磁盘，磁盘清理由 worker 拾起任务时统一执行。
-        # 原因：restart_task() 可能在旧运行的 pi 子进程仍活跃时被调用，
-        # 立即 rmtree(run/) 会导致 pi 进程 cwd 被删（日志显示 "(deleted)"），
-        # funcdb 同时消失 → "no such table: functions" 错误。
-        # worker_service._execute_task() 始终在执行前清空 run/ 和 output/，
-        # 因此这里无需重复清理。
-
-        # ── 5. 写入 task_restarted 事件（新的第一条时间线记录）──
-        _safe_create_task_event(
-            db,
-            task_id=row.task_id,
-            project_id=row.project_id,
-            event_type="task_restarted",
-            message="任务已重置并重新启动",
-            source=TASK_EVENT_SOURCE_EA,
-            status=row.status,
-            payload={},
-            dedupe_key=_event_dedupe_key(row.task_id, "task_restarted", now_local()),
-        )
         db.commit()
 
         self.schedule_dispatch(row.project_id)
