@@ -700,7 +700,7 @@ class PipelineEngine:
                            feedback="script fast-path: body matched", attempt=1)
                 self._emit("r2_script_pass", func_hash=func_hash,
                            function=func_state.name, detail=_sr.detail)
-                upsert_stage_result_index(
+                await self._aupsert(
                     task_id=self.task_id, stage_key="r2_j", role_kind="script",
                     scope_kind="func", attempt=1,
                     file_hash=file_hash, func_hash=func_hash,
@@ -1136,7 +1136,7 @@ class PipelineEngine:
                 }
                 write_stage_result_files(result_file=result_file, raw_file=raw_file,
                                          payload=_skip_payload, raw_text=ar.output or "")
-                upsert_stage_result_index(
+                await self._aupsert(
                     task_id=self.task_id, stage_key="r2_j", role_kind="judge",
                     scope_kind="func", attempt=attempt,
                     file_hash=file_hash, func_hash=func_hash,
@@ -1169,7 +1169,7 @@ class PipelineEngine:
             result_file = dirs.stage_result_file("r2_j", "judge", func_hash, attempt)
             raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, attempt)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=attempt,
+            await self._aupsert(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=attempt,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
                                       summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
             func_state.r2_j_feedback = feedback
@@ -1328,7 +1328,7 @@ class PipelineEngine:
                 result_file = dirs.stage_result_file("r3_w", "worker", func_hash, func_state.r3_w_attempts)
                 raw_file = dirs.stage_raw_file("r3_w", "worker", func_hash, func_state.r3_w_attempts)
                 write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-                upsert_stage_result_index(task_id=self.task_id, stage_key="r3_w", role_kind="worker", scope_kind="func", attempt=func_state.r3_w_attempts,
+                await self._aupsert(task_id=self.task_id, stage_key="r3_w", role_kind="worker", scope_kind="func", attempt=func_state.r3_w_attempts,
                                           file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
                                           summary=str(result_payload["result"])[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
                 if analysis is not None:
@@ -1490,7 +1490,7 @@ class PipelineEngine:
             result_file = dirs.stage_result_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
             raw_file = dirs.stage_raw_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r3_j", role_kind="judge", scope_kind="func", attempt=func_state.r3_j_attempts,
+            await self._aupsert(task_id=self.task_id, stage_key="r3_j", role_kind="judge", scope_kind="func", attempt=func_state.r3_j_attempts,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
                                       summary=summary, result_file_path=str(result_file), raw_file_path=str(raw_file))
 
@@ -1944,7 +1944,7 @@ class PipelineEngine:
             }
             write_stage_result_files(result_file=result_file, raw_file=raw_file,
                                      payload=result_payload, raw_text=ar.output or "")
-            upsert_stage_result_index(
+            await self._aupsert(
                 task_id=self.task_id, stage_key="r4_j", role_kind="judge",
                 scope_kind="func", attempt=func_state.r4_j_attempts,
                 func_hash=func_hash, status="passed" if passed else "failed",
@@ -2150,7 +2150,7 @@ class PipelineEngine:
                 payload={"stage": "r5_w", "attempt": attempts, "scope": "func", "func_hash": func_hash, "status": "ok", "report_file": str(report_out)},
                 raw_text=(await asyncio.to_thread(lambda: report_out.read_text(encoding="utf-8")) if report_out.exists() else ""),
             )
-            upsert_stage_result_index(task_id=self.task_id, stage_key="r5_w", role_kind="worker", scope_kind="func", attempt=attempts,
+            await self._aupsert(task_id=self.task_id, stage_key="r5_w", role_kind="worker", scope_kind="func", attempt=attempts,
                                       func_hash=func_hash, status="ok", summary=func_name[:200], result_file_path=str(worker_result_file), raw_file_path=str(worker_raw_file))
 
             # Report-func-J
@@ -2182,7 +2182,7 @@ class PipelineEngine:
                     payload={"stage": "r5_j", "attempt": attempts, "scope": "func", "func_hash": func_hash, "passed": j_passed, "summary": j_feedback[:200], "feedback": j_feedback},
                     raw_text=j_ar.output or "",
                 )
-                upsert_stage_result_index(task_id=self.task_id, stage_key="r5_j", role_kind="judge", scope_kind="func", attempt=attempts,
+                await self._aupsert(task_id=self.task_id, stage_key="r5_j", role_kind="judge", scope_kind="func", attempt=attempts,
                                           func_hash=func_hash, status="passed" if j_passed else "failed", passed=j_passed, summary=j_feedback[:200],
                                           result_file_path=str(j_result_file), raw_file_path=str(j_raw_file))
                 self._emit("r5_j_done", func_hash=func_hash, function=func_name,
@@ -2327,6 +2327,16 @@ class PipelineEngine:
             self._on_event(SwarmEvent(type=etype, task_id=self.task_id, data=data))
         except Exception:
             pass
+
+    async def _aupsert(self, **kwargs) -> None:
+        """async wrapper for upsert_stage_result_index。
+
+        将同步 MySQL 操作推到线程池，避免阻塞 asyncio 事件循环。
+        在 R2 fast-path 并发场景下（336 个函数同时 PASS），同步调用会导致事件循环
+        被一个个串行送入阻塞，此期间 R3 agent 无法被调度，且如果 MySQL 开销较大
+        可能导致租约续期线程的连接池等待超时。
+        """
+        await asyncio.to_thread(lambda: upsert_stage_result_index(**kwargs))
 
     def _stage_sys_prompt(self, stage: str) -> str:
         pipeline_dir = os.path.abspath(
