@@ -611,9 +611,15 @@ class PipelineEngine:
             _on_r1_done(len(func_hashes))
             if self._cancel.is_set() or not func_hashes:
                 return
-            # R1 完成后立即并行启动本文件所有函数的流水线
+        # R1 完成后立即并行启动本文件所有函数的流水线
+            # 用信号量限制并发数，避免 336 个函数同时进入 asyncio 调度
+            # 引发 event loop 任务风暴 → health probe 超时 → K8s SIGKILL
+            _func_sem = asyncio.Semaphore(max(1, int(os.environ.get('EA_FUNC_PIPELINE_CONCURRENCY', '32'))))
+            async def _func_pipeline_with_sem(fh: str, fhash: str, fpath: str) -> None:
+                async with _func_sem:
+                    await _func_pipeline(fh, fhash, fpath)
             await asyncio.gather(*[
-                _func_pipeline(fh, file_hash, file_path)
+                _func_pipeline_with_sem(fh, file_hash, file_path)
                 for fh in func_hashes
             ])
 
