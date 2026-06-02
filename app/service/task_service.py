@@ -601,6 +601,7 @@ def _requeue_expired_running_tasks(
     now: datetime | None = None,
     *,
     project_id: str | None = None,
+    owner_pod: str | None = None,
     limit: int | None = None,
     scheduler_instance: str = "scheduler",
     alive_owner_pods: set[str] | None = None,
@@ -622,6 +623,9 @@ def _requeue_expired_running_tasks(
     )
     if project_id:
         query = query.filter(AppEaTask.project_id == project_id)
+    normalized_owner_pod = str(owner_pod or "").strip()
+    if normalized_owner_pod:
+        query = query.filter(AppEaTask.owner_pod == normalized_owner_pod)
     if limit is not None and limit > 0:
         query = query.limit(limit)
     candidates = query.all()

@@ -69,6 +69,8 @@ class WorkerSlotSnapshot:
     source: str
     error: str | None
     active_tasks: list[dict[str, Any]]
+    claimed_running_tasks: int
+    ghost_running_tasks: int
 
 
 class WorkerSlotService:
@@ -248,6 +250,12 @@ class WorkerSlotService:
         stale_cutoff = add_seconds_local(now, -STALE_AFTER_SECONDS)
         live_pods = self._list_live_worker_pods()
         worker_rows = db.query(AppEaWorkerSlot).order_by(AppEaWorkerSlot.pod_name.asc(), AppEaWorkerSlot.id.asc()).all()
+        claimed_running_query = db.query(AppEaTask).filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "running",
+            AppEaTask.owner_pod.is_not(None),
+            AppEaTask.cancel_requested.is_(False),
+        )
         running_query = db.query(AppEaTask).filter(
             AppEaTask.is_deleted.is_(False),
             AppEaTask.status == "running",
@@ -261,10 +269,27 @@ class WorkerSlotService:
             AppEaTask.status == "pending",
         )
         if str(project_id or "").strip():
+            claimed_running_query = claimed_running_query.filter(AppEaTask.project_id == project_id)
             running_query = running_query.filter(AppEaTask.project_id == project_id)
             queued_query = queued_query.filter(AppEaTask.project_id == project_id)
+        claimed_running_rows = claimed_running_query.all()
         running_rows = running_query.all()
         queued_tasks = int(queued_query.count())
+        claimed_by_owner: dict[str, list[Any]] = {}
+        ghost_running_tasks = 0
+        running_expired_lease = 0
+        running_expired_lease_owner_alive = 0
+        for row in claimed_running_rows:
+            owner = str(row.owner_pod or "").strip()
+            if not owner:
+                continue
+            claimed_by_owner.setdefault(owner, []).append(row)
+            lease_expires_at = getattr(row, "lease_expires_at", None)
+            if lease_expires_at is None or lease_expires_at < now:
+                ghost_running_tasks += 1
+                running_expired_lease += 1
+                if owner in live_pods:
+                    running_expired_lease_owner_alive += 1
 
         active_by_owner: dict[str, list[dict[str, Any]]] = {}
         for row in running_rows:
@@ -305,6 +330,8 @@ class WorkerSlotService:
                 error = "retired worker registry row"
                 retired_workers += 1
             running_tasks = len(active_tasks)
+            claimed_running_tasks = len(claimed_by_owner.get(pod_name, []))
+            ghost_tasks = max(0, claimed_running_tasks - running_tasks)
             available_slots = max(0, int(row.max_concurrent_tasks) - running_tasks)
             payload = WorkerSlotSnapshot(
                 worker_id=row.worker_id,
@@ -334,6 +361,8 @@ class WorkerSlotService:
                 source=source,
                 error=error,
                 active_tasks=active_tasks,
+                claimed_running_tasks=claimed_running_tasks,
+                ghost_running_tasks=ghost_tasks,
             )
             target = live_workers if is_live_pod else retired_workers_payload
             target.append(self._worker_payload_from_snapshot(payload))
@@ -368,12 +397,15 @@ class WorkerSlotService:
                 source="stale_owner",
                 error="owner pod has running tasks but no live worker heartbeat",
                 active_tasks=sorted(active_tasks, key=lambda item: item["task_id"]),
+                claimed_running_tasks=len(active_tasks),
+                ghost_running_tasks=len(active_tasks),
             )
             stale_owner_payload.append(self._worker_payload_from_snapshot(snapshot))
 
         workers_payload = live_workers + stale_owner_payload
         total_capacity = sum(int(item["max_concurrent_tasks"]) for item in live_workers)
         busy_slots = sum(int(item["running_tasks"]) for item in live_workers)
+        total_claimed_running = sum(int(item.get("claimed_running_tasks") or 0) for item in live_workers)
         agent_total_capacity = sum(int(item.get("agent_process_limit") or 0) for item in live_workers)
         agent_in_use = sum(int(item.get("agent_process_in_use") or 0) for item in live_workers)
         agent_waiting_requests = sum(int(item.get("agent_waiting_requests") or 0) for item in live_workers)
@@ -400,6 +432,10 @@ class WorkerSlotService:
             "stale_owner_workers": len(stale_owner_payload),
             "total_capacity": total_capacity,
             "busy_slots": busy_slots,
+            "claimed_running_tasks": total_claimed_running,
+            "ghost_running_tasks": ghost_running_tasks,
+            "running_expired_lease": running_expired_lease,
+            "running_expired_lease_owner_alive": running_expired_lease_owner_alive,
             "running_jobs": busy_slots,
             "available_slots": max(0, total_capacity - busy_slots),
             "dispatch_limit": dispatch_limit,
@@ -455,6 +491,8 @@ class WorkerSlotService:
             "source": worker.source,
             "error": worker.error,
             "active_tasks": worker.active_tasks,
+            "claimed_running_tasks": worker.claimed_running_tasks,
+            "ghost_running_tasks": worker.ghost_running_tasks,
             "active_jobs": [
                 {
                     "pi_job_id": task["task_id"],

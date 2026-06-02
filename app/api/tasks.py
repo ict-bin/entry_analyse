@@ -324,6 +324,8 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
     max_concurrent_tasks: int
     max_concurrent_jobs: int
     running_tasks: int = 0
+    claimed_running_tasks: int = 0
+    ghost_running_tasks: int = 0
     running_jobs: int = 0
     queued_jobs: int = 0
     available_slots: int = 0
@@ -360,6 +362,10 @@ class EntryAnalyseSlotClusterResponse(BaseModel):
     stale_owner_workers: int = 0
     total_capacity: int = 0
     busy_slots: int = 0
+    claimed_running_tasks: int = 0
+    ghost_running_tasks: int = 0
+    running_expired_lease: int = 0
+    running_expired_lease_owner_alive: int = 0
     running_jobs: int = 0
     available_slots: int = 0
     dispatch_limit: int = 0
@@ -450,6 +456,9 @@ class AgentPodSnapshotResponse(BaseModel):
 class AgentObservabilitySummaryResponse(BaseModel):
     pod_name: str
     active_processes: int = 0
+    claimed_running_tasks: int = 0
+    runtime_observed_task_count: int = 0
+    ghost_running_tasks: int = 0
     residual_processes: int = 0
     unknown_processes: int = 0
     killable_residual_processes: int = 0
@@ -499,6 +508,9 @@ class AgentRuntimeAggregateSummaryResponse(BaseModel):
     healthy_pods: int = 0
     total_processes: int = 0
     tracked_processes: int = 0
+    claimed_running_tasks: int = 0
+    runtime_observed_task_count: int = 0
+    ghost_running_tasks: int = 0
     residual_processes: int = 0
     unknown_processes: int = 0
     killable_residual_processes: int = 0
@@ -943,6 +955,9 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
             "healthy_pods": int(summary.get("healthy_pods") or len([item for item in pods if bool(item.get("healthy", True))])),
             "total_processes": len(processes),
             "tracked_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "tracked"]),
+            "claimed_running_tasks": int(summary.get("claimed_running_tasks") or 0),
+            "runtime_observed_task_count": int(summary.get("runtime_observed_task_count") or len([item for item in tasks if str(item.get("ownership_status") or "") == "tracked"])),
+            "ghost_running_tasks": int(summary.get("ghost_running_tasks") or 0),
             "residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual"]),
             "unknown_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown"]),
             "killable_residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual" and bool(item.get("kill_allowed"))]),

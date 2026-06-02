@@ -216,6 +216,7 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     db = _FakeDb([
         [healthy_worker],
         [valid_running],
+        [valid_running],
         [SimpleNamespace(), SimpleNamespace()],
     ])
     monkeypatch.setattr(worker_slot_service, "_load_svc_config_from_db", lambda _db, _project_id: SimpleNamespace(max_concurrent_tasks=4))
@@ -226,11 +227,15 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["queued_jobs"] == 2
     assert snapshot["busy_slots"] == 1
     assert snapshot["available_slots"] == 3
+    assert snapshot["claimed_running_tasks"] == 1
+    assert snapshot["ghost_running_tasks"] == 0
     assert snapshot["registry_visible_workers"] == 1
     assert snapshot["live_pod_count"] == 0
     assert snapshot["registry_missing_live_pods"] == 0
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
+    assert snapshot["workers"][0]["claimed_running_tasks"] == 1
+    assert snapshot["workers"][0]["ghost_running_tasks"] == 0
 
 
 def test_metrics_expose_expired_running_lease_diagnostics(monkeypatch) -> None:
@@ -603,6 +608,11 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
         "get_worker_slot_service",
         lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
     )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: SimpleNamespace(claimed_running_task_count=lambda: 0),
+    )
 
     class _TaskQuery:
         def filter(self, *args, **kwargs):
@@ -629,6 +639,9 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert row["owner_kind"] == "unknown"
     assert row["kill_allowed"] is True
     assert row["kill_block_reason"] is None
+    assert snapshot["summary"]["claimed_running_tasks"] == 0
+    assert snapshot["summary"]["runtime_observed_task_count"] == 0
+    assert snapshot["summary"]["ghost_running_tasks"] == 0
     assert snapshot["summary"]["killable_unknown_processes"] == 1
 
 
@@ -649,6 +662,11 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
         agent_observability,
         "get_worker_slot_service",
         lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: SimpleNamespace(claimed_running_task_count=lambda: 1),
     )
 
     class _TaskQuery:
@@ -684,6 +702,9 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
     assert snapshot["processes"][0]["runtime_kind"] == "codex"
     assert snapshot["processes"][0]["match_source"] == "session_arg_path"
     assert snapshot["processes"][0]["task_id"] == "eat_1"
+    assert snapshot["summary"]["claimed_running_tasks"] == 1
+    assert snapshot["summary"]["runtime_observed_task_count"] == 1
+    assert snapshot["summary"]["ghost_running_tasks"] == 0
 
 
 def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch) -> None:
@@ -703,6 +724,11 @@ def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch
         agent_observability,
         "get_worker_slot_service",
         lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: SimpleNamespace(claimed_running_task_count=lambda: 2),
     )
 
     running_row = SimpleNamespace(
@@ -743,6 +769,9 @@ def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch
     snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
     assert snapshot["processes"][0]["task_id"] == "eat_new"
     assert snapshot["processes"][0]["owner_kind"] == "tracked"
+    assert snapshot["summary"]["claimed_running_tasks"] == 2
+    assert snapshot["summary"]["runtime_observed_task_count"] == 1
+    assert snapshot["summary"]["ghost_running_tasks"] == 1
     assert snapshot["summary"]["active_processes"] == 1
     assert snapshot["summary"]["residual_processes"] == 0
 

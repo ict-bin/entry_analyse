@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask
 from app.service.worker_slot_service import get_worker_slot_service
+from app.service.worker_service import get_worker_service
 
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
@@ -393,10 +394,19 @@ class AgentObservabilityService:
         residual_task_rows = [item for item in ownership_rows if item.ownership_status == "residual"]
         scanned_at = time.time()
         pod_slot = cluster_by_pod.get(POD_NAME) or {}
+        claimed_running_tasks = 0
+        with contextlib.suppress(Exception):
+            worker_service = get_worker_service()
+            claimed_running_tasks = int(worker_service.claimed_running_task_count() or 0)
+        runtime_observed_task_count = len(running_task_rows)
+        ghost_running_tasks = max(0, claimed_running_tasks - runtime_observed_task_count)
         return {
             "summary": {
                 "pod_name": POD_NAME,
                 "active_processes": len(tracked_processes),
+                "claimed_running_tasks": claimed_running_tasks,
+                "runtime_observed_task_count": runtime_observed_task_count,
+                "ghost_running_tasks": ghost_running_tasks,
                 "residual_processes": len(residual_processes),
                 "unknown_processes": len(unknown_processes),
                 "killable_residual_processes": len([item for item in residual_processes if item.kill_allowed]),
@@ -437,6 +447,8 @@ class AgentObservabilityService:
                     runtime_kind: len([item for item in process_rows if str(item.runtime_kind or "unknown") == runtime_kind])
                     for runtime_kind in sorted({str(item.runtime_kind or "unknown") for item in process_rows})
                 },
+                "claimed_running_tasks": claimed_running_tasks,
+                "ghost_running_tasks": ghost_running_tasks,
                 "last_scanned_at": scanned_at,
                 "scan_errors": 0,
                 "processes": [item.__dict__ for item in process_rows],

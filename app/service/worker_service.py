@@ -152,6 +152,8 @@ class WorkerService:
         self._task_abort_callbacks: dict[str, Any] = {}
         self._task_guard_reasons: dict[str, str] = {}
         self._task_lease_started_at: dict[str, float] = {}
+        self._startup_reconciled_expired_tasks: int = 0
+        self._startup_reconciled_owner_alive_tasks: int = 0
 
     def has_local_task(self, task_id: str) -> bool:
         task = _running_tasks.get(task_id)
@@ -168,6 +170,63 @@ class WorkerService:
         for tid in done:
             _running_tasks.pop(tid, None)
         return len(_running_tasks)
+
+    def claimed_running_task_count(self) -> int:
+        from app.service import task_service as task_mod
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            return int(
+                db.query(AppEaTask)
+                .filter(
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.status == "running",
+                    AppEaTask.cancel_requested.is_(False),
+                    AppEaTask.owner_pod == task_mod.POD_NAME,
+                )
+                .count()
+            )
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def startup_reconcile_snapshot(self) -> dict[str, int]:
+        return {
+            "reconciled_expired_tasks": int(self._startup_reconciled_expired_tasks or 0),
+            "reconciled_owner_alive_tasks": int(self._startup_reconciled_owner_alive_tasks or 0),
+        }
+
+    def _reconcile_local_stale_owned_tasks(self) -> None:
+        from app.service import task_service as task_mod
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            reconciled, owner_alive = task_mod._requeue_expired_running_tasks(
+                db,
+                owner_pod=task_mod.POD_NAME,
+                limit=WORKER_MAINTENANCE_MAX_STALE_TASKS,
+                scheduler_instance=f"worker-startup:{task_mod.POD_NAME}",
+                alive_owner_pods={task_mod.POD_NAME},
+            )
+            if reconciled:
+                db.commit()
+                self._startup_reconciled_expired_tasks += int(reconciled)
+                self._startup_reconciled_owner_alive_tasks += int(owner_alive)
+                logger.warning(
+                    "worker startup reconciled expired locally-owned tasks worker_id=%s reconciled=%s owner_alive=%s",
+                    task_mod.POD_NAME,
+                    reconciled,
+                    owner_alive,
+                )
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
 
     def start_task(self, task_id: str) -> asyncio.Task:
         existing = _running_tasks.get(task_id)
@@ -703,6 +762,7 @@ class WorkerService:
         if self._running:
             return
         self._running = True
+        self._reconcile_local_stale_owned_tasks()
         self._heartbeat_stop.clear()
         self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
         self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
