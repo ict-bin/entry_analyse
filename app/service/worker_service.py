@@ -271,8 +271,6 @@ class WorkerService:
                 return HTTPStatus.SERVICE_UNAVAILABLE
             if self._guard_state.state == "unhealthy":
                 return HTTPStatus.SERVICE_UNAVAILABLE
-            if not snap.main_loop_alive and self._started_at > 0:
-                return HTTPStatus.SERVICE_UNAVAILABLE
             if self._heartbeat_health.consecutive_failures >= WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD:
                 return HTTPStatus.SERVICE_UNAVAILABLE
             if self._lease_health.consecutive_failures >= WORKER_GUARD_LEASE_FAILURE_THRESHOLD:
