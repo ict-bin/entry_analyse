@@ -1,32 +1,21 @@
-FROM public.ecr.aws/docker/library/ubuntu:24.04
+ARG SECFLOW_PI_AGENT_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602
+FROM ${SECFLOW_PI_AGENT_RUNTIME_IMAGE}
 
 ARG SECFLOW_BUILD_VERSION=""
-
-ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# ═══ 系统工具 ═════════════════════════════════════════════════════════════════
-RUN apt-get update && apt-get install -y \
-    curl wget gnupg ca-certificates git zip \
-    python3 python3-pip python3-venv \
-    bubblewrap \
-    universal-ctags \
-    sqlite3 \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bubblewrap \
+        sqlite3 \
+        universal-ctags \
     && rm -rf /var/lib/apt/lists/*
-
-# ═══ Node.js 22 ═══════════════════════════════════════════════════════════════
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# ═══ pi-coding-agent ══════════════════════════════════════════════════════════
-RUN npm install -g @mariozechner/pi-coding-agent
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
 WORKDIR /opt/entry_analyse
 # 先拷贝依赖文件，使 pip install 层可被缓存（app/ 变更时不重装依赖）
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
+RUN pip install --no-cache-dir -r requirements.txt -q
 COPY app/               ./app/
 COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
