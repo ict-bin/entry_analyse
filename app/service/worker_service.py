@@ -886,11 +886,18 @@ class WorkerService:
             except StopIteration:
                 pass
 
-    async def _renew_task_lease(self, task_id: str, stop_event: asyncio.Event) -> None:
+    def _renew_task_lease_thread(self, task_id: str, stop_event: "threading.Event") -> None:
+        """租约续期线程：独立于 asyncio 事件循环运行，避免事件循环饥饿导致续租失败。
+
+        原 async 版本与流水线协程共享同一事件循环；当 R2 fast-path 等大量同步阻塞 I/O
+        占满事件循环时，续租协程无法得到调度，租约到期后其他 pod 接管并清空磁盘。
+        改为 daemon thread 后彻底解耦，无论事件循环是否阻塞都能按时续租。
+        """
+        import threading as _threading
         from app.service import task_service as task_mod
 
-        while not stop_event.is_set():
-            await asyncio.sleep(task_mod.LEASE_RENEW_INTERVAL_SECONDS)
+        while not stop_event.wait(timeout=task_mod.LEASE_RENEW_INTERVAL_SECONDS):
+            # wait() 返回 True 表示 stop_event 被 set，退出
             if stop_event.is_set():
                 break
             try:
@@ -1018,10 +1025,10 @@ class WorkerService:
 
         event_buffer: list[dict] = []
         project_id: str | None = None
-        lease_stop_event = asyncio.Event()
+        lease_stop_event: "threading.Event" = __import__("threading").Event()
         control_cancel_event = asyncio.Event()
         _local_cancel_events[task_id] = control_cancel_event
-        lease_task: asyncio.Task | None = None
+        lease_thread: "threading.Thread | None" = None
         control_task: asyncio.Task | None = None
         cancel_cleanup_task: asyncio.Task | None = None
         task_roots: list[str] = []
@@ -1238,7 +1245,13 @@ class WorkerService:
             self._task_abort_callbacks[task_id] = orch.abort
             self._task_guard_reasons.pop(task_id, None)
             self._task_lease_started_at[task_id] = time.time()
-            lease_task = asyncio.create_task(self._renew_task_lease(task_id, lease_stop_event), name=f"ea_lease_{task_id}")
+            lease_thread = __import__("threading").Thread(
+                target=self._renew_task_lease_thread,
+                args=(task_id, lease_stop_event),
+                name=f"ea_lease_{task_id}",
+                daemon=True,
+            )
+            lease_thread.start()
             control_task = asyncio.create_task(
                 self._watch_task_control(task_id, lease_stop_event, control_cancel_event, orch),
                 name=f"ea_control_{task_id}",
@@ -1512,12 +1525,14 @@ class WorkerService:
             except Exception:
                 pass
         finally:
-            lease_stop_event.set()
+            lease_stop_event.set()            # 通知续租线程退出
             _local_cancel_events.pop(task_id, None)
             self._task_abort_callbacks.pop(task_id, None)
             self._task_guard_reasons.pop(task_id, None)
             self._task_lease_started_at.pop(task_id, None)
-            for bg_task in (lease_task, control_task, cancel_cleanup_task):
+            if lease_thread is not None:
+                lease_thread.join(timeout=5)   # 等待续租线程退出（最多 5s）
+            for bg_task in (control_task, cancel_cleanup_task):
                 if bg_task is not None:
                     bg_task.cancel()
                     try:
