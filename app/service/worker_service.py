@@ -1201,6 +1201,8 @@ class WorkerService:
 
             # step-B: 磁盘清理
             # ENOENT 正常忽略；其他错误（如 NFS 故障）显式抛出，不允许静默吸收。
+            # ENOTEMPTY：进程刚退出但 NFS 还没刷新，最多重试 3 次（间0.5s）再抛出。
+            if task_snapshot.output_path:
                 import pathlib as _pl
                 import shutil as _shutil
                 import errno as _errno
@@ -1210,10 +1212,20 @@ class WorkerService:
                 )
                 for _subdir in ("run", "output"):
                     _d = _task_dir / _subdir
-                    try:
-                        _shutil.rmtree(str(_d))
-                    except OSError as _e:
-                        if _e.errno != _errno.ENOENT:
+                    for _attempt in range(4):
+                        try:
+                            _shutil.rmtree(str(_d))
+                            break
+                        except OSError as _e:
+                            if _e.errno == _errno.ENOENT:
+                                break
+                            if _e.errno == _errno.ENOTEMPTY and _attempt < 3:
+                                logger.warning(
+                                    "worker: rmtree ENOTEMPTY for %s/ task %s, retry %d/3",
+                                    _subdir, task_id, _attempt + 1,
+                                )
+                                import time as _time; _time.sleep(0.5)
+                                continue
                             logger.error(
                                 "worker: failed to clean %s/ for %s: %s",
                                 _subdir, task_id, _e,

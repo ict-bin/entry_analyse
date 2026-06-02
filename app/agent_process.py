@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import pathlib
+import time
 import re
 import shutil
 import signal
@@ -225,7 +226,16 @@ def cleanup_task_pi_processes(
             continue
         except Exception:
             continue
-    return killed
+        # 等待进程真正退出（轮询 /proc/{pid}，最多 5s）
+        # SIGKILL 只是发信号，进程退出需要内核回收，有结暄延迟。
+        # 不等就返回会导致后续 rmtree 遇到 ENOTEMPTY（进程还在写文件）。
+        _deadline = time.monotonic() + 5.0
+        while time.monotonic() < _deadline:
+            if not pathlib.Path(f"/proc/{pid}").exists():
+                break
+            time.sleep(0.05)
+        else:
+            logger(f"process pid={pid} did not exit within 5s after SIGKILL")
 
 
 @dataclass
