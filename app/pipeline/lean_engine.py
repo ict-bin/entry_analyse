@@ -2620,18 +2620,20 @@ class LeanPipelineEngine:
         _af_start = time.monotonic()
         try:
             model = self.cfg.workers.agents[0].model if self.cfg.workers.agents else ""
-            is_entry = await api_filter_function(
+            is_entry, _af_llm_dur = await api_filter_function(
                 func_name=func_name,
                 signature=signature,
                 body=body,
                 model=model,
                 cancel_event=self._cancel,
             )
-            _af_dur = self._dur(_af_start)
+            _af_wall_dur = self._dur(_af_start)  # 含等待时间（informational）
             self._emit(
                 "api_filter_done",
                 func_hash=func_hash, function=func_name,
-                is_entry=int(is_entry), duration_ms=_af_dur,
+                is_entry=int(is_entry),
+                duration_ms=_af_llm_dur,          # 实际 LLM 调用时间（不含等待）
+                wall_duration_ms=_af_wall_dur,    # 含信号量等待的总耗时
             )
             return is_entry
         except Exception as exc:

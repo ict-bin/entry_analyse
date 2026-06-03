@@ -36,7 +36,7 @@ logger = logging.getLogger("ea.pipeline.api_filter")
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent"))
 _MODELS_JSON_PATH = Path(_PI_DIR) / "models.json"
 
-_DEFAULT_CONCURRENCY      = int(os.environ.get("EA_API_FILTER_CONCURRENCY",      "16"))
+_DEFAULT_CONCURRENCY      = int(os.environ.get("EA_API_FILTER_CONCURRENCY",       "8"))
 _REQUEST_TIMEOUT          = int(os.environ.get("EA_API_FILTER_TIMEOUT_SECONDS",   "45"))
 _MAX_RETRIES              = int(os.environ.get("EA_API_FILTER_MAX_RETRIES",        "2"))
 _MAX_BODY_CHARS           = int(os.environ.get("EA_API_FILTER_MAX_BODY_CHARS",  "3000"))
@@ -201,15 +201,17 @@ async def api_filter_function(
     body:         str,
     model:        str = "",
     cancel_event: asyncio.Event | None = None,
-) -> bool:
+) -> tuple[bool, int]:
     """
     对单个函数调用 LLM API，快速判断是否为外部入口。
 
-    返回 True（继续 R3）或 False（跳过 R3，函数已过滤）。
-    API 调用失败时保守返回 True（不漏报）。
+    返回 (is_entry: bool, llm_duration_ms: int)
+      is_entry=True  → 继续 R3（或调用失败时保守保留）
+      is_entry=False → 跳过 R3，函数过滤
+    API 调用失败时保守返回 (True, 0)（不漏报）。
     """
     if cancel_event and cancel_event.is_set():
-        return True  # 取消时保守保留
+        return True, 0  # 取消时保守保留
 
     # 准备 prompt（截断超大 body）
     body_capped = body[:_MAX_BODY_CHARS]
@@ -235,6 +237,7 @@ async def api_filter_function(
     # 信号量限制并发
     sem = get_api_filter_sem()
     async with sem:
+        _llm_start = time.monotonic()  # 信号量 acquire 后才开始计时（不含等待）
         for attempt in range(1, _MAX_RETRIES + 2):
             if cancel_event and cancel_event.is_set():
                 return True
@@ -254,8 +257,10 @@ async def api_filter_function(
                         "api_filter: cannot parse response for %s after %d attempts, keeping",
                         func_name, attempt
                     )
-                    return True
-                return result
+                    _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
+                    return True, _dur
+                _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
+                return result, _dur
             except Exception as exc:
                 logger.debug(
                     "api_filter: HTTP error for %s (attempt %d): %s",
@@ -268,5 +273,6 @@ async def api_filter_function(
                         "api_filter: failed for %s after %d attempts (%s), keeping",
                         func_name, attempt, exc
                     )
-                    return True  # 保守保留
-    return True
+                    _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
+                    return True, _dur  # 保守保留
+    return True, 0
