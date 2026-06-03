@@ -262,6 +262,12 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
             f"     不携带来自外部的消息 payload（依据是函数体操作，不是参数名）\n"
             f"   - 参数虽含 message/request 字样，但函数体只做内部状态查询或字段更新，\n"
             f"     没有对该参数所指数据做解析或安全相关的分支处理\n"
+            f"   **服务生命周期函数必须 filter（即使参数含 socket/callback）：**\n"
+            f"   满足下列全部特征时必须输出 filter，不论参数名如何：\n"
+            f"   ① 函数名含 `*_init`/`*_start`/`*_stop`/`*_free`/`*_register`/`*_setup`/`*_bind` 等生命周期标志\n"
+            f"   ② 函数体内无 recv/recvfrom/recvmsg/read/accept/MsgReceive 等接收外部数据的调用\n"
+            f"   ③ 参数中的 socket 是路径字符串（用于 bind/listen）或参数是函数指针/回调指针\n"
+            f"   → 这类函数是服务启动配置，参数是配置值，不是 HTTP/IPC 请求 payload，必须 filter\n"
         )
     else:
         step2 = (
@@ -285,6 +291,12 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
             f"     不携带来自外部的消息 payload（依据是函数体操作，不是参数名）\n"
             f"   - 参数虽含 message/request 字样，但函数体只做内部状态查询或字段更新，\n"
             f"     没有对该参数所指数据做解析或安全相关的分支处理\n"
+            f"   **服务生命周期函数必须 filter（即使参数含 socket/callback）：**\n"
+            f"   满足下列全部特征时必须输出 filter，不论参数名如何：\n"
+            f"   ① 函数名含 `*_init`/`*_start`/`*_stop`/`*_free`/`*_register`/`*_setup`/`*_bind` 等生命周期标志\n"
+            f"   ② 函数体内无 recv/recvfrom/recvmsg/read/accept/MsgReceive 等接收外部数据的调用\n"
+            f"   ③ 参数中的 socket 是路径字符串（用于 bind/listen）或参数是函数指针/回调指针\n"
+            f"   → 这类函数是服务启动配置，参数是配置值，不是 HTTP/IPC 请求 payload，必须 filter\n"
         )
 
     return (

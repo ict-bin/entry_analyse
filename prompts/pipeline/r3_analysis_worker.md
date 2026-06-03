@@ -33,6 +33,17 @@
 - 函数职责是**纯构造或发送**：填写字段、分配 output buffer、调用 send/write/emit API，无接收行为（典型前缀 `Create*/Fill*/Build*/Send*/Write*`）
 - 函数是 FSM action 或纯内部状态更新/计数统计
 - 函数体只做格式转换/内存填充，处理内部已有数据
+- **服务生命周期函数**（重要）：函数的主要工作是服务启动、停止、绑定或注册，而非处理运行期请求。  
+  满足下列全部特征时 **必须 filter**，即使参数含有 socket/callback/handler 等词：  
+  ① 函数名含 `*_init`/`*_start`/`*_stop`/`*_free`/`*_register`/`*_setup`/`*_bind` 等生命周期标志  
+  ② 函数体内**无** `recv`/`recvfrom`/`recvmsg`/`read`/`accept`/`MsgReceive` 等接收外部数据的调用  
+  ③ 参数中的 socket 是**路径字符串**（用于 bind/listen，守护进程配置值，非请求 payload），  
+     或参数是**函数指针/回调指针**（框架注册参数，非用户传入的消息数据）  
+  > **典型误判场景**：`rest_server_init(const char *socket, daemon_shutdown_cb_t cb)` 中，  
+  > `socket` 是 Unix socket 绑定路径（如 `/run/isulad/isula.sock`），`cb` 是停机回调，  
+  > 二者均为服务配置值，**不是 HTTP 请求数据**，应 filter。  
+  > **关键判断**：socket 路径用于 `bind()`/`listen()` = 配置值 = filter；  
+  > socket fd 用于 `recv()`/`accept()` 得到的数据 = 请求数据 = keep
 
 **`keep`（默认）**：`has_external_input=true` 且不满足任何 filter 条件  
 **不确定时保守保留（宁可误报不能漏报）**
