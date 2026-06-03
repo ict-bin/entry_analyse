@@ -34,10 +34,15 @@ K8S_SERVICE_HOST = str(os.environ.get("KUBERNETES_SERVICE_HOST") or "").strip()
 K8S_SERVICE_PORT = str(os.environ.get("KUBERNETES_SERVICE_PORT") or "443").strip() or "443"
 K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 K8S_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-WORKER_LABEL_SELECTOR = str(
-    os.environ.get("EA_WORKER_POD_LABEL_SELECTOR")
-    or "name=secflow-app-entry-analyse-worker"
-).strip()
+WORKER_LABEL_SELECTORS: tuple[str, ...] = tuple(
+    item.strip()
+    for item in (
+        os.environ.get("EA_WORKER_POD_LABEL_SELECTORS")
+        or os.environ.get("EA_WORKER_POD_LABEL_SELECTOR")
+        or "name=secflow-app-entry-analyse-worker,app=secflow-app-entry-analyse-worker"
+    ).split(",")
+    if item.strip()
+)
 
 
 @dataclass
@@ -107,29 +112,32 @@ class WorkerSlotService:
                 return set()
         except Exception:
             return set()
-        url = (
-            f"https://{K8S_SERVICE_HOST}:{K8S_SERVICE_PORT}"
-            f"/api/v1/namespaces/{K8S_NAMESPACE}/pods?labelSelector={urllib.parse.quote(WORKER_LABEL_SELECTOR)}"
-        )
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         context = ssl.create_default_context(cafile=K8S_CA_PATH if os.path.exists(K8S_CA_PATH) else None)
-        try:
-            with urllib.request.urlopen(request, context=context, timeout=5) as response:
-                import json
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-            return set()
         live: set[str] = set()
-        for item in payload.get("items") or []:
-            if not isinstance(item, dict):
+        selectors = WORKER_LABEL_SELECTORS or ("name=secflow-app-entry-analyse-worker",)
+        for selector in selectors:
+            url = (
+                f"https://{K8S_SERVICE_HOST}:{K8S_SERVICE_PORT}"
+                f"/api/v1/namespaces/{K8S_NAMESPACE}/pods?labelSelector={urllib.parse.quote(selector)}"
+            )
+            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            try:
+                with urllib.request.urlopen(request, context=context, timeout=5) as response:
+                    import json
+                    payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                logger.warning("entry worker live pod query failed selector=%s: %s", selector, exc)
                 continue
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            status = item.get("status") if isinstance(item.get("status"), dict) else {}
-            phase = str(status.get("phase") or "").strip().lower()
-            deletion_timestamp = metadata.get("deletionTimestamp")
-            pod_name = str(metadata.get("name") or "").strip()
-            if pod_name and not deletion_timestamp and phase in {"pending", "running"}:
-                live.add(pod_name)
+            for item in payload.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                status = item.get("status") if isinstance(item.get("status"), dict) else {}
+                phase = str(status.get("phase") or "").strip().lower()
+                deletion_timestamp = metadata.get("deletionTimestamp")
+                pod_name = str(metadata.get("name") or "").strip()
+                if pod_name and not deletion_timestamp and phase in {"pending", "running"}:
+                    live.add(pod_name)
         return live
 
     def upsert_heartbeat(
@@ -250,6 +258,13 @@ class WorkerSlotService:
         stale_cutoff = add_seconds_local(now, -STALE_AFTER_SECONDS)
         live_pods = self._list_live_worker_pods()
         worker_rows = db.query(AppEaWorkerSlot).order_by(AppEaWorkerSlot.pod_name.asc(), AppEaWorkerSlot.id.asc()).all()
+        if not live_pods:
+            for row in worker_rows:
+                pod_name = str(row.pod_name or "").strip()
+                if not pod_name or row.last_heartbeat_at is None:
+                    continue
+                if row.last_heartbeat_at >= stale_cutoff:
+                    live_pods.add(pod_name)
         claimed_running_query = db.query(AppEaTask).filter(
             AppEaTask.is_deleted.is_(False),
             AppEaTask.status == "running",

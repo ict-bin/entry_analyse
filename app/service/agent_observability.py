@@ -45,6 +45,7 @@ _ENV_SESSION_KEYS = ("EA_SESSION_FILE", "EA_SESSION_PATH")
 _ENV_WORKSPACE_KEYS = ("EA_WORKSPACE_ROOT",)
 _PARENT_CHAIN_LIMIT = 32
 _TRACKED_OWNER_KINDS = {"tracked", "tracked_subprocess", "tracked_inferred"}
+_RUNNING_TASK_STATUSES = {"running", "pending", "queued", "dispatching"}
 
 
 @dataclass
@@ -580,6 +581,21 @@ class AgentObservabilityService:
                 ownership_confidence = "env_inferred"
                 ownership_evidence = "env_task_or_session_or_workspace"
                 kill_block_reason = "进程环境变量与活跃 root 上下文一致"
+            elif (
+                task_row is not None
+                and str(task_status or "").strip() in _RUNNING_TASK_STATUSES
+                and (
+                    env_task_id
+                    or env_session_path
+                    or env_workspace_root
+                    or match_source in {"session_arg_path", "cwd", "task_root"}
+                )
+            ):
+                owner_kind = "tracked_inferred"
+                owner_reason = "running_task_workspace_or_env_match"
+                ownership_confidence = "workspace_inferred" if match_source else "env_inferred"
+                ownership_evidence = match_source or "env_task_or_session_or_workspace"
+                kill_block_reason = "进程与运行中任务工作目录或环境上下文一致"
             elif task_row is not None and str(task_status or "").strip() in {"failed", "error", "cancelled"}:
                 owner_kind = "residual"
                 owner_reason = "db_terminal_task_matched_without_registry_owner"
