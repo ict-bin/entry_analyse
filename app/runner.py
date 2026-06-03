@@ -17,6 +17,7 @@ entry_analyse — Agent 子进程执行器
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -94,6 +95,12 @@ def _build_isolated_args(args: list[str], cwd: str) -> list[str]:
         )
 
     return args
+
+
+def _get_worker_service():
+    from .service.worker_service import get_worker_service
+
+    return get_worker_service()
 
 
 def _bwrap_wrap_args(bwrap: str, cwd: str) -> list[str]:
@@ -911,6 +918,19 @@ async def _run_with_api_retry(
             )
             proc = handle.proc
             slot_lease.bind_pid(getattr(proc, "pid", None))
+            with contextlib.suppress(Exception):
+                _get_worker_service().register_live_agent_process(
+                    pid=getattr(proc, "pid", None),
+                    task_id=str(task_id or ""),
+                    runtime_kind="pi",
+                    stage_key=stage_key,
+                    role_kind=role_kind,
+                    workspace_root=cwd,
+                    session_path=session_file,
+                    cwd=cwd,
+                    command=" ".join(_spawn_args),
+                    pgid=handle.pgid,
+                )
 
             # ── 向 stdin 写入 prompt，然后关闭（发送 EOF）──
             if current_stdin and proc.stdin:
@@ -925,6 +945,11 @@ async def _run_with_api_retry(
             if cancel_event:
                 async def _cancel_monitor() -> None:
                     await cancel_event.wait()
+                    with contextlib.suppress(Exception):
+                        _get_worker_service().mark_live_agent_process_terminating(
+                            getattr(proc, "pid", None),
+                            reason="cancel_event",
+                        )
                     pgid: int | None = None
                     try:
                         pgid = process_group_id(proc)
@@ -978,12 +1003,22 @@ async def _run_with_api_retry(
                 exec_result.exit_code = proc.returncode or 0
 
             except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    _get_worker_service().mark_live_agent_process_terminating(
+                        getattr(proc, "pid", None),
+                        reason="task_cancelled",
+                    )
                 await handle.terminate_tree(reason="task_cancelled")
                 raise
             except Exception as e:
                 _log_warn(f"pi 进程读取异常: {e}")
                 exec_result.error = f"pi process read error: {e}"
                 exec_result.exit_code = -1
+                with contextlib.suppress(Exception):
+                    _get_worker_service().mark_live_agent_process_terminating(
+                        getattr(proc, "pid", None),
+                        reason=f"read_exception:{type(e).__name__}",
+                    )
                 await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
             finally:
                 if _cancel_task:
@@ -997,6 +1032,11 @@ async def _run_with_api_retry(
                     term_timeout=2.0,
                     kill_timeout=2.0,
                 )
+                with contextlib.suppress(Exception):
+                    _get_worker_service().unregister_live_agent_process(
+                        getattr(proc, "pid", None),
+                        reason=f"exit_code={proc.returncode}" if getattr(proc, "returncode", None) is not None else "finally_cleanup",
+                    )
             return exec_result
 
         # ── 执行（只对执行计时，不包括排队等候）──

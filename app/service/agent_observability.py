@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask
 from app.service.worker_slot_service import get_worker_slot_service
-from app.service.worker_service import get_worker_service
+from app.service.worker_service import ORPHAN_PROCESS_GRACE_SECONDS, get_worker_service
 
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
@@ -40,6 +40,11 @@ _AGENT_TOKENS: tuple[tuple[str, str], ...] = (
     ("/pi", "pi"),
 )
 _WRAPPER_NAMES = {"node", "npm", "npx", "pnpm", "yarn", "python", "python3", "uv"}
+_ENV_TASK_KEYS = ("EA_TASK_ID", "TASK_ID", "PARENT_TASK_ID")
+_ENV_SESSION_KEYS = ("EA_SESSION_FILE", "EA_SESSION_PATH")
+_ENV_WORKSPACE_KEYS = ("EA_WORKSPACE_ROOT",)
+_PARENT_CHAIN_LIMIT = 32
+_TRACKED_OWNER_KINDS = {"tracked", "tracked_subprocess", "tracked_inferred"}
 
 
 @dataclass
@@ -65,6 +70,20 @@ class AgentProcessSnapshot:
     role_kind: str | None
     owner_kind: str
     owner_reason: str
+    registry_root_pid: int | None
+    registry_root_pgid: int | None
+    registry_owned: bool
+    registry_state: str | None
+    registry_task_id: str | None
+    registry_last_seen_at: float | None
+    ownership_confidence: str
+    ownership_evidence: str | None
+    env_task_id: str | None
+    env_session_path: str | None
+    parent_chain_root_pid: int | None
+    db_task_status: str | None
+    suspected_orphan_since: float | None
+    orphan_grace_expires_at: float | None
     kill_allowed: bool
     kill_block_reason: str | None
     heartbeat_age_seconds: float | None
@@ -158,6 +177,46 @@ def _collect_open_paths(proc_dir: pathlib.Path) -> list[str]:
     return deduped
 
 
+def _read_proc_environ(proc_dir: pathlib.Path) -> dict[str, str]:
+    try:
+        raw = (proc_dir / "environ").read_bytes()
+    except Exception:
+        return {}
+    rows: dict[str, str] = {}
+    for item in raw.split(b"\x00"):
+        if not item or b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        rows[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
+    return rows
+
+
+def _env_value(env_map: dict[str, str], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = str(env_map.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _registry_row_matches_env(
+    registry_row: dict[str, Any] | None,
+    *,
+    env_task_id: str | None,
+    env_session_path: str | None,
+    env_workspace_root: str | None,
+) -> bool:
+    if registry_row is None or str(registry_row.get("state") or "") == "exited":
+        return False
+    if env_task_id and str(registry_row.get("task_id") or "") == str(env_task_id):
+        return True
+    if env_session_path and _normalize_path(registry_row.get("session_path")) == env_session_path:
+        return True
+    if env_workspace_root and _normalize_path(registry_row.get("workspace_root")) == env_workspace_root:
+        return True
+    return False
+
+
 def _read_proc_stat(pid: int) -> dict[str, Any]:
     proc = pathlib.Path("/proc") / str(pid)
     stat_raw = _read_text(proc / "stat")
@@ -191,6 +250,7 @@ def _read_proc_stat(pid: int) -> dict[str, Any]:
         "runtime_kind": _infer_runtime_kind(command, exe),
         "session_arg_path": _extract_session_arg_path(command),
         "open_paths": _collect_open_paths(proc),
+        "env_map": _read_proc_environ(proc),
     }
 
 
@@ -208,6 +268,103 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
             continue
         results.append(stat)
     return results
+
+
+def iter_local_agent_processes() -> list[dict[str, Any]]:
+    return _iter_agent_processes()
+
+
+def _worker_service_live_registry_rows(worker_service: Any) -> list[dict[str, Any]]:
+    fn = getattr(worker_service, "snapshot_live_agent_processes", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            return list(fn() or [])
+    return []
+
+
+def _worker_service_suspected_orphans(worker_service: Any) -> dict[int, dict[str, Any]]:
+    fn = getattr(worker_service, "snapshot_suspected_orphans", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            return dict(fn() or {})
+    return {}
+
+
+def _worker_service_reconcile_suspected_orphans(worker_service: Any, observed_pids: set[int]) -> None:
+    fn = getattr(worker_service, "reconcile_suspected_orphans", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            fn(observed_pids)
+
+
+def _worker_service_claimed_running_task_count(worker_service: Any) -> int:
+    fn = getattr(worker_service, "claimed_running_task_count", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            return int(fn() or 0)
+    return 0
+
+
+def _build_proc_index(proc_rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    return {
+        int(item.get("pid")): item
+        for item in proc_rows
+        if item.get("pid") is not None
+    }
+
+
+def _resolve_parent_chain_root_pid(
+    proc: dict[str, Any],
+    *,
+    live_roots_by_pid: dict[int, dict[str, Any]],
+    proc_index: dict[int, dict[str, Any]],
+) -> int | None:
+    current_ppid = proc.get("ppid")
+    depth = 0
+    while current_ppid and depth < _PARENT_CHAIN_LIMIT:
+        try:
+            current_pid = int(current_ppid)
+        except Exception:
+            return None
+        if current_pid in live_roots_by_pid:
+            return current_pid
+        parent_proc = proc_index.get(current_pid)
+        if parent_proc is None:
+            return None
+        current_ppid = parent_proc.get("ppid")
+        depth += 1
+    return None
+
+
+def _build_proc_index(proc_rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    return {
+        int(item.get("pid")): item
+        for item in proc_rows
+        if item.get("pid") is not None
+    }
+
+
+def _resolve_parent_chain_root(
+    proc: dict[str, Any],
+    *,
+    live_roots_by_pid: dict[int, dict[str, Any]],
+    proc_index: dict[int, dict[str, Any]],
+) -> dict[str, Any] | None:
+    current_ppid = proc.get("ppid")
+    depth = 0
+    while current_ppid and depth < _PARENT_CHAIN_LIMIT:
+        try:
+            current_pid = int(current_ppid)
+        except Exception:
+            return None
+        if current_pid in live_roots_by_pid:
+            return live_roots_by_pid[current_pid]
+        parent_proc = proc_index.get(current_pid)
+        if parent_proc is None:
+            return None
+        current_ppid = parent_proc.get("ppid")
+        depth += 1
+    return None
 
 
 def _task_roots(row: AppEaTask) -> list[str]:
@@ -314,33 +471,140 @@ class AgentObservabilityService:
             for worker in cluster_snapshot.get("workers") or []
         }
 
+        worker_service = get_worker_service()
+        live_registry_rows = {
+            int(item.get("root_pid") or item.get("pid")): item
+            for item in _worker_service_live_registry_rows(worker_service)
+            if item.get("root_pid") is not None or item.get("pid") is not None
+        }
+        live_registry_by_pgid = {
+            int(item.get("root_pgid")): item
+            for item in live_registry_rows.values()
+            if item.get("root_pgid") is not None and str(item.get("state") or "") != "exited"
+        }
+        proc_rows = _iter_agent_processes()
+        proc_index = _build_proc_index(proc_rows)
+        _worker_service_reconcile_suspected_orphans(worker_service, {int(item.get("pid")) for item in proc_rows if item.get("pid") is not None})
+        suspected_orphans = _worker_service_suspected_orphans(worker_service)
+
         process_rows: list[AgentProcessSnapshot] = []
-        for proc in _iter_agent_processes():
+        for proc in proc_rows:
+            pid = int(proc["pid"])
             task_id, match_source, workspace_root = _match_task(proc, task_rows, task_roots_by_id)
-            task_row = task_by_id.get(task_id or "")
+            direct_registry_row = live_registry_rows.get(pid)
+            pgid_registry_row = None
+            if proc.get("pgid") is not None:
+                with contextlib.suppress(Exception):
+                    pgid_registry_row = live_registry_by_pgid.get(int(proc.get("pgid")))
+            parent_chain_root_pid = _resolve_parent_chain_root_pid(
+                proc,
+                live_roots_by_pid=live_registry_rows,
+                proc_index=proc_index,
+            )
+            parent_registry_row = live_registry_rows.get(parent_chain_root_pid) if parent_chain_root_pid is not None else None
+            env_map = proc.get("env_map") or {}
+            env_task_id = _env_value(env_map, _ENV_TASK_KEYS)
+            env_session_path = _normalize_path(_env_value(env_map, _ENV_SESSION_KEYS))
+            env_workspace_root = _normalize_path(_env_value(env_map, _ENV_WORKSPACE_KEYS))
+
+            env_registry_row = None
+            for candidate in live_registry_rows.values():
+                if _registry_row_matches_env(
+                    candidate,
+                    env_task_id=env_task_id,
+                    env_session_path=env_session_path,
+                    env_workspace_root=env_workspace_root,
+                ):
+                    env_registry_row = candidate
+                    break
+            registry_row = direct_registry_row or pgid_registry_row or parent_registry_row or env_registry_row
+            if registry_row is not None and registry_row.get("task_id"):
+                task_id = str(registry_row.get("task_id") or task_id or "")
+            elif env_task_id:
+                task_id = str(env_task_id or task_id or "")
+            task_row = task_by_id.get(task_id or "") or task_by_id.get(str((registry_row or {}).get("task_id") or "") or "")
             task_name = task_row.task_name if task_row is not None else None
             task_status = str(task_row.status or "") if task_row is not None else None
-            stage_key = str(((task_row.stages_json or {}).get("current_stage")) or "") if task_row is not None else None
-            role_kind = _extract_role_kind(str(proc.get("command") or ""))
+            stage_key = (
+                str(registry_row.get("stage_key") or "")
+                if registry_row is not None
+                else (str(((task_row.stages_json or {}).get("current_stage")) or "") if task_row is not None else None)
+            )
+            role_kind = (
+                str((registry_row or {}).get("role_kind") or "")
+                or _extract_role_kind(str(proc.get("command") or ""))
+            )
+            registry_owned = bool(registry_row is not None and str((registry_row or {}).get("state") or "") != "exited")
+            registry_state = str((registry_row or {}).get("state") or "") or None
+            registry_task_id = str((registry_row or {}).get("task_id") or "") or None
+            registry_last_seen_at = float((registry_row or {}).get("last_seen_at") or 0.0) or None
+            registry_root_pid = int((registry_row or {}).get("root_pid") or (registry_row or {}).get("pid")) if registry_row is not None and ((registry_row or {}).get("root_pid") or (registry_row or {}).get("pid")) is not None else None
+            registry_root_pgid = int((registry_row or {}).get("root_pgid") or (registry_row or {}).get("pgid")) if registry_row is not None and ((registry_row or {}).get("root_pgid") or (registry_row or {}).get("pgid")) is not None else None
+            orphan_row = suspected_orphans.get(pid) or {}
+            suspected_orphan_since = float(orphan_row.get("first_detected_at") or 0.0) or None
+            orphan_grace_expires_at = (
+                suspected_orphan_since + float(ORPHAN_PROCESS_GRACE_SECONDS)
+            ) if suspected_orphan_since else None
             owner_kind = "unknown"
             owner_reason = "unmatched_process"
-            kill_allowed = True
-            kill_block_reason = None
-            if task_row is not None:
-                if str(task_status or "").strip() == "running":
-                    owner_kind = "tracked"
-                    owner_reason = "running_task_matched"
-                    kill_allowed = False
-                    kill_block_reason = "进程归属于运行中任务"
-                else:
-                    owner_kind = "residual"
-                    owner_reason = "non_running_task_residual"
-                    kill_allowed = True
-                    kill_block_reason = None
+            ownership_confidence = "none"
+            ownership_evidence = None
+            kill_allowed = False
+            kill_block_reason = "进程尚未通过 orphan 复核"
+            if direct_registry_row is not None and registry_owned:
+                owner_kind = "tracked"
+                owner_reason = "runtime_registry_root_owned"
+                ownership_confidence = "explicit"
+                ownership_evidence = "registry_root_pid"
+                kill_block_reason = "进程仍被运行时活跃注册表持有"
+            elif pgid_registry_row is not None and registry_owned:
+                owner_kind = "tracked_subprocess"
+                owner_reason = "process_group_inherited_from_live_root"
+                ownership_confidence = "process_group"
+                ownership_evidence = "shared_pgid"
+                kill_block_reason = "进程仍归属于活跃 root process group"
+            elif parent_registry_row is not None and registry_owned:
+                owner_kind = "tracked_subprocess"
+                owner_reason = "parent_chain_inherited_from_live_root"
+                ownership_confidence = "parent_chain"
+                ownership_evidence = "ancestor_root_pid"
+                kill_block_reason = "进程仍归属于活跃父进程链"
+            elif env_registry_row is not None and registry_owned and _registry_row_matches_env(
+                env_registry_row,
+                env_task_id=env_task_id,
+                env_session_path=env_session_path,
+                env_workspace_root=env_workspace_root,
+            ):
+                owner_kind = "tracked_inferred"
+                owner_reason = "environment_inferred_live_root"
+                ownership_confidence = "env_inferred"
+                ownership_evidence = "env_task_or_session_or_workspace"
+                kill_block_reason = "进程环境变量与活跃 root 上下文一致"
+            elif task_row is not None and str(task_status or "").strip() in {"failed", "error", "cancelled"}:
+                owner_kind = "residual"
+                owner_reason = "db_terminal_task_matched_without_registry_owner"
+                ownership_confidence = "workspace_inferred" if match_source else "none"
+                ownership_evidence = match_source
+                kill_block_reason = "进程仍处于 orphan 保护期" if orphan_grace_expires_at and time.time() < orphan_grace_expires_at else None
+                kill_allowed = bool(orphan_grace_expires_at and time.time() >= orphan_grace_expires_at)
+            elif suspected_orphan_since is not None:
+                owner_kind = "suspected_orphan"
+                owner_reason = "registry_unowned_process_under_grace_or_recheck"
+                ownership_confidence = "workspace_inferred" if match_source else "none"
+                ownership_evidence = match_source
+                kill_block_reason = "进程仍处于 orphan 保护期" if orphan_grace_expires_at and time.time() < orphan_grace_expires_at else None
+                kill_allowed = bool(orphan_grace_expires_at and time.time() >= orphan_grace_expires_at)
+            else:
+                owner_kind = "unknown"
+                owner_reason = "unmatched_process_pending_orphan_classification"
+                ownership_confidence = "workspace_inferred" if match_source else "none"
+                ownership_evidence = match_source
+                kill_allowed = False
+                kill_block_reason = "进程尚未进入 orphan 保护期"
             process_rows.append(
                 AgentProcessSnapshot(
                     pod_name=POD_NAME,
-                    pid=int(proc["pid"]),
+                    pid=pid,
                     pgid=proc.get("pgid"),
                     ppid=proc.get("ppid"),
                     command=str(proc.get("command") or ""),
@@ -360,10 +624,24 @@ class AgentObservabilityService:
                     role_kind=role_kind,
                     owner_kind=owner_kind,
                     owner_reason=owner_reason,
+                    registry_root_pid=registry_root_pid,
+                    registry_root_pgid=registry_root_pgid,
+                    registry_owned=registry_owned,
+                    registry_state=registry_state,
+                    registry_task_id=registry_task_id,
+                    registry_last_seen_at=registry_last_seen_at,
+                    ownership_confidence=ownership_confidence,
+                    ownership_evidence=ownership_evidence,
+                    env_task_id=env_task_id,
+                    env_session_path=env_session_path,
+                    parent_chain_root_pid=parent_chain_root_pid,
+                    db_task_status=task_status,
+                    suspected_orphan_since=suspected_orphan_since,
+                    orphan_grace_expires_at=orphan_grace_expires_at,
                     kill_allowed=kill_allowed,
                     kill_block_reason=kill_block_reason,
                     heartbeat_age_seconds=None,
-                    termination_state="running",
+                    termination_state=registry_state or "running",
                 )
             )
 
@@ -372,7 +650,11 @@ class AgentObservabilityService:
             linked_processes = [item for item in process_rows if item.task_id == row.task_id]
             if not linked_processes:
                 continue
-            ownership_status = "tracked" if str(row.status or "").strip() == "running" else "residual"
+            ownership_status = (
+                "tracked"
+                if any(item.owner_kind in _TRACKED_OWNER_KINDS for item in linked_processes)
+                else ("residual" if str(row.status or "").strip() != "running" else "unknown")
+            )
             ownership_rows.append(
                 AgentTaskOwnershipSnapshot(
                     task_id=row.task_id,
@@ -387,17 +669,16 @@ class AgentObservabilityService:
                 )
             )
 
-        tracked_processes = [item for item in process_rows if item.owner_kind == "tracked"]
+        tracked_processes = [item for item in process_rows if item.owner_kind in _TRACKED_OWNER_KINDS]
         residual_processes = [item for item in process_rows if item.owner_kind == "residual"]
+        suspected_orphan_processes = [item for item in process_rows if item.owner_kind == "suspected_orphan"]
         unknown_processes = [item for item in process_rows if item.owner_kind == "unknown"]
         running_task_rows = [item for item in ownership_rows if item.ownership_status == "tracked"]
         residual_task_rows = [item for item in ownership_rows if item.ownership_status == "residual"]
         scanned_at = time.time()
         pod_slot = cluster_by_pod.get(POD_NAME) or {}
         claimed_running_tasks = 0
-        with contextlib.suppress(Exception):
-            worker_service = get_worker_service()
-            claimed_running_tasks = int(worker_service.claimed_running_task_count() or 0)
+        claimed_running_tasks = _worker_service_claimed_running_task_count(worker_service)
         runtime_observed_task_count = len(running_task_rows)
         ghost_running_tasks = max(0, claimed_running_tasks - runtime_observed_task_count)
         return {
@@ -408,8 +689,10 @@ class AgentObservabilityService:
                 "runtime_observed_task_count": runtime_observed_task_count,
                 "ghost_running_tasks": ghost_running_tasks,
                 "residual_processes": len(residual_processes),
+                "suspected_orphan_processes": len(suspected_orphan_processes),
                 "unknown_processes": len(unknown_processes),
                 "killable_residual_processes": len([item for item in residual_processes if item.kill_allowed]),
+                "killable_suspected_orphan_processes": len([item for item in suspected_orphan_processes if item.kill_allowed]),
                 "killable_unknown_processes": len([item for item in unknown_processes if item.kill_allowed]),
                 "agent_process_limit": int(pod_slot.get("agent_process_limit") or 0),
                 "agent_process_in_use": int(pod_slot.get("agent_process_in_use") or 0),
@@ -431,6 +714,7 @@ class AgentObservabilityService:
                 "process_count": len(process_rows),
                 "tracked_process_count": len(tracked_processes),
                 "residual_process_count": len(residual_processes),
+                "suspected_orphan_process_count": len(suspected_orphan_processes),
                 "unknown_process_count": len(unknown_processes),
                 "task_count": len(ownership_rows),
                 "running_task_count": len(running_task_rows),

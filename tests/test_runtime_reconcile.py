@@ -1,5 +1,6 @@
 import asyncio
 from datetime import timedelta
+import time
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
@@ -51,6 +52,20 @@ class _FakeDb:
 
 def _db_generator(db):
     yield db
+
+
+def _fake_worker_service(
+    *,
+    claimed_running_tasks: int = 0,
+    live_rows: list[dict] | None = None,
+    suspected_orphans: dict[int, dict[str, object]] | None = None,
+):
+    return SimpleNamespace(
+        claimed_running_task_count=lambda: claimed_running_tasks,
+        snapshot_live_agent_processes=lambda: list(live_rows or []),
+        snapshot_suspected_orphans=lambda: dict(suspected_orphans or {}),
+        reconcile_suspected_orphans=lambda _observed: None,
+    )
 
 
 def test_scheduler_reconcile_cancelled_task_records_events(monkeypatch) -> None:
@@ -565,7 +580,7 @@ def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:
         ],
         "processes": [
             {"pid": 11, "owner_kind": "tracked", "kill_allowed": False},
-            {"pid": 22, "owner_kind": "orphan", "kill_allowed": True},
+            {"pid": 22, "owner_kind": "suspected_orphan", "kill_allowed": True},
             {"pid": 33, "owner_kind": "unknown", "kill_allowed": True},
             {"pid": 44, "owner_kind": "unknown", "kill_allowed": False},
         ],
@@ -582,7 +597,9 @@ def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:
     assert runtime["summary"]["healthy_pods"] == 1
     assert runtime["summary"]["tracked_processes"] == 1
     assert runtime["summary"]["residual_processes"] == 0
+    assert runtime["summary"]["suspected_orphan_processes"] == 1
     assert runtime["summary"]["unknown_processes"] == 2
+    assert runtime["summary"]["killable_suspected_orphan_processes"] == 1
     assert runtime["summary"]["killable_unknown_processes"] == 1
     assert runtime["summary"]["aggregate_partial"] is True
     assert runtime["summary"]["aggregate_failed_targets"] == ["pod-b"]
@@ -590,7 +607,7 @@ def test_agent_runtime_aggregate_counts_suspected_orphans() -> None:
     assert runtime["summary"]["healthy_pods"] == 1
 
 
-def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch) -> None:
+def test_agent_snapshot_marks_unmatched_process_as_suspected_orphan_under_grace(monkeypatch) -> None:
     monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
         "pid": 1234,
         "ppid": 1,
@@ -601,7 +618,8 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
         "rss_bytes": 4096,
         "runtime_kind": "pi",
         "session_arg_path": None,
-        "open_session_paths": [],
+        "open_paths": [],
+        "env_map": {},
     }])
     monkeypatch.setattr(
         agent_observability,
@@ -611,7 +629,17 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     monkeypatch.setattr(
         agent_observability,
         "get_worker_service",
-        lambda: SimpleNamespace(claimed_running_task_count=lambda: 0),
+        lambda: _fake_worker_service(
+            claimed_running_tasks=0,
+            suspected_orphans={
+                1234: {
+                    "pid": 1234,
+                    "first_detected_at": now_local().timestamp(),
+                    "last_seen_at": now_local().timestamp(),
+                    "last_reason": "registry_unowned_process",
+                }
+            },
+        ),
     )
 
     class _TaskQuery:
@@ -636,13 +664,76 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
 
     assert len(snapshot["processes"]) == 1
     row = snapshot["processes"][0]
-    assert row["owner_kind"] == "unknown"
-    assert row["kill_allowed"] is True
-    assert row["kill_block_reason"] is None
+    assert row["owner_kind"] == "suspected_orphan"
+    assert row["kill_allowed"] is False
+    assert row["kill_block_reason"] == "进程仍处于 orphan 保护期"
     assert snapshot["summary"]["claimed_running_tasks"] == 0
     assert snapshot["summary"]["runtime_observed_task_count"] == 0
     assert snapshot["summary"]["ghost_running_tasks"] == 0
-    assert snapshot["summary"]["killable_unknown_processes"] == 1
+    assert snapshot["summary"]["suspected_orphan_processes"] == 1
+    assert snapshot["summary"]["killable_unknown_processes"] == 0
+
+
+def test_agent_snapshot_marks_expired_suspected_orphan_as_killable(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 2234,
+        "ppid": 1,
+        "pgid": 2234,
+        "command": "node /usr/bin/pi",
+        "cwd": "/tmp/orphan-agent",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "env_map": {},
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    first_seen = time.time() - (agent_observability.ORPHAN_PROCESS_GRACE_SECONDS + 5)
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: _fake_worker_service(
+            claimed_running_tasks=0,
+            suspected_orphans={
+                2234: {
+                    "pid": 2234,
+                    "first_detected_at": first_seen,
+                    "last_seen_at": first_seen,
+                    "last_reason": "registry_unowned_process",
+                }
+            },
+        ),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return []
+
+        def count(self):
+            return 0
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    row = snapshot["processes"][0]
+    assert row["owner_kind"] == "suspected_orphan"
+    assert row["kill_allowed"] is True
+    assert row["kill_block_reason"] is None
+    assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1
 
 
 def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
@@ -666,7 +757,7 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
     monkeypatch.setattr(
         agent_observability,
         "get_worker_service",
-        lambda: SimpleNamespace(claimed_running_task_count=lambda: 1),
+        lambda: _fake_worker_service(claimed_running_tasks=1),
     )
 
     class _TaskQuery:
@@ -702,9 +793,10 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
     assert snapshot["processes"][0]["runtime_kind"] == "codex"
     assert snapshot["processes"][0]["match_source"] == "session_arg_path"
     assert snapshot["processes"][0]["task_id"] == "eat_1"
+    assert snapshot["processes"][0]["owner_kind"] == "unknown"
     assert snapshot["summary"]["claimed_running_tasks"] == 1
-    assert snapshot["summary"]["runtime_observed_task_count"] == 1
-    assert snapshot["summary"]["ghost_running_tasks"] == 0
+    assert snapshot["summary"]["runtime_observed_task_count"] == 0
+    assert snapshot["summary"]["ghost_running_tasks"] == 1
 
 
 def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch) -> None:
@@ -728,7 +820,7 @@ def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch
     monkeypatch.setattr(
         agent_observability,
         "get_worker_service",
-        lambda: SimpleNamespace(claimed_running_task_count=lambda: 2),
+        lambda: _fake_worker_service(claimed_running_tasks=2),
     )
 
     running_row = SimpleNamespace(
@@ -768,12 +860,254 @@ def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch
 
     snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
     assert snapshot["processes"][0]["task_id"] == "eat_new"
-    assert snapshot["processes"][0]["owner_kind"] == "tracked"
+    assert snapshot["processes"][0]["owner_kind"] == "unknown"
     assert snapshot["summary"]["claimed_running_tasks"] == 2
-    assert snapshot["summary"]["runtime_observed_task_count"] == 1
-    assert snapshot["summary"]["ghost_running_tasks"] == 1
-    assert snapshot["summary"]["active_processes"] == 1
+    assert snapshot["summary"]["runtime_observed_task_count"] == 0
+    assert snapshot["summary"]["ghost_running_tasks"] == 2
+    assert snapshot["summary"]["active_processes"] == 0
     assert snapshot["summary"]["residual_processes"] == 0
+
+
+def test_agent_snapshot_classifies_same_pgid_subagent_as_tracked_subprocess(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 2002,
+        "ppid": 2001,
+        "pgid": 2001,
+        "command": "node /usr/bin/pi subagent",
+        "cwd": "/tmp/workspace",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "env_map": {},
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: _fake_worker_service(
+            claimed_running_tasks=1,
+            live_rows=[{
+                "root_pid": 2001,
+                "root_pgid": 2001,
+                "task_id": "eat_live",
+                "stage_key": "entry_analysis",
+                "role_kind": "coder",
+                "workspace_root": "/tmp/workspace",
+                "session_path": "/tmp/workspace/session.jsonl",
+                "state": "live",
+                "last_seen_at": now_local().timestamp(),
+            }],
+        ),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(
+                task_id="eat_live",
+                project_id="p1",
+                task_name="entry task",
+                input_path="/tmp/in",
+                output_path="/tmp/out",
+                source_path="/tmp/src",
+                status="running",
+                owner_pod="",
+                lease_expires_at=None,
+                stages_json={},
+            )]
+
+        def count(self):
+            return 1
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    row = snapshot["processes"][0]
+    assert row["owner_kind"] == "tracked_subprocess"
+    assert row["ownership_confidence"] == "process_group"
+    assert row["registry_root_pid"] == 2001
+    assert row["kill_allowed"] is False
+
+
+def test_agent_snapshot_classifies_parent_chain_subagent_as_tracked_subprocess(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 3003,
+        "ppid": 3002,
+        "pgid": 3999,
+        "command": "node /usr/bin/pi subagent",
+        "cwd": "/tmp/workspace",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "env_map": {},
+    }, {
+        "pid": 3002,
+        "ppid": 3001,
+        "pgid": 3998,
+        "command": "node bridge",
+        "cwd": "/tmp/workspace",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 1024,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "env_map": {},
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: _fake_worker_service(
+            claimed_running_tasks=1,
+            live_rows=[{
+                "root_pid": 3001,
+                "root_pgid": 3001,
+                "task_id": "eat_chain",
+                "stage_key": "entry_analysis",
+                "role_kind": "coder",
+                "workspace_root": "/tmp/workspace",
+                "session_path": "/tmp/workspace/session.jsonl",
+                "state": "live",
+                "last_seen_at": now_local().timestamp(),
+            }],
+        ),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(
+                task_id="eat_chain",
+                project_id="p1",
+                task_name="entry task",
+                input_path="/tmp/in",
+                output_path="/tmp/out",
+                source_path="/tmp/src",
+                status="running",
+                owner_pod="",
+                lease_expires_at=None,
+                stages_json={},
+            )]
+
+        def count(self):
+            return 1
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    row = next(item for item in snapshot["processes"] if item["pid"] == 3003)
+    assert row["owner_kind"] == "tracked_subprocess"
+    assert row["ownership_confidence"] == "parent_chain"
+    assert row["parent_chain_root_pid"] == 3001
+    assert row["kill_allowed"] is False
+
+
+def test_agent_snapshot_classifies_env_inferred_subagent_as_tracked(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 4002,
+        "ppid": 1,
+        "pgid": 4999,
+        "command": "node /usr/bin/pi detached-subagent",
+        "cwd": "/tmp/workspace",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "env_map": {
+            "EA_TASK_ID": "eat_env",
+            "EA_SESSION_PATH": "/tmp/workspace/session.jsonl",
+            "EA_WORKSPACE_ROOT": "/tmp/workspace",
+        },
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(get_cluster_snapshot=lambda _db, project_id="": {"workers": []}),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: _fake_worker_service(
+            claimed_running_tasks=1,
+            live_rows=[{
+                "root_pid": 4001,
+                "root_pgid": 4001,
+                "task_id": "eat_env",
+                "stage_key": "entry_analysis",
+                "role_kind": "coder",
+                "workspace_root": "/tmp/workspace",
+                "session_path": "/tmp/workspace/session.jsonl",
+                "state": "live",
+                "last_seen_at": now_local().timestamp(),
+            }],
+        ),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(
+                task_id="eat_env",
+                project_id="p1",
+                task_name="entry task",
+                input_path="/tmp/in",
+                output_path="/tmp/out",
+                source_path="/tmp/src",
+                status="running",
+                owner_pod="",
+                lease_expires_at=None,
+                stages_json={},
+            )]
+
+        def count(self):
+            return 1
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    row = snapshot["processes"][0]
+    assert row["owner_kind"] == "tracked_inferred"
+    assert row["ownership_confidence"] == "env_inferred"
+    assert row["env_task_id"] == "eat_env"
+    assert row["env_session_path"] == "/tmp/workspace/session.jsonl"
+    assert row["kill_allowed"] is False
 
 
 def test_resolve_worker_targets_prefers_pod_ip_only() -> None:

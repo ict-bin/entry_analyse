@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.service.task_service import get_task_service
+from app.service.worker_service import get_worker_service
 from app.service.worker_slot_service import get_worker_slot_service
 
 from . import router
@@ -40,6 +41,8 @@ _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
     "cache_hits": 0,
     "cache_misses": 0,
 }
+
+_TRACKED_OWNER_KINDS = {"tracked", "tracked_subprocess", "tracked_inferred"}
 
 
 def _invalidate_agent_aggregate_cache() -> None:
@@ -409,6 +412,20 @@ class AgentProcessSnapshotResponse(BaseModel):
     role_kind: Optional[str] = None
     owner_kind: str
     owner_reason: str
+    registry_root_pid: Optional[int] = None
+    registry_root_pgid: Optional[int] = None
+    registry_owned: bool = False
+    registry_state: Optional[str] = None
+    registry_task_id: Optional[str] = None
+    registry_last_seen_at: Optional[float] = None
+    ownership_confidence: str = "none"
+    ownership_evidence: Optional[str] = None
+    env_task_id: Optional[str] = None
+    env_session_path: Optional[str] = None
+    parent_chain_root_pid: Optional[int] = None
+    db_task_status: Optional[str] = None
+    suspected_orphan_since: Optional[float] = None
+    orphan_grace_expires_at: Optional[float] = None
     kill_allowed: bool = False
     kill_block_reason: Optional[str] = None
     heartbeat_age_seconds: Optional[float] = None
@@ -434,6 +451,7 @@ class AgentPodSnapshotResponse(BaseModel):
     process_count: int = 0
     tracked_process_count: int = 0
     residual_process_count: int = 0
+    suspected_orphan_process_count: int = 0
     unknown_process_count: int = 0
     task_count: int = 0
     running_task_count: int = 0
@@ -460,8 +478,10 @@ class AgentObservabilitySummaryResponse(BaseModel):
     runtime_observed_task_count: int = 0
     ghost_running_tasks: int = 0
     residual_processes: int = 0
+    suspected_orphan_processes: int = 0
     unknown_processes: int = 0
     killable_residual_processes: int = 0
+    killable_suspected_orphan_processes: int = 0
     killable_unknown_processes: int = 0
     agent_process_limit: int = 0
     agent_process_in_use: int = 0
@@ -512,8 +532,10 @@ class AgentRuntimeAggregateSummaryResponse(BaseModel):
     runtime_observed_task_count: int = 0
     ghost_running_tasks: int = 0
     residual_processes: int = 0
+    suspected_orphan_processes: int = 0
     unknown_processes: int = 0
     killable_residual_processes: int = 0
+    killable_suspected_orphan_processes: int = 0
     killable_unknown_processes: int = 0
     agent_total_capacity: int = 0
     agent_in_use: int = 0
@@ -772,10 +794,12 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
 
     summary = {
         "pod_name": "entry-analyse-aggregate",
-        "active_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "tracked"]),
+        "active_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") in _TRACKED_OWNER_KINDS]),
         "residual_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "residual"]),
+        "suspected_orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "suspected_orphan"]),
         "unknown_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown"]),
         "killable_residual_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "residual" and bool(item.get("kill_allowed"))]),
+        "killable_suspected_orphan_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "suspected_orphan" and bool(item.get("kill_allowed"))]),
         "killable_unknown_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
         "agent_process_limit": sum(int(item.get("agent_process_limit") or 0) for item in pod_rows),
         "agent_process_in_use": sum(int(item.get("agent_process_in_use") or 0) for item in pod_rows),
@@ -858,8 +882,10 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
     counters = {
         "active_processes": 0,
         "residual_processes": 0,
+        "suspected_orphan_processes": 0,
         "unknown_processes": 0,
         "killable_residual_processes": 0,
+        "killable_suspected_orphan_processes": 0,
         "killable_unknown_processes": 0,
         "scan_errors": 0,
     }
@@ -954,13 +980,15 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
             "total_pods": int(summary.get("total_pods") or len(pods)),
             "healthy_pods": int(summary.get("healthy_pods") or len([item for item in pods if bool(item.get("healthy", True))])),
             "total_processes": len(processes),
-            "tracked_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "tracked"]),
+            "tracked_processes": len([item for item in processes if str(item.get("owner_kind") or "") in _TRACKED_OWNER_KINDS]),
             "claimed_running_tasks": int(summary.get("claimed_running_tasks") or 0),
             "runtime_observed_task_count": int(summary.get("runtime_observed_task_count") or len([item for item in tasks if str(item.get("ownership_status") or "") == "tracked"])),
             "ghost_running_tasks": int(summary.get("ghost_running_tasks") or 0),
             "residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual"]),
+            "suspected_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "suspected_orphan"]),
             "unknown_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown"]),
             "killable_residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual" and bool(item.get("kill_allowed"))]),
+            "killable_suspected_orphan_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "suspected_orphan" and bool(item.get("kill_allowed"))]),
             "killable_unknown_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
             "agent_total_capacity": sum(int(item.get("agent_process_limit") or 0) for item in pods),
             "agent_in_use": sum(int(item.get("agent_process_in_use") or 0) for item in pods),
@@ -1131,7 +1159,7 @@ def list_agent_processes(
     if kill_allowed is not None:
         rows = [row for row in rows if bool(row.get("kill_allowed")) is bool(kill_allowed)]
     if orphan_only:
-        rows = [row for row in rows if str(row.get("owner_kind") or "") == "residual"]
+        rows = [row for row in rows if str(row.get("owner_kind") or "") == "suspected_orphan"]
     return rows
 
 
@@ -1173,7 +1201,7 @@ async def list_agent_aggregate_processes(
     if kill_allowed is not None:
         rows = [row for row in rows if bool(row.get("kill_allowed")) is bool(kill_allowed)]
     if orphan_only:
-        rows = [row for row in rows if str(row.get("owner_kind") or "") == "residual"]
+        rows = [row for row in rows if str(row.get("owner_kind") or "") == "suspected_orphan"]
     return rows
 
 
@@ -1303,6 +1331,16 @@ async def kill_agent_process(
         },
         task_id=row.get("task_id"),
     )
+    allowed, block_reason = get_worker_service().revalidate_kill_eligibility(pid)
+    if not allowed:
+        return AgentProcessKillResponse(
+            requested=1,
+            matched=1,
+            succeeded=0,
+            failed=0,
+            skipped=1,
+            items=[AgentProcessKillItemResponse(pid=pid, pgid=row.get("pgid"), status="skipped", reason=block_reason or row.get("kill_block_reason"))],
+        )
     result = get_agent_observability_service().kill_process(pid)
     _invalidate_agent_aggregate_cache()
     return AgentProcessKillResponse(
@@ -1335,7 +1373,7 @@ async def kill_all_orphan_processes(
     from app.service.agent_observability import get_agent_observability_service
 
     snapshot = get_agent_observability_service().build_snapshot(db, project_id=None)
-    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "residual" and row.get("kill_allowed")]
+    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "suspected_orphan" and row.get("kill_allowed")]
     logger.warning(
         "entry-agent-bulk-kill operator=%s count=%s pids=%s",
         user.get("username") or user.get("name") or "unknown",
@@ -1359,7 +1397,14 @@ async def kill_all_orphan_processes(
             },
             task_id=row.get("task_id"),
         )
-    items = [get_agent_observability_service().kill_process(int(row["pid"])) for row in killable]
+    items = []
+    for row in killable:
+        pid = int(row["pid"])
+        allowed, block_reason = get_worker_service().revalidate_kill_eligibility(pid)
+        if not allowed:
+            items.append({"pid": pid, "pgid": row.get("pgid"), "status": "skipped", "reason": block_reason or row.get("kill_block_reason")})
+            continue
+        items.append(get_agent_observability_service().kill_process(pid))
     _invalidate_agent_aggregate_cache()
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
@@ -1381,7 +1426,7 @@ async def kill_all_agent_aggregate_suspected_orphans(
     user, token = user_and_token
     ensure_admin_user(user)
     snapshot = await _build_agent_aggregate_snapshot(token, db)
-    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "unknown" and row.get("kill_allowed")]
+    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "suspected_orphan" and row.get("kill_allowed")]
     cluster_snapshot = get_worker_slot_service().get_cluster_snapshot(db, project_id=None)
     worker_by_pod = {str(worker.get("pod_name") or ""): worker for worker in cluster_snapshot.get("workers") or []}
     items: list[dict[str, Any]] = []

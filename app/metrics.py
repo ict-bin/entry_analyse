@@ -855,11 +855,11 @@ def _render_agent_observability_metrics() -> list[str]:
     for item in processes:
         key = (str(item.get("owner_kind") or "unknown"), str(item.get("pod_name") or "unknown"), str(item.get("role_kind") or "unknown"))
         process_counts[key] += 1
-        if str(item.get("owner_kind") or "") == "orphan":
+        if str(item.get("owner_kind") or "") == "residual":
             orphan_by_pod[str(item.get("pod_name") or "unknown")] += 1
             if bool(item.get("kill_allowed")):
                 killable_by_pod[str(item.get("pod_name") or "unknown")] += 1
-        if str(item.get("owner_kind") or "") == "unknown":
+        if str(item.get("owner_kind") or "") == "suspected_orphan":
             suspected_by_pod[str(item.get("pod_name") or "unknown")] += 1
             if bool(item.get("kill_allowed")):
                 killable_suspected_by_pod[str(item.get("pod_name") or "unknown")] += 1

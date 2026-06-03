@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_pi_processes
+from app.agent_process import cleanup_task_pi_processes
 from app.agent_slots import get_agent_process_slot_manager
 from app.config import build_task_config
 from app.db import get_db
@@ -58,6 +58,7 @@ WORKER_GUARD_LEASE_FAILURE_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_GUAR
 WORKER_HEALTH_PORT = max(1, int(os.environ.get("EA_WORKER_HEALTH_PORT", "18080")))
 WORKER_MAIN_LOOP_STALE_SECONDS = max(5, int(os.environ.get("EA_WORKER_MAIN_LOOP_STALE_SECONDS", str(max(WORKER_POLL_SECONDS * 4, 20)))))
 WORKER_LEASE_EXPIRED_WARNING_SECONDS = max(5, int(os.environ.get("EA_WORKER_LEASE_EXPIRED_WARNING_SECONDS", "180")))
+ORPHAN_PROCESS_GRACE_SECONDS = max(30, int(os.environ.get("EA_ORPHAN_PROCESS_GRACE_SECONDS", "900")))
 
 
 @dataclass
@@ -118,6 +119,35 @@ class WorkerHealthServerSnapshot:
     guard_reason: str | None = None
     last_error: str | None = None
     shutting_down: bool = False
+
+
+@dataclass
+class LiveAgentProcessRecord:
+    root_pid: int
+    root_pgid: int | None
+    task_id: str
+    project_id: str | None = None
+    runtime_kind: str | None = None
+    owner_worker_id: str | None = None
+    pod_name: str | None = None
+    stage_key: str | None = None
+    role_kind: str | None = None
+    workspace_root: str | None = None
+    session_path: str | None = None
+    cwd: str | None = None
+    command: str | None = None
+    registered_at: float = 0.0
+    last_seen_at: float = 0.0
+    state: str = "live"
+    termination_reason: str | None = None
+
+
+@dataclass
+class SuspectedOrphanRecord:
+    pid: int
+    first_detected_at: float
+    last_seen_at: float
+    last_reason: str | None = None
 
 
 def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
@@ -209,12 +239,216 @@ class WorkerService:
         self._task_abort_callbacks: dict[str, Any] = {}
         self._task_guard_reasons: dict[str, str] = {}
         self._task_lease_started_at: dict[str, float] = {}
+        self._live_agent_processes: dict[int, LiveAgentProcessRecord] = {}
+        self._suspected_orphans: dict[int, SuspectedOrphanRecord] = {}
+        self._agent_registry_lock = threading.Lock()
         self._startup_reconciled_expired_tasks: int = 0
         self._startup_reconciled_owner_alive_tasks: int = 0
         self._main_loop_last_tick_at: float = 0.0
         self._maintenance_task_started_at: float = 0.0
         self._maintenance_task_ready = False
         self._started_at: float = 0.0
+
+    def register_live_agent_process(
+        self,
+        *,
+        pid: int | None,
+        task_id: str,
+        project_id: str | None = None,
+        runtime_kind: str | None,
+        stage_key: str | None,
+        role_kind: str | None,
+        workspace_root: str | None = None,
+        session_path: str | None = None,
+        cwd: str | None,
+        command: str | None,
+        pgid: int | None,
+    ) -> None:
+        if not pid:
+            return
+        now_ts = time.time()
+        with self._agent_registry_lock:
+            self._live_agent_processes[int(pid)] = LiveAgentProcessRecord(
+                root_pid=int(pid),
+                root_pgid=pgid,
+                task_id=str(task_id or ""),
+                project_id=str(project_id or "").strip() or None,
+                runtime_kind=runtime_kind,
+                owner_worker_id=os.environ.get("EA_POD_NAME") or os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "entry-analyse-pod",
+                pod_name=os.environ.get("EA_POD_NAME") or os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "entry-analyse-pod",
+                stage_key=stage_key,
+                role_kind=role_kind,
+                workspace_root=workspace_root,
+                session_path=session_path,
+                cwd=cwd,
+                command=command,
+                registered_at=now_ts,
+                last_seen_at=now_ts,
+                state="live",
+                termination_reason=None,
+            )
+            self._suspected_orphans.pop(int(pid), None)
+
+    def touch_live_agent_process(self, pid: int | None) -> None:
+        if not pid:
+            return
+        with self._agent_registry_lock:
+            record = self._live_agent_processes.get(int(pid))
+            if record is not None:
+                record.last_seen_at = time.time()
+
+    def mark_live_agent_process_terminating(self, pid: int | None, *, reason: str | None = None) -> None:
+        if not pid:
+            return
+        with self._agent_registry_lock:
+            record = self._live_agent_processes.get(int(pid))
+            if record is not None:
+                record.state = "terminating"
+                record.termination_reason = reason
+                record.last_seen_at = time.time()
+
+    def unregister_live_agent_process(self, pid: int | None, *, reason: str | None = None) -> None:
+        if not pid:
+            return
+        with self._agent_registry_lock:
+            record = self._live_agent_processes.pop(int(pid), None)
+            if record is not None:
+                record.state = "exited"
+                record.termination_reason = reason or record.termination_reason
+                record.last_seen_at = time.time()
+
+    def snapshot_live_agent_processes(self) -> list[dict[str, Any]]:
+        with self._agent_registry_lock:
+            return [
+                {
+                    "pid": record.root_pid,
+                    "root_pid": record.root_pid,
+                    "root_pgid": record.root_pgid,
+                    "task_id": record.task_id,
+                    "project_id": record.project_id,
+                    "runtime_kind": record.runtime_kind,
+                    "owner_worker_id": record.owner_worker_id,
+                    "pod_name": record.pod_name,
+                    "stage_key": record.stage_key,
+                    "role_kind": record.role_kind,
+                    "workspace_root": record.workspace_root,
+                    "session_path": record.session_path,
+                    "cwd": record.cwd,
+                    "command": record.command,
+                    "pgid": record.root_pgid,
+                    "registered_at": record.registered_at,
+                    "last_seen_at": record.last_seen_at,
+                    "state": record.state,
+                    "termination_reason": record.termination_reason,
+                }
+                for record in self._live_agent_processes.values()
+            ]
+
+    def revalidate_kill_eligibility(self, pid: int) -> tuple[bool, str | None]:
+        now_ts = time.time()
+        with self._agent_registry_lock:
+            live_record = self._live_agent_processes.get(int(pid))
+            if live_record is not None and str(live_record.state or "") != "exited":
+                return False, "进程仍被运行时活跃注册表持有"
+            live_records = [record for record in self._live_agent_processes.values() if str(record.state or "") != "exited"]
+            live_root_pids = {int(record.root_pid) for record in live_records}
+            current_pgid = None
+            try:
+                current_pgid = os.getpgid(int(pid))
+            except Exception:
+                current_pgid = None
+            for record in self._live_agent_processes.values():
+                if str(record.state or "") == "exited":
+                    continue
+                if record.root_pgid is not None:
+                    if current_pgid is not None and int(current_pgid) == int(record.root_pgid):
+                        return False, "进程仍归属于活跃 root process group"
+            current_pid = int(pid)
+            chain_depth = 0
+            while chain_depth < 32:
+                stat_path = f"/proc/{current_pid}/stat"
+                try:
+                    stat_raw = open(stat_path, "r", encoding="utf-8", errors="replace").read().strip()
+                except Exception:
+                    break
+                fields = stat_raw.split()
+                if len(fields) <= 4:
+                    break
+                try:
+                    parent_pid = int(fields[3])
+                except Exception:
+                    break
+                if parent_pid <= 1:
+                    break
+                if parent_pid in live_root_pids:
+                    return False, "进程仍归属于活跃父进程链"
+                current_pid = parent_pid
+                chain_depth += 1
+            env_map: dict[str, str] = {}
+            try:
+                raw_env = open(f"/proc/{int(pid)}/environ", "rb").read()
+            except Exception:
+                raw_env = b""
+            if raw_env:
+                for item in raw_env.split(b"\x00"):
+                    if not item or b"=" not in item:
+                        continue
+                    key, value = item.split(b"=", 1)
+                    env_map[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
+            env_task_id = str(env_map.get("EA_TASK_ID") or env_map.get("TASK_ID") or env_map.get("PARENT_TASK_ID") or "").strip()
+            env_session_path = str(env_map.get("EA_SESSION_FILE") or env_map.get("EA_SESSION_PATH") or "").strip()
+            env_workspace_root = str(env_map.get("EA_WORKSPACE_ROOT") or "").strip()
+            for record in live_records:
+                if env_task_id and str(record.task_id or "") == env_task_id:
+                    return False, "进程环境变量与活跃 root task 一致"
+                if env_session_path and str(record.session_path or "").strip() == env_session_path:
+                    return False, "进程环境变量与活跃 root session 一致"
+                if env_workspace_root and str(record.workspace_root or "").strip() == env_workspace_root:
+                    return False, "进程环境变量与活跃 root workspace 一致"
+            orphan = self._suspected_orphans.get(int(pid))
+            if orphan is None:
+                return False, "进程尚未进入 orphan 保护期"
+            if now_ts < float(orphan.first_detected_at or 0.0) + ORPHAN_PROCESS_GRACE_SECONDS:
+                return False, "进程仍处于 orphan 保护期"
+        return True, None
+
+    def snapshot_suspected_orphans(self) -> dict[int, dict[str, Any]]:
+        with self._agent_registry_lock:
+            return {
+                pid: {
+                    "pid": record.pid,
+                    "first_detected_at": record.first_detected_at,
+                    "last_seen_at": record.last_seen_at,
+                    "last_reason": record.last_reason,
+                }
+                for pid, record in self._suspected_orphans.items()
+            }
+
+    def reconcile_suspected_orphans(self, observed_pids: set[int]) -> None:
+        now_ts = time.time()
+        with self._agent_registry_lock:
+            live_pids = {
+                int(pid)
+                for pid, record in self._live_agent_processes.items()
+                if str(record.state or "") != "exited"
+            }
+            for pid in observed_pids:
+                if pid in live_pids:
+                    self._suspected_orphans.pop(pid, None)
+                    continue
+                existing = self._suspected_orphans.get(pid)
+                if existing is None:
+                    self._suspected_orphans[pid] = SuspectedOrphanRecord(
+                        pid=pid,
+                        first_detected_at=now_ts,
+                        last_seen_at=now_ts,
+                        last_reason="registry_unowned_process",
+                    )
+                else:
+                    existing.last_seen_at = now_ts
+            stale = [pid for pid in self._suspected_orphans if pid not in observed_pids]
+            for pid in stale:
+                self._suspected_orphans.pop(pid, None)
 
     def _set_startup_phase(self, phase: str, *, probe_safe_ready: bool | None = None) -> None:
         now_ts = time.time()
@@ -971,17 +1205,20 @@ class WorkerService:
                         )
                     except Exception as scoped_exc:
                         logger.warning("task-scoped maintenance cleanup failed for %s: %s", stale_row.task_id, scoped_exc)
-                if killed_processes < WORKER_MAINTENANCE_MAX_KILLS:
-                    # Run orphan cleanup synchronously in a thread-pool with timeout
+                phase_started = time.perf_counter()
+                observed_pids: set[int] = set()
+                from app.service.agent_observability import iter_local_agent_processes
+
+                for proc in await asyncio.wait_for(
+                    asyncio.to_thread(iter_local_agent_processes),
+                    timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS,
+                ):
                     try:
-                        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                            _fut = _ex.submit(cleanup_orphan_pi_processes, logger.warning, label="ea_worker_maintenance")
-                            orphan_killed = _fut.result(timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS)
-                            killed_processes += min(orphan_killed, WORKER_MAINTENANCE_MAX_KILLS - killed_processes)
-                    except _cf.TimeoutError:
-                        logger.warning("orphan cleanup timed out after %ss", WORKER_MAINTENANCE_TIMEOUT_SECONDS)
-                    except Exception as _oe:
-                        logger.warning("orphan cleanup error: %s", _oe)
+                        observed_pids.add(int(proc.get("pid")))
+                    except Exception:
+                        continue
+                self.reconcile_suspected_orphans(observed_pids)
+                self._record_phase_duration(self._maintenance_health, phase="cleanup_call", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 self._record_loop_success(self._maintenance_health, phase="maintenance", duration_ms=duration_ms)
                 if not self._maintenance_task_ready:
