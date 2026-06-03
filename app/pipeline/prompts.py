@@ -184,9 +184,9 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
         if body_lines_capped <= 200:
             _body_escaped = body_content[:8000]
             step1 = (
-                f"**函数体**（共 {body_lines_capped} 行，已预加载）：\n"
+                f"## 函数体（已预加载，共 {body_lines_capped} 行）\n"
                 f"```c\n{_body_escaped}\n```\n"
-                f"\n⚠️ 如上方内容截断或不完整，请用 `sed -n '{start_line},{end_line}p' {file_path}` 重新获取。\n"
+                f"\n**函数体完整可信，无需任何 bash/read 工具。直接根据上方内容分析并输出 `<result>` 块。**\n"
             )
         else:
             # 大函数：不嵌入全体，改用 awk 扫描
@@ -309,7 +309,7 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
 
 # ─── R3 Judge（函数级） ──────────────────────────────────────────────────────
 
-def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
+def build_r3_j_prompt(
     func_hash: str,
     func_name: str,
     signature: str,
@@ -319,75 +319,90 @@ def build_r3_j_prompt(  # 正确命名：R3-J 外部输入验证
     file_path: str,
     db_path: "Path",
     worker_result_file: str = "",
+    w_result_json: "dict | None" = None,
+    funcdb_record: "dict | None" = None,
+    body_content: str = "",
 ) -> str:
-    """
-    R3 Judge（函数级）：验证单个函数的外部输入分析质量。
-
-    v2 变化：
-    - 删除 awk 硬编码模式扫描（仅适用于特定项目）
-    - 改为：读取函数体后由 Agent 直接语义分析 P/A 分类
-    - 更准确且适用于任意代码库
-    """
+    """R3 Judge v3: zero-tool mode when data is pre-loaded."""
+    import json as _json
     basename = os.path.basename(file_path)
-    sed_body = f"sed -n '{start_line},{end_line}p' {file_path}"
+
+    _w_block = ""
+    if w_result_json:
+        try:
+            _ri = w_result_json.get("result") or {}
+            if isinstance(_ri, str):
+                _ri = _json.loads(_ri)
+            _w_json_str = _json.dumps(_ri, ensure_ascii=False, indent=2)[:2000]
+            _w_block = (
+                "\n## Worker 分析结果（已预加载）\n\n"
+                f"```json\n{_w_json_str}\n```\n"
+                "\n无需再读取 W 结果文件。\n"
+            )
+        except Exception:
+            pass
+
+    _db_block = ""
+    if funcdb_record:
+        _sig = funcdb_record.get("signature") or signature
+        _an = funcdb_record.get("analysis") or {}
+        if isinstance(_an, str):
+            try: _an = _json.loads(_an)
+            except: _an = {}
+        _he = funcdb_record.get("has_external_input")
+        _an_str = _json.dumps(_an, ensure_ascii=False)[:400]
+        _db_block = (
+            "\n## Funcdb 记录（已预加载）\n\n"
+            f"- signature: `{_sig[:120]}`\n"
+            f"- has_external_input: {_he}\n"
+            f"- analysis: `{_an_str}`\n"
+            "\n无需再调用 ea_db.py get。\n"
+        )
+
+    _body_block = ""
+    if body_content:
+        _bc = body_content[:6000]
+        _bl = _bc.count("\n") + 1
+        _body_block = (
+            f"\n## 函数体（已预加载，共 {_bl} 行）\n\n"
+            f"```c\n{_bc}\n```\n"
+            "\n无需再调用 sed 读取源文件。\n"
+        )
+    else:
+        _body_block = (
+            f"\n## 函数体（请读取）\n\n"
+            f"```bash\nsed -n '{start_line},{end_line}p' {file_path}\n```\n"
+        )
+
+    _has_all = bool(w_result_json and funcdb_record and body_content)
+    _tool_notice = (
+        "\n> **所有分析数据已预加载，无需调用任何工具（bash/read）。"
+        "直接判断 W 结论自洽性，输出语句即可。**\n"
+    ) if _has_all else ""
 
     return (
-        f"# R3 Judge \u2014 \u5916\u90e8\u8f93\u5165\u5206\u6790\u9a8c\u8bc1\n\n"
-        f"| \u5b57\u6bb5      | \u5024                       |\n"
-        f"|-----------|-------------------------|\n"
-        f"| func_hash | `{func_hash}`            |\n"
-        f"| name      | `{func_name}`            |\n"
-        f"| \u884c\u8303\u56f4    | {start_line}~{end_line}\uff08\u5171 {body_lines} \u884c\uff09|\n"
-        f"| \u6587\u4ef6      | `{basename}`             |\n\n"
-        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
-        f"## \u6b65\u9aa4 1\uff1a\u83b7\u53d6 R2 \u5206\u6790\u7ed3\u679c\n\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py get {db_path} {func_hash}\n"
-        f"```\n\n"
-        f"\u82e5\u7ed3\u679c\u4e3a `has_external_input: false` \u2192 \u76f4\u63a5\u8f93\u51fa**\u901a\u8fc7: \u662f**\uff0c\u65e0\u9700\u540e\u7eed\u6b65\u9aa4\u3002\n\n"
-        f"## \u6b65\u9aa4 2\uff1a\u9a8c\u8bc1 taints \u53c2\u6570\u771f\u5b9e\u6027\uff08\u4ec5\u5f53 has_external_input=true\uff09\n\n"
-        f"```bash\n"
-        f"sed -n '{start_line}p' {file_path}\n"
-        f"```\n\n"
-        f"\u5bf9\u6bd4 `taints` \u5217\u8868\u4e2d\u6bcf\u4e2a\u53c2\u6570\u540d\u662f\u5426\u5728\u7b7e\u540d\u4e2d**\u771f\u5b9e\u51fa\u73b0**\uff1a\n"
-        f"- \u274c `output`/`out_`/`result`/`rsp`/`response` \u7b49\u662f**\u8f93\u51fa\u53c2\u6570**\uff0c\u4e0d\u662f\u5916\u90e8\u8f93\u5165 taint\n"
-        f"- \u274c \u53c2\u6570\u540d\u4e0d\u5728\u7b7e\u540d\u4e2d \u2192 taints \u5b57\u6bb5\u9519\u8bef\n"
-        f"- \u2705 buf/data/msg/packet/request/context/pkt \u7c7b\u53c2\u6570\u540d \u2192 \u5408\u7406\u7684\u8f93\u5165 taint\n\n"
-        f"## \u6b65\u9aa4 3\uff1a\u9a8c\u8bc1 P/A \u5206\u7c7b\uff08\u76f4\u63a5\u8bfb\u4ee3\u7801\u5206\u6790\uff09\n\n"
-        f"```bash\n{sed_body}\n```\n\n"
-        f"\u9605\u8bfb\u51fd\u6570\u4f53\uff0c\u76f4\u63a5\u5224\u65ad\uff1a\n\n"
-        f"**\u4e3b\u52a8\u578b\uff08A\uff09**\uff1a\u51fd\u6570\u4f53\u5185\u5b58\u5728**\u4e3b\u52a8\u83b7\u53d6\u5916\u90e8\u6570\u636e**\u7684\u8c03\u7528\uff0c\u5305\u62ec\u4f46\u4e0d\u9650\u4e8e\uff1a\n"
-        f"  - \u7f51\u7edc\u63a5\u6536\uff08recv\u3001recvfrom\u3001recvmsg\u3001read\u7b49\uff09\n"
-        f"  - IPC \u6d88\u606f\u63a5\u6536\uff08\u6839\u636e\u4ee3\u7801\u8bed\u4e49\u5224\u65ad\uff0c\u4e0d\u4f9d\u8d56\u5177\u4f53\u51fd\u6570\u540d\uff09\n"
-        f"  - \u961f\u5217/\u7ba1\u9053\u8bfb\u53d6\u3001\u5171\u4eab\u5185\u5b58\u8bfb\u53d6\u3001\u6587\u4ef6\u8bfb\u53d6\u7b49\n"
-        f"  - \u5b9a\u65f6\u5668\u6d88\u606f\u8bfb\u53d6\u3001\u5185\u6838\u4e8b\u4ef6\u8bfb\u53d6\n\n"
-        f"**\u88ab\u52a8\u578b\uff08P\uff09**\uff1a\u51fd\u6570\u4f53\u5185**\u6ca1\u6709**\u4e3b\u52a8\u83b7\u53d6\u884c\u4e3a\uff0c\u6570\u636e\u5168\u90e8\u6765\u81ea\u8c03\u7528\u8005\u4f20\u5165\u7684\u53c2\u6570\n\n"
-        f"\u5982\u679c\u5206\u7c7b\u4e0e\u4e0a\u8ff0\u4e0d\u7b26\uff1a\n"
-        f"- R2 \u6807\u6ce8\u4e3a `A` \u4f46\u4ee3\u7801\u4e2d**\u627e\u4e0d\u5230**\u4e3b\u52a8 I/O \u8c03\u7528 \u2192 \u5e94\u4e3a `P`\uff0c\u9519\u8bef\n"
-        f"- R2 \u6807\u6ce8\u4e3a `P` \u4f46\u4ee3\u7801\u4e2d**\u786e\u5b9e\u6709**\u4e3b\u52a8 I/O \u8c03\u7528 \u2192 \u5e94\u4e3a `A`\uff0c\u9519\u8bef\n\n"
-        f"## \u8f93\u51fa\u683c\u5f0f\uff08\u56fa\u5b9a 3 \u884c\uff0c\u6458\u8981\u5fc5\u987b \u226460 \u5b57\uff09\n\n"
-        f"```\n"
-        f"\u901a\u8fc7: \u662f\n"
-        f"\u6458\u8981: taints \u53c2\u6570\u771f\u5b9e\uff0cP/A \u5206\u7c7b\u6b63\u786e\n"
-        f"```\n\n"
-        f"\u6216\uff1a\n\n"
-        f"```\n"
-        f"\u901a\u8fc7: \u5426\n"
-        f"\u6458\u8981: <\u226460\u5b57\uff0c\u4e00\u53e5\u8bdd\u8bf4\u660e\u6838\u5fc3\u95ee\u9898\uff0c\u5982\u201coutput_base \u662f\u8f93\u51fa\u53c2\u6570\u975e\u8f93\u5165taint\u201d>\n"
-        f"\u53cd\u9988: <\u8be6\u7ec6\u5185\u5bb9\uff1a\u5177\u4f53\u54ea\u4e2a\u5b57\u6bb5\u6709\u4f55\u95ee\u9898\uff0c\u6b63\u786e\u5024\u5e94\u8be5\u662f\u4ec0\u4e48>\n"
-        f"```\n\n"
-        f"## \u539f\u5219\n\n"
-        f"- \u53ea\u9a8c\u8bc1\u672c\u51fd\u6570\uff0c\u4e0d\u505a\u8de8\u51fd\u6570\u6f0f\u5224\u68c0\u6d4b\n"
-        f"- \u53d1\u73b0\u771f\u5b9e\u5b57\u6bb5\u9519\u8bef\u624d FAIL\uff0c\u4e0d\u4e3a\u683c\u5f0f\u6216\u63cf\u8ff0\u95ee\u9898 FAIL\n"
-        f"- \u9047\u5230\u5f02\u5e38\uff08\u51fd\u6570\u4f53\u8bfb\u53d6\u5931\u8d25\u7b49\uff09\u2192 \u9ed8\u8ba4\u901a\u8fc7\uff0c\u4e0d\u963b\u585e\u6d41\u7a0b\n"
-        f"- has_external_input=false \u7684\u51fd\u6570 \u2192 \u76f4\u63a5\u8f93\u51fa\u901a\u8fc7\uff0c\u65e0\u9700\u9a8c\u8bc1\n"
+        f"# R3 Judge — 外部输入分析验证\n\n"
+        f"| 字段 | 値 |\n"
+        f"|---|---|\n"
+        f"| func_hash | `{func_hash}` |\n"
+        f"| name | `{func_name}` |\n"
+        f"| 行范围 | {start_line}~{end_line}（共 {body_lines} 行）|\n"
+        f"| 文件 | `{basename}` |\n"
+        f"{_tool_notice}"
+        f"{_w_block}"
+        f"{_db_block}"
+        f"{_body_block}\n"
+        f"## 验证要点\n\n"
+        "1. **taints 参数真实性**：P 型 taints 必须是签名中真实参数名（非输出参数）\n"
+        "2. **P/A 分类自洽**：体内有主动 I/O 调用 → A；纯参数传入 → P\n"
+        "3. **decision 合理**：has_input=true 且无构造/发送特征 → keep\n\n"
+        "## 输出格式\n\n"
+        "```\n通过: 是\n摘要: taints 参数真实，P/A 分类自洽\n```\n\n"
+        "或：\n\n"
+        "```\n通过: 否\n摘要: <≤60字核心问题>\n反馈: <具体字段错误及正确値>\n```\n\n"
+        "**has_external_input=false 时直接输出 `通过: 是`。**\n"
+        "\n原则：只验证自洽性，不做跨函数漏判检测；遇异常默认通过。\n"
     )
-
-
-
-
-# ─── R4 Worker ────────────────────────────────────────────────────────────────
-
 def build_r4_func_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
     """
     R4-W 重试轮次的短消息。Session 已有首轮调用链分析上下文，无需重发完整 prompt。

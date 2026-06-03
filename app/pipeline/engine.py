@@ -1460,11 +1460,18 @@ class PipelineEngine:
                         body_content=_prefetched_body,
                     )
                 _r3w_start = time.monotonic()
+                # 当函数体已预嵌入且不是重试时：禘1次调用，禁止所有 tool call
+                # Agent 只需读 prompt 中的预嵌内容直接输出结果，无需任何工具
+                _r3w_body_lines = _prefetched_body.count('\n') + 1 if _prefetched_body else 0
+                _r3w_tools: list[str] | None = None  # 默认使用 acfg.tools
+                if _prefetched_body and _r3w_body_lines <= 200 and not is_retry:
+                    _r3w_tools = []  # 全量禁用 tool，强制单轮输出
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
                     context=f"r3_w:{func_hash}", acfg=acfg,
                     priority=SemPriority.R3_J if is_retry else SemPriority.R3_W,
+                    tools_override=_r3w_tools,
                 )
                 _r3w_dur = self._dur(_r3w_start)
                 _r3w_ti, _r3w_to = self._tok(ar)
@@ -1657,6 +1664,43 @@ class PipelineEngine:
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r3_analysis_judge')
             worker_result_file = dirs.stage_result_file("r3_w", "worker", func_hash, max(1, func_state.r3_w_attempts))
+
+            # 预读 W 结果文件内容（代替 agent cat 命令）
+            _w_result_json: dict = {}
+            try:
+                if worker_result_file.exists():
+                    _w_result_json = json.loads(worker_result_file.read_text(encoding="utf-8")) or {}
+            except Exception:
+                pass
+
+            # 预读 funcdb 记录（代替 agent ea_db.py get 命令）
+            _funcdb_record: dict = {}
+            try:
+                from .funcdb import FunctionDB as _FDB_j
+                _rec_j = await asyncio.to_thread(
+                    lambda: _FDB_j.open(dirs.r1, file_hash).get_function(func_hash)
+                )
+                if _rec_j:
+                    _funcdb_record = {
+                        "has_external_input": _rec_j.get("has_external_input"),
+                        "analysis": _rec_j.get("analysis"),
+                        "signature": _rec_j.get("signature") or func_state.signature,
+                    }
+            except Exception as _fj_e:
+                logger.debug("R3-J funcdb prefetch failed %s: %s", func_hash, _fj_e)
+
+            # 预读函数体（代替 agent sed 命令）
+            _r3j_body = ""
+            try:
+                from .funcdb import FunctionDB as _FDB_jb
+                _rec_jb = await asyncio.to_thread(
+                    lambda: _FDB_jb.open(dirs.r1, file_hash).get_function(func_hash)
+                )
+                if _rec_jb:
+                    _r3j_body = str(_rec_jb.get("body") or "")
+            except Exception:
+                pass
+
             prompt = P.build_r3_j_prompt(
                 func_hash=func_hash,
                 func_name=func_state.name,
@@ -1667,6 +1711,9 @@ class PipelineEngine:
                 file_path=file_path,
                 db_path=db_path,
                 worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
+                w_result_json=_w_result_json,
+                funcdb_record=_funcdb_record,
+                body_content=_r3j_body,
             )
             _r3j_start = time.monotonic()
             ar = await self._call_agent(
@@ -2503,9 +2550,10 @@ class PipelineEngine:
         session_file: str,
         cwd: str,
         context: str = "",
-        acfg: AgentInstanceConfig,
+        acfg: "AgentInstanceConfig",
         priority: int = SemPriority.R5_W,
-    ) -> AgentResult:
+        tools_override: list[str] | None = None,  # None = 使用 acfg.tools 默认列表
+    ) -> "AgentResult":
         stage_key = {
             SemPriority.R1_W: "r1_w",
             SemPriority.R1_J: "r1_j",
@@ -2532,7 +2580,7 @@ class PipelineEngine:
         ar = await run_agent(
                     prompt=prompt,
                     model=acfg.model,
-                    tools=acfg.tools or self.cfg.workers.default_tools,
+                    tools=tools_override if tools_override is not None else (acfg.tools or self.cfg.workers.default_tools),
                     system_prompt=system_prompt,
                     cwd=cwd,
                     thinking_level=(
