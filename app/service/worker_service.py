@@ -846,6 +846,51 @@ class WorkerService:
                 logger.warning("worker runtime config refresh failed: %s", exc)
 
 
+    def _heartbeat_once(self) -> None:
+        from app.service import task_service as task_mod
+
+        started = time.perf_counter()
+        snapshot = self._runtime_config_snapshot()
+        phase_started = time.perf_counter()
+        agent_snapshot = get_agent_process_slot_manager().snapshot()
+        self._record_phase_duration(self._heartbeat_health, phase="agent_snapshot", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
+        phase_started = time.perf_counter()
+        self._execute_with_timeout(
+            lambda: self._write_worker_heartbeat(
+                worker_id=task_mod.POD_NAME,
+                pod_name=task_mod.POD_NAME,
+                pod_ip=task_mod.POD_IP or None,
+                http_port=WORKER_HTTP_PORT,
+                max_concurrent_tasks=snapshot.max_concurrent_tasks,
+                agent_snapshot=agent_snapshot,
+                heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
+                heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
+            ),
+            timeout_seconds=WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS,
+            timeout_message="heartbeat db operation timeout",
+        )
+        self._record_phase_duration(self._heartbeat_health, phase="db_commit", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        self._record_loop_success(self._heartbeat_health, phase="heartbeat_write", duration_ms=duration_ms)
+        if duration_ms > WORKER_HEARTBEAT_SLOW_MS:
+            self._record_loop_slow(self._heartbeat_health)
+            logger.warning(
+                "worker heartbeat slow phase=heartbeat_write duration_ms=%.1f worker_id=%s phase_durations_ms=%s",
+                duration_ms,
+                task_mod.POD_NAME,
+                dict(self._heartbeat_health.phase_durations_ms),
+            )
+        logger.info(
+            "worker heartbeat ok worker_id=%s duration_ms=%.1f running_tasks=%s agent_in_use=%s agent_waiting_requests=%s max_concurrent_tasks=%s agent_process_limit=%s",
+            task_mod.POD_NAME,
+            duration_ms,
+            self.local_running_count(),
+            int(agent_snapshot.get("in_use") or 0),
+            int(agent_snapshot.get("waiting_requests") or 0),
+            snapshot.max_concurrent_tasks,
+            snapshot.agent_process_limit,
+        )
+
     def _heartbeat_thread_main(self) -> None:
         from app.service import task_service as task_mod
 
@@ -915,7 +960,7 @@ class WorkerService:
                     # Run orphan cleanup synchronously in a thread-pool with timeout
                     try:
                         with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                            _fut = _ex.submit(cleanup_orphan_pi_processes, logger.warning, "ea_worker_maintenance")
+                            _fut = _ex.submit(cleanup_orphan_pi_processes, logger.warning, label="ea_worker_maintenance")
                             orphan_killed = _fut.result(timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS)
                             killed_processes += min(orphan_killed, WORKER_MAINTENANCE_MAX_KILLS - killed_processes)
                     except _cf.TimeoutError:
