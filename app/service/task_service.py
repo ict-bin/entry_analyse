@@ -2220,7 +2220,7 @@ class TaskService:
         *,
         project_id: str,
         page: int = 1,
-        per_page: int = 100,
+        per_page: int = 50,
         status: Optional[str] = None,
         mode: Optional[str] = None,
         parent_task_id: Optional[str] = None,
