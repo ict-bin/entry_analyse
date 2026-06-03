@@ -35,7 +35,7 @@ async def _schedule_dispatch_async(svc, project_id: str) -> None:
     svc.schedule_dispatch(project_id)
 
 
-_running_tasks: dict[str, threading.Thread] = {}
+_running_tasks: dict[str, asyncio.Task] = {}
 # task_id -> asyncio.Event: 外部信号立即唤醒 _watch_task_control，无需等待轮询间隔
 _cancel_wake: dict[str, asyncio.Event] = {}
 _local_cancel_events: dict[str, asyncio.Event] = {}
@@ -178,10 +178,10 @@ class WorkerService:
         self._heartbeat_stop = threading.Event()
         self._infra_stop = threading.Event()  # shared stop for all infra threads
         # Legacy fields kept for compatibility
-        self._task: Optional[threading.Thread] = None
-        self._maintenance_task: Optional[threading.Thread] = None
-        self._runtime_config_task: Optional[threading.Thread] = None
-        self._guard_task: Optional[threading.Thread] = None
+        self._task: Optional[asyncio.Task] = None
+        self._maintenance_task: Optional[threading.Thread] = None  # kept as thread
+        self._runtime_config_task: Optional[threading.Thread] = None  # kept as thread
+        self._guard_task: Optional[threading.Thread] = None  # kept as thread
         # Main asyncio event loop reference (set by asyncio context, used by threads)
         self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._runtime_config = WorkerRuntimeConfigSnapshot()
@@ -377,14 +377,14 @@ class WorkerService:
         task = _running_tasks.get(task_id)
         if task is None:
             return False
-        if not task.is_alive():
+        if task.done():
             _running_tasks.pop(task_id, None)
             return False
         return True
 
     def local_running_count(self) -> int:
         """本 pod 当前正在运行的任务数（清理已完成的条目后统计）。"""
-        done = [tid for tid, t in _running_tasks.items() if not t.is_alive()]
+        done = [tid for tid, t in _running_tasks.items() if t.done()]
         for tid in done:
             _running_tasks.pop(tid, None)
         return len(_running_tasks)
@@ -446,32 +446,27 @@ class WorkerService:
             except StopIteration:
                 pass
 
-    def start_task(self, task_id: str) -> threading.Thread:
-        """Start a task in a dedicated thread with its own asyncio event loop."""
+    def start_task(self, task_id: str) -> "asyncio.Task":
+        """Start a task as an asyncio.Task in the main event loop.
+
+        Infrastructure loops (_loop, _maintenance, _guard, _runtime_config) now run as
+        daemon threads, so the main event loop is exclusively for task execution.
+        Keeping tasks in the main loop is critical: AgentProcessSlotManager uses
+        asyncio.Lock/Event which MUST be used from a single event loop. Per-task
+        new_event_loop() caused cross-loop Future.set_result() failures in Python 3.11,
+        silently losing agent slot release wakeups → tasks deadlocked waiting for slots.
+        """
         existing = _running_tasks.get(task_id)
-        if existing is not None and existing.is_alive():
+        if existing is not None and not existing.done():
             return existing
-        if existing is not None and not existing.is_alive():
+        if existing is not None and existing.done():
             _running_tasks.pop(task_id, None)
-
-        def _run_in_own_loop() -> None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._execute_task(task_id))
-            except Exception as exc:
-                logger.error("task %s execution failed: %s", task_id, exc, exc_info=True)
-            finally:
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-                _running_tasks.pop(task_id, None)
-
-        t = threading.Thread(target=_run_in_own_loop, name=f"ea_task_{task_id}", daemon=True)
-        _running_tasks[task_id] = t
-        t.start()
-        return t
+        task = asyncio.create_task(
+            self._execute_task(task_id),
+            name=f"ea_task_{task_id}",
+        )
+        _running_tasks[task_id] = task
+        return task
 
     async def _discover_active_projects(self) -> list[str]:
         db_gen = get_db()
