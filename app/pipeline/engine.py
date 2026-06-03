@@ -84,7 +84,7 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
 
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
-from ..agent_slots import SemPriority, get_agent_process_slot_manager
+from ..agent_slots import SemPriority, agent_process_slot, get_agent_process_slot_manager
 from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
@@ -431,6 +431,9 @@ class PipelineEngine:
         self._source_dir: str = ""
         self._out_dir: Path | None = None  # 输出目录（per-func report 使用）
         self._r4_j_confirmed: bool = False
+        # API_Filter result cache for current run. Direct API calls are now part of
+        # the full pipeline and share pod-level AgentProcessSlotManager capacity.
+        self._api_filter_results: dict[str, bool] = {}
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -559,6 +562,17 @@ class PipelineEngine:
             func_state = fs.functions.get(func_hash)
             if func_state is None or func_state.r2_j_state != NodeState.PASSED:
                 return
+
+            # ── API_Filter: Direct LLM API 预筛（完整模式默认启用）───────────────
+            # API call 与 pi Agent 共用 pod 级 AgentProcessSlotManager 槽位，
+            # 优先级位于 R2-W 与 R3-J 之间，避免 Direct API 与 Agent 双通道并发导致 OOM。
+            if func_hash not in self._api_filter_results:
+                _af_passed = await self._run_api_filter(
+                    file_hash, func_hash, file_path, dirs, state
+                )
+                self._api_filter_results[func_hash] = _af_passed
+            if not self._api_filter_results.get(func_hash, True):
+                return  # API_Filter 判定为非入口，跳过 R3/R4/R5
 
             # ── R3 分析: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
             await self._run_r3_analysis(
@@ -2578,6 +2592,83 @@ class PipelineEngine:
             self._on_event(SwarmEvent(type=etype, task_id=self.task_id, data=data))
         except Exception:
             pass
+
+    async def _run_api_filter(
+        self,
+        file_hash: str,
+        func_hash: str,
+        file_path: str,
+        dirs: "PipelineDirs",
+        state: "PipelineState",
+    ) -> bool:
+        """
+        Direct LLM API 预筛：判断函数是否值得进入 R3 Agent 分析。
+
+        正式合入完整模式后，API call 默认启用，并且必须和 pi Agent 共用
+        AgentProcessSlotManager 槽位，避免 Direct API 与 Agent 双通道并发造成 OOM。
+        失败时保守返回 True（不漏报）。
+        """
+        from .api_filter import api_filter_function
+        from .funcdb import FunctionDB as _FDBAF
+
+        func_state = state.files[file_hash].functions.get(func_hash)
+        func_name = func_state.name if func_state else func_hash[:8]
+        signature = func_state.signature if func_state else ""
+
+        body = ""
+        try:
+            _rec_af = await asyncio.to_thread(
+                lambda: _FDBAF.open(dirs.r1, file_hash).get_function(func_hash)
+            )
+            if _rec_af:
+                body = str(_rec_af.get("body") or "")
+        except Exception as _af_exc:
+            logger.debug("api_filter body prefetch failed %s: %s", func_hash, _af_exc)
+
+        self._emit("api_filter_start", func_hash=func_hash, function=func_name)
+        _af_start = time.monotonic()
+
+        def _emit_slot_event(event_type: str, payload: dict[str, Any]) -> None:
+            self._emit(event_type, **payload)
+
+        try:
+            model = self.cfg.workers.agents[0].model if self.cfg.workers.agents else ""
+            async with agent_process_slot(
+                priority=SemPriority.API_FILTER,
+                task_id=self.task_id,
+                stage_key="api_filter",
+                role_kind="api",
+                cancel_event=self._cancel,
+                on_event=_emit_slot_event,
+            ):
+                is_entry, _af_llm_dur = await api_filter_function(
+                    func_name=func_name,
+                    signature=signature,
+                    body=body,
+                    model=model,
+                    cancel_event=self._cancel,
+                )
+            _af_wall_dur = self._dur(_af_start)  # 含槽位等待 + API semaphore 等待
+            self._emit(
+                "api_filter_done",
+                func_hash=func_hash,
+                function=func_name,
+                is_entry=int(is_entry),
+                duration_ms=_af_llm_dur,          # 实际 LLM 调用时间（不含排队）
+                wall_duration_ms=_af_wall_dur,    # 含 AgentProcessSlot/API semaphore 等待
+            )
+            return bool(is_entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("api_filter failed for %s, keeping: %s", func_hash, exc)
+            self._emit(
+                "api_filter_error",
+                func_hash=func_hash,
+                function=func_name,
+                error=str(exc)[:100],
+            )
+            return True
 
     async def _aupsert(self, **kwargs) -> None:
         """async wrapper for upsert_stage_result_index。

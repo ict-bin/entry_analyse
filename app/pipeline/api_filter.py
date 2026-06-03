@@ -14,9 +14,13 @@ entry_analyse — API Filter (Direct LLM API, no pi subprocess)
   - Agent 失败保守保留（不漏报）
 
 并发控制：
-  EA_API_FILTER_CONCURRENCY  默认 16
+  EA_API_FILTER_CONCURRENCY  默认 8
   EA_API_FILTER_TIMEOUT_SECONDS 默认 45
   EA_API_FILTER_MAX_RETRIES  默认 2
+
+注意：模块内 semaphore 只限制 Direct API 自身并发；正式接入流水线时，
+外层还必须申请 AgentProcessSlotManager 槽位，使 API call 与 pi Agent
+共用同一 pod 级资源队列，避免双通道并发导致 OOM。
 """
 from __future__ import annotations
 import re as _re
@@ -329,7 +333,7 @@ async def api_filter_function(
         )
     except Exception as exc:
         logger.warning("api_filter: provider load failed: %s, keeping %s", exc, func_name)
-        return True
+        return True, 0
 
     # 信号量限制并发
     sem = get_api_filter_sem()
@@ -337,7 +341,7 @@ async def api_filter_function(
         _llm_start = time.monotonic()  # 信号量 acquire 后才开始计时（不含等待）
         for attempt in range(1, _MAX_RETRIES + 2):
             if cancel_event and cancel_event.is_set():
-                return True
+                return True, 0
             try:
                 resp_text = await _call_llm_once(base_url, api_key, model_id, messages)
                 result = _parse_is_entry(resp_text)

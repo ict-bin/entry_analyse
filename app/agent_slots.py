@@ -28,6 +28,10 @@ class SemPriority:
     R1_W = 2
     R2_J = 3
     R2_W = 4
+    # Direct API prefilter shares the same pod-level slot queue.
+    # Priority must be after R2-W and before R3-J so cheap filtering can
+    # reduce R3 agent load without starving R2 validation.
+    API_FILTER = 4.5
     R3_J = 5
     R3_W = 6
     R4_J = 7
@@ -70,7 +74,7 @@ def _read_rss_bytes(pid: int | None) -> int:
 @dataclass
 class AgentSlotTicket:
     sequence: int
-    priority: int           # 排队优先级，数字越小越优先
+    priority: float         # 排队优先级，数字越小越优先；API_FILTER=4.5 位于 R2-W 与 R3-J 之间
     task_id: str | None
     stage_key: str | None
     role_kind: str | None
@@ -121,9 +125,9 @@ class AgentProcessSlotManager:
     def __init__(self, capacity: int) -> None:
         self.capacity = max(1, int(capacity or 1))
         self._lock = threading.RLock()
-        # 堆元素：(priority: int, sequence: int, ticket: AgentSlotTicket)
+        # 堆元素：(priority: float, sequence: int, ticket: AgentSlotTicket)
         # sequence 保证相同 priority 时 FIFO；ticket 自身不参与比较
-        self._waiters: list[tuple[int, int, AgentSlotTicket]] = []
+        self._waiters: list[tuple[float, int, AgentSlotTicket]] = []
         self._in_use = 0
         self._leases: dict[int, AgentSlotLease] = {}
         self._sequence = 0
@@ -202,7 +206,7 @@ class AgentProcessSlotManager:
     async def acquire(
         self,
         *,
-        priority: int = SemPriority.DEFAULT,
+        priority: float = SemPriority.DEFAULT,
         task_id: str | None = None,
         stage_key: str | None = None,
         role_kind: str | None = None,
@@ -426,7 +430,7 @@ def get_agent_process_slot_manager() -> AgentProcessSlotManager:
 @asynccontextmanager
 async def agent_process_slot(
     *,
-    priority: int = SemPriority.DEFAULT,
+    priority: float = SemPriority.DEFAULT,
     task_id: str | None = None,
     stage_key: str | None = None,
     role_kind: str | None = None,

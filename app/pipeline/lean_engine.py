@@ -93,7 +93,7 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
 
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
-from ..agent_slots import SemPriority, get_agent_process_slot_manager
+from ..agent_slots import SemPriority, agent_process_slot, get_agent_process_slot_manager
 from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
@@ -2596,7 +2596,8 @@ class LeanPipelineEngine:
     ) -> bool:
         """
         直接调用 LLM API 快速预筛，判断函数是否为外部入口。
-        无 pi 子进程，单次 HTTP 请求，信号量限制并发。
+        Direct API 与 pi Agent 共用 pod 级 AgentProcessSlotManager 槽位，
+        优先级位于 R2-W 与 R3-J 之间，避免双通道并发导致 OOM。
         失败时保守返回 True（不漏报）。
         """
         from .api_filter import api_filter_function
@@ -2618,16 +2619,28 @@ class LeanPipelineEngine:
 
         self._emit("api_filter_start", func_hash=func_hash, function=func_name)
         _af_start = time.monotonic()
+
+        def _emit_slot_event(event_type: str, payload: dict[str, Any]) -> None:
+            self._emit(event_type, **payload)
+
         try:
             model = self.cfg.workers.agents[0].model if self.cfg.workers.agents else ""
-            is_entry, _af_llm_dur = await api_filter_function(
-                func_name=func_name,
-                signature=signature,
-                body=body,
-                model=model,
+            async with agent_process_slot(
+                priority=SemPriority.API_FILTER,
+                task_id=self.task_id,
+                stage_key="api_filter",
+                role_kind="api",
                 cancel_event=self._cancel,
-            )
-            _af_wall_dur = self._dur(_af_start)  # 含等待时间（informational）
+                on_event=_emit_slot_event,
+            ):
+                is_entry, _af_llm_dur = await api_filter_function(
+                    func_name=func_name,
+                    signature=signature,
+                    body=body,
+                    model=model,
+                    cancel_event=self._cancel,
+                )
+            _af_wall_dur = self._dur(_af_start)  # 含 AgentProcessSlot/API semaphore 等待
             self._emit(
                 "api_filter_done",
                 func_hash=func_hash, function=func_name,
