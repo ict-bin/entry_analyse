@@ -846,6 +846,23 @@ class WorkerService:
                 logger.warning("worker runtime config refresh failed: %s", exc)
 
 
+    def _heartbeat_thread_main(self) -> None:
+        from app.service import task_service as task_mod
+
+        while self._running and not self._heartbeat_stop.is_set():
+            try:
+                self._heartbeat_once()
+            except Exception as exc:
+                self._record_loop_failure(self._heartbeat_health, phase="heartbeat_write", exc=exc)
+                self._log_background_failure(
+                    logger_message="worker slot heartbeat failed",
+                    health=self._heartbeat_health,
+                    phase=self._heartbeat_health.last_phase or "heartbeat_write",
+                    exc=exc,
+                    worker_id=task_mod.POD_NAME,
+                )
+            self._heartbeat_stop.wait(WORKER_SLOT_HEARTBEAT_SECONDS)
+
     def _maintenance_thread_body(self) -> None:
         """Maintenance loop — daemon thread, no asyncio."""
         from app.service import task_service as task_mod
