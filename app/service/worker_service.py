@@ -35,7 +35,7 @@ async def _schedule_dispatch_async(svc, project_id: str) -> None:
     svc.schedule_dispatch(project_id)
 
 
-_running_tasks: dict[str, asyncio.Task] = {}
+_running_tasks: dict[str, threading.Thread] = {}
 # task_id -> asyncio.Event: 外部信号立即唤醒 _watch_task_control，无需等待轮询间隔
 _cancel_wake: dict[str, asyncio.Event] = {}
 _local_cancel_events: dict[str, asyncio.Event] = {}
@@ -139,16 +139,26 @@ def _task_runtime_roots_from_row(row: AppEaTask) -> list[str]:
     return roots
 
 
+def _set_asyncio_event_threadsafe(ev: asyncio.Event | None) -> bool:
+    """Set an asyncio.Event from any thread/event loop safely."""
+    if ev is None:
+        return False
+    loop = getattr(ev, "_loop", None)
+    if loop is not None and getattr(loop, "is_running", lambda: False)():
+        try:
+            loop.call_soon_threadsafe(ev.set)
+            return True
+        except RuntimeError:
+            return False
+    ev.set()
+    return True
+
+
 def trigger_instant_cancel(task_id: str) -> bool:
     """由内置 cancel HTTP server 调用，立即唤醒 _watch_task_control。"""
-    cancel_ev = _local_cancel_events.get(task_id)
-    if cancel_ev is not None:
-        cancel_ev.set()
-    ev = _cancel_wake.get(task_id)
-    if ev:
-        ev.set()
-        return True
-    return cancel_ev is not None
+    ok1 = _set_asyncio_event_threadsafe(_local_cancel_events.get(task_id))
+    ok2 = _set_asyncio_event_threadsafe(_cancel_wake.get(task_id))
+    return ok1 or ok2
 
 
 async def _wait_cancel_first(delay: float, cancel_event: asyncio.Event | None) -> bool:
@@ -178,7 +188,7 @@ class WorkerService:
         self._heartbeat_stop = threading.Event()
         self._infra_stop = threading.Event()  # shared stop for all infra threads
         # Legacy fields kept for compatibility
-        self._task: Optional[asyncio.Task] = None
+        self._task: Optional[threading.Thread] = None
         self._maintenance_task: Optional[threading.Thread] = None  # kept as thread
         self._runtime_config_task: Optional[threading.Thread] = None  # kept as thread
         self._guard_task: Optional[threading.Thread] = None  # kept as thread
@@ -377,14 +387,14 @@ class WorkerService:
         task = _running_tasks.get(task_id)
         if task is None:
             return False
-        if task.done():
+        if not task.is_alive():
             _running_tasks.pop(task_id, None)
             return False
         return True
 
     def local_running_count(self) -> int:
         """本 pod 当前正在运行的任务数（清理已完成的条目后统计）。"""
-        done = [tid for tid, t in _running_tasks.items() if t.done()]
+        done = [tid for tid, t in _running_tasks.items() if not t.is_alive()]
         for tid in done:
             _running_tasks.pop(tid, None)
         return len(_running_tasks)
@@ -446,27 +456,37 @@ class WorkerService:
             except StopIteration:
                 pass
 
-    def start_task(self, task_id: str) -> "asyncio.Task":
-        """Start a task as an asyncio.Task in the main event loop.
+    def start_task(self, task_id: str) -> threading.Thread:
+        """Start a task in a dedicated thread with its own asyncio event loop.
 
-        Infrastructure loops (_loop, _maintenance, _guard, _runtime_config) now run as
-        daemon threads, so the main event loop is exclusively for task execution.
-        Keeping tasks in the main loop is critical: AgentProcessSlotManager uses
-        asyncio.Lock/Event which MUST be used from a single event loop. Per-task
-        new_event_loop() caused cross-loop Future.set_result() failures in Python 3.11,
-        silently losing agent slot release wakeups → tasks deadlocked waiting for slots.
+        Long-running pipeline work must not run on the FastAPI/main loop, otherwise
+        task-list APIs become intermittently unavailable. AgentProcessSlotManager is
+        now cross-thread/event-loop safe, so per-task loops are safe again.
         """
         existing = _running_tasks.get(task_id)
-        if existing is not None and not existing.done():
+        if existing is not None and existing.is_alive():
             return existing
-        if existing is not None and existing.done():
+        if existing is not None and not existing.is_alive():
             _running_tasks.pop(task_id, None)
-        task = asyncio.create_task(
-            self._execute_task(task_id),
-            name=f"ea_task_{task_id}",
-        )
-        _running_tasks[task_id] = task
-        return task
+
+        def _run_in_own_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._execute_task(task_id))
+            except Exception as exc:
+                logger.error("task %s execution failed: %s", task_id, exc, exc_info=True)
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                _running_tasks.pop(task_id, None)
+
+        t = threading.Thread(target=_run_in_own_loop, name=f"ea_task_{task_id}", daemon=True)
+        _running_tasks[task_id] = t
+        t.start()
+        return t
 
     async def _discover_active_projects(self) -> list[str]:
         db_gen = get_db()

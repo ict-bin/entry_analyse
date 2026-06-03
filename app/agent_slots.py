@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import heapq
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.models import AGENT_PROCESS_LIMIT_DEFAULT, normalize_agent_process_limit
@@ -74,7 +75,8 @@ class AgentSlotTicket:
     stage_key: str | None
     role_kind: str | None
     requested_at: float
-    event: asyncio.Event = field(default_factory=asyncio.Event)
+    loop: asyncio.AbstractEventLoop | None = None
+    future: asyncio.Future | None = None
     cancelled: bool = False
     awarded: bool = False   # True 表示 release() 已将槽位直接转移到此 ticket
 
@@ -113,12 +115,12 @@ class AgentProcessSlotManager:
                   无 waiter 时才真正归还槽
     - set_capacity()：动态调整容量（受 EA_AGENT_PROCESS_LIMIT / AGENT_PROCESS_LIMIT_DEFAULT 硬限制）
 
-    线程安全：所有状态变更均在 asyncio.Lock 保护下进行。
+    线程安全：所有状态变更均在 threading.RLock 保护下进行；waiter 通过 loop.call_soon_threadsafe 跨线程唤醒。
     """
 
     def __init__(self, capacity: int) -> None:
         self.capacity = max(1, int(capacity or 1))
-        self._lock = asyncio.Lock()
+        self._lock = threading.RLock()
         # 堆元素：(priority: int, sequence: int, ticket: AgentSlotTicket)
         # sequence 保证相同 priority 时 FIFO；ticket 自身不参与比较
         self._waiters: list[tuple[int, int, AgentSlotTicket]] = []
@@ -153,9 +155,26 @@ class AgentProcessSlotManager:
             if ticket.cancelled:
                 continue
             ticket.awarded = True
-            ticket.event.set()
+            self._wake_ticket(ticket)
             return True
         return False
+
+    def _wake_ticket(self, ticket: AgentSlotTicket) -> None:
+        """Wake a waiter safely across task threads/event loops."""
+        fut = ticket.future
+        loop = ticket.loop
+        if fut is None or loop is None or fut.done():
+            return
+
+        def _set_result() -> None:
+            if not fut.done():
+                fut.set_result(True)
+
+        try:
+            loop.call_soon_threadsafe(_set_result)
+        except RuntimeError:
+            # Target loop is already closed; mark cancelled so later releases skip it.
+            ticket.cancelled = True
 
     # ── set_capacity ──────────────────────────────────────────────────────────
 
@@ -167,7 +186,7 @@ class AgentProcessSlotManager:
         返回最终生效的容量值。
         """
         new_capacity = normalize_agent_process_limit(capacity)
-        async with self._lock:
+        with self._lock:
             self.capacity = new_capacity
             # 扩容：逐个为新增槽分配给等待中的 waiter。
             # _award_next_waiter() 是 release 转移模式（不改 _in_use），
@@ -192,8 +211,9 @@ class AgentProcessSlotManager:
     ) -> AgentSlotLease:
         requested_at = time.time()
         entered_slow_path = False
+        loop = asyncio.get_running_loop()
 
-        async with self._lock:
+        with self._lock:
             self._sequence += 1
             ticket = AgentSlotTicket(
                 sequence=self._sequence,
@@ -202,6 +222,8 @@ class AgentProcessSlotManager:
                 stage_key=str(stage_key or "").strip() or None,
                 role_kind=str(role_kind or "").strip() or None,
                 requested_at=requested_at,
+                loop=loop,
+                future=loop.create_future(),
             )
 
             if self._in_use < self.capacity:
@@ -242,10 +264,9 @@ class AgentProcessSlotManager:
                 },
             )
 
-        # ── 等待被 release() 唤醒 ──
+        # ── 等待被 release()/set_capacity() 跨线程唤醒 ──
         while True:
-            wait_task = asyncio.create_task(ticket.event.wait())
-            tasks: set[asyncio.Task[Any]] = {wait_task}
+            tasks: set[asyncio.Future | asyncio.Task[Any]] = {ticket.future} if ticket.future is not None else set()
             cancel_task: asyncio.Task[Any] | None = None
             if cancel_event is not None:
                 cancel_task = asyncio.create_task(cancel_event.wait())
@@ -254,17 +275,13 @@ class AgentProcessSlotManager:
             try:
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for t in pending:
-                    t.cancel()
+                    if isinstance(t, asyncio.Task):
+                        t.cancel()
             except (asyncio.CancelledError, BaseException):
-                # 外层 asyncio.wait_for 超时注入 CancelledError：
-                # 必须在此清理孤儿 ticket，否则它留在 _waiters 堆里，
-                # 后续 release() 会把槽位转移给它（ticket.awarded=True），
-                # 但无协程等候 → slot 永久泏漏。
-                for t in tasks:
-                    t.cancel()
-                async with self._lock:
+                if cancel_task is not None:
+                    cancel_task.cancel()
+                with self._lock:
                     if ticket.awarded:
-                        # slot 已被转移过来但我们要撤退：传递给下一个 waiter 或归还
                         if not self._award_next_waiter():
                             self._in_use = max(0, self._in_use - 1)
                     else:
@@ -282,7 +299,7 @@ class AgentProcessSlotManager:
                 and cancel_event is not None
                 and cancel_event.is_set()
             ):
-                async with self._lock:
+                with self._lock:
                     if ticket.awarded:
                         # 槽位已转移给我们，但我们要取消——传递给下一个 waiter 或归还
                         if not self._award_next_waiter():
@@ -306,7 +323,7 @@ class AgentProcessSlotManager:
                 raise asyncio.CancelledError("agent slot wait cancelled")
 
             # ── 检查是否拿到槽 ──
-            async with self._lock:
+            with self._lock:
                 if ticket.cancelled:
                     raise asyncio.CancelledError("agent slot wait cancelled")
 
@@ -342,13 +359,13 @@ class AgentProcessSlotManager:
                         )
                     return lease
 
-                # 虚假唤醒（不应发生，防御性处理）
-                ticket.event.clear()
+                # 虚假唤醒（不应发生，防御性处理）：重建本 loop 的 future。
+                ticket.future = loop.create_future()
 
     # ── release ───────────────────────────────────────────────────────────────
 
     async def release(self, lease: AgentSlotLease) -> None:
-        async with self._lock:
+        with self._lock:
             self._leases.pop(id(lease), None)
             # 尝试将槽位直接转移给优先级最高的 waiter
             if self._award_next_waiter():
