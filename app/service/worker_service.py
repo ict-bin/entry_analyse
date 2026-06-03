@@ -1209,14 +1209,21 @@ class WorkerService:
                 observed_pids: set[int] = set()
                 from app.service.agent_observability import iter_local_agent_processes
 
-                for proc in await asyncio.wait_for(
-                    asyncio.to_thread(iter_local_agent_processes),
-                    timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS,
-                ):
-                    try:
-                        observed_pids.add(int(proc.get("pid")))
-                    except Exception:
-                        continue
+                try:
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                        proc_rows = _ex.submit(iter_local_agent_processes).result(
+                            timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS
+                        )
+                    for proc in proc_rows or []:
+                        try:
+                            observed_pids.add(int(proc.get("pid")))
+                        except Exception:
+                            continue
+                except _cf.TimeoutError:
+                    logger.warning(
+                        "suspected orphan scan timed out after %ss",
+                        WORKER_MAINTENANCE_TIMEOUT_SECONDS,
+                    )
                 self.reconcile_suspected_orphans(observed_pids)
                 self._record_phase_duration(self._maintenance_health, phase="cleanup_call", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
                 duration_ms = (time.perf_counter() - started) * 1000.0
