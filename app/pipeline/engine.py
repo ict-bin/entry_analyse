@@ -1460,18 +1460,12 @@ class PipelineEngine:
                         body_content=_prefetched_body,
                     )
                 _r3w_start = time.monotonic()
-                # 当函数体已预嵌入且不是重试时：禘1次调用，禁止所有 tool call
-                # Agent 只需读 prompt 中的预嵌内容直接输出结果，无需任何工具
-                _r3w_body_lines = _prefetched_body.count('\n') + 1 if _prefetched_body else 0
-                _r3w_tools: list[str] | None = None  # 默认使用 acfg.tools
-                if _prefetched_body and _r3w_body_lines <= 200 and not is_retry:
-                    _r3w_tools = []  # 全量禁用 tool，强制单轮输出
+                # 函数体已预嵌入时 prompt 已内联限制说明（最多1次bash），无需完全禁tool
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
                     context=f"r3_w:{func_hash}", acfg=acfg,
                     priority=SemPriority.R3_J if is_retry else SemPriority.R3_W,
-                    tools_override=_r3w_tools,
                 )
                 _r3w_dur = self._dur(_r3w_start)
                 _r3w_ti, _r3w_to = self._tok(ar)
@@ -1596,33 +1590,6 @@ class PipelineEngine:
                    func_hash=func_hash, function=func_state.name)
         try:
             # ── Pre-validation: has_external_input=false 直接通过 ──────────────────────
-            if not func_state.has_external_input:
-                _r3j_dur_auto = 0
-                _r3j_summary = "[auto-pass] has_external_input=false, 无需 J 审核"
-                result_file = dirs.stage_result_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
-                raw_file    = dirs.stage_raw_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
-                _r3j_auto_payload = {
-                    "stage": "r3_j", "attempt": func_state.r3_j_attempts, "scope": "func",
-                    "func_hash": func_hash, "file_hash": file_hash,
-                    "passed": True, "auto_pass": True, "summary": _r3j_summary,
-                    "feedback": _r3j_summary,
-                }
-                write_stage_result_files(result_file=result_file, raw_file=raw_file,
-                                         payload=_r3j_auto_payload, raw_text="[auto-pass]")
-                await self._aupsert(
-                    task_id=self.task_id, stage_key="r3_j", role_kind="judge",
-                    scope_kind="func", attempt=func_state.r3_j_attempts,
-                    file_hash=file_hash, func_hash=func_hash,
-                    status="passed", passed=True, summary=_r3j_summary,
-                    result_file_path=str(result_file), raw_file_path=str(raw_file),
-                    tokens_input=0, tokens_output=0, duration_ms=0,
-                )
-                self._emit("r3_j_done",
-                           func_hash=func_hash, function=func_state.name,
-                           passed=True, auto_pass=True,
-                           tokens_input=0, tokens_output=0, duration_ms=0)
-                return True, _r3j_summary
-
             # ── Pre-validation: taints 格式预检 ──────────────────────────────────
             # 如果 Worker 给出了明显格式错误的 taints，直接失败，不需要 agent
             import re as _re

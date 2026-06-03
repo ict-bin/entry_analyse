@@ -186,7 +186,7 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
             step1 = (
                 f"## 函数体（已预加载，共 {body_lines_capped} 行）\n"
                 f"```c\n{_body_escaped}\n```\n"
-                f"\n**函数体完整可信，无需任何 bash/read 工具。直接根据上方内容分析并输出 `<result>` 块。**\n"
+                f"\n**函数体已预加载，无需读取源文件或 funcdb。直接根据上方内容分析；如内容有疑问（截断或乱码），最多进行 1 次 bash 确认。**\n"
             )
         else:
             # 大函数：不嵌入全体，改用 awk 扫描
@@ -400,8 +400,11 @@ def build_r3_j_prompt(
         "```\n通过: 是\n摘要: taints 参数真实，P/A 分类自洽\n```\n\n"
         "或：\n\n"
         "```\n通过: 否\n摘要: <≤60字核心问题>\n反馈: <具体字段错误及正确値>\n```\n\n"
-        "**has_external_input=false 时直接输出 `通过: 是`。**\n"
-        "\n原则：只验证自洽性，不做跨函数漏判检测；遇异常默认通过。\n"
+        "**has_external_input=false 的快速反漏报检查**：\n"
+        "- 签名参数名含 buf/data/msg/packet/req 且体内有 I/O 调用 → **通过: 否**（W 漏判）\n"
+        "- 函数名含 handle/recv/dispatch/on_/callback 且体内有 I/O 调用 → **通过: 否**\n"
+        "- 两者均无 → 直接输出 `通过: 是`\n"
+        "\n原则：宁可误报不能漏报；遇读取异常默认通过。\n"
     )
 def build_r4_func_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
     """
