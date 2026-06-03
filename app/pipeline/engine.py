@@ -212,6 +212,86 @@ J_VERDICT_DELETE = "__DELETE__"
 J_VERDICT_SKIP   = "__SKIP__"   # 源文件函数体不完整，永久跳过
 
 
+def _r2_j_script_check(
+    func_name: str,
+    func_hash: str,
+    start_line: int,
+    end_line: int,
+    file_path: str,
+    w_result_payload: dict,
+) -> tuple[str | None, str]:
+    """
+    R2-J 脚本化预检。返回 (verdict, reason)。
+
+    verdict:
+      'pass'           — 行号正确
+      'pass_delete'    — 函数实际不存在
+      'pass_skip'      — SOURCE_INCOMPLETE 已确认
+      None             — 无法确定，转交 agent 处理
+
+    包括的检查：
+      1. 函数实在源文件中存在 -> 否则 pass_delete
+      2. Worker SOURCE_INCOMPLETE 声明 -> awk 验证
+      3. Worker 给出修正平行括号匹配 + 首/末行正确 -> pass
+      4. Worker NO_CORRECTIONS: 验证当前行号平行括号 + 首/末行 -> pass
+    """
+    try:
+        src_text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        lines = src_text.splitlines()
+
+        # 1. 函数存在性检查
+        func_in_file = any(f"{func_name}(" in ln for ln in lines)
+        if not func_in_file:
+            # 进一步检查带空格 / * 前缀（指针返回类型函数）
+            func_in_file = any(func_name in ln for ln in lines)
+        if not func_in_file:
+            return ("pass_delete", f"源文件中找不到 {func_name}()，应从 funcdb 删除")
+
+        # 2. SOURCE_INCOMPLETE 验证
+        if w_result_payload.get("source_incomplete"):
+            depth = 0
+            for idx, ln in enumerate(lines[start_line - 1:], start=start_line):
+                for ch in ln:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            # 找到闭合括号，Worker 判断有误
+                            return (None, f"awk 找到闭合括号 L{idx}，Worker SOURCE_INCOMPLETE 可能有误")
+            return ("pass_skip", "SOURCE_INCOMPLETE 已确认：未找到闭合括号")
+
+        # 3/4. 行号验证
+        corrections = w_result_payload.get("corrections") or []
+        if corrections:
+            c = corrections[0] if isinstance(corrections, list) else corrections
+            check_start = int(c.get("start_line") or start_line)
+            check_end   = int(c.get("end_line") or end_line)
+        else:
+            check_start, check_end = start_line, end_line
+
+        if check_start < 1 or check_end < check_start or check_end > len(lines):
+            return (None, f"check range [{check_start},{check_end}] 超出文件范围")
+
+        region = lines[check_start - 1 : check_end]
+        opens  = sum(ln.count("{") for ln in region)
+        closes = sum(ln.count("}") for ln in region)
+
+        first_ln = lines[check_start - 1] if check_start <= len(lines) else ""
+        last_ln  = lines[check_end - 1]   if check_end  <= len(lines) else ""
+        func_in_first = func_name in first_ln
+        last_is_close = last_ln.strip().startswith("}")
+
+        if opens == closes and opens >= 1 and func_in_first and last_is_close:
+            return ("pass", f"平行括号匹配 ({opens}={closes})，首末行正确")
+
+        # 花括号不匹配或首末行异常 -> 转交 agent
+        return (None, f"平括号 {opens}/{closes}，first_ok={func_in_first}，last_ok={last_is_close}")
+
+    except Exception as exc:
+        return (None, f"脚本检查异常: {exc}")
+
+
 def _parse_j_result(output: str) -> tuple[bool, str]:
     """从 Judge 输出中解析 (passed, feedback)。
 
@@ -1053,7 +1133,11 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> bool:
-        """R2-J：验证 ctags 提取的函数行号是否正确，返回 passed。"""
+        """R2-J：验证 ctags 提取的函数行号是否正确，返回 passed。
+
+        v5 改进：首先走脚本化检查（_r2_j_script_check），预期覆盖 90%+ 案例。
+        只有自动检查不能确定的边界情况才走 agent。
+        """
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_j_state = NodeState.RUNNING
         func_state.r2_j_attempts += 1
@@ -1065,28 +1149,73 @@ class PipelineEngine:
         self._emit("r2_j_start",
                    func_hash=func_hash, function=func_state.name,
                    file=Path(file_path).name)
+        ar = None  # 脚本化路径下无 agent 调用，initialize 防止 getattr 失败
         try:
-            acfg = self._judge_acfg()
-            sys_prompt = self._stage_sys_prompt('r2_judge')
-            # 使用 W 的最新结果文件（按 r2_w_attempts，而非 j_attempt）
+            # ── Step 1: 脚本化预检（IO 在线程池，防止阻塞事件循环）─────────────────
             worker_result_file = dirs.stage_result_file(
                 "r2_w", "worker", func_hash,
                 max(1, func_state.r2_w_attempts))
-            prompt = P.build_r2_j_prompt(
-                func_hash=func_hash,
-                func_name=func_state.name,
-                start_line=func_state.start_line,
-                end_line=func_state.end_line,
-                file_path=file_path,
-                worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
+            _w_payload: dict = {}
+            try:
+                if worker_result_file.exists():
+                    _w_payload = json.loads(worker_result_file.read_text(encoding="utf-8")) or {}
+                    # 调整为脚本检查所需格式
+                    _r2w_result = _w_payload.get("result") or {}
+                    if isinstance(_r2w_result, str):
+                        _r2w_result = {}
+                    _w_chk = {
+                        "source_incomplete": bool(_w_payload.get("source_incomplete") or _r2w_result.get("source_incomplete")),
+                        "corrections": _r2w_result.get("corrections") or [],
+                        "no_corrections": bool(_r2w_result.get("no_corrections") or _w_payload.get("status") == "no_corrections"),
+                    }
+                else:
+                    _w_chk = {}
+            except Exception:
+                _w_chk = {}
+
+            _script_verdict, _script_reason = await asyncio.to_thread(
+                _r2_j_script_check,
+                func_state.name, func_hash,
+                func_state.start_line, func_state.end_line,
+                file_path, _w_chk,
             )
-            ar = await self._call_agent(
-                prompt=prompt, system_prompt=sys_prompt,
-                session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
-                context=f"r2_j:{func_hash}", acfg=acfg,
-                priority=SemPriority.R2_J,
-            )
-            passed, feedback = _parse_j_result(ar.output)
+            logger.debug("R2-J script_check %s: verdict=%s reason=%s",
+                         func_hash, _script_verdict, _script_reason)
+
+            _r2j_start = time.monotonic()
+            if _script_verdict is not None:
+                # 脚本化检查给出确定结果，无需 agent
+                if _script_verdict == "pass_delete":
+                    passed, feedback = True, J_VERDICT_DELETE + _script_reason
+                elif _script_verdict == "pass_skip":
+                    passed, feedback = False, J_VERDICT_SKIP + _script_reason
+                else:  # 'pass'
+                    passed, feedback = True, f"[script] {_script_reason}"
+                _r2j_dur = self._dur(_r2j_start)
+                _r2j_ti, _r2j_to = 0, 0  # 无 agent 调用
+                self._emit("r2_j_script", func_hash=func_hash, function=func_state.name,
+                           verdict=_script_verdict, reason=_script_reason[:100])
+            else:
+                # ── Step 2: 苹果类基线 agent 处理边界情况 ────────────────────────
+                acfg = self._judge_acfg()
+                sys_prompt = self._stage_sys_prompt('r2_judge')
+                prompt = P.build_r2_j_prompt(
+                    func_hash=func_hash,
+                    func_name=func_state.name,
+                    start_line=func_state.start_line,
+                    end_line=func_state.end_line,
+                    file_path=file_path,
+                    worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
+                )
+                ar = await self._call_agent(
+                    prompt=prompt, system_prompt=sys_prompt,
+                    session_file=session_file, cwd=str(dirs.stage_cwd("r2_j")),
+                    context=f"r2_j:{func_hash}", acfg=acfg,
+                    priority=SemPriority.R2_J,
+                )
+                _r2j_dur = self._dur(_r2j_start)
+                _r2j_ti, _r2j_to = self._tok(ar)
+                passed, feedback = _parse_j_result(ar.output)
             # DELETE 裁定：函数不存在（宏定义等），从 funcdb 删除并强制通过
             delete_verdict = feedback.startswith(J_VERDICT_DELETE)
             if delete_verdict:
@@ -1142,8 +1271,9 @@ class PipelineEngine:
                     "summary": ("[SKIP] " + real_feedback)[:200],
                     "feedback": "[SKIP] " + real_feedback,
                 }
+                _r2j_raw = "[script]" if _script_verdict is not None else (getattr(ar, "output", None) or "")
                 write_stage_result_files(result_file=result_file, raw_file=raw_file,
-                                         payload=_skip_payload, raw_text=ar.output or "")
+                                         payload=_skip_payload, raw_text=_r2j_raw)
                 await self._aupsert(
                     task_id=self.task_id, stage_key="r2_j", role_kind="judge",
                     scope_kind="func", attempt=attempt,
@@ -1151,6 +1281,7 @@ class PipelineEngine:
                     status="incomplete", passed=False,
                     summary=("[SKIP] " + real_feedback)[:200],
                     result_file_path=str(result_file), raw_file_path=str(raw_file),
+                    tokens_input=_r2j_ti, tokens_output=_r2j_to, duration_ms=_r2j_dur,
                 )
                 self._emit("r2_source_incomplete",
                            func_hash=func_hash, function=func_state.name,
@@ -1176,10 +1307,12 @@ class PipelineEngine:
             }
             result_file = dirs.stage_result_file("r2_j", "judge", func_hash, attempt)
             raw_file = dirs.stage_raw_file("r2_j", "judge", func_hash, attempt)
-            write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
+            _r2j_raw2 = "[script]" if _script_verdict is not None else (getattr(ar, "output", None) or "")
+            write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=_r2j_raw2)
             await self._aupsert(task_id=self.task_id, stage_key="r2_j", role_kind="judge", scope_kind="func", attempt=attempt,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
-                                      summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
+                                      summary=feedback[:200], result_file_path=str(result_file), raw_file_path=str(raw_file),
+                                      tokens_input=_r2j_ti, tokens_output=_r2j_to, duration_ms=_r2j_dur)
             func_state.r2_j_feedback = feedback
             func_state.r2_j_state = NodeState.PASSED if passed else NodeState.FAILED
             if not passed and feedback:
@@ -1301,6 +1434,17 @@ class PipelineEngine:
                     body_lines = max(
                         0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
                     )
+                    # 预取函数体：funcdb 已存储 body，避免 agent 首轮 bash call
+                    _prefetched_body = ""
+                    try:
+                        from .funcdb import FunctionDB as _FDB3
+                        _rec3 = await asyncio.to_thread(
+                            lambda: _FDB3.open(dirs.r1, file_hash).get_function(func_hash)
+                        )
+                        if _rec3:
+                            _prefetched_body = str(_rec3.get("body") or "")
+                    except Exception as _be:
+                        logger.debug("R3-W body prefetch failed %s: %s", func_hash, _be)
                     prompt = P.build_r3_w_prompt(
                         func_hash=func_hash,
                         func_name=func_state.name,
@@ -1313,13 +1457,17 @@ class PipelineEngine:
                         is_retry=False,
                         feedback="",
                         judge_result_file="",
+                        body_content=_prefetched_body,
                     )
+                _r3w_start = time.monotonic()
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
                     session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
                     context=f"r3_w:{func_hash}", acfg=acfg,
                     priority=SemPriority.R3_J if is_retry else SemPriority.R3_W,
                 )
+                _r3w_dur = self._dur(_r3w_start)
+                _r3w_ti, _r3w_to = self._tok(ar)
 
                 analysis = _parse_r2_analysis(ar.output)
                 result_payload = {
@@ -1338,7 +1486,8 @@ class PipelineEngine:
                 write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
                 await self._aupsert(task_id=self.task_id, stage_key="r3_w", role_kind="worker", scope_kind="func", attempt=func_state.r3_w_attempts,
                                           file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
-                                          summary=str(result_payload["result"])[:200], result_file_path=str(result_file), raw_file_path=str(raw_file))
+                                          summary=str(result_payload["result"])[:200], result_file_path=str(result_file), raw_file_path=str(raw_file),
+                                          tokens_input=_r3w_ti, tokens_output=_r3w_to, duration_ms=_r3w_dur)
                 if analysis is not None:
                     has_input = bool(analysis.get("has_external_input", True))
                     func_state.has_external_input = has_input
@@ -1400,7 +1549,9 @@ class PipelineEngine:
                            func_hash=func_hash, function=func_state.name,
                            has_external_input=func_state.has_external_input,
                            entry_role=func_state.entry_role or None,
-                           r4_decision=func_state.r4_decision or None)
+                           r4_decision=func_state.r4_decision or None,
+                           tokens_input=_r3w_ti, tokens_output=_r3w_to,
+                           duration_ms=_r3w_dur)
                 break
 
             except Exception as exc:
@@ -1418,7 +1569,13 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> tuple[bool, str]:
-        """R2 Judge 函数级（每次新 session）。返回 (passed, summary)。"""
+        """R3 Judge 函数级（每次新 session）。返回 (passed, summary)。
+
+        v5 改进：
+          - has_external_input=false → 直接自动通过（占 60-80%，零 agent 调用）
+          - taints 格式预检（含中文/空格/括号 → 直接失败）
+          - 其余情况才走 agent
+        """
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r3_j_state = NodeState.RUNNING
         func_state.r3_j_attempts += 1
@@ -1431,6 +1588,72 @@ class PipelineEngine:
         self._emit("r3_j_start",
                    func_hash=func_hash, function=func_state.name)
         try:
+            # ── Pre-validation: has_external_input=false 直接通过 ──────────────────────
+            if not func_state.has_external_input:
+                _r3j_dur_auto = 0
+                _r3j_summary = "[auto-pass] has_external_input=false, 无需 J 审核"
+                result_file = dirs.stage_result_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
+                raw_file    = dirs.stage_raw_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
+                _r3j_auto_payload = {
+                    "stage": "r3_j", "attempt": func_state.r3_j_attempts, "scope": "func",
+                    "func_hash": func_hash, "file_hash": file_hash,
+                    "passed": True, "auto_pass": True, "summary": _r3j_summary,
+                    "feedback": _r3j_summary,
+                }
+                write_stage_result_files(result_file=result_file, raw_file=raw_file,
+                                         payload=_r3j_auto_payload, raw_text="[auto-pass]")
+                await self._aupsert(
+                    task_id=self.task_id, stage_key="r3_j", role_kind="judge",
+                    scope_kind="func", attempt=func_state.r3_j_attempts,
+                    file_hash=file_hash, func_hash=func_hash,
+                    status="passed", passed=True, summary=_r3j_summary,
+                    result_file_path=str(result_file), raw_file_path=str(raw_file),
+                    tokens_input=0, tokens_output=0, duration_ms=0,
+                )
+                self._emit("r3_j_done",
+                           func_hash=func_hash, function=func_state.name,
+                           passed=True, auto_pass=True,
+                           tokens_input=0, tokens_output=0, duration_ms=0)
+                return True, _r3j_summary
+
+            # ── Pre-validation: taints 格式预检 ──────────────────────────────────
+            # 如果 Worker 给出了明显格式错误的 taints，直接失败，不需要 agent
+            import re as _re
+            try:
+                from .funcdb import FunctionDB as _FDB_pre
+                _pre_data = _FDB_pre.open(dirs.r1, file_hash).get_function(func_hash)
+                if _pre_data:
+                    _pre_a = _pre_data.get("analysis") or {}
+                    if isinstance(_pre_a, str):
+                        import json as _json_pre; _pre_a = _json_pre.loads(_pre_a)
+                    _pre_taints = _pre_a.get("taints") or []
+                    _invalid_taints = [
+                        t for t in _pre_taints
+                        if not _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(t))
+                    ]
+                    if _invalid_taints:
+                        _r3j_fail_summary = f"[pre-fail] taints 格式非法: {_invalid_taints[:3]}"
+                        result_file = dirs.stage_result_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
+                        raw_file    = dirs.stage_raw_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
+                        write_stage_result_files(result_file=result_file, raw_file=raw_file,
+                                                 payload={"passed": False, "summary": _r3j_fail_summary}, raw_text="[pre-fail]")
+                        await self._aupsert(
+                            task_id=self.task_id, stage_key="r3_j", role_kind="judge",
+                            scope_kind="func", attempt=func_state.r3_j_attempts,
+                            file_hash=file_hash, func_hash=func_hash,
+                            status="failed", passed=False, summary=_r3j_fail_summary,
+                            result_file_path=str(result_file), raw_file_path=str(raw_file),
+                            tokens_input=0, tokens_output=0, duration_ms=0,
+                        )
+                        self._emit("r3_j_done",
+                                   func_hash=func_hash, function=func_state.name,
+                                   passed=False, pre_fail=True, summary=_r3j_fail_summary,
+                                   tokens_input=0, tokens_output=0, duration_ms=0)
+                        return False, _r3j_fail_summary
+            except Exception as _pre_exc:
+                logger.debug("R3-J pre-validation error %s: %s", func_hash, _pre_exc)
+
+            # ── 常规 agent 验证路径 ────────────────────────────────────────────
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r3_analysis_judge')
             worker_result_file = dirs.stage_result_file("r3_w", "worker", func_hash, max(1, func_state.r3_w_attempts))
@@ -1445,12 +1668,15 @@ class PipelineEngine:
                 db_path=db_path,
                 worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
             )
+            _r3j_start = time.monotonic()
             ar = await self._call_agent(
                 prompt=prompt, system_prompt=sys_prompt,
                 session_file=session_file, cwd=str(dirs.stage_cwd("r3_j")),
                 context=f"r3_j:{func_hash}", acfg=acfg,
                 priority=SemPriority.R3_J,
             )
+            _r3j_dur = self._dur(_r3j_start)
+            _r3j_ti, _r3j_to = self._tok(ar)
             passed, feedback = _parse_j_result(ar.output)
 
             # Engine 硬校验：仅针对有参函数校验 taints 非空
@@ -1500,7 +1726,8 @@ class PipelineEngine:
             write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
             await self._aupsert(task_id=self.task_id, stage_key="r3_j", role_kind="judge", scope_kind="func", attempt=func_state.r3_j_attempts,
                                       file_hash=file_hash, func_hash=func_hash, status="passed" if passed else "failed", passed=passed,
-                                      summary=summary, result_file_path=str(result_file), raw_file_path=str(raw_file))
+                                      summary=summary, result_file_path=str(result_file), raw_file_path=str(raw_file),
+                                      tokens_input=_r3j_ti, tokens_output=_r3j_to, duration_ms=_r3j_dur)
 
             func_state.r3_j_state = NodeState.PASSED if passed else NodeState.FAILED
             func_state.r3_j_feedback_summary = summary
@@ -1538,7 +1765,8 @@ class PipelineEngine:
             self._emit("r3_j_done",
                        func_hash=func_hash, function=func_state.name,
                        passed=passed, summary=summary,
-                       r4_decision=func_state.r4_decision or None)
+                       r4_decision=func_state.r4_decision or None,
+                       tokens_input=_r3j_ti, tokens_output=_r3j_to, duration_ms=_r3j_dur)
             return passed, summary
 
         except Exception as exc:
@@ -2345,6 +2573,20 @@ class PipelineEngine:
         可能导致租约续期线程的连接池等待超时。
         """
         await asyncio.to_thread(lambda: upsert_stage_result_index(**kwargs))
+
+    @staticmethod
+    def _tok(ar) -> tuple[int, int]:
+        """从 AgentResult 提取 (tokens_input, tokens_output)，不存在时返回 (0,0)。"""
+        try:
+            u = ar.token_usage
+            return int(u.input or 0), int(u.output or 0)
+        except Exception:
+            return 0, 0
+
+    @staticmethod
+    def _dur(start: float) -> int:
+        """从 monotonic start 计算 duration_ms。"""
+        return max(0, int((time.monotonic() - start) * 1000))
 
     def _stage_sys_prompt(self, stage: str) -> str:
         pipeline_dir = os.path.abspath(

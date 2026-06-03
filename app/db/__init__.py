@@ -56,6 +56,10 @@ _MIGRATIONS = [
     "CREATE INDEX ix_ea_stage_result_task_stage_role_attempt ON secflow_app_ea_stage_result_index (task_id, stage_key, role_kind, attempt)",
     "CREATE INDEX ix_ea_stage_result_task_func_stage ON secflow_app_ea_stage_result_index (task_id, func_hash, stage_key)",
     "CREATE INDEX ix_ea_stage_result_task_file_stage ON secflow_app_ea_stage_result_index (task_id, file_hash, stage_key)",
+    # Add token usage and duration tracking per stage (added 2026-06)
+    "ALTER TABLE secflow_app_ea_stage_result_index ADD COLUMN tokens_input INT NULL",
+    "ALTER TABLE secflow_app_ea_stage_result_index ADD COLUMN tokens_output INT NULL",
+    "ALTER TABLE secflow_app_ea_stage_result_index ADD COLUMN duration_ms INT NULL",
     """
     CREATE TABLE secflow_app_ea_worker_slots (
         id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,

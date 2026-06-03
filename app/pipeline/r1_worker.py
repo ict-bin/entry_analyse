@@ -249,13 +249,15 @@ def build_r1_w_initial_prompt(
     gaps: "list | None" = None,  # deprecated, ignored
 ) -> str:
     """
-    R1-W 首次 prompt：文件级覆盖率检查（Gap 文件模式）。
+    R1-W 首次 prompt：文件级覆盖率检查（Gap 内嵌模式）。
 
-    Gap 内容单独存储到 {file_hash}_gaps.json，
-    通过 sed 读取，不嵌入 prompt，避免大文件时 prompt 超大。
+    v5 改进：gap 代码直接嵌入 prompt（每个 gap 最多嵌入 80 行），
+    消除首轮 'cat gaps_file' + N次 'sed -n' bash call。
+    超出嵌入限制的 gap 保留 sed 指引。
 
     gaps_llm_file_path: 经预筛后只含 LLM 需审查条目的 gaps 文件，若提供则 W 使用此文件而非全量文件。
     """
+    import json as _json
     basename = os.path.basename(file_path)
     abs_path = os.path.abspath(file_path)
     db_path  = dirs.r1_functions_db(file_hash)
@@ -272,32 +274,87 @@ def build_r1_w_initial_prompt(
     _display_gap_file = gaps_llm_file_path or gaps_file_path
     _has_gap_file     = bool(_display_gap_file and _display_gap_file.exists())
 
+    # 预读 gap 文件内容 + 源文件行，构建内嵌块
+    _INLINE_MAX_GAPS    = 30   # 内嵌最多 30 个 gap
+    _INLINE_MAX_LINES   = 80   # 单个 gap 最多嵌入 80 行
+    _INLINE_TOTAL_CHARS = 12000  # 总内嵌字符上限
+
+    gap_instruction = ""
     if _has_gap_file:
         _skipped_hint = (
             f"（已预筛：{skipped_n} 个 gap 确认为 extern/macro/comment/typedef，无需检查）\n\n"
             if skipped_n > 0 else ""
         )
-        gap_instruction = (
-            f"## Gap 文件（ctags 未覆盖的行区间）\n\n"
-            f"{_skipped_hint}"
-            f"请读取 gap 信息文件：\n\n"
-            f"```bash\n"
-            f"cat {_display_gap_file}\n"
-            f"```\n\n"
-            f"每个 gap 条目包含 `start`/`end`/`lines`/`kind` 字段。"
-            f"对于每个 gap，用 sed 查看具体内容：\n\n"
-            f"```bash\n"
-            f"sed -n '<start>,<end>p' {abs_path}\n"
-            f"```\n\n"
-            f"如需确认某函数是否已在 funcdb 中，优先使用：\n\n"
-            f"```bash\n"
-            f"python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>\n"
-            f"python3 /opt/entry_analyse/scripts/ea_db.py between-lines {db_path} <start> <end>\n"
-            f"```\n\n"
-            f"⚠️ 不要用 `grep` / `strings` 直接扫描 `.db` 文件。"
-            f" `ea_db.py` 若未命中也会返回结构化 JSON（如 `rows: []`），这表示查询成功。"
-            f" 判断是否有完整函数定义（有函数体 `{{` ... `}}`）则输出新增修正。"
-        )
+        try:
+            _gaps_data = _json.loads(_display_gap_file.read_text(encoding="utf-8"))
+        except Exception:
+            _gaps_data = []
+
+        # 尝试预读源文件行
+        try:
+            _src_lines = Path(abs_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            _src_lines = []
+
+        if _gaps_data and _src_lines:
+            # 内嵌 gap 代码段
+            _inline_parts: list[str] = []
+            _fallback_gaps: list[dict] = []
+            _total_chars = 0
+            for _g in _gaps_data[:_INLINE_MAX_GAPS]:
+                _gs, _ge = int(_g.get("start", 0)), int(_g.get("end", 0))
+                _glines  = _ge - _gs + 1
+                if _glines <= 0:
+                    continue
+                if len(_inline_parts) < _INLINE_MAX_GAPS and _total_chars < _INLINE_TOTAL_CHARS:
+                    _snippet = _src_lines[_gs - 1: min(_ge, _gs + _INLINE_MAX_LINES - 1)]
+                    _truncated = _ge - _gs + 1 > _INLINE_MAX_LINES
+                    _snippet_text = "\n".join(_snippet)
+                    _total_chars += len(_snippet_text)
+                    _label = f"Gap L{_gs}-{_ge} ({_glines}行, kind={_g.get('kind','?')})"
+                    if _truncated:
+                        _label += f" [展示前{_INLINE_MAX_LINES}行，剩余用 sed -n '{_gs},{_ge}p' {abs_path}]"
+                    _inline_parts.append(f"### {_label}\n```c\n{_snippet_text}\n```")
+                else:
+                    _fallback_gaps.append(_g)
+
+            _inline_block = "\n\n".join(_inline_parts)
+            _fallback_block = ""
+            if _fallback_gaps:
+                _fb_lines = []
+                for _fg in _fallback_gaps:
+                    _fs, _fe = _fg["start"], _fg["end"]
+                    _fb_lines.append(
+                        f"- L{_fs}-{_fe} ({_fg.get('lines','?')}行, kind={_fg.get('kind','?')}): "
+                        f"`sed -n '{_fs},{_fe}p' {abs_path}`"
+                    )
+                _fallback_block = (
+                    f"\n\n### 剩余 Gap（请用 sed 查看）\n" + "\n".join(_fb_lines)
+                )
+
+            gap_instruction = (
+                f"## Gap 区间（ctags 未覆盖的行）\n\n"
+                f"{_skipped_hint}"
+                f"共 {len(_gaps_data)} 个 gap，代码已内嵌如下（无需额外读取）：\n\n"
+                f"{_inline_block}"
+                f"{_fallback_block}\n\n"
+                f"确认某函数是否已在 funcdb：\n"
+                f"```bash\n"
+                f"python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>\n"
+                f"python3 /opt/entry_analyse/scripts/ea_db.py between-lines {db_path} <start> <end>\n"
+                f"```\n"
+                f"⚠️ 不要用 `grep` / `strings` 直接扫描 `.db` 文件。"
+            )
+        else:
+            # 异常回退到旧模式
+            gap_instruction = (
+                f"## Gap 文件（ctags 未覆盖的行区间）\n\n"
+                f"{_skipped_hint}"
+                f"请读取 gap 信息文件：\n\n"
+                f"```bash\nclecat {_display_gap_file}\n```\n\n"
+                f"对每个 gap 用 sed 查看：`sed -n '<start>,<end>p' {abs_path}`\n"
+                f"确认函数：`python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>`\n"
+            )
     else:
         gap_instruction = (
             f"## Gap 检查\n\n"
@@ -413,11 +470,12 @@ def build_r2_w_prompt(
     is_retry: bool = False,
     feedback: str = "",
     judge_result_file: str = "",
+    body_content: str = "",  # 预取函数体，提供时替代首个 sed
 ) -> str:
     """
     R2-W prompt：单函数行号/签名准确性校正。
 
-    LLM 职责：用 bash sed 实际读取指定行，确认/修正 start_line/end_line。
+    body_content 提供时，直接嵌入函数体内容，无需首个 sed 读取。
     """
     basename = os.path.basename(file_path)
     abs_path = os.path.abspath(file_path)
@@ -428,12 +486,32 @@ def build_r2_w_prompt(
     if is_retry and judge_result_file:
         retry_section += f"\n**上一轮 Judge 结果文件**：`{judge_result_file}`（请先读取该文件再修正）\n"
 
+    # 嵌入预取的函数体（最多 120 行，超出时保留 sed 指引）
+    if body_content and not is_retry:
+        _body_lines_n = body_content.count('\n') + 1
+        if _body_lines_n <= 120:
+            _body_block = (
+                f"**函数体**（已预加载，共 {_body_lines_n} 行）：\n"
+                f"```c\n{body_content[:6000]}\n```\n"
+                f"如上方内容不完整，请用 `sed -n '{start_line},{end_line}p' {abs_path}` 重新获取。\n"
+            )
+        else:
+            _body_block = (
+                f"**步骤 1**：读取当前范围内容：\n"
+                f"```bash\nsed -n '{start_line},{end_line}p' {abs_path}\n```\n"
+            )
+    else:
+        _body_block = (
+            f"**步骤 1**：读取当前范围内容：\n"
+            f"```bash\nsed -n '{start_line},{end_line}p' {abs_path}\n```\n"
+        )
+
     return (
         f"# Round 1b — 函数准确性校正：`{func_name}` in `{basename}`\n\n"
         f"当前记录：start_line={start_line}, end_line={end_line}\n"
         f"{retry_section}\n"
         f"## 执行步骤\n\n"
-        f"1. 用 `sed -n '{start_line},{end_line}p' {abs_path}` 查看当前范围内容\n\n"
+        f"{_body_block}\n"
         f"2. 确认：\n"
         f"   - 第一行是否包含函数名（不是注释行）\n"
         f"   - 最后一行是否是 `}}` 闭合括号\n"
@@ -795,6 +873,14 @@ async def run_r2_w_worker(
             feedback=feedback,
         )
     else:
+        # 首次调用：预取 funcdb 中存储的 body，嵌入 prompt除一个 sed bash call
+        _r2w_body = ""
+        try:
+            _rec_r2w = db.get_function(func_hash)
+            if _rec_r2w:
+                _r2w_body = str(_rec_r2w.get("body") or "")
+        except Exception:
+            pass
         prompt = build_r2_w_prompt(
             func_hash=func_hash,
             func_name=func_name,
@@ -804,6 +890,7 @@ async def run_r2_w_worker(
             is_retry=is_retry,
             feedback=feedback,
             judge_result_file=j_result_path,
+            body_content=_r2w_body,
         )
 
     ar: AgentResult = await run_agent(

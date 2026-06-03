@@ -215,5 +215,8 @@ class AppEaStageResultIndex(Base):
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     raw_file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    tokens_input: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_output: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)

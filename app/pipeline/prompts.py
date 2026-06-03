@@ -151,17 +151,18 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
     end_line: int,
     body_lines: int,
     file_path: str,
-    db_path: Path,
+    db_path: "Path",
     is_retry: bool = False,
     feedback: str = "",
     judge_result_file: str = "",
+    body_content: str = "",   # 预取函数体，提供时替代首个 bash call
 ) -> str:
     """
-    R2 Worker：分析单个函数是否有外部输入。
+    R3-W prompt：分析单个函数是否有外部输入。
 
-    - 初始 prompt 只含元数据（~700字节），函数体按需 bash 获取
+    - body_content 提供时：直接嵌入函数体，剪去首个 bash 读取步骤（减少 1-2 次 tool call）
+    - body_content 为空：保留原有三档策略（sed/python3/awk）
     - retry feedback 格式：【评审摘要：xxx】详细见文件：path（由 engine 注入）
-    - 三档策略：≤60行 sed 全量 / 61-200行 python3 关键字扫描 / >200行 awk 过滤
     """
     basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
@@ -176,7 +177,32 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
     )
 
     # ── 三档策略 ──────────────────────────────────────────────────────────────
-    if body_lines <= 60:
+    # 预取 body 存在时：直接嵌入，跳过 bash step1
+    if body_content and not is_retry:
+        # 限制嵌入长度（最多 200 行 / 8000 字符），超出部分需要 Agent 自行读取
+        body_lines_capped = body_content.count('\n') + 1
+        if body_lines_capped <= 200:
+            _body_escaped = body_content[:8000]
+            step1 = (
+                f"**函数体**（共 {body_lines_capped} 行，已预加载）：\n"
+                f"```c\n{_body_escaped}\n```\n"
+                f"\n⚠️ 如上方内容截断或不完整，请用 `sed -n '{start_line},{end_line}p' {file_path}` 重新获取。\n"
+            )
+        else:
+            # 大函数：不嵌入全体，改用 awk 扫描
+            step1 = (
+                f"**步骤 1**：awk 行级扫描外部 I/O 调用（共 {body_lines} 行，只返回命中行）：\n"
+                f"```bash\n"
+                f"awk 'NR>={start_line} && NR<={end_line} && \\\n"
+                f"     /{_AWK_REGEX}/ \\\n"
+                f"     {{print NR" + chr(34) + f": " + chr(34) + f"$0}}' {file_path}\n"
+                f"```\n"
+                f"并读取函数签名行：\n"
+                f"```bash\n"
+                f"sed -n '{start_line}p' {file_path}\n"
+                f"```\n"
+            )
+    elif body_lines <= 60:
         step1 = (
             f"**步骤 1**：读取完整函数体（共 {body_lines} 行）：\n"
             f"```bash\n"

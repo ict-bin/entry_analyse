@@ -118,6 +118,9 @@ def upsert_stage_result_index(
     summary: str = "",
     result_file_path: str = "",
     raw_file_path: str = "",
+    tokens_input: int = 0,
+    tokens_output: int = 0,
+    duration_ms: int | None = None,
 ) -> None:
     db_gen = get_db()
     db = next(db_gen)
@@ -148,6 +151,9 @@ def upsert_stage_result_index(
         row.summary = summary[:1000] if summary else None
         row.result_file_path = result_file_path or None
         row.raw_file_path = raw_file_path or None
+        row.tokens_input = tokens_input or None
+        row.tokens_output = tokens_output or None
+        row.duration_ms = duration_ms
         db.commit()
     finally:
         try:
