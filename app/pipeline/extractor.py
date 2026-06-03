@@ -59,18 +59,23 @@ def compute_func_hash(file_path: str, func_name: str, start_line: int) -> str:
 # ─── tree-sitter 提取 ────────────────────────────────────────────────────────
 
 _TS_AVAILABLE: bool | None = None   # None = 未检测
-_TS_PARSER = None                   # 全局 Parser 实例，复用避免重复初始化
+_TS_PARSER_C   = None               # C   语言 Parser
+_TS_PARSER_CPP = None               # C++ 语言 Parser
+
+# C++ 源文件扩展名集合
+_CPP_EXTENSIONS = frozenset({".cc", ".cpp", ".cxx", ".c++", ".C",
+                              ".hh", ".hpp", ".hxx", ".h++"})
 
 
 def _check_tree_sitter() -> bool:
-    """检测 tree-sitter + tree-sitter-c 是否可用，结果缓存。"""
-    global _TS_AVAILABLE, _TS_PARSER
+    """检测 tree-sitter + tree-sitter-c/cpp 是否可用，结果缓存。"""
+    global _TS_AVAILABLE, _TS_PARSER_C, _TS_PARSER_CPP
     if _TS_AVAILABLE is not None:
         return _TS_AVAILABLE
     try:
         from tree_sitter import Language, Parser  # type: ignore
         import tree_sitter_c  # type: ignore
-        _TS_PARSER = Parser(Language(tree_sitter_c.language()))
+        _TS_PARSER_C = Parser(Language(tree_sitter_c.language()))
         _TS_AVAILABLE = True
     except Exception as exc:
         _TS_AVAILABLE = False
@@ -79,7 +84,28 @@ def _check_tree_sitter() -> bool:
             "Install with: pip install tree-sitter tree-sitter-c",
             exc,
         )
-    return _TS_AVAILABLE
+        return False
+    # 尝试加载 C++ 解析器（可选，不影响 C 文件提取）
+    try:
+        from tree_sitter import Language, Parser  # type: ignore
+        import tree_sitter_cpp  # type: ignore
+        _TS_PARSER_CPP = Parser(Language(tree_sitter_cpp.language()))
+        logger.info("tree-sitter-cpp loaded: C++ files will use C++ parser")
+    except Exception as exc:
+        logger.warning(
+            "tree-sitter-cpp not available, C++ files fall back to C parser: %s. "
+            "Install with: pip install tree-sitter-cpp",
+            exc,
+        )
+    return True
+
+
+def _get_parser_for_file(file_path: str):
+    """根据文件扩展名返回合适的 Parser（C++ 文件优先用 CPP parser）。"""
+    ext = Path(file_path).suffix.lower()
+    if ext in _CPP_EXTENSIONS and _TS_PARSER_CPP is not None:
+        return _TS_PARSER_CPP
+    return _TS_PARSER_C
 
 
 def _ts_extract_name(node) -> str:
@@ -161,7 +187,7 @@ def _extract_functions_tree_sitter(
 
     支持错误恢复：损坏内容被标记为 ERROR 节点后，后续正常函数仍可提取。
     """
-    parser = _TS_PARSER
+    parser = _get_parser_for_file(file_path)
     content = "\n".join(lines)
     tree = parser.parse(bytes(content, "utf-8"))
 
