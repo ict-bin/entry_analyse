@@ -19,6 +19,7 @@ entry_analyse — API Filter (Direct LLM API, no pi subprocess)
   EA_API_FILTER_MAX_RETRIES  默认 2
 """
 from __future__ import annotations
+import re as _re
 
 import asyncio
 import json
@@ -103,6 +104,73 @@ def _load_provider_config(model: str) -> tuple[str, str, str]:
 
 
 # ─── 单次 HTTP 请求 ────────────────────────────────────────────────────────────
+
+
+# ─── Python 侧确定性预筛 ───────────────────────────────────────────────────────────
+
+_ACTIVE_IO_PAT = _re.compile(
+    r'(recv|recvfrom|recvmsg|accept|fread|fgets|getline|fopen|open|pread|readv|ioctl|mmap|'
+    r'mq_receive|msgrcv|MsgReceive|MsgRead|yajl_tree_parse|json_tokener_parse|'
+    r'cJSON_Parse|grpc_|http_request)\s*\(',
+    _re.I
+)
+
+_INTERNAL_NAME_PAT = _re.compile(
+    r'^(make_sure_|make_|merge_|set_(?!sec|up|socket|opts)|alloc_|free_|init_|update_|'
+    r'convert_|fill_|build_|format_|validate_|verify_|check_|is_|has_|add_|del_|'
+    r'remove_|clean_|clear_|reset_|copy_|clone_|dup_|print_|log_|dump_|debug_)',
+    _re.I
+)
+
+_ENTRY_NAME_HINT_PAT = _re.compile(
+    r'(parse|handle|dispatch|recv|receive|serve|on_|process_msg|request|'
+    r'register|callback|hook)',
+    _re.I
+)
+
+
+def _prefilter_is_entry(func_name: str, signature: str, body: str) -> "bool | None":
+    """
+    Python 侧确定性预筛，不调用 LLM。
+    True  -> 函数体含 I/O 系统调用，是入口
+    False -> 内部函数模式且无原始指针，不是入口
+    None  -> 不确定，交给 LLM
+    """
+    import re as _r2
+
+    # 1. 函数体含系统调用/解析调用 -> 是入口
+    _io = _r2.compile(
+        "recv|recvfrom|recvmsg|accept|fread|fgets|getline"
+        r"|fopen\s*[(]|pread|readv|ioctl|mmap\s*[(]"
+        r"|stat\s*[(]|lstat\s*[(]|readdir|scandir"
+        "|mq_receive|msgrcv|MsgReceive|MsgRead"
+        "|yajl_tree_parse|json_tokener_parse|cJSON_Parse"
+        "|grpc_|http_request",
+        _r2.I
+    )
+    if _io.search(body):
+        return True
+
+    # 2. 内部函数命名模式 -> 不是入口
+    _int = _r2.compile(
+        "^(make_sure_|make_|merge_|set_|alloc_|free_|init_|update_"
+        "|convert_|fill_|build_|format_|validate_|verify_"
+        "|check_|is_|has_|add_|del_|remove_|clean_|clear_"
+        "|reset_|copy_|clone_|dup_|print_|log_|dump_|debug_)",
+        _r2.I
+    )
+    if _int.match(func_name):
+        return False
+
+    # 3. 签名含原始 char* 指针 -> 可能是入口，交 LLM
+    _raw = _r2.compile(r"(const\s+char|unsigned\s+char|uint8_t|void)\s*[*]")
+    if _raw.search(signature):
+        return None
+
+    # 4. 只有结构体参数 -> 内部处理层
+    return False
+
+
 
 async def _call_llm_once(
     base_url: str,
@@ -237,6 +305,15 @@ async def api_filter_function(
     body_capped = body[:_MAX_BODY_CHARS]
     if len(body) > _MAX_BODY_CHARS:
         body_capped += f"\n... (truncated, total {len(body)} chars)"
+
+    # ── Python 侧确定性预筛（不调用 LLM，速度极快）────────────────────────────────
+    _pre = _prefilter_is_entry(func_name, signature, body_capped)
+    if _pre is True:
+        logger.debug("api_filter prefilter: %s -> is_entry=1 (IO syscall found)", func_name)
+        return True, 0
+    if _pre is False:
+        logger.debug("api_filter prefilter: %s -> is_entry=0 (internal pattern)", func_name)
+        return False, 0
 
     messages = [
         {"role": "system",  "content": _SYSTEM_PROMPT},
