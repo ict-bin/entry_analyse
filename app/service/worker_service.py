@@ -1,6 +1,7 @@
 """Worker execution service for entry-analysis tasks."""
 
 from __future__ import annotations
+import sys
 
 import asyncio
 import json
@@ -28,7 +29,13 @@ from app.time_utils import now_local
 
 logger = logging.getLogger("ea.worker")
 
-_running_tasks: dict[str, asyncio.Task] = {}
+
+async def _schedule_dispatch_async(svc, project_id: str) -> None:
+    """Async wrapper for schedule_dispatch — callable via run_coroutine_threadsafe."""
+    svc.schedule_dispatch(project_id)
+
+
+_running_tasks: dict[str, threading.Thread] = {}
 # task_id -> asyncio.Event: 外部信号立即唤醒 _watch_task_control，无需等待轮询间隔
 _cancel_wake: dict[str, asyncio.Event] = {}
 _local_cancel_events: dict[str, asyncio.Event] = {}
@@ -162,13 +169,21 @@ async def _wait_cancel_first(delay: float, cancel_event: asyncio.Event | None) -
 class WorkerService:
     def __init__(self):
         self._running = False
-        self._task: Optional[asyncio.Task] = None
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        # Infrastructure loops run as daemon threads (no asyncio)
+        self._loop_thread: Optional[threading.Thread] = None
+        self._maintenance_thread: Optional[threading.Thread] = None
+        self._runtime_config_thread: Optional[threading.Thread] = None
+        self._guard_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
-        self._maintenance_task: Optional[asyncio.Task] = None
-        self._runtime_config_task: Optional[asyncio.Task] = None
-        self._guard_task: Optional[asyncio.Task] = None
+        self._infra_stop = threading.Event()  # shared stop for all infra threads
+        # Legacy fields kept for compatibility
+        self._task: Optional[threading.Thread] = None
+        self._maintenance_task: Optional[threading.Thread] = None
+        self._runtime_config_task: Optional[threading.Thread] = None
+        self._guard_task: Optional[threading.Thread] = None
+        # Main asyncio event loop reference (set by asyncio context, used by threads)
+        self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._runtime_config = WorkerRuntimeConfigSnapshot()
         self._heartbeat_health = WorkerLoopHealthSnapshot()
         self._lease_health = WorkerLoopHealthSnapshot()
@@ -362,14 +377,14 @@ class WorkerService:
         task = _running_tasks.get(task_id)
         if task is None:
             return False
-        if task.done():
+        if not task.is_alive():
             _running_tasks.pop(task_id, None)
             return False
         return True
 
     def local_running_count(self) -> int:
         """本 pod 当前正在运行的任务数（清理已完成的条目后统计）。"""
-        done = [tid for tid, t in _running_tasks.items() if t.done()]
+        done = [tid for tid, t in _running_tasks.items() if not t.is_alive()]
         for tid in done:
             _running_tasks.pop(tid, None)
         return len(_running_tasks)
@@ -431,18 +446,32 @@ class WorkerService:
             except StopIteration:
                 pass
 
-    def start_task(self, task_id: str) -> asyncio.Task:
+    def start_task(self, task_id: str) -> threading.Thread:
+        """Start a task in a dedicated thread with its own asyncio event loop."""
         existing = _running_tasks.get(task_id)
-        if existing is not None and not existing.done():
+        if existing is not None and existing.is_alive():
             return existing
-        if existing is not None and existing.done():
+        if existing is not None and not existing.is_alive():
             _running_tasks.pop(task_id, None)
-        task = asyncio.create_task(
-            self._execute_task(task_id),
-            name=f"ea_task_{task_id}",
-        )
-        _running_tasks[task_id] = task
-        return task
+
+        def _run_in_own_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._execute_task(task_id))
+            except Exception as exc:
+                logger.error("task %s execution failed: %s", task_id, exc, exc_info=True)
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                _running_tasks.pop(task_id, None)
+
+        t = threading.Thread(target=_run_in_own_loop, name=f"ea_task_{task_id}", daemon=True)
+        _running_tasks[task_id] = t
+        t.start()
+        return t
 
     async def _discover_active_projects(self) -> list[str]:
         db_gen = get_db()
@@ -688,6 +717,53 @@ class WorkerService:
             except StopIteration:
                 pass
 
+    def _discover_active_projects_sync(self) -> list[str]:
+        """Sync version of project discovery — safe to call from threads."""
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            from app.db.models import AppEaTask as _AEATask
+            rows = (
+                db.query(_AEATask.project_id)
+                .filter(
+                    _AEATask.is_deleted.is_(False),
+                    _AEATask.status.in_(["pending", "running"]),
+                )
+                .distinct()
+                .all()
+            )
+            return [str(r[0]) for r in rows if r and r[0]]
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _loop_thread_body(self) -> None:
+        """Dispatch polling loop — runs as a daemon thread, no asyncio."""
+        from app.service import task_service as task_mod
+
+        while self._running and not self._infra_stop.wait(timeout=WORKER_POLL_SECONDS):
+            self._main_loop_last_tick_at = time.time()
+            self._set_startup_phase("dispatch_polling")
+            try:
+                project_ids = self._discover_active_projects_sync()
+                svc = task_mod.get_task_service()
+                loop = self._main_event_loop
+                for project_id in project_ids:
+                    if loop is not None and loop.is_running():
+                        # schedule_dispatch needs asyncio (creates asyncio.Task internally)
+                        asyncio.run_coroutine_threadsafe(
+                            _schedule_dispatch_async(svc, project_id), loop
+                        )
+                    else:
+                        svc.schedule_dispatch(project_id)
+            except Exception as exc:
+                with self._health_server_lock:
+                    self._health_server_snapshot.last_error = f"worker_loop: {exc}"
+                logger.warning("worker poll failed: %s", exc)
+
+    # Keep async version for backward compat (no longer used in start())
     async def _loop(self) -> None:
         from app.service import task_service as task_mod
 
@@ -704,18 +780,18 @@ class WorkerService:
                 logger.warning("worker poll failed: %s", exc)
             await asyncio.sleep(WORKER_POLL_SECONDS)
 
-    async def _runtime_config_loop(self) -> None:
+    def _runtime_config_thread_body(self) -> None:
+        """Runtime config refresh loop — daemon thread, no asyncio."""
         from app.service import task_service as task_mod
-        while self._running:
+
+        while self._running and not self._infra_stop.wait(timeout=RUNTIME_CONFIG_REFRESH_SECONDS):
             started = time.perf_counter()
             try:
-                project_ids = await self._discover_active_projects()
+                project_ids = self._discover_active_projects_sync()
                 db_gen = get_db()
-                db: Session = next(db_gen)
+                db = next(db_gen)
                 try:
                     max_concurrent_tasks_values: list[int] = []
-                    # agent_process_limit: None/0 表示“该 project 不限制”，不参与 min 计算
-                    # 只有明确配置了正整数的才参与
                     agent_process_limit_values: list[int] = []
                     if project_ids:
                         for project_id in project_ids:
@@ -725,8 +801,6 @@ class WorkerService:
                             if _apl > 0:
                                 agent_process_limit_values.append(_apl)
                     else:
-                        # 无活距任务时，仍从 DB 读取所有已配置 project 的配置（而非回退到 file config）
-                        # 避免 file config 默认展 8 排挤了 DB 里配置的正确限制
                         from app.db.models import AppEaProjectConfig as _EaPC
                         all_project_rows = db.query(_EaPC.project_id).all()
                         all_project_ids = [str(r[0]) for r in all_project_rows if r and r[0]]
@@ -740,107 +814,45 @@ class WorkerService:
                             except Exception:
                                 pass
                         if not max_concurrent_tasks_values:
-                            max_concurrent_tasks_values.append(1)  # 保底默认値
+                            max_concurrent_tasks_values.append(1)
                 finally:
                     try:
                         next(db_gen)
                     except StopIteration:
                         pass
                 max_concurrent_tasks = max(1, min(max_concurrent_tasks_values))
-                # agent_process_limit 取 max：各 project 按自身需求，worker 满足最高需求
-                # 无 project 显式配置时回退到环境变量
                 _default_apl = int(os.environ.get("EA_AGENT_PROCESS_LIMIT", "8") or "8")
                 agent_process_limit = max(1, max(agent_process_limit_values)) if agent_process_limit_values else _default_apl
                 agent_manager = get_agent_process_slot_manager()
-                await agent_manager.set_capacity(agent_process_limit)
+                # set_capacity is async — call via event loop if available
+                loop = self._main_event_loop
+                if loop is not None and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(agent_manager.set_capacity(agent_process_limit), loop)
+                duration_ms = (time.perf_counter() - started) * 1000.0
                 self._runtime_config = WorkerRuntimeConfigSnapshot(
                     max_concurrent_tasks=max_concurrent_tasks,
                     agent_process_limit=agent_process_limit,
                     active_projects=project_ids,
                     refreshed_at=time.time(),
-                    refresh_duration_ms=(time.perf_counter() - started) * 1000.0,
-                    consecutive_failures=0,
-                    last_error=None,
+                    refresh_duration_ms=duration_ms,
                 )
-                self._record_loop_success(
-                    self._runtime_config_health,
-                    phase="runtime_config_refresh",
-                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                self._record_loop_success(self._runtime_config_health, phase="runtime_config", duration_ms=duration_ms)
+                logger.info(
+                    "worker config refreshed max_concurrent_tasks=%s agent_process_limit=%s",
+                    max_concurrent_tasks, agent_process_limit,
                 )
             except Exception as exc:
-                self._runtime_config.consecutive_failures += 1
-                self._runtime_config.last_error = str(exc)
-                self._record_loop_failure(self._runtime_config_health, phase="runtime_config_refresh", exc=exc)
+                self._record_loop_failure(self._runtime_config_health, phase="runtime_config", exc=exc)
                 logger.warning("worker runtime config refresh failed: %s", exc)
-            await asyncio.sleep(RUNTIME_CONFIG_REFRESH_SECONDS)
 
-    def _heartbeat_once(self) -> None:
+
+    def _maintenance_thread_body(self) -> None:
+        """Maintenance loop — daemon thread, no asyncio."""
         from app.service import task_service as task_mod
-
-        started = time.perf_counter()
-        snapshot = self._runtime_config_snapshot()
-        phase_started = time.perf_counter()
-        agent_snapshot = get_agent_process_slot_manager().snapshot()
-        self._record_phase_duration(self._heartbeat_health, phase="agent_snapshot", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
-        phase_started = time.perf_counter()
-        self._execute_with_timeout(
-            lambda: self._write_worker_heartbeat(
-                worker_id=task_mod.POD_NAME,
-                pod_name=task_mod.POD_NAME,
-                pod_ip=task_mod.POD_IP or None,
-                http_port=WORKER_HTTP_PORT,
-                max_concurrent_tasks=snapshot.max_concurrent_tasks,
-                agent_snapshot=agent_snapshot,
-                heartbeat_duration_ms=(time.perf_counter() - started) * 1000.0,
-                heartbeat_failure_count=self._heartbeat_health.consecutive_failures,
-            ),
-            timeout_seconds=WORKER_HEARTBEAT_DB_TIMEOUT_SECONDS,
-            timeout_message="heartbeat db operation timeout",
-        )
-        self._record_phase_duration(self._heartbeat_health, phase="db_commit", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
-        duration_ms = (time.perf_counter() - started) * 1000.0
-        self._record_loop_success(self._heartbeat_health, phase="heartbeat_write", duration_ms=duration_ms)
-        if duration_ms > WORKER_HEARTBEAT_SLOW_MS:
-            self._record_loop_slow(self._heartbeat_health)
-            logger.warning(
-                "worker heartbeat slow phase=heartbeat_write duration_ms=%.1f worker_id=%s phase_durations_ms=%s",
-                duration_ms,
-                task_mod.POD_NAME,
-                dict(self._heartbeat_health.phase_durations_ms),
-            )
-        logger.info(
-            "worker heartbeat ok worker_id=%s duration_ms=%.1f running_tasks=%s agent_in_use=%s agent_waiting_requests=%s max_concurrent_tasks=%s agent_process_limit=%s",
-            task_mod.POD_NAME,
-            duration_ms,
-            self.local_running_count(),
-            int(agent_snapshot.get("in_use") or 0),
-            int(agent_snapshot.get("waiting_requests") or 0),
-            snapshot.max_concurrent_tasks,
-            snapshot.agent_process_limit,
-        )
-
-    def _heartbeat_thread_main(self) -> None:
-        from app.service import task_service as task_mod
-
-        while self._running and not self._heartbeat_stop.is_set():
-            try:
-                self._heartbeat_once()
-            except Exception as exc:
-                self._record_loop_failure(self._heartbeat_health, phase="heartbeat_write", exc=exc)
-                self._log_background_failure(
-                    logger_message="worker slot heartbeat failed",
-                    health=self._heartbeat_health,
-                    phase=self._heartbeat_health.last_phase or "heartbeat_write",
-                    exc=exc,
-                    worker_id=task_mod.POD_NAME,
-                )
-            self._heartbeat_stop.wait(WORKER_SLOT_HEARTBEAT_SECONDS)
-
-    async def _maintenance_loop(self) -> None:
-        from app.service import task_service as task_mod
+        import concurrent.futures as _cf
 
         self._maintenance_task_started_at = time.time()
-        while self._running:
+        while self._running and not self._infra_stop.wait(timeout=ORPHAN_PI_SWEEP_SECONDS):
             started = time.perf_counter()
             candidate_task_count = 0
             killed_processes = 0
@@ -848,7 +860,7 @@ class WorkerService:
             self._set_startup_phase("maintenance_reconcile")
             try:
                 db_gen = get_db()
-                db: Session = next(db_gen)
+                db = next(db_gen)
                 try:
                     stale_local_rows = (
                         db.query(AppEaTask)
@@ -883,15 +895,16 @@ class WorkerService:
                     except Exception as scoped_exc:
                         logger.warning("task-scoped maintenance cleanup failed for %s: %s", stale_row.task_id, scoped_exc)
                 if killed_processes < WORKER_MAINTENANCE_MAX_KILLS:
-                    remaining_budget = WORKER_MAINTENANCE_MAX_KILLS - killed_processes
-                    phase_started = time.perf_counter()
-                    orphan_killed = await asyncio.wait_for(
-                        asyncio.to_thread(cleanup_orphan_pi_processes, logger.warning, label="ea_worker_maintenance"),
-                        timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS,
-                    )
-                    self._record_phase_duration(self._maintenance_health, phase="cleanup_call", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
-                    killed_processes += min(orphan_killed, remaining_budget)
-                    maintenance_truncated = maintenance_truncated or orphan_killed > remaining_budget
+                    # Run orphan cleanup synchronously in a thread-pool with timeout
+                    try:
+                        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                            _fut = _ex.submit(cleanup_orphan_pi_processes, logger.warning, "ea_worker_maintenance")
+                            orphan_killed = _fut.result(timeout=WORKER_MAINTENANCE_TIMEOUT_SECONDS)
+                            killed_processes += min(orphan_killed, WORKER_MAINTENANCE_MAX_KILLS - killed_processes)
+                    except _cf.TimeoutError:
+                        logger.warning("orphan cleanup timed out after %ss", WORKER_MAINTENANCE_TIMEOUT_SECONDS)
+                    except Exception as _oe:
+                        logger.warning("orphan cleanup error: %s", _oe)
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 self._record_loop_success(self._maintenance_health, phase="maintenance", duration_ms=duration_ms)
                 if not self._maintenance_task_ready:
@@ -900,38 +913,42 @@ class WorkerService:
                 if duration_ms > (WORKER_MAINTENANCE_TIMEOUT_SECONDS * 1000) or maintenance_truncated:
                     self._record_loop_slow(self._maintenance_health)
                     logger.warning(
-                        "worker maintenance slow phase=maintenance duration_ms=%.1f candidate_task_count=%s killed_processes=%s maintenance_truncated=%s",
-                        duration_ms,
-                        candidate_task_count,
-                        killed_processes,
-                        maintenance_truncated,
+                        "worker maintenance slow duration_ms=%.1f candidate_task_count=%s killed_processes=%s",
+                        duration_ms, candidate_task_count, killed_processes,
                     )
             except Exception as exc:
                 self._record_loop_failure(self._maintenance_health, phase="maintenance", exc=exc)
                 with self._health_server_lock:
                     self._health_server_snapshot.last_error = f"maintenance: {exc}"
                 self._log_background_failure(
-                    logger_message=f"worker maintenance failed candidate_task_count={candidate_task_count} killed_processes={killed_processes}",
+                    logger_message=f"worker maintenance failed",
                     health=self._maintenance_health,
                     phase=self._maintenance_health.last_phase or "maintenance",
                     exc=exc,
                 )
-            await asyncio.sleep(ORPHAN_PI_SWEEP_SECONDS)
 
-    async def _guard_loop(self) -> None:
-        while self._running:
+
+    def _guard_thread_body(self) -> None:
+        """Guard evaluation loop — daemon thread, no asyncio."""
+        while self._running and not self._infra_stop.wait(timeout=WORKER_GUARD_LOOP_SECONDS):
             try:
-                await self._evaluate_guard_once()
+                self._evaluate_guard_sync()
             except Exception as exc:
                 logger.warning(
-                    "worker guard evaluation failed error_type=%s error_repr=%r traceback=%s",
-                    type(exc).__name__,
-                    exc,
-                    traceback.format_exc(),
+                    "worker guard evaluation failed error_type=%s error_repr=%r",
+                    type(exc).__name__, exc,
                 )
-            await asyncio.sleep(WORKER_GUARD_LOOP_SECONDS)
+
+
+    def _evaluate_guard_sync(self) -> None:
+        """Sync guard evaluation - called from thread."""
+        self._do_evaluate_guard()
 
     async def _evaluate_guard_once(self) -> None:
+        """Async wrapper - kept for backward compat."""
+        self._do_evaluate_guard()
+
+    def _do_evaluate_guard(self) -> None:
         from app.service import task_service as task_mod
 
         local_running = self.local_running_count()
@@ -1005,17 +1022,37 @@ class WorkerService:
         self._reconcile_local_stale_owned_tasks()
         self._set_startup_phase("startup_reconcile")
         self._heartbeat_stop.clear()
-        self._task = asyncio.create_task(self._loop(), name="ea_worker_loop")
-        self._runtime_config_task = asyncio.create_task(self._runtime_config_loop(), name="ea_worker_runtime_config")
-        self._maintenance_task = asyncio.create_task(self._maintenance_loop(), name="ea_worker_maintenance")
-        self._guard_task = asyncio.create_task(self._guard_loop(), name="ea_worker_guard")
+        # Capture the running asyncio event loop for use by threads
+        try:
+            self._main_event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._main_event_loop = None
+
+        self._infra_stop.clear()
+
+        # All infrastructure loops run as daemon threads — no asyncio dependency
+        self._loop_thread = threading.Thread(
+            target=self._loop_thread_body, name="ea_worker_loop", daemon=True)
+        self._runtime_config_thread = threading.Thread(
+            target=self._runtime_config_thread_body, name="ea_worker_runtime_config", daemon=True)
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance_thread_body, name="ea_worker_maintenance", daemon=True)
+        self._guard_thread = threading.Thread(
+            target=self._guard_thread_body, name="ea_worker_guard", daemon=True)
         self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_thread_main,
-            name="ea_worker_slot_heartbeat",
-            daemon=True,
-        )
-        self._heartbeat_thread.start()
-        logger.info("Entry-analysis worker started (poll=%ss)", WORKER_POLL_SECONDS)
+            target=self._heartbeat_thread_main, name="ea_worker_slot_heartbeat", daemon=True)
+
+        # Keep legacy references for compatibility
+        self._task = self._loop_thread
+        self._maintenance_task = self._maintenance_thread
+        self._runtime_config_task = self._runtime_config_thread
+        self._guard_task = self._guard_thread
+
+        for t in (self._loop_thread, self._runtime_config_thread,
+                  self._maintenance_thread, self._guard_thread,
+                  self._heartbeat_thread):
+            t.start()
+        logger.info("Entry-analysis worker started (poll=%ss, all infra loops are threads)", WORKER_POLL_SECONDS)
 
     def stop(self) -> None:
         self._running = False
@@ -1024,12 +1061,13 @@ class WorkerService:
             self._health_server_snapshot.worker_probe_safe_ready = False
         self._set_startup_phase("stopping", probe_safe_ready=False)
         self._heartbeat_stop.set()
-        for bg_task in (self._task, self._runtime_config_task, self._maintenance_task, self._guard_task):
-            if bg_task and not bg_task.done():
-                bg_task.cancel()
-        heartbeat_thread = self._heartbeat_thread
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join(timeout=1.0)
+        self._infra_stop.set()  # signals all infra threads to stop
+        # Wait briefly for threads to notice the stop signal
+        for t in (self._loop_thread, self._runtime_config_thread,
+                  self._maintenance_thread, self._guard_thread,
+                  self._heartbeat_thread):
+            if t and t.is_alive():
+                t.join(timeout=2.0)
         self._stop_health_server()
 
     def is_running(self) -> bool:
@@ -1211,6 +1249,103 @@ class WorkerService:
                 next(db_gen)
             except StopIteration:
                 pass
+
+    def _start_lease_renewer_proc(
+        self, task_id: str, stop_event: "threading.Event"
+    ) -> "subprocess.Popen | None":
+        """Launch lease_renewer.py as an independent subprocess.
+
+        The subprocess uses pymysql directly (no shared SQLAlchemy pool) and
+        renews the lease independently of the worker's asyncio event loop.
+        A monitor thread watches the subprocess and sets stop_event on exit.
+        """
+        import subprocess as _sp
+        from app.service import task_service as task_mod
+        from app.db import _engine as _db_engine
+
+        try:
+            # Extract DB connection params from the SQLAlchemy engine URL
+            url = _db_engine.url if _db_engine is not None else None
+            if url is None:
+                logger.warning("lease_renewer: no DB engine available, skipping subprocess")
+                return None
+
+            host = str(url.host or "127.0.0.1")
+            port = int(url.port or 3306)
+            user = str(url.username or "")
+            password = str(url.password or "")
+            database = str(url.database or "")
+            interval = task_mod.LEASE_RENEW_INTERVAL_SECONDS
+            duration = task_mod.LEASE_DURATION_SECONDS
+
+            import os as _os
+            script = _os.path.join(_os.path.dirname(__file__), "lease_renewer.py")
+            proc = _sp.Popen(
+                [
+                    sys.executable, script,
+                    "--task_id", task_id,
+                    "--pod_name", task_mod.POD_NAME,
+                    "--host", host,
+                    "--port", str(port),
+                    "--user", user,
+                    "--password", password,
+                    "--database", database,
+                    "--interval", str(interval),
+                    "--duration", str(duration),
+                    "--parent_pid", str(_os.getpid()),
+                ],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.PIPE,
+                close_fds=True,
+            )
+            logger.info(
+                "lease_renewer subprocess started task=%s pid=%s interval=%ss duration=%ss",
+                task_id, proc.pid, interval, duration,
+            )
+
+            # Monitor thread: watch subprocess and set stop_event when it exits
+            def _monitor() -> None:
+                try:
+                    _, stderr_data = proc.communicate(timeout=None)
+                    rc = proc.returncode
+                    if stderr_data:
+                        for line in stderr_data.decode("utf-8", errors="replace").splitlines()[-20:]:
+                            logger.debug("lease_renewer[%s]: %s", task_id, line)
+                    if rc != 0:
+                        logger.warning(
+                            "lease_renewer subprocess exited abnormally task=%s pid=%s rc=%s",
+                            task_id, proc.pid, rc,
+                        )
+                        stop_event.set()  # signal task to abort
+                except Exception as _e:
+                    logger.warning("lease_renewer monitor error task=%s: %s", task_id, _e)
+                finally:
+                    stop_event.set()
+
+            monitor_t = threading.Thread(
+                target=_monitor, name=f"ea_lease_monitor_{task_id}", daemon=True)
+            monitor_t.start()
+
+            # Also hook stop_event: when task stops, terminate the subprocess
+            def _stopper() -> None:
+                stop_event.wait()
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    
+            stopper_t = threading.Thread(
+                target=_stopper, name=f"ea_lease_stopper_{task_id}", daemon=True)
+            stopper_t.start()
+
+            return proc
+        except Exception as exc:
+            logger.error("Failed to start lease_renewer subprocess task=%s: %s", task_id, exc)
+            return None
 
     def _renew_task_lease_thread(self, task_id: str, stop_event: "threading.Event") -> None:
         """租约续期线程：独立于 asyncio 事件循环运行，避免事件循环饥饿导致续租失败。
@@ -1571,13 +1706,18 @@ class WorkerService:
             self._task_abort_callbacks[task_id] = orch.abort
             self._task_guard_reasons.pop(task_id, None)
             self._task_lease_started_at[task_id] = time.time()
-            lease_thread = __import__("threading").Thread(
-                target=self._renew_task_lease_thread,
-                args=(task_id, lease_stop_event),
-                name=f"ea_lease_{task_id}",
-                daemon=True,
-            )
-            lease_thread.start()
+            # Launch lease renewal as an independent subprocess (pymysql, no shared pool)
+            lease_proc = self._start_lease_renewer_proc(task_id, lease_stop_event)
+            if lease_proc is None:
+                # Fallback to thread if subprocess launch fails
+                logger.warning("lease_renewer subprocess failed to start, falling back to thread for %s", task_id)
+                lease_proc_fallback = __import__("threading").Thread(
+                    target=self._renew_task_lease_thread,
+                    args=(task_id, lease_stop_event),
+                    name=f"ea_lease_{task_id}",
+                    daemon=True,
+                )
+                lease_proc_fallback.start()
             control_task = asyncio.create_task(
                 self._watch_task_control(task_id, lease_stop_event, control_cancel_event, orch),
                 name=f"ea_control_{task_id}",
