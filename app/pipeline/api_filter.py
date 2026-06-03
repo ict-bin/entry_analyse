@@ -171,8 +171,24 @@ def _parse_is_entry(text: str) -> bool | None:
 _SYSTEM_PROMPT = """\
 你是 C/C++ 代码安全分析专家，专门判断函数是否为模块的**外部入口**。
 
-外部入口定义：函数通过参数接收来自模块外部的可控数据（被动型 P），
-或在函数体内主动调用 I/O 接口获取外部数据（主动型 A，如 recv/recvfrom/MsgReceive 等）。
+外部入口的核心标准：**跨进程边界接收未经验证的原始数据**。
+
+✅ 是外部入口（以下任一）：
+- 函数体内直接调用 recv/recvfrom/read/fread/fgets/getline/ioctl/accept 等 I/O 系统调用
+- 函数体内调用封装的网络/IPC API，如 MsgReceive/NetlinkRecv/SNMP_MsgGet 等
+- 接收 const char * / char * / void * / unsigned char * 参数，且函数名或注释明確表明处理来自外部的原始字符串/缓冲区
+
+❌ 不是外部入口（以下任一）：
+- 参数是内部 C 结构体指针（如 *_spec, *_config, *_t, *_info, *defs_、等）——这些是已解析的内部数据
+- 函数仅对内部结构体进行字段赋值、验证、格式转换、内存分配
+- 函数名含 make_/merge_/set_/alloc_/free_/init_/update_/convert_/fill_/build_ 且不调用 I/O
+- static 工具函数、错误处理函数、日志函数
+- 函数调用者全部是同模块内部函数（没有模块外部调用者）
+
+关键区别：
+- "container_config *" / "oci_runtime_spec *" 等结构体指针 → 内部处理层，不是入口
+- "const char *volume_str" 或 "const char *json_str" → 可能是入口（取决于该字符串是否来自外部）
+- 函数体内有 fopen/json_parse/yajl 调用 → 可能是入口
 
 你的任务：快速判断给定函数是否为外部入口。
 
@@ -182,7 +198,7 @@ _SYSTEM_PROMPT = """\
 """
 
 _USER_TMPL = """\
-函数：{name}
+函数名：{name}
 签名：{signature}
 
 函数体：
@@ -190,7 +206,11 @@ _USER_TMPL = """\
 {body}
 ```
 
-该函数是否为外部入口？只输出 JSON。"""
+请判断该函数是否为外部入口：即直接接收来自进程边界以外的未验证原始数据。
+如果参数是内部 C 结构体指针（如 *_spec/*_config/*_t 等），这通常是内部处理层而非外部入口。
+
+只输出 JSON。"""
+
 
 
 # ─── 主调用函数 ───────────────────────────────────────────────────────────────
