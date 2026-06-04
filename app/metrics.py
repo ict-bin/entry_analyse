@@ -188,6 +188,8 @@ def _render_task_metrics() -> list[str]:
     stage_session_counts: dict[str, int] = defaultdict(int)
     expired_running_count = 0
     expired_running_owner_alive = 0
+    invalid_owner_running_count = 0
+    invalid_owner_running_alive = 0
     now = now_local()
     live_owner_pods = set()
     scheduler_stats = get_scheduler_service().runtime_reconcile_stats_snapshot()
@@ -209,6 +211,13 @@ def _render_task_metrics() -> list[str]:
             owner_pod = str(row.owner_pod or "").strip()
             if owner_pod and owner_pod in live_owner_pods:
                 expired_running_owner_alive += 1
+        if status == "running" and not bool(row.cancel_requested):
+            owner_pod = str(row.owner_pod or "").strip()
+            owner_valid = owner_pod.startswith("secflow-app-entry-analyse-worker-") or owner_pod.startswith("secflow-app-entry-analyse-worker-adaptive-")
+            if owner_pod and not owner_valid:
+                invalid_owner_running_count += 1
+                if owner_pod in live_owner_pods:
+                    invalid_owner_running_alive += 1
         if row.started_at and row.created_at:
             queue_sum += _seconds_between(row.created_at, row.started_at)
             queue_count += 1
@@ -463,6 +472,15 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_ea_tasks_running_expired_lease_reconciled_total Running expired-lease tasks requeued by scheduler reconcile.",
         "# TYPE secflow_ea_tasks_running_expired_lease_reconciled_total counter",
         f"secflow_ea_tasks_running_expired_lease_reconciled_total {int(scheduler_stats.get('reconciled_total') or 0)}",
+        "# HELP secflow_ea_tasks_running_invalid_owner Running tasks whose owner pod is not a valid worker.",
+        "# TYPE secflow_ea_tasks_running_invalid_owner gauge",
+        f"secflow_ea_tasks_running_invalid_owner {invalid_owner_running_count}",
+        "# HELP secflow_ea_tasks_running_invalid_owner_owner_alive Running invalid-owner tasks whose owner pod still appears alive.",
+        "# TYPE secflow_ea_tasks_running_invalid_owner_owner_alive gauge",
+        f"secflow_ea_tasks_running_invalid_owner_owner_alive {invalid_owner_running_alive}",
+        "# HELP secflow_ea_task_requeue_invalid_owner_total Running invalid-owner tasks requeued by scheduler reconcile.",
+        "# TYPE secflow_ea_task_requeue_invalid_owner_total counter",
+        f"secflow_ea_task_requeue_invalid_owner_total {int(scheduler_stats.get('invalid_owner_reconciled_total') or 0)}",
         "# HELP secflow_ea_timeout_total Timeout-classified terminal tasks.",
         "# TYPE secflow_ea_timeout_total counter",
         f"secflow_ea_timeout_total {timeout_total}",

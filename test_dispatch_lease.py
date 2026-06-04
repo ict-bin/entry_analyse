@@ -1,5 +1,6 @@
 import unittest
 from datetime import timedelta
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -81,6 +82,37 @@ class EntryDispatchLeaseTests(unittest.TestCase):
 
             second = self.service._claim_task_row_atomic(db, row.id)
             self.assertIsNone(second)
+        finally:
+            db.close()
+
+    def test_acquire_dispatch_lease_denied_for_non_worker_role(self):
+        db = self.SessionLocal()
+        try:
+            with patch("app.service.task_service.get_runtime_role", return_value="api"):
+                token = self.service._acquire_dispatch_lease(db, "p1")
+            self.assertIsNone(token)
+        finally:
+            db.close()
+
+    def test_claim_task_row_atomic_denied_for_non_worker_role(self):
+        db = self.SessionLocal()
+        try:
+            db.add(
+                AppEaTask(
+                    task_id="eat_denied",
+                    project_id="p1",
+                    task_name="pending",
+                    input_path="/tmp/in",
+                    module_name="mod-a",
+                    prompt_content="prompt",
+                    status="pending",
+                )
+            )
+            db.commit()
+            row = db.query(AppEaTask).filter_by(task_id="eat_denied").one()
+            with patch("app.service.task_service.get_runtime_role", return_value="api"):
+                claimed = self.service._claim_task_row_atomic(db, row.id)
+            self.assertIsNone(claimed)
         finally:
             db.close()
 

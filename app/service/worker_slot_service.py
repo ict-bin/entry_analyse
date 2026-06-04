@@ -15,8 +15,9 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask, AppEaWorkerSlot
 from app.models import normalize_max_concurrent_tasks
+from app.service.runtime_role import RUNTIME_ROLE_WORKER
 from app.time_utils import add_seconds_local, isoformat_local, now_local
-from app.service.task_service import _load_svc_config_from_db, _project_dispatch_limit_filter
+from app.service.task_service import _is_valid_worker_owner, _load_svc_config_from_db, _owner_role_guess, _project_dispatch_limit_filter
 
 logger = logging.getLogger("ea.worker_slot")
 
@@ -49,6 +50,7 @@ WORKER_LABEL_SELECTORS: tuple[str, ...] = tuple(
 class WorkerSlotSnapshot:
     worker_id: str
     pod_name: str
+    runtime_role: str
     pod_ip: str | None
     http_port: int
     first_seen_at: str | None
@@ -146,6 +148,7 @@ class WorkerSlotService:
         *,
         worker_id: str,
         pod_name: str,
+        runtime_role: str = RUNTIME_ROLE_WORKER,
         pod_ip: str | None,
         http_port: int,
         max_concurrent_tasks: int,
@@ -163,6 +166,15 @@ class WorkerSlotService:
         heartbeat_duration_ms: float | None = None,
         heartbeat_failure_count: int = 0,
     ) -> None:
+        normalized_role = str(runtime_role or "").strip().lower() or "unknown"
+        if normalized_role != RUNTIME_ROLE_WORKER:
+            logger.error(
+                "reject worker slot heartbeat for non-worker runtime_role=%s worker_id=%s pod_name=%s",
+                normalized_role,
+                worker_id,
+                pod_name,
+            )
+            return
         normalized_capacity = normalize_max_concurrent_tasks(max_concurrent_tasks)
         row = db.query(AppEaWorkerSlot).filter(AppEaWorkerSlot.worker_id == worker_id).first()
         now = now_local()
@@ -170,6 +182,7 @@ class WorkerSlotService:
             row = AppEaWorkerSlot(
                 worker_id=worker_id,
                 pod_name=pod_name,
+                runtime_role=normalized_role,
                 pod_ip=pod_ip,
                 http_port=max(1, int(http_port or 8080)),
                 max_concurrent_tasks=normalized_capacity,
@@ -191,6 +204,7 @@ class WorkerSlotService:
             db.add(row)
         else:
             row.pod_name = pod_name
+            row.runtime_role = normalized_role
             row.pod_ip = pod_ip
             row.http_port = max(1, int(http_port or 8080))
             row.max_concurrent_tasks = normalized_capacity
@@ -294,17 +308,30 @@ class WorkerSlotService:
         ghost_running_tasks = 0
         running_expired_lease = 0
         running_expired_lease_owner_alive = 0
+        running_invalid_owner = 0
+        running_invalid_owner_owner_alive = 0
+        registry_worker_pods = {
+            str(row.pod_name or "").strip()
+            for row in worker_rows
+            if str(getattr(row, "runtime_role", "") or "").strip().lower() == RUNTIME_ROLE_WORKER
+            and str(row.pod_name or "").strip()
+        }
         for row in claimed_running_rows:
             owner = str(row.owner_pod or "").strip()
             if not owner:
                 continue
             claimed_by_owner.setdefault(owner, []).append(row)
+            owner_valid = _is_valid_worker_owner(owner, registry_worker_pods)
             lease_expires_at = getattr(row, "lease_expires_at", None)
             if lease_expires_at is None or lease_expires_at < now:
                 ghost_running_tasks += 1
                 running_expired_lease += 1
                 if owner in live_pods:
                     running_expired_lease_owner_alive += 1
+            if not owner_valid:
+                running_invalid_owner += 1
+                if owner in live_pods:
+                    running_invalid_owner_owner_alive += 1
 
         active_by_owner: dict[str, list[dict[str, Any]]] = {}
         for row in running_rows:
@@ -317,6 +344,10 @@ class WorkerSlotService:
                     "entry_id": row.parent_stage_item_id or row.parent_stage_item_key or row.module_name,
                     "status": row.status,
                     "lease_expires_at": isoformat_local(row.lease_expires_at),
+                    "owner_role_guess": _owner_role_guess(owner),
+                    "owner_valid": _is_valid_worker_owner(owner, registry_worker_pods),
+                    "owner_live": owner in live_pods,
+                    "reconcile_reason": "invalid_owner" if not _is_valid_worker_owner(owner, registry_worker_pods) else None,
                 }
             )
 
@@ -351,6 +382,7 @@ class WorkerSlotService:
             payload = WorkerSlotSnapshot(
                 worker_id=row.worker_id,
                 pod_name=row.pod_name,
+                runtime_role=str(getattr(row, "runtime_role", RUNTIME_ROLE_WORKER) or RUNTIME_ROLE_WORKER),
                 pod_ip=row.pod_ip,
                 http_port=int(getattr(row, "http_port", 8080) or 8080),
                 first_seen_at=isoformat_local(getattr(row, "created_at", None)),
@@ -387,6 +419,7 @@ class WorkerSlotService:
             snapshot = WorkerSlotSnapshot(
                 worker_id=f"stale-owner::{owner_pod}",
                 pod_name=owner_pod,
+                runtime_role=_owner_role_guess(owner_pod),
                 pod_ip=None,
                 http_port=8080,
                 first_seen_at=None,
@@ -451,6 +484,8 @@ class WorkerSlotService:
             "ghost_running_tasks": ghost_running_tasks,
             "running_expired_lease": running_expired_lease,
             "running_expired_lease_owner_alive": running_expired_lease_owner_alive,
+            "running_invalid_owner": running_invalid_owner,
+            "running_invalid_owner_owner_alive": running_invalid_owner_owner_alive,
             "running_jobs": busy_slots,
             "available_slots": max(0, total_capacity - busy_slots),
             "dispatch_limit": dispatch_limit,
@@ -478,6 +513,7 @@ class WorkerSlotService:
             "worker_id": worker.worker_id,
             "url": worker.pod_ip or worker.pod_name,
             "pod_name": worker.pod_name,
+            "runtime_role": worker.runtime_role,
             "pod_ip": worker.pod_ip,
             "http_port": worker.http_port,
             "first_seen_at": worker.first_seen_at,

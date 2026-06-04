@@ -25,9 +25,11 @@ from app.db import get_db
 from app.db.models import AppEaTask, AppEaStageResultIndex, AppEaTaskEvent
 from app.logging_utils import log_event
 from app.orchestrator import Orchestrator
+from app.service.runtime_role import RUNTIME_ROLE_WORKER, get_runtime_role
 from app.time_utils import now_local
 
 logger = logging.getLogger("ea.worker")
+WORKER_RUNTIME_ROLE = get_runtime_role()
 
 
 async def _schedule_dispatch_async(svc, project_id: str) -> None:
@@ -697,6 +699,9 @@ class WorkerService:
         task-list APIs become intermittently unavailable. AgentProcessSlotManager is
         now cross-thread/event-loop safe, so per-task loops are safe again.
         """
+        if WORKER_RUNTIME_ROLE != RUNTIME_ROLE_WORKER:
+            logger.error("refuse start_task on non-worker runtime_role=%s task_id=%s", WORKER_RUNTIME_ROLE, task_id)
+            raise RuntimeError(f"runtime role {WORKER_RUNTIME_ROLE} cannot start tasks")
         existing = _running_tasks.get(task_id)
         if existing is not None and existing.is_alive():
             return existing
@@ -1108,6 +1113,7 @@ class WorkerService:
             lambda: self._write_worker_heartbeat(
                 worker_id=task_mod.POD_NAME,
                 pod_name=task_mod.POD_NAME,
+                runtime_role=WORKER_RUNTIME_ROLE,
                 pod_ip=task_mod.POD_IP or None,
                 http_port=WORKER_HTTP_PORT,
                 max_concurrent_tasks=snapshot.max_concurrent_tasks,
@@ -1325,6 +1331,11 @@ class WorkerService:
     def start(self) -> None:
         if self._running:
             return
+        logger.info(
+            "worker runtime self-check runtime_role=%s pod_name=%s enabled_components=worker",
+            WORKER_RUNTIME_ROLE,
+            os.environ.get("EA_POD_NAME") or os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "entry-analyse-pod",
+        )
         self._running = True
         self._started_at = time.time()
         self._main_loop_last_tick_at = self._started_at
@@ -1595,6 +1606,9 @@ class WorkerService:
         from app.db import _engine as _db_engine
 
         try:
+            if WORKER_RUNTIME_ROLE != RUNTIME_ROLE_WORKER:
+                logger.error("lease renewer start denied for non-worker runtime_role=%s task_id=%s", WORKER_RUNTIME_ROLE, task_id)
+                return None
             # Extract DB connection params from the SQLAlchemy engine URL
             url = _db_engine.url if _db_engine is not None else None
             if url is None:

@@ -315,6 +315,98 @@ def test_metrics_expose_expired_running_lease_diagnostics(monkeypatch) -> None:
     assert "secflow_ea_tasks_running_expired_lease_reconciled_total 4" in text
 
 
+def test_metrics_expose_invalid_owner_diagnostics(monkeypatch) -> None:
+    now = now_local()
+    rows = [
+        SimpleNamespace(
+            status="running",
+            cancel_requested=False,
+            lease_expires_at=now + timedelta(seconds=30),
+            owner_pod="secflow-app-entry-analyse-api-pod",
+            started_at=None,
+            created_at=now,
+            finished_at=None,
+            error=None,
+            result_json=None,
+            stages_json={},
+            module_name="m1",
+        ),
+    ]
+
+    class _MetricsDb:
+        def query(self, model):
+            del model
+            return _FakeQuery(rows)
+
+    monkeypatch.setattr(app_db, "get_db", lambda: _db_generator(_MetricsDb()))
+    monkeypatch.setattr(
+        worker_slot_service,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(
+            _list_live_worker_pods=lambda: {"secflow-app-entry-analyse-api-pod"},
+            get_cluster_snapshot=lambda _db, project_id="": {
+                "total_capacity": 0,
+                "busy_slots": 0,
+                "available_slots": 0,
+                "dispatch_limit": 0,
+                "dispatch_running": 0,
+                "dispatch_available": 0,
+            },
+        ),
+    )
+    monkeypatch.setattr(metrics_mod, "get_scheduler_service", lambda: SimpleNamespace(runtime_reconcile_stats_snapshot=lambda: {"reconciled_total": 0, "invalid_owner_reconciled_total": 3}))
+
+    text = "\n".join(metrics_mod._render_task_metrics())
+    assert "secflow_ea_tasks_running_invalid_owner 1" in text
+    assert "secflow_ea_tasks_running_invalid_owner_owner_alive 1" in text
+    assert "secflow_ea_task_requeue_invalid_owner_total 3" in text
+
+
+def test_scheduler_reconcile_invalid_owner_running_task(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    db = SessionLocal()
+    now = now_local()
+    try:
+        row = AppEaTask(
+            task_id="eat_invalid_owner",
+            project_id="p1",
+            task_name="invalid-owner",
+            input_path="/tmp/invalid",
+            module_name="m1",
+            prompt_content="prompt",
+            status="running",
+            owner_pod="secflow-app-entry-analyse-api-pod",
+            lease_expires_at=now + timedelta(seconds=60),
+        )
+        db.add(row)
+        db.commit()
+
+        monkeypatch.setattr(scheduler_service, "get_db", lambda: _db_generator(db))
+        monkeypatch.setattr(
+            worker_slot_service,
+            "get_worker_slot_service",
+            lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
+        )
+        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: {"secflow-app-entry-analyse-api-pod"})
+        monkeypatch.setattr(task_service, "_worker_registry_pods", lambda _db, _now=None: {"secflow-app-entry-analyse-worker-aaa-bbb"})
+        events = []
+        monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
+
+        changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
+        db.refresh(row)
+
+        assert changed == 1
+        assert row.status == "pending"
+        assert row.owner_pod is None
+        assert events[0]["event_type"] == "task_invalid_owner_detected"
+        assert events[1]["event_type"] == "task_requeued_after_invalid_owner_reconcile"
+        assert events[1]["payload"]["reconcile_reason"] == "invalid_owner_alive"
+    finally:
+        db.close()
+
+
 def test_metrics_summary_alerts_on_expired_running_lease() -> None:
     rows = metrics_summary_mod.parse_prometheus_metrics(
         "\n".join(

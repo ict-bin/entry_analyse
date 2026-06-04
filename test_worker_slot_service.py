@@ -131,6 +131,23 @@ class WorkerSlotServiceTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_upsert_heartbeat_rejects_non_worker_role(self):
+        db = self.SessionLocal()
+        try:
+            self.service.upsert_heartbeat(
+                db,
+                worker_id="api-a",
+                pod_name="secflow-app-entry-analyse-xxx",
+                runtime_role="api",
+                pod_ip="10.0.0.9",
+                http_port=3000,
+                max_concurrent_tasks=1,
+            )
+            rows = db.query(AppEaWorkerSlot).all()
+            self.assertEqual([], rows)
+        finally:
+            db.close()
+
     def test_cluster_snapshot_dispatch_running_excludes_binary_security_children(self):
         db = self.SessionLocal()
         try:

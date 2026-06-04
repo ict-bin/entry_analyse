@@ -315,12 +315,17 @@ class EntryAnalyseActiveTaskRefResponse(BaseModel):
     entry_id: Optional[str] = None
     status: str
     lease_expires_at: Optional[str] = None
+    owner_role_guess: Optional[str] = None
+    owner_valid: bool = True
+    owner_live: bool = False
+    reconcile_reason: Optional[str] = None
 
 
 class EntryAnalyseWorkerSlotResponse(BaseModel):
     worker_id: str
     url: Optional[str] = None
     pod_name: str
+    runtime_role: str = "worker"
     pod_ip: Optional[str] = None
     first_seen_at: Optional[str] = None
     healthy: bool
@@ -369,6 +374,8 @@ class EntryAnalyseSlotClusterResponse(BaseModel):
     ghost_running_tasks: int = 0
     running_expired_lease: int = 0
     running_expired_lease_owner_alive: int = 0
+    running_invalid_owner: int = 0
+    running_invalid_owner_owner_alive: int = 0
     running_jobs: int = 0
     available_slots: int = 0
     dispatch_limit: int = 0

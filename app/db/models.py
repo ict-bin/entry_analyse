@@ -152,6 +152,7 @@ class AppEaWorkerSlot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     worker_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
     pod_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    runtime_role: Mapped[str] = mapped_column(String(32), nullable=False, default="worker", index=True)
     pod_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     http_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8080)
     max_concurrent_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

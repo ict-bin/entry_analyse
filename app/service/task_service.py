@@ -25,7 +25,7 @@ from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent, AppEaSt
 from app.logging_utils import log_event
 from app.models import normalize_max_concurrent_tasks
 from app.service.session_index import build_session_catalog
-from app.service.runtime_role import role_enabled
+from app.service.runtime_role import RUNTIME_ROLE_WORKER, get_runtime_role, role_enabled
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 from app.agent_process import cleanup_task_pi_processes
 
@@ -52,6 +52,7 @@ _USER_TIMELINE_EVENT_TYPES: set[str] = {
     "task_dispatch_skipped_no_capacity",
     "task_lease_taken_over",
     "task_requeued_after_expired_lease_reconcile",
+    "task_requeued_after_invalid_owner_reconcile",
     "task_requeued_after_orphaned_running_reconcile",
     "task_requeued_after_dispatch_timeout",
     "task_owner_recovered_after_restart",
@@ -104,6 +105,7 @@ POD_IP = (
     or os.environ.get("POD_IP")
     or ""
 )
+WORKER_OWNER_POD_RE = re.compile(r"^secflow-app-entry-analyse-worker(?:-adaptive)?-[a-z0-9]+-[a-z0-9]+$")
 
 _dispatch_tasks: dict[str, asyncio.Task] = {}
 _dispatch_locks: dict[str, asyncio.Lock] = {}
@@ -636,6 +638,43 @@ def _dispatch_lease_expired_expr():
     return or_(AppEaDispatchLease.lease_expires_at.is_(None), AppEaDispatchLease.lease_expires_at < now)
 
 
+def _current_runtime_role() -> str:
+    return get_runtime_role()
+
+
+def _worker_runtime_enforced() -> bool:
+    return _current_runtime_role() == RUNTIME_ROLE_WORKER
+
+
+def _owner_role_guess(owner_pod: str | None) -> str:
+    owner = str(owner_pod or "").strip()
+    if not owner:
+        return "unknown"
+    if owner.startswith("secflow-app-entry-analyse-worker-adaptive-"):
+        return "worker_adaptive"
+    if owner.startswith("secflow-app-entry-analyse-worker-"):
+        return "worker"
+    if owner.startswith("secflow-app-entry-analyse-"):
+        return "api"
+    return "unknown"
+
+
+def _is_valid_worker_owner_pod(owner_pod: str | None) -> bool:
+    owner = str(owner_pod or "").strip()
+    if not owner:
+        return False
+    return bool(WORKER_OWNER_POD_RE.match(owner))
+
+
+def _is_valid_worker_owner(owner_pod: str | None, worker_registry_pods: set[str] | None = None) -> bool:
+    owner = str(owner_pod or "").strip()
+    if not _is_valid_worker_owner_pod(owner):
+        return False
+    if worker_registry_pods is not None and owner not in worker_registry_pods:
+        return False
+    return True
+
+
 def _alive_entry_analysis_owner_pods(db: Session, now: datetime | None = None) -> set[str]:
     from app.service.worker_slot_service import STALE_AFTER_SECONDS, get_worker_slot_service
 
@@ -645,6 +684,7 @@ def _alive_entry_analysis_owner_pods(db: Session, now: datetime | None = None) -
     registry_rows = (
         db.query(AppEaWorkerSlot.pod_name)
         .filter(
+            AppEaWorkerSlot.runtime_role == RUNTIME_ROLE_WORKER,
             AppEaWorkerSlot.last_heartbeat_at.is_not(None),
             AppEaWorkerSlot.last_heartbeat_at >= registry_cutoff,
         )
@@ -655,6 +695,28 @@ def _alive_entry_analysis_owner_pods(db: Session, now: datetime | None = None) -
         if pod:
             live_pods.add(pod)
     return live_pods
+
+
+def _worker_registry_pods(db: Session, now: datetime | None = None) -> set[str]:
+    from app.service.worker_slot_service import STALE_AFTER_SECONDS
+
+    current = now or now_local()
+    registry_cutoff = add_seconds_local(current, -STALE_AFTER_SECONDS)
+    rows = (
+        db.query(AppEaWorkerSlot.pod_name)
+        .filter(
+            AppEaWorkerSlot.runtime_role == RUNTIME_ROLE_WORKER,
+            AppEaWorkerSlot.last_heartbeat_at.is_not(None),
+            AppEaWorkerSlot.last_heartbeat_at >= registry_cutoff,
+        )
+        .all()
+    )
+    pods: set[str] = set()
+    for pod_name, in rows:
+        pod = str(pod_name or "").strip()
+        if pod:
+            pods.add(pod)
+    return pods
 
 
 def _requeue_expired_running_tasks(
@@ -763,6 +825,121 @@ def _requeue_expired_running_tasks(
                 owner_is_alive,
                 scheduler_instance,
             ),
+        )
+        requeued += 1
+    return requeued, owner_alive_requeued
+
+
+def _requeue_invalid_owner_running_tasks(
+    db: Session,
+    now: datetime | None = None,
+    *,
+    project_id: str | None = None,
+    limit: int | None = None,
+    scheduler_instance: str = "scheduler",
+    alive_owner_pods: set[str] | None = None,
+    worker_registry_pods: set[str] | None = None,
+) -> tuple[int, int]:
+    current = now or now_local()
+    owner_pods = alive_owner_pods if alive_owner_pods is not None else _alive_entry_analysis_owner_pods(db, current)
+    registry_pods = worker_registry_pods if worker_registry_pods is not None else _worker_registry_pods(db, current)
+    query = (
+        db.query(AppEaTask)
+        .filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "running",
+            AppEaTask.cancel_requested.is_(False),
+            AppEaTask.owner_pod.is_not(None),
+        )
+        .order_by(AppEaTask.updated_at.asc(), AppEaTask.id.asc())
+    )
+    if project_id:
+        query = query.filter(AppEaTask.project_id == project_id)
+    if limit is not None and limit > 0:
+        query = query.limit(limit)
+    candidates = query.all()
+    requeued = 0
+    owner_alive_requeued = 0
+    for row in candidates:
+        previous_owner = str(row.owner_pod or "").strip() or None
+        if _is_valid_worker_owner(previous_owner, registry_pods):
+            continue
+        owner_is_alive = bool(previous_owner and previous_owner in owner_pods)
+        previous_owner_ip = row.owner_pod_ip
+        previous_lease_expires_at = row.lease_expires_at
+        updated = db.execute(
+            update(AppEaTask)
+            .where(
+                AppEaTask.id == row.id,
+                AppEaTask.status == "running",
+                AppEaTask.cancel_requested.is_(False),
+                AppEaTask.owner_pod == previous_owner,
+            )
+            .values(
+                status="pending",
+                owner_pod=None,
+                owner_pod_ip=None,
+                lease_expires_at=None,
+                cancel_requested=False,
+                finished_at=None,
+                stages_json=None,
+                error=None,
+                result_json=None,
+                latest_abnormal_reason_json=None,
+                updated_at=now_local(),
+            )
+        )
+        if int(getattr(updated, "rowcount", 0) or 0) != 1:
+            continue
+        refreshed = db.query(AppEaTask).filter(AppEaTask.id == row.id).first()
+        if refreshed is None:
+            continue
+        if owner_is_alive:
+            owner_alive_requeued += 1
+        _safe_create_task_event(
+            db,
+            task_id=refreshed.task_id,
+            project_id=refreshed.project_id,
+            event_type="task_invalid_owner_detected",
+            message="任务运行 owner 非法，已进入回收流程",
+            source=TASK_EVENT_SOURCE_SYSTEM,
+            level="warning",
+            stage_key="entry_analysis",
+            file_path=refreshed.input_path,
+            status="running",
+            payload={
+                "previous_owner_pod": previous_owner,
+                "previous_owner_role_guess": _owner_role_guess(previous_owner),
+                "live_owner_present": owner_is_alive,
+                "owner_valid": False,
+                "scheduler_instance": scheduler_instance,
+            },
+            dedupe_key=_event_dedupe_key(refreshed.task_id, "task_invalid_owner_detected", previous_owner, scheduler_instance),
+        )
+        _safe_create_task_event(
+            db,
+            task_id=refreshed.task_id,
+            project_id=refreshed.project_id,
+            event_type="task_requeued_after_invalid_owner_reconcile",
+            message="任务因非法 owner 被收回并重新进入调度队列",
+            source=TASK_EVENT_SOURCE_SYSTEM,
+            level="warning",
+            stage_key="entry_analysis",
+            file_path=refreshed.input_path,
+            status=refreshed.status,
+            payload={
+                "previous_owner_pod": previous_owner,
+                "previous_owner_pod_ip": previous_owner_ip,
+                "previous_owner_role_guess": _owner_role_guess(previous_owner),
+                "previous_lease_expires_at": previous_lease_expires_at.isoformat() if previous_lease_expires_at else None,
+                "reconcile_reason": "invalid_owner_alive" if owner_is_alive else "invalid_owner_missing",
+                "live_owner_present": owner_is_alive,
+                "owner_valid": False,
+                "scheduler_instance": scheduler_instance,
+                "reset_to_schedulable": True,
+                "restart_mode": "fresh_start",
+            },
+            dedupe_key=_event_dedupe_key(refreshed.task_id, "task_requeued_after_invalid_owner_reconcile", previous_owner, previous_lease_expires_at, owner_is_alive, scheduler_instance),
         )
         requeued += 1
     return requeued, owner_alive_requeued
@@ -1920,6 +2097,15 @@ class TaskService:
 
     @staticmethod
     def _acquire_dispatch_lease(db: Session, project_id: str) -> str | None:
+        if not _worker_runtime_enforced():
+            logger.error(
+                "dispatch lease denied for non-worker runtime_role=%s pod=%s project_id=%s",
+                _current_runtime_role(),
+                POD_NAME,
+                project_id,
+            )
+            db.rollback()
+            return None
         now = now_local()
         token = uuid.uuid4().hex
         lease_deadline = _dispatch_lease_deadline()
@@ -1967,6 +2153,15 @@ class TaskService:
 
     @staticmethod
     def _claim_task_row(db: Session, row_id: int) -> AppEaTask | None:
+        if not _worker_runtime_enforced():
+            logger.error(
+                "task claim denied for non-worker runtime_role=%s pod=%s row_id=%s",
+                _current_runtime_role(),
+                POD_NAME,
+                row_id,
+            )
+            db.rollback()
+            return None
         row = (
             db.query(AppEaTask)
             .filter(
@@ -2016,6 +2211,9 @@ class TaskService:
                     "previous_owner_pod": previous_owner_pod,
                     "owner_pod": POD_NAME,
                     "reason": "lease_takeover",
+                    "runtime_role": _current_runtime_role(),
+                    "worker_id": POD_NAME,
+                    "dispatch_source": "worker_dispatch",
                 },
                 dedupe_key=_event_dedupe_key(row.task_id, "task_lease_taken_over", previous_owner_pod, POD_NAME, row.lease_expires_at, row.updated_at),
             )
@@ -2040,6 +2238,9 @@ class TaskService:
                 "dispatch_mode": "select_for_update",
                 "lease_expires_at": isoformat_local(row.lease_expires_at),
                 "lease_takeover": bool(is_lease_takeover),
+                "runtime_role": _current_runtime_role(),
+                "worker_id": POD_NAME,
+                "dispatch_source": "worker_dispatch",
             },
             dedupe_key=_event_dedupe_key(row.task_id, "task_dispatched", POD_NAME, row.started_at, row.lease_expires_at, "select_for_update"),
         )
@@ -2049,6 +2250,15 @@ class TaskService:
 
     @staticmethod
     def _claim_task_row_atomic(db: Session, row_id: int) -> AppEaTask | None:
+        if not _worker_runtime_enforced():
+            logger.error(
+                "atomic task claim denied for non-worker runtime_role=%s pod=%s row_id=%s",
+                _current_runtime_role(),
+                POD_NAME,
+                row_id,
+            )
+            db.rollback()
+            return None
         row = (
             db.query(AppEaTask)
             .filter(
@@ -2131,6 +2341,9 @@ class TaskService:
                         "previous_owner_pod": previous_owner_pod,
                         "owner_pod": POD_NAME,
                         "reason": "lease_takeover",
+                        "runtime_role": _current_runtime_role(),
+                        "worker_id": POD_NAME,
+                        "dispatch_source": "worker_dispatch",
                     },
                     dedupe_key=_event_dedupe_key(refreshed.task_id, "task_lease_taken_over", previous_owner_pod, POD_NAME, row.lease_expires_at, refreshed.updated_at),
                 )
@@ -2149,6 +2362,9 @@ class TaskService:
                     "dispatch_mode": "atomic_claim",
                     "lease_expires_at": isoformat_local(refreshed.lease_expires_at),
                     "lease_takeover": bool(is_takeover),
+                    "runtime_role": _current_runtime_role(),
+                    "worker_id": POD_NAME,
+                    "dispatch_source": "worker_dispatch",
                 },
                 dedupe_key=_event_dedupe_key(refreshed.task_id, "task_dispatched", POD_NAME, refreshed.started_at, refreshed.lease_expires_at, "atomic_claim"),
             )
@@ -3267,6 +3483,8 @@ class TaskService:
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "workspace") if run_root else None
         error_text = str(row.error or "").strip().lower()
+        owner_role_guess = _owner_role_guess(row.owner_pod)
+        owner_valid = _is_valid_worker_owner_pod(row.owner_pod) if row.owner_pod else False
         awaiting_takeover = bool(
             str(row.status or "") == "running"
             and (
@@ -3279,6 +3497,7 @@ class TaskService:
             and row.lease_expires_at is not None
             and row.lease_expires_at < now_local()
         )
+        reconcile_reason = "awaiting_takeover" if reconcile_pending else ("invalid_owner" if row.owner_pod and not owner_valid else None)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_safe_origin_payload(row),
@@ -3291,9 +3510,13 @@ class TaskService:
             "workspace_root": workspace_root,
             "status": row.status,
             "owner_pod": row.owner_pod,
+            "owner_role_guess": owner_role_guess,
+            "owner_valid": owner_valid,
+            "owner_live": owner_valid,
             "lease_expires_at": fmt(row.lease_expires_at),
             "awaiting_takeover": awaiting_takeover,
             "reconcile_pending": reconcile_pending,
+            "reconcile_reason": reconcile_reason,
             "cancel_requested": row.cancel_requested,
             "cancel_acknowledged": row.cancel_acknowledged,
             "cancel_process_cleanup_done": row.cancel_process_cleanup_done,

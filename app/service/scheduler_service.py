@@ -29,17 +29,23 @@ class _ExpiredRunningReconcileStats:
         self._lock = threading.Lock()
         self._reconciled_total = 0
         self._owner_alive_total = 0
+        self._invalid_owner_reconciled_total = 0
+        self._invalid_owner_alive_total = 0
 
-    def observe(self, *, reconciled: int = 0, owner_alive: int = 0) -> None:
+    def observe(self, *, reconciled: int = 0, owner_alive: int = 0, invalid_reconciled: int = 0, invalid_owner_alive: int = 0) -> None:
         with self._lock:
             self._reconciled_total += max(0, int(reconciled))
             self._owner_alive_total += max(0, int(owner_alive))
+            self._invalid_owner_reconciled_total += max(0, int(invalid_reconciled))
+            self._invalid_owner_alive_total += max(0, int(invalid_owner_alive))
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
             return {
                 "reconciled_total": self._reconciled_total,
                 "owner_alive_total": self._owner_alive_total,
+                "invalid_owner_reconciled_total": self._invalid_owner_reconciled_total,
+                "invalid_owner_alive_total": self._invalid_owner_alive_total,
             }
 
 
@@ -67,18 +73,35 @@ class SchedulerService:
         from app.service.task_service import (
             _alive_entry_analysis_owner_pods,
             _requeue_expired_running_tasks,
+            _requeue_invalid_owner_running_tasks,
+            _worker_registry_pods,
         )
 
+        alive_owner_pods = _alive_entry_analysis_owner_pods(db, now)
+        registry_pods = _worker_registry_pods(db, now)
+        invalid_reconciled, invalid_owner_alive = _requeue_invalid_owner_running_tasks(
+            db,
+            now,
+            limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
+            scheduler_instance="scheduler",
+            alive_owner_pods=alive_owner_pods,
+            worker_registry_pods=registry_pods,
+        )
         reconciled, owner_alive = _requeue_expired_running_tasks(
             db,
             now,
             limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
             scheduler_instance="scheduler",
-            alive_owner_pods=_alive_entry_analysis_owner_pods(db, now),
+            alive_owner_pods=alive_owner_pods,
         )
-        if reconciled or owner_alive:
-            _expired_running_reconcile_stats.observe(reconciled=reconciled, owner_alive=owner_alive)
-        return reconciled, owner_alive
+        if reconciled or owner_alive or invalid_reconciled or invalid_owner_alive:
+            _expired_running_reconcile_stats.observe(
+                reconciled=reconciled,
+                owner_alive=owner_alive,
+                invalid_reconciled=invalid_reconciled,
+                invalid_owner_alive=invalid_owner_alive,
+            )
+        return reconciled + invalid_reconciled, owner_alive + invalid_owner_alive
 
     def runtime_reconcile_stats_snapshot(self) -> dict[str, int]:
         return _expired_running_reconcile_stats.snapshot()
