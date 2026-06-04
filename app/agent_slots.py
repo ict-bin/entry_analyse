@@ -380,6 +380,40 @@ class AgentProcessSlotManager:
 
     # ── snapshot ──────────────────────────────────────────────────────────────
 
+    # ── 强制释放孤儿 lease（每次任务启动前 / 定期维护） ─────────────────────────────
+
+    def force_release_orphaned(self, *, stale_age_seconds: float = 3600.0) -> int:
+        """释放 PID 已死、或超过 stale_age_seconds 无 PID 的孤儿 lease，返回释放数量。
+
+        应在以下时机调用：
+        1. _execute_task 启动流水线之前（清理当前 pod 上一次运行的残留）
+        2. 定期 maintenance loop（每 5 分钟扫描一次）
+        """
+        import os as _os
+        released = 0
+        with self._lock:
+            dead_ids: list[int] = []
+            now = time.time()
+            for lid, lease in list(self._leases.items()):
+                dead = False
+                if lease.pid is not None:
+                    try:
+                        _os.kill(lease.pid, 0)  # 信号 0 ＝ 仅检查进程是否存在
+                    except ProcessLookupError:
+                        dead = True             # PID 已死
+                    except PermissionError:
+                        dead = False            # 进程存在但无权限
+                elif now - lease.acquired_at > stale_age_seconds:
+                    dead = True                 # 超时无 PID 的僵尸 lease
+                if dead:
+                    dead_ids.append(lid)
+            for lid in dead_ids:
+                self._leases.pop(lid, None)
+                if not self._award_next_waiter():
+                    self._in_use = max(0, self._in_use - 1)
+                released += 1
+        return released
+
     def snapshot(self) -> dict[str, Any]:
         # 注意：无锁快照，用于监控指标，可能有微小不一致（可接受）
         queue_rows = [

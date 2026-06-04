@@ -1225,6 +1225,16 @@ class WorkerService:
                         WORKER_MAINTENANCE_TIMEOUT_SECONDS,
                     )
                 self.reconcile_suspected_orphans(observed_pids)
+                # 定期释放孤儿 agent slot lease（PID 已死但 lease 未释放）
+                try:
+                    _slot_released = get_agent_process_slot_manager().force_release_orphaned()
+                    if _slot_released:
+                        logger.warning(
+                            "worker maintenance: force-released %d orphaned slot leases",
+                            _slot_released,
+                        )
+                except Exception as _sle:
+                    logger.warning("orphaned slot release error: %s", _sle)
                 self._record_phase_duration(self._maintenance_health, phase="cleanup_call", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 self._record_loop_success(self._maintenance_health, phase="maintenance", duration_ms=duration_ms)
@@ -2047,6 +2057,14 @@ class WorkerService:
                 _cancel_cleanup_monitor(),
                 name=f"ea_cancel_cleanup_{task_id}",
             )
+            # 在启动流水线之前，强制释放当前 pod 上上一次运行残留的孤儿 agent slot lease
+            # （此类泄漏由 MySQL 断连导致 pipeline 终止并重启时发生）
+            _orphaned = get_agent_process_slot_manager().force_release_orphaned()
+            if _orphaned:
+                logger.warning(
+                    "worker: force-released %d orphaned agent slot leases before starting task %s",
+                    _orphaned, task_id,
+                )
             result = await orch.execute(task_id)
             cancel_requested = control_cancel_event.is_set()
             guard_reason = self._task_guard_reasons.get(task_id)
