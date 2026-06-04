@@ -1896,22 +1896,6 @@ class WorkerService:
                 row.owner_pod = task_mod.POD_NAME
                 row.owner_pod_ip = task_mod.POD_IP
                 row.lease_expires_at = task_mod._lease_deadline()
-                task_mod._safe_create_task_event(
-                    db,
-                    task_id=row.task_id,
-                    project_id=row.project_id,
-                    event_type="task_started",
-                    message="任务已开始执行",
-                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
-                    status=row.status,
-                    stage_key="entry_analysis",
-                    file_path=str(row.input_path or "").strip() or None,
-                    payload={
-                        "owner_pod": task_mod.POD_NAME,
-                        "owner_pod_ip": task_mod.POD_IP or None,
-                    },
-                    dedupe_key=task_mod._event_dedupe_key(row.task_id, "task_started", task_mod.POD_NAME, row.started_at, row.updated_at),
-                )
                 db.commit()
 
                 svc = task_mod._load_svc_config_from_db(db, row.project_id)
@@ -1985,11 +1969,8 @@ class WorkerService:
                 _db2.query(AppEaStageResultIndex).filter(
                     AppEaStageResultIndex.task_id == task_id
                 ).delete(synchronize_session=False)
-                _db2.query(AppEaTaskEvent).filter(
-                    AppEaTaskEvent.task_id == task_id
-                ).delete(synchronize_session=False)
                 _db2.commit()
-                logger.info("worker: cleared stage_result_index + task_event for %s", task_id)
+                logger.info("worker: cleared stage_result_index for %s without touching task timeline", task_id)
             except Exception as _dbe:
                 logger.warning("worker: DB pre-run cleanup failed for %s: %s", task_id, _dbe)
             finally:
@@ -2032,6 +2013,41 @@ class WorkerService:
                             raise
                     _d.mkdir(parents=True, exist_ok=True)
                     logger.info("worker: reset %s/ for %s", _subdir, task_id)
+
+            # User-facing timeline must survive requeue/takeover; emit task_started after
+            # pre-run cleanup so it is never wiped by runtime field reset.
+            _db_gen3 = get_db()
+            _db3 = next(_db_gen3)
+            try:
+                _row3 = (
+                    _db3.query(AppEaTask)
+                    .filter_by(task_id=task_id)
+                    .filter(AppEaTask.owner_pod == task_mod.POD_NAME)
+                    .first()
+                )
+                if _row3 is not None and _row3.status == "running":
+                    task_mod._safe_create_task_event(
+                        _db3,
+                        task_id=_row3.task_id,
+                        project_id=_row3.project_id,
+                        event_type="task_started",
+                        message="任务已开始执行",
+                        source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                        status=_row3.status,
+                        stage_key="entry_analysis",
+                        file_path=str(_row3.input_path or "").strip() or None,
+                        payload={
+                            "owner_pod": task_mod.POD_NAME,
+                            "owner_pod_ip": task_mod.POD_IP or None,
+                        },
+                        dedupe_key=task_mod._event_dedupe_key(_row3.task_id, "task_started", task_mod.POD_NAME, _row3.started_at, _row3.updated_at),
+                    )
+                    _db3.commit()
+            finally:
+                try:
+                    next(_db_gen3)
+                except StopIteration:
+                    pass
 
             orch = Orchestrator(config=cfg, on_event=on_event)
             self._task_abort_callbacks[task_id] = orch.abort
