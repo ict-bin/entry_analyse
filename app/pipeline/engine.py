@@ -2667,6 +2667,7 @@ class PipelineEngine:
                     body=body,
                     model=model,
                     cancel_event=self._cancel,
+                    timeout_seconds=int(getattr(self.cfg, "agent_run_timeout_seconds", 3600)),
                 )
             _af_wall_dur = self._dur(_af_start)  # 含槽位等待 + API semaphore 等待
             self._emit(

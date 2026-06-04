@@ -42,7 +42,7 @@ _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent
 _MODELS_JSON_PATH = Path(_PI_DIR) / "models.json"
 
 _DEFAULT_CONCURRENCY      = int(os.environ.get("EA_API_FILTER_CONCURRENCY",       "8"))
-_REQUEST_TIMEOUT          = int(os.environ.get("EA_API_FILTER_TIMEOUT_SECONDS",   "45"))
+_REQUEST_TIMEOUT          = int(os.environ.get("EA_API_FILTER_TIMEOUT_SECONDS",   "3600"))  # 对齐 agent_run_timeout_seconds
 _MAX_RETRIES              = int(os.environ.get("EA_API_FILTER_MAX_RETRIES",        "2"))
 _MAX_BODY_CHARS           = int(os.environ.get("EA_API_FILTER_MAX_BODY_CHARS",  "3000"))
 
@@ -160,10 +160,11 @@ async def _call_llm_once(
     api_key:  str,
     model_id: str,
     messages: list[dict],
-    max_tokens: int = 64,
+    timeout_seconds: int = _REQUEST_TIMEOUT,
 ) -> str:
     """
     向 OpenAI-compatible endpoint 发送单次请求，返回 assistant 文本。
+    不限制 max_tokens，让推理模型（MiniMax-M2.5 等）自由输出完整思考链 + 答案。
     """
     try:
         import aiohttp
@@ -178,11 +179,12 @@ async def _call_llm_once(
     payload = {
         "model":       model_id,
         "messages":    messages,
-        "max_tokens":  max_tokens,
+        # 不设 max_tokens：推理模型需要先生成 <think>...</think> 再输出答案，
+        # 强制 64 tokens 会截断思考链导致解析失败
         "temperature": 0.0,
     }
 
-    timeout = aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -196,11 +198,17 @@ def _parse_is_entry(text: str) -> bool | None:
     """
     从 LLM 响应中解析 is_entry 值。
 
+    自动处理推理模型（MiniMax-M2.5 / DeepSeek-R1 等）的 <think>...</think> 前缀。
+
     接受格式：
       {"is_entry": 1}  /  {"is_entry": 0}
       is_entry: 1       /  is_entry: 0
       1 / 0
     """
+    # 剥离推理模型的 <think>...</think> 块，只看最终答案
+    think_stripped = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    if think_stripped:  # 剥离后非空才替换，否则保留原文（兜底）
+        text = think_stripped
     # JSON 对象
     m = re.search(r'"is_entry"\s*:\s*([01])', text)
     if m:
@@ -285,11 +293,12 @@ _USER_TMPL = """\
 # ─── 主调用函数 ───────────────────────────────────────────────────────────────
 
 async def api_filter_function(
-    func_name:    str,
-    signature:    str,
-    body:         str,
-    model:        str = "",
-    cancel_event: asyncio.Event | None = None,
+    func_name:       str,
+    signature:       str,
+    body:            str,
+    model:           str = "",
+    cancel_event:    asyncio.Event | None = None,
+    timeout_seconds: int = _REQUEST_TIMEOUT,  # 默认对齐 agent_run_timeout_seconds
 ) -> tuple[bool, int]:
     """
     对单个函数调用 LLM API，快速判断是否为外部入口。
@@ -340,7 +349,8 @@ async def api_filter_function(
             if cancel_event and cancel_event.is_set():
                 return True, 0
             try:
-                resp_text = await _call_llm_once(base_url, api_key, model_id, messages)
+                resp_text = await _call_llm_once(base_url, api_key, model_id, messages,
+                                                       timeout_seconds=timeout_seconds)
                 result = _parse_is_entry(resp_text)
                 if result is None:
                     logger.debug(
