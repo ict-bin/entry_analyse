@@ -2651,6 +2651,7 @@ class LeanPipelineEngine:
                     model=model,
                     cancel_event=self._cancel,
                     timeout_seconds=int(getattr(self.cfg, "agent_run_timeout_seconds", 3600)),
+                    session_file=str(dirs.af_session(func_hash)),
                 )
             _af_wall_dur = self._dur(_af_start)  # 含 AgentProcessSlot/API semaphore 等待
             self._emit(

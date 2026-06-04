@@ -292,6 +292,52 @@ _USER_TMPL = """\
 
 # ─── 主调用函数 ───────────────────────────────────────────────────────────────
 
+
+# ─── JSONL 会话日志 ─────────────────────────────────────────────────────
+
+def _write_af_session(
+    session_file: 'str | None',
+    func_name: str,
+    attempt: int,
+    messages: 'list[dict]',
+    response_raw: 'str | None',
+    parsed_result: 'bool | None',
+    duration_ms: int,
+    error: 'str | None',
+) -> None:
+    """
+    追加写入一条 API_Filter 会话记录到 JSONL 文件。
+
+    每行一个 JSON 对象，包含：
+      ts / func_name / attempt / request_msgs / response_raw /
+      parsed_is_entry (0/1/null) / duration_ms / error
+
+    session_file=None 时跳过，不影响主流程。
+    """
+    if not session_file:
+        return
+    import json as _json
+    import time as _time
+    import pathlib as _pl
+    record = {
+        'ts':              _time.time(),
+        'func_name':       func_name,
+        'attempt':         attempt,
+        'request_msgs':    messages,
+        'response_raw':    response_raw,
+        'parsed_is_entry': None if parsed_result is None else int(parsed_result),
+        'duration_ms':     duration_ms,
+        'error':           error,
+    }
+    try:
+        p = _pl.Path(session_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open('a', encoding='utf-8') as f:
+            f.write(_json.dumps(record, ensure_ascii=False) + chr(10))
+    except Exception as _e:
+        logger.debug('af session write failed %s: %s', session_file, _e)
+
+
 async def api_filter_function(
     func_name:       str,
     signature:       str,

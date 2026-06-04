@@ -179,6 +179,10 @@ class PipelineDirs:
     def r3_j_session(self, func_hash: str, attempt: int) -> Path:
         return self.sessions / f"r3-j-{func_hash}-a{attempt}.jsonl"
 
+    def af_session(self, func_hash: str) -> Path:
+        """API_Filter LLM 会话 JSONL 文件，每次函数的所有请求/响应追加写入同一文件。"""
+        return self.sessions / f"af-{func_hash}.jsonl"
+
     # R4 Callchain（函数级）
     # R5 Per-func Report
     def r5_w_session(self, func_hash: str) -> Path:
