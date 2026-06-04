@@ -52,8 +52,6 @@ def normalize_agent_process_limit(value: int | str | None) -> int:
     return min(candidate, AGENT_PROCESS_LIMIT_LIMIT)
 
 
-# ─── Agent 实例配置 ───────────────────────────────────────────────────────────
-
 class AgentInstanceConfig(BaseModel):
     model: str = Field(..., description="该实例使用的 LLM 模型")
     tools: Optional[list[str]] = Field(default=None)
@@ -69,10 +67,9 @@ class RoleConfig(BaseModel):
     agents: list[AgentInstanceConfig] = Field(default_factory=list)
 
 
-# ─── 服务配置（由管理员一次性配置，长期不变）─────────────────────────────────
-
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
+
     model_config = ConfigDict(protected_namespaces=())
 
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
@@ -99,7 +96,6 @@ class ServiceConfig(BaseModel):
     master_shard_size: int = Field(default=MASTER_SHARD_SIZE_DEFAULT)
     master_shard_parallelism: int = Field(default=MASTER_SHARD_PARALLELISM_DEFAULT)
 
-    # 各阶段轮次配置（-1=无限，0=跳过，N=上限）
     r1_max_rounds: int = Field(default=-1)
     r2_max_rounds: int = Field(default=-1)
     r3_max_rounds: int = Field(default=-1)
@@ -114,25 +110,24 @@ class ServiceConfig(BaseModel):
     judges: RoleConfig = Field(default_factory=RoleConfig)
     pipeline_prompts_dir: str = Field(
         default="./prompts/pipeline",
-        description="四阶段流水线各阶段系统提示词目录（r1_worker.md, r1_judge.md, ...）"
+        description="四阶段流水线各阶段系统提示词目录（r1_worker.md, r1_judge.md, ...）",
     )
 
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
     lean_mode: bool = Field(
         default=False,
-        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
+        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J",
     )
     lean_file_max_rounds: int = Field(
         default=-1,
-        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）"
+        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）",
     )
     lean_module_max_rounds: int = Field(
         default=-1,
-        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
+        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）",
     )
     api_filter_entry_judge: bool = Field(
         default=True,
@@ -141,23 +136,23 @@ class ServiceConfig(BaseModel):
             "Direct LLM API 在 R3 前快速判断函数是否是外部入口；"
             "R3 仅做污点分析（不再重复判断是否入口）。"
             "关闭则由 R3 Agent 完整判断入口 + 分析污点，适合需要最高准确度的场景。"
-        )
+        ),
     )
+    api_filter_timeout_seconds: int = Field(default=120, description="API_Filter 单次 LLM 请求超时时间（秒）")
+    api_filter_max_timeouts: int = Field(default=2, description="API_Filter 超时达到该次数后跳过该函数")
+    api_filter_parse_max_retries: int = Field(default=1, description="API_Filter 不可解析响应最大重试次数")
 
-
-# ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
 
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
+
     model_config = ConfigDict(protected_namespaces=())
 
-    # 用户输入部分
     task: str = Field(..., description="用户的一句话 prompt")
     module_name: str = Field(default="", description="从 prompt 解析出的模块名")
     cwd: str = Field(default="/data/target", description="模块目录（含 files.list 或子模块目录）")
     source_path: Optional[str] = Field(default=None, description="源码根目录（用于解析files.list中的文件路径；为None时使用cwd）")
 
-    # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     min_rounds: int = Field(default=2)
@@ -182,44 +177,33 @@ class TaskConfig(BaseModel):
     judges: RoleConfig = Field(default_factory=RoleConfig)
     pipeline_prompts_dir: str = Field(
         default="./prompts/pipeline",
-        description="四阶段流水线各阶段系统提示词目录（r1_worker.md, r1_judge.md, ...）"
+        description="四阶段流水线各阶段系统提示词目录（r1_worker.md, r1_judge.md, ...）",
     )
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    # ── 每阶段最大重试轮次（-1=无限重试，0=跳过，正整数=上限）─────────────────────
-    r1_max_rounds: int = Field(default=-1,
-        description="R1 文件级 ctags 提取+覆盖率 W+J 最大轮次（-1=无限）")
-    r2_max_rounds: int = Field(default=-1,
-        description="R2 ctags 行号准确性 W+J 最大轮次（-1=无限）")
-    r3_max_rounds: int = Field(default=-1,
-        description="R3 外部输入分析 W+J 最大轮次（-1=无限）")
-    r3_j_max_rounds: int = Field(default=-1,
-        description="R3 外部输入分析 Judge 最大轮次（-1=无限）")
-    r4_func_max_rounds: int = Field(default=-1,
-        description="R4 per-func 跨文件分析最大轮次（-1=无限）")
-    r4_func_j_max_rounds: int = Field(default=-1,
-        description="R4 per-func Judge 最大轮次（-1=无限）")
-    r4_final_max_rounds: int = Field(default=-1,
-        description="R4 汇总 Judge 最大轮次（-1=无限）")
-    report_func_max_rounds: int = Field(default=-1,
-        description="Report per-func W+J 最大轮次（-1=无限）")
-    report_final_max_rounds: int = Field(default=-1,
-        description="Report final W+J 最大轮次（-1=无限）")
+    r1_max_rounds: int = Field(default=-1, description="R1 文件级 ctags 提取+覆盖率 W+J 最大轮次（-1=无限）")
+    r2_max_rounds: int = Field(default=-1, description="R2 ctags 行号准确性 W+J 最大轮次（-1=无限）")
+    r3_max_rounds: int = Field(default=-1, description="R3 外部输入分析 W+J 最大轮次（-1=无限）")
+    r3_j_max_rounds: int = Field(default=-1, description="R3 外部输入分析 Judge 最大轮次（-1=无限）")
+    r4_func_max_rounds: int = Field(default=-1, description="R4 per-func 跨文件分析最大轮次（-1=无限）")
+    r4_func_j_max_rounds: int = Field(default=-1, description="R4 per-func Judge 最大轮次（-1=无限）")
+    r4_final_max_rounds: int = Field(default=-1, description="R4 汇总 Judge 最大轮次（-1=无限）")
+    report_func_max_rounds: int = Field(default=-1, description="Report per-func W+J 最大轮次（-1=无限）")
+    report_final_max_rounds: int = Field(default=-1, description="Report final W+J 最大轮次（-1=无限）")
 
-    # ── 精简模式（与完整模式完全独立，零干扰）────────────────────────────────
     lean_mode: bool = Field(
         default=False,
-        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J"
+        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J",
     )
     lean_file_max_rounds: int = Field(
         default=-1,
-        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）"
+        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）",
     )
     lean_module_max_rounds: int = Field(
         default=-1,
-        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
+        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）",
     )
     api_filter_entry_judge: bool = Field(
         default=True,
@@ -228,10 +212,12 @@ class TaskConfig(BaseModel):
             "Direct LLM API 在 R3 前快速判断函数是否是外部入口；"
             "R3 仅做污点分析（不再重复判断是否入口）。"
             "关闭则由 R3 Agent 完整判断入口 + 分析污点，适合需要最高准确度的场景。"
-        )
+        ),
     )
+    api_filter_timeout_seconds: int = Field(default=120)
+    api_filter_max_timeouts: int = Field(default=2)
+    api_filter_parse_max_retries: int = Field(default=1)
 
-    # 断点续跑：填入已有任务 ID，自动检测上次完成的轮次并从下一轮继续
     resume_task_id: str = Field(default="", description="保留字段（未使用，续跑功能已废弃，重启请使用 restart API）")
 
     @property
@@ -243,8 +229,6 @@ class TaskConfig(BaseModel):
         return len(self.judges.agents)
 
 
-# ─── Token 统计 ───────────────────────────────────────────────────────────────
-
 class TokenUsage(BaseModel):
     input: int = 0
     output: int = 0
@@ -252,7 +236,7 @@ class TokenUsage(BaseModel):
     cache_write: int = 0
     cost: float = 0.0
 
-    def __iadd__(self, other: TokenUsage) -> TokenUsage:
+    def __iadd__(self, other: "TokenUsage") -> "TokenUsage":
         self.input += other.input
         self.output += other.output
         self.cache_read += other.cache_read
@@ -260,8 +244,6 @@ class TokenUsage(BaseModel):
         self.cost += other.cost
         return self
 
-
-# ─── 执行结果 ─────────────────────────────────────────────────────────────────
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -276,7 +258,7 @@ class WorkerResult(BaseModel):
     worker_id: str
     model: str = ""
     output: str = ""
-    entry_file: str = ""  # Worker 写入的 entry-list.md 路径
+    entry_file: str = ""
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
 
@@ -326,6 +308,7 @@ class TaskResult(BaseModel):
     final_output: str = ""
     total_duration_ms: float = 0
     total_tokens: TokenUsage = Field(default_factory=TokenUsage)
+    api_filter_summary: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
 

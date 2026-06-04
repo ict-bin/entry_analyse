@@ -66,6 +66,10 @@ _USER_TIMELINE_EVENT_TYPES: set[str] = {
     "task_dispatch_failed",
     "task_lease_lost",
     "task_runtime_interrupted",
+    "api_filter_started",
+    "api_filter_timed_out",
+    "api_filter_skipped",
+    "api_filter_failed",
 }
 
 

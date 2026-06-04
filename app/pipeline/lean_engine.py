@@ -441,7 +441,7 @@ class LeanPipelineEngine:
         self._out_dir: Path | None = None  # 输出目录（per-func report 使用）
         self._r4_j_confirmed: bool = False
         # API_Filter: 每函数预筛结果缓存（内存级，重启清空）
-        self._api_filter_results: dict[str, bool] = {}
+        self._api_filter_results: dict[str, dict[str, Any]] = {}
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -573,11 +573,14 @@ class LeanPipelineEngine:
 
             # ── API_Filter: 直接 LLM API 预筛（精简模式专用）───────────────────
             if func_hash not in self._api_filter_results:
-                _af_passed = await self._run_api_filter(
+                _af_result = await self._run_api_filter(
                     file_hash, func_hash, file_path, dirs, state
                 )
-                self._api_filter_results[func_hash] = _af_passed
-            if not self._api_filter_results.get(func_hash, True):
+                self._api_filter_results[func_hash] = _af_result
+            _af_cached = self._api_filter_results.get(func_hash, {})
+            if _af_cached.get("skipped"):
+                return
+            if _af_cached.get("is_entry") is False:
                 return  # API_Filter 判定为非入口，跳过 R3/R4
 
             # ── R3 分析: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
@@ -737,6 +740,26 @@ class LeanPipelineEngine:
 
         # Fix-5: 从 sessions JSONL 聚合 token 用量
         self._total_token_usage = _aggregate_session_tokens(dirs.sessions)
+
+        total_functions = 0
+        passed_functions = 0
+        skipped_functions = 0
+        timeout_skipped_functions = 0
+        for file_state in state.files.values():
+            total_functions += len(file_state.functions)
+            for func_state in file_state.functions.values():
+                if func_state.api_filter_state == "passed":
+                    passed_functions += 1
+                elif func_state.api_filter_state == "skipped":
+                    skipped_functions += 1
+                    if func_state.api_filter_skip_reason == "timeout":
+                        timeout_skipped_functions += 1
+        self._api_filter_summary = {
+            "total_functions": total_functions,
+            "passed_functions": passed_functions,
+            "skipped_functions": skipped_functions,
+            "timeout_skipped_functions": timeout_skipped_functions,
+        }
 
         return final_entries
 
@@ -2609,7 +2632,7 @@ class LeanPipelineEngine:
         直接调用 LLM API 快速预筛，判断函数是否为外部入口。
         Direct API 与 pi Agent 共用 pod 级 AgentProcessSlotManager 槽位，
         优先级位于 R2-W 与 R3-J 之间，避免双通道并发导致 OOM。
-        失败时保守返回 True（不漏报）。
+        失败时仅在非 skip 场景下保守 keep；timeout/parse 达到上限时跳过该函数。
         """
         from .api_filter import api_filter_function
         from .funcdb import FunctionDB as _FDBAF
@@ -2617,6 +2640,9 @@ class LeanPipelineEngine:
         func_state = state.files[file_hash].functions.get(func_hash)
         func_name = func_state.name if func_state else func_hash[:8]
         signature = func_state.signature if func_state else ""
+        if func_state is not None:
+            func_state.api_filter_state = "running"
+            await asyncio.to_thread(state.save, dirs.state_file)
 
         body = ""
         try:
@@ -2628,7 +2654,7 @@ class LeanPipelineEngine:
         except Exception as _af_exc:
             logger.debug("api_filter body prefetch failed %s: %s", func_hash, _af_exc)
 
-        self._emit("api_filter_start", func_hash=func_hash, function=func_name)
+        self._emit("api_filter_start", func_hash=func_hash, function=func_name, file_hash=file_hash)
         _af_start = time.monotonic()
 
         def _emit_slot_event(event_type: str, payload: dict[str, Any]) -> None:
@@ -2644,29 +2670,100 @@ class LeanPipelineEngine:
                 cancel_event=self._cancel,
                 on_event=_emit_slot_event,
             ):
-                is_entry, _af_llm_dur = await api_filter_function(
+                result = await api_filter_function(
                     func_name=func_name,
                     signature=signature,
                     body=body,
                     model=model,
                     cancel_event=self._cancel,
-                    timeout_seconds=int(getattr(self.cfg, "agent_run_timeout_seconds", 3600)),
+                    timeout_seconds=int(getattr(self.cfg, "api_filter_timeout_seconds", 120) or 120),
                     session_file=str(dirs.af_session(func_hash)),
                 )
             _af_wall_dur = self._dur(_af_start)  # 含 AgentProcessSlot/API semaphore 等待
+            if func_state is not None:
+                func_state.api_filter_attempts = int(result.get("attempts", 0) or 0)
+                func_state.api_filter_duration_ms = int(result.get("duration_ms", 0) or 0)
+                func_state.api_filter_last_error = str(result.get("error_message", "") or "")
+                func_state.api_filter_timed_out = str(result.get("error_kind", "") or "") == "timeout"
+                if result.get("skipped"):
+                    func_state.api_filter_state = "skipped"
+                    func_state.api_filter_decision = "skip"
+                    func_state.api_filter_skip_reason = str(result.get("skip_reason", "") or "")
+                elif result.get("completed"):
+                    func_state.api_filter_state = "passed"
+                    func_state.api_filter_decision = "keep" if result.get("is_entry") else "filter"
+                    func_state.api_filter_skip_reason = ""
+                else:
+                    func_state.api_filter_state = "failed"
+                    func_state.api_filter_decision = "keep" if result.get("is_entry", True) else "filter"
+                await asyncio.to_thread(state.save, dirs.state_file)
+
+            if str(result.get("error_kind", "") or "") == "timeout":
+                self._emit(
+                    "api_filter_timed_out",
+                    func_hash=func_hash,
+                    function=func_name,
+                    file_hash=file_hash,
+                    attempt=int(result.get("attempts", 0) or 0),
+                    timeout_seconds=int(getattr(self.cfg, "api_filter_timeout_seconds", 120) or 120),
+                    duration_ms=int(result.get("duration_ms", 0) or 0),
+                    error_kind=result.get("error_kind"),
+                    error_message=str(result.get("error_message", "") or "")[:200],
+                    will_retry=not bool(result.get("skipped")),
+                )
+            if result.get("skipped"):
+                self._emit(
+                    "api_filter_skipped",
+                    func_hash=func_hash,
+                    function=func_name,
+                    file_hash=file_hash,
+                    attempt=int(result.get("attempts", 0) or 0),
+                    duration_ms=int(result.get("duration_ms", 0) or 0),
+                    error_kind=result.get("error_kind"),
+                    error_message=str(result.get("error_message", "") or "")[:200],
+                    skipped=True,
+                    skip_reason=result.get("skip_reason"),
+                )
+            elif not result.get("completed"):
+                self._emit(
+                    "api_filter_failed",
+                    func_hash=func_hash,
+                    function=func_name,
+                    file_hash=file_hash,
+                    attempt=int(result.get("attempts", 0) or 0),
+                    duration_ms=int(result.get("duration_ms", 0) or 0),
+                    error_kind=result.get("error_kind"),
+                    error_message=str(result.get("error_message", "") or "")[:200],
+                    skipped=False,
+                )
             self._emit(
                 "api_filter_done",
                 func_hash=func_hash, function=func_name,
-                is_entry=int(is_entry),
-                duration_ms=_af_llm_dur,          # 实际 LLM 调用时间（不含等待）
+                is_entry=None if result.get("is_entry") is None else int(bool(result.get("is_entry"))),
+                skipped=bool(result.get("skipped")),
+                skip_reason=result.get("skip_reason"),
+                duration_ms=int(result.get("duration_ms", 0) or 0),  # 实际 LLM 调用时间（不含等待）
                 wall_duration_ms=_af_wall_dur,    # 含信号量等待的总耗时
             )
-            return is_entry
+            return result
         except Exception as exc:
             logger.warning("api_filter failed for %s, keeping: %s", func_hash, exc)
-            self._emit("api_filter_error", func_hash=func_hash, function=func_name,
-                       error=str(exc)[:100])
-            return True
+            if func_state is not None:
+                func_state.api_filter_state = "failed"
+                func_state.api_filter_last_error = str(exc)
+                await asyncio.to_thread(state.save, dirs.state_file)
+            self._emit("api_filter_failed", func_hash=func_hash, function=func_name,
+                       file_hash=file_hash, error_kind="exception", error_message=str(exc)[:200], skipped=False)
+            return {
+                "completed": False,
+                "is_entry": True,
+                "skipped": False,
+                "skip_reason": "",
+                "error_kind": "exception",
+                "error_message": str(exc),
+                "attempts": 0,
+                "duration_ms": 0,
+            }
 
     async def _aupsert(self, **kwargs) -> None:
         """async wrapper for upsert_stage_result_index。

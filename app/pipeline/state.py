@@ -55,6 +55,15 @@ class FunctionState:
     r2_j_feedback_path: str = ""
     r2_source_incomplete: bool = False  # agent 判定源文件函数体不完整，永久跳过后续阶段
 
+    # ── API_Filter：精简模式下的函数级预筛────────────────────────────────────
+    api_filter_state: str = "pending"  # pending|running|passed|failed|skipped
+    api_filter_attempts: int = 0
+    api_filter_decision: str = ""      # keep|filter|skip
+    api_filter_skip_reason: str = ""
+    api_filter_last_error: str = ""
+    api_filter_timed_out: bool = False
+    api_filter_duration_ms: int = 0
+
     # ── R3：外部输入分析（原 R2）─────────────────────────────────────────────
     r3_w_state:    NodeState = NodeState.PENDING
     r3_w_attempts: int = 0
@@ -147,6 +156,13 @@ class FunctionState:
             data[_f] = NodeState(data.get(_f, 'pending'))
 
         data.setdefault('entry_role', '')
+        data.setdefault('api_filter_state', 'pending')
+        data.setdefault('api_filter_attempts', 0)
+        data.setdefault('api_filter_decision', '')
+        data.setdefault('api_filter_skip_reason', '')
+        data.setdefault('api_filter_last_error', '')
+        data.setdefault('api_filter_timed_out', False)
+        data.setdefault('api_filter_duration_ms', 0)
         data.setdefault('r4_decision', '')
         data.setdefault('r4_note', '')
         data.setdefault('r4_j_feedback', '')

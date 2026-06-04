@@ -42,9 +42,28 @@ _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent
 _MODELS_JSON_PATH = Path(_PI_DIR) / "models.json"
 
 _DEFAULT_CONCURRENCY      = int(os.environ.get("EA_API_FILTER_CONCURRENCY",       "8"))
-_REQUEST_TIMEOUT          = int(os.environ.get("EA_API_FILTER_TIMEOUT_SECONDS",   "3600"))  # 对齐 agent_run_timeout_seconds
+_REQUEST_TIMEOUT          = int(os.environ.get("EA_API_FILTER_TIMEOUT_SECONDS",   "120"))
 _MAX_RETRIES              = int(os.environ.get("EA_API_FILTER_MAX_RETRIES",        "2"))
+_MAX_TIMEOUTS             = int(os.environ.get("EA_API_FILTER_MAX_TIMEOUTS",      "2"))
+_PARSE_MAX_RETRIES        = int(os.environ.get("EA_API_FILTER_PARSE_MAX_RETRIES", "1"))
+_SKIP_ON_TIMEOUT          = str(os.environ.get("EA_API_FILTER_SKIP_ON_TIMEOUT", "true")).strip().lower() not in {"0", "false", "no", "off"}
+_SKIP_ON_PARSE_FAILURE    = str(os.environ.get("EA_API_FILTER_SKIP_ON_PARSE_FAILURE", "true")).strip().lower() not in {"0", "false", "no", "off"}
 _MAX_BODY_CHARS           = int(os.environ.get("EA_API_FILTER_MAX_BODY_CHARS",  "3000"))
+
+
+def _classify_error(exc: Exception) -> str:
+    try:
+        import aiohttp
+    except ImportError:
+        aiohttp = None
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    if aiohttp is not None:
+        if isinstance(exc, aiohttp.ClientResponseError):
+            return "http_error"
+        if isinstance(exc, aiohttp.ClientError):
+            return "transport_error"
+    return "transport_error"
 
 # 模块级信号量（单 event loop 内共享）
 _api_filter_sem: asyncio.Semaphore | None = None
@@ -346,17 +365,38 @@ async def api_filter_function(
     cancel_event:    asyncio.Event | None = None,
     timeout_seconds: int = _REQUEST_TIMEOUT,  # 默认对齐 agent_run_timeout_seconds
     session_file:    str | None = None,       # API_Filter JSONL 审计日志；None=不保存
-) -> tuple[bool, int]:
+) -> dict[str, Any]:
     """
     对单个函数调用 LLM API，快速判断是否为外部入口。
 
-    返回 (is_entry: bool, llm_duration_ms: int)
-      is_entry=True  → 继续 R3（或调用失败时保守保留）
-      is_entry=False → 跳过 R3，函数过滤
-    API 调用失败时保守返回 (True, 0)（不漏报）。
+    返回结构化结果：
+      completed / is_entry / skipped / skip_reason / error_kind /
+      error_message / attempts / duration_ms
     """
+    def _result(
+        *,
+        completed: bool,
+        is_entry: bool | None,
+        skipped: bool,
+        skip_reason: str,
+        error_kind: str,
+        error_message: str,
+        attempts: int,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        return {
+            "completed": bool(completed),
+            "is_entry": is_entry,
+            "skipped": bool(skipped),
+            "skip_reason": str(skip_reason or "").strip(),
+            "error_kind": str(error_kind or "").strip(),
+            "error_message": str(error_message or "").strip(),
+            "attempts": max(0, int(attempts or 0)),
+            "duration_ms": max(0, int(duration_ms or 0)),
+        }
+
     if cancel_event and cancel_event.is_set():
-        return True, 0  # 取消时保守保留
+        return _result(completed=False, is_entry=True, skipped=False, skip_reason="", error_kind="cancelled", error_message="cancelled", attempts=0, duration_ms=0)
 
     # 准备 prompt（截断超大 body）
     body_capped = body[:_MAX_BODY_CHARS]
@@ -368,11 +408,11 @@ async def api_filter_function(
     if _pre is True:
         logger.debug("api_filter prefilter: %s -> is_entry=1 (IO syscall found)", func_name)
         _write_af_session(session_file, func_name, 0, [], None, True, 0, error="prefilter:true")
-        return True, 0
+        return _result(completed=True, is_entry=True, skipped=False, skip_reason="", error_kind="", error_message="", attempts=0, duration_ms=0)
     if _pre is False:
         logger.debug("api_filter prefilter: %s -> is_entry=0 (internal pattern)", func_name)
         _write_af_session(session_file, func_name, 0, [], None, False, 0, error="prefilter:false")
-        return False, 0
+        return _result(completed=True, is_entry=False, skipped=False, skip_reason="", error_kind="", error_message="", attempts=0, duration_ms=0)
 
     messages = [
         {"role": "system",  "content": _SYSTEM_PROMPT},
@@ -390,15 +430,18 @@ async def api_filter_function(
         logger.warning("api_filter: provider load failed: %s, keeping %s", exc, func_name)
         _write_af_session(session_file, func_name, 0, messages, None, True, 0,
                           error=f"provider_load_failed: {exc}")
-        return True, 0
+        return _result(completed=False, is_entry=True, skipped=False, skip_reason="", error_kind="provider_error", error_message=str(exc), attempts=0, duration_ms=0)
 
     # 信号量限制并发
     sem = get_api_filter_sem()
     async with sem:
         _llm_start = time.monotonic()  # 信号量 acquire 后才开始计时（不含等待）
-        for attempt in range(1, _MAX_RETRIES + 2):
+        timeout_failures = 0
+        parse_failures = 0
+        max_attempts = max(1, _MAX_RETRIES + 1)
+        for attempt in range(1, max_attempts + 1):
             if cancel_event and cancel_event.is_set():
-                return True, 0
+                return _result(completed=False, is_entry=True, skipped=False, skip_reason="", error_kind="cancelled", error_message="cancelled", attempts=attempt - 1, duration_ms=0)
             try:
                 resp_text = await _call_llm_once(base_url, api_key, model_id, messages,
                                                        timeout_seconds=timeout_seconds)
@@ -407,34 +450,63 @@ async def api_filter_function(
                 _write_af_session(session_file, func_name, attempt, messages, resp_text,
                                   result, _dur, error=None)
                 if result is None:
+                    parse_failures += 1
                     logger.debug(
                         "api_filter: unparseable response for %s (attempt %d): %r",
                         func_name, attempt, resp_text[:100]
                     )
-                    if attempt <= _MAX_RETRIES:
+                    if parse_failures <= _PARSE_MAX_RETRIES and attempt < max_attempts:
                         await asyncio.sleep(1.0 * attempt)
                         continue
-                    # 无法解析 → 保守保留
-                    logger.warning(
-                        "api_filter: cannot parse response for %s after %d attempts, keeping",
-                        func_name, attempt
-                    )
-                    return True, _dur
-                return result, _dur
+                    if _SKIP_ON_PARSE_FAILURE:
+                        logger.warning(
+                            "api_filter: cannot parse response for %s after %d attempts, skipping function",
+                            func_name, attempt
+                        )
+                        return _result(
+                            completed=False,
+                            is_entry=None,
+                            skipped=True,
+                            skip_reason="parse_error",
+                            error_kind="parse_error",
+                            error_message="unparseable response",
+                            attempts=attempt,
+                            duration_ms=_dur,
+                        )
+                    return _result(completed=False, is_entry=True, skipped=False, skip_reason="", error_kind="parse_error", error_message="unparseable response", attempts=attempt, duration_ms=_dur)
+                return _result(completed=True, is_entry=result, skipped=False, skip_reason="", error_kind="", error_message="", attempts=attempt, duration_ms=_dur)
             except Exception as exc:
                 _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
+                error_kind = _classify_error(exc)
+                if error_kind == "timeout":
+                    timeout_failures += 1
                 logger.debug(
                     "api_filter: HTTP error for %s (attempt %d): %s",
                     func_name, attempt, exc
                 )
                 _write_af_session(session_file, func_name, attempt, messages, None,
                                   None, _dur, error=str(exc))
-                if attempt <= _MAX_RETRIES:
+                if error_kind == "timeout" and _SKIP_ON_TIMEOUT and timeout_failures >= _MAX_TIMEOUTS:
+                    logger.warning(
+                        "api_filter: timeout for %s reached limit=%d, skipping function",
+                        func_name, _MAX_TIMEOUTS
+                    )
+                    return _result(
+                        completed=False,
+                        is_entry=None,
+                        skipped=True,
+                        skip_reason="timeout",
+                        error_kind="timeout",
+                        error_message=str(exc),
+                        attempts=attempt,
+                        duration_ms=_dur,
+                    )
+                if attempt < max_attempts:
                     await asyncio.sleep(2.0 * attempt)
                 else:
                     logger.warning(
                         "api_filter: failed for %s after %d attempts (%s), keeping",
                         func_name, attempt, exc
                     )
-                    return True, _dur  # 保守保留
-    return True, 0
+                    return _result(completed=False, is_entry=True, skipped=False, skip_reason="", error_kind=error_kind, error_message=str(exc), attempts=attempt, duration_ms=_dur)
+    return _result(completed=False, is_entry=True, skipped=False, skip_reason="", error_kind="", error_message="", attempts=0, duration_ms=0)

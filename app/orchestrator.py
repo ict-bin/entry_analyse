@@ -285,6 +285,7 @@ class Orchestrator:
                 result.error = "流水线未产生任何外部入口结果"
 
             result.final_output = json.dumps(entries, ensure_ascii=False, indent=2)
+            result.api_filter_summary = dict(getattr(engine, "_api_filter_summary", {}) or {})
 
         except PiFatalError as e:
             result.status = TaskStatus.FAILED
