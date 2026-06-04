@@ -345,6 +345,7 @@ async def api_filter_function(
     model:           str = "",
     cancel_event:    asyncio.Event | None = None,
     timeout_seconds: int = _REQUEST_TIMEOUT,  # 默认对齐 agent_run_timeout_seconds
+    session_file:    str | None = None,       # API_Filter JSONL 审计日志；None=不保存
 ) -> tuple[bool, int]:
     """
     对单个函数调用 LLM API，快速判断是否为外部入口。
@@ -366,9 +367,11 @@ async def api_filter_function(
     _pre = _prefilter_is_entry(func_name, signature, body_capped)
     if _pre is True:
         logger.debug("api_filter prefilter: %s -> is_entry=1 (IO syscall found)", func_name)
+        _write_af_session(session_file, func_name, 0, [], None, True, 0, error="prefilter:true")
         return True, 0
     if _pre is False:
         logger.debug("api_filter prefilter: %s -> is_entry=0 (internal pattern)", func_name)
+        _write_af_session(session_file, func_name, 0, [], None, False, 0, error="prefilter:false")
         return False, 0
 
     messages = [
@@ -385,6 +388,8 @@ async def api_filter_function(
         )
     except Exception as exc:
         logger.warning("api_filter: provider load failed: %s, keeping %s", exc, func_name)
+        _write_af_session(session_file, func_name, 0, messages, None, True, 0,
+                          error=f"provider_load_failed: {exc}")
         return True, 0
 
     # 信号量限制并发
@@ -397,7 +402,10 @@ async def api_filter_function(
             try:
                 resp_text = await _call_llm_once(base_url, api_key, model_id, messages,
                                                        timeout_seconds=timeout_seconds)
+                _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
                 result = _parse_is_entry(resp_text)
+                _write_af_session(session_file, func_name, attempt, messages, resp_text,
+                                  result, _dur, error=None)
                 if result is None:
                     logger.debug(
                         "api_filter: unparseable response for %s (attempt %d): %r",
@@ -411,15 +419,16 @@ async def api_filter_function(
                         "api_filter: cannot parse response for %s after %d attempts, keeping",
                         func_name, attempt
                     )
-                    _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
                     return True, _dur
-                _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
                 return result, _dur
             except Exception as exc:
+                _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
                 logger.debug(
                     "api_filter: HTTP error for %s (attempt %d): %s",
                     func_name, attempt, exc
                 )
+                _write_af_session(session_file, func_name, attempt, messages, None,
+                                  None, _dur, error=str(exc))
                 if attempt <= _MAX_RETRIES:
                     await asyncio.sleep(2.0 * attempt)
                 else:
@@ -427,6 +436,5 @@ async def api_filter_function(
                         "api_filter: failed for %s after %d attempts (%s), keeping",
                         func_name, attempt, exc
                     )
-                    _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
                     return True, _dur  # 保守保留
     return True, 0
