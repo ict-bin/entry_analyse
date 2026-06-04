@@ -563,20 +563,26 @@ class PipelineEngine:
             if func_state is None or func_state.r2_j_state != NodeState.PASSED:
                 return
 
-            # ── API_Filter: Direct LLM API 预筛（完整模式默认启用）───────────────
-            # API call 与 pi Agent 共用 pod 级 AgentProcessSlotManager 槽位，
-            # 优先级位于 R2-W 与 R3-J 之间，避免 Direct API 与 Agent 双通道并发导致 OOM。
-            if func_hash not in self._api_filter_results:
-                _af_passed = await self._run_api_filter(
-                    file_hash, func_hash, file_path, dirs, state
-                )
-                self._api_filter_results[func_hash] = _af_passed
-            if not self._api_filter_results.get(func_hash, True):
-                return  # API_Filter 判定为非入口，跳过 R3/R4/R5
+            # ── API_Filter: 判断函数是否入口（由配置开关控制）─────────────────────
+            # api_filter_entry_judge=True: AF 主导入口判断，R3 仅做污点分析
+            # api_filter_entry_judge=False: 跳过 AF，R3 Agent 完整判断入口 + 分析污点
+            _af_enabled = bool(getattr(self.cfg, 'api_filter_entry_judge', True))
+            _entry_confirmed = False
+            if _af_enabled:
+                if func_hash not in self._api_filter_results:
+                    _af_passed = await self._run_api_filter(
+                        file_hash, func_hash, file_path, dirs, state
+                    )
+                    self._api_filter_results[func_hash] = _af_passed
+                if not self._api_filter_results.get(func_hash, True):
+                    return  # API_Filter 判定为非入口，跳过 R3/R4/R5
+                _entry_confirmed = True  # AF 确认是入口，R3 仅做污点分析
 
             # ── R3 分析: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
+            # entry_confirmed=True 时 R3-W 知道入口已由 AF 确认，仅做污点分析
             await self._run_r3_analysis(
-                func_hash, file_hash, file_path, dirs, state)
+                func_hash, file_hash, file_path, dirs, state,
+                entry_confirmed=_entry_confirmed)
             if self._cancel.is_set():
                 return
             # R3 分析 W 已通过 decision 字段直接设置 r4_decision，无需单独 R3 入口判断阶段
@@ -869,11 +875,14 @@ class PipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
+        entry_confirmed: bool = False,
     ) -> None:
         """
         Phase 3 函数单元：
           1. R3-W（外部输入分析）+ R3-J（验证）
           2. 检查 has_external_input，否则跳过后续
+
+        entry_confirmed=True: API_Filter 已确认是入口，R3 仅做污点分析。
 
         注意：per-func 入口决策 (_run_r3_entry) 由 _func_pipeline 在
         CC 完成后调用（R4 步骤），确保能获得完整的 caller_ctx。
@@ -887,7 +896,9 @@ class PipelineEngine:
 
         # R3-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
         if func_state.r3_w_state != NodeState.PASSED:
-            await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
+            await self._run_r3_analysis_w(
+                file_hash, func_hash, file_path, dirs, state,
+                entry_confirmed=entry_confirmed)
 
         if self._cancel.is_set():
             return
@@ -897,14 +908,17 @@ class PipelineEngine:
                 if func_state.r3_j_state == NodeState.PASSED:
                     break
                 passed, _ = await self._run_r3_analysis_j(
-                    file_hash, func_hash, file_path, dirs, state)
+                    file_hash, func_hash, file_path, dirs, state,
+                    entry_confirmed=entry_confirmed)
                 if passed:
                     break
                 func_state.r3_w_state = NodeState.PENDING
                 func_state.r3_w_feedback = (
                     func_state.r3_j_feedback_path or func_state.r3_j_feedback_summary or ""
                 )
-                await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
+                await self._run_r3_analysis_w(
+                    file_hash, func_hash, file_path, dirs, state,
+                    entry_confirmed=entry_confirmed)
         if self._cancel.is_set():
             return
 
@@ -1395,8 +1409,12 @@ class PipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
+        entry_confirmed: bool = False,
     ) -> None:
-        """R3 Worker：外部输入分析（函数级，session 跨重试共享）。"""
+        """R3 Worker：外部输入分析（函数级，session 跨重试共享）。
+
+        entry_confirmed=True 时 prompt 知道入口已由 AF 确认，仅分析污点。
+        """
         func_state = state.files[file_hash].functions[func_hash]
         r3_max = int(getattr(self.cfg, "r3_max_rounds", -1))
         # 修复：原来误用 dirs.r4_w_session()，生成 r4-w-*.jsonl，导致 R3-W session 被误当 R4 session
@@ -1472,6 +1490,7 @@ class PipelineEngine:
                         feedback="",
                         judge_result_file="",
                         body_content=_prefetched_body,
+                        entry_already_confirmed=entry_confirmed,
                     )
                 _r3w_start = time.monotonic()
                 # 函数体已预嵌入时 prompt 已内联限制说明（最多1次bash），无需完全禁tool
@@ -1583,6 +1602,7 @@ class PipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
+        entry_confirmed: bool = False,
     ) -> tuple[bool, str]:
         """R3 Judge 函数级（每次新 session）。返回 (passed, summary)。
 

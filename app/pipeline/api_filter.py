@@ -112,68 +112,47 @@ def _load_provider_config(model: str) -> tuple[str, str, str]:
 
 # ─── Python 侧确定性预筛 ───────────────────────────────────────────────────────────
 
+# Minimal prefilter: only I/O fast path, everything else to LLM
+# No prefix rules to avoid false negatives in config-processing modules
+
 _ACTIVE_IO_PAT = _re.compile(
-    r'(recv|recvfrom|recvmsg|accept|fread|fgets|getline|fopen|open|pread|readv|ioctl|mmap|'
-    r'mq_receive|msgrcv|MsgReceive|MsgRead|yajl_tree_parse|json_tokener_parse|'
-    r'cJSON_Parse|grpc_|http_request)\s*\(',
-    _re.I
-)
-
-_INTERNAL_NAME_PAT = _re.compile(
-    r'^(make_sure_|make_|merge_|set_(?!sec|up|socket|opts)|alloc_|free_|init_|update_|'
-    r'convert_|fill_|build_|format_|validate_|verify_|check_|is_|has_|add_|del_|'
-    r'remove_|clean_|clear_|reset_|copy_|clone_|dup_|print_|log_|dump_|debug_)',
-    _re.I
-)
-
-_ENTRY_NAME_HINT_PAT = _re.compile(
-    r'(parse|handle|dispatch|recv|receive|serve|on_|process_msg|request|'
-    r'register|callback|hook)',
+    r'(recv\b|recvfrom\b|recvmsg\b|accept\b|fread\s*\(|fgets\s*\(|getline\s*\(|'
+    r'pread\s*\(|readv\s*\(|ioctl\s*\(|'
+    r'mq_receive\b|msgrcv\b|MsgReceive\b|MsgRead\b|'
+    r'readdir\s*\(|opendir\s*\(|scandir\s*\(|'
+    r'yajl_tree_parse\s*\(|json_tokener_parse\s*\(|cJSON_Parse\s*\()',
     _re.I
 )
 
 
 def _prefilter_is_entry(func_name: str, signature: str, body: str) -> "bool | None":
     """
-    Python 侧确定性预筛，不调用 LLM。
-    True  -> 函数体含 I/O 系统调用，是入口
-    False -> 内部函数模式且无原始指针，不是入口
-    None  -> 不确定，交给 LLM
+    Minimal deterministic prefilter. No LLM call.
+
+    True: body has direct I/O syscall -> fast-path entry.
+    None: all other cases -> LLM with expert knowledge.
+
+    IMPORTANT: No False return path.
+    Historical prefix rules (merge_/add_/verify_/...) caused 91% FN rate
+    on config-processing modules like iSulad spec. Removed entirely.
     """
     import re as _r2
 
-    # 1. 函数体含系统调用/解析调用 -> 是入口
+    # Direct I/O syscall in body -> fast-path entry, skip LLM
     _io = _r2.compile(
-        "recv|recvfrom|recvmsg|accept|fread|fgets|getline"
-        r"|fopen\s*[(]|pread|readv|ioctl|mmap\s*[(]"
-        r"|stat\s*[(]|lstat\s*[(]|readdir|scandir"
-        "|mq_receive|msgrcv|MsgReceive|MsgRead"
-        "|yajl_tree_parse|json_tokener_parse|cJSON_Parse"
-        "|grpc_|http_request",
+        r"recv\b|recvfrom\b|recvmsg\b|accept\b"
+        r"|fread\s*[(]|fgets\s*[(]|getline\s*[(]"
+        r"|pread\s*[(]|readv\s*[(]|ioctl\s*[(]"
+        r"|mq_receive\b|msgrcv\b|MsgReceive\b|MsgRead\b"
+        r"|readdir\s*[(]|opendir\s*[(]|scandir\s*[(]"
+        r"|yajl_tree_parse\s*[(]|json_tokener_parse\s*[(]|cJSON_Parse\s*[(]",
         _r2.I
     )
     if _io.search(body):
         return True
 
-    # 2. 内部函数命名模式 -> 不是入口
-    _int = _r2.compile(
-        "^(make_sure_|make_|merge_|set_|alloc_|free_|init_|update_"
-        "|convert_|fill_|build_|format_|validate_|verify_"
-        "|check_|is_|has_|add_|del_|remove_|clean_|clear_"
-        "|reset_|copy_|clone_|dup_|print_|log_|dump_|debug_)",
-        _r2.I
-    )
-    if _int.match(func_name):
-        return False
-
-    # 3. 签名含原始 char* 指针 -> 可能是入口，交 LLM
-    _raw = _r2.compile(r"(const\s+char|unsigned\s+char|uint8_t|void)\s*[*]")
-    if _raw.search(signature):
-        return None
-
-    # 4. 只有结构体参数 -> 内部处理层
-    return False
-
+    # All other cases: LLM judges (config boundaries, struct params, etc.)
+    return None
 
 
 async def _call_llm_once(
@@ -241,30 +220,42 @@ def _parse_is_entry(text: str) -> bool | None:
 # ─── 系统提示词 ────────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-你是 C/C++ 代码安全分析专家，专门判断函数是否为模块的**外部入口**。
+你是资深 C/C++ 代码安全专家，专门判断函数是否是模块的**外部入口**。
 
-外部入口的核心标准：**跨进程边界接收未经验证的原始数据**。
+## 核心标准：函数是否接收来自模块外部的未验证数据
 
-✅ 是外部入口（以下任一）：
-- 函数体内直接调用 recv/recvfrom/read/fread/fgets/getline/ioctl/accept 等 I/O 系统调用
-- 函数体内调用封装的网络/IPC API，如 MsgReceive/NetlinkRecv/SNMP_MsgGet 等
-- 接收 const char * / char * / void * / unsigned char * 参数，且函数名或注释明確表明处理来自外部的原始字符串/缓冲区
+### ✅ 是外部入口（以下任一）
 
-❌ 不是外部入口（以下任一）：
-- 参数是内部 C 结构体指针（如 *_spec, *_config, *_t, *_info, *defs_、等）——这些是已解析的内部数据
-- 函数仅对内部结构体进行字段赋值、验证、格式转换、内存分配
-- 函数名含 make_/merge_/set_/alloc_/free_/init_/update_/convert_/fill_/build_ 且不调用 I/O
-- static 工具函数、错误处理函数、日志函数
-- 函数调用者全部是同模块内部函数（没有模块外部调用者）
+**A 型（主动接收）**：
+- 函数体内直接调用网络/IPC/文件 I/O 系统调用：
+  recv/recvfrom/recvmsg/accept/fread/fgets/getline/pread/ioctl 等
+- 调用封装的外部数据获取 API：MsgReceive/NetlinkRecv/SNMP_MsgGet 等
 
-关键区别：
-- "container_config *" / "oci_runtime_spec *" 等结构体指针 → 内部处理层，不是入口
-- "const char *volume_str" 或 "const char *json_str" → 可能是入口（取决于该字符串是否来自外部）
-- 函数体内有 fopen/json_parse/yajl 调用 → 可能是入口
+**P 型（参数承载）**：
+- 接收 `const char *` / `char *` / `void *` 参数，且来自模块外部（配置字符串、路径字符串等）
+- 接收外部配置结构体（`host_config *`、`container_config *`、`docker_seccomp *` 等），
+  且函数是该模块对外暴露的处理/合并/验证/转换接口
+- 接收数组 `const char **` 参数（capabilities/envs/devices 数组）
 
-你的任务：快速判断给定函数是否为外部入口。
+### ❌ 不是外部入口（以下任一）
 
-**只输出 JSON**，不要任何解释：
+- 纯内部工具函数：内存分配、格式化输出、日志打印、错误处理
+- 生命周期函数（init/start/stop/free/bind/register）：无运行期请求接收行为
+- 函数体只操作模块内部已初始化状态变量，没有任何来自外部的数据输入
+- 仅操作 `oci_runtime_spec *oci_spec` 单个字段（纯内部字段写入）且无外部配置参数
+
+## 判断要点
+
+1. **优先看签名参数**：参数携带外部配置/数据 → 入口
+2. **再看函数体**：有 I/O 调用 → 入口
+3. **函数前缀不可靠**：`merge_*`/`add_*`/`verify_*`/`set_*`/`check_*`
+   在配置处理模块中大量用于模块边界入口，不能仅凭前缀判断
+4. **配置结构体参数**：
+   - `host_config *` 或 `container_config *` 作为输入 → 可能是入口
+   - `oci_runtime_spec *` 作为输出目标（配合外部配置参数）→ 通常是入口
+   - 函数只有 `oci_runtime_spec *` 且无外部配置参数 → 纯内部，不是入口
+
+只输出 JSON，不要任何解释：
 - 是外部入口 → {"is_entry": 1}
 - 不是外部入口 → {"is_entry": 0}
 """
@@ -278,10 +269,16 @@ _USER_TMPL = """\
 {body}
 ```
 
-请判断该函数是否为外部入口：即直接接收来自进程边界以外的未验证原始数据。
-如果参数是内部 C 结构体指针（如 *_spec/*_config/*_t 等），这通常是内部处理层而非外部入口。
+请判断：此函数是否为模块外部入口（接收来自模块边界外的未验证数据）？
+
+判断要点：
+1. 签名参数是否携带外部数据（配置字符串、配置结构体、数据数组）？
+2. 函数体是否有 recv/fread/ioctl 等 I/O 调用？
+3. 函数名前缀（merge_/add_/verify_/check_/set_）不可作为否定依据。
 
 只输出 JSON。"""
+
+
 
 
 

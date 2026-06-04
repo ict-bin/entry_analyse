@@ -134,6 +134,15 @@ class ServiceConfig(BaseModel):
         default=-1,
         description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
     )
+    api_filter_entry_judge: bool = Field(
+        default=True,
+        description=(
+            "启用 API_Filter 主导入口判断："
+            "Direct LLM API 在 R3 前快速判断函数是否是外部入口；"
+            "R3 仅做污点分析（不再重复判断是否入口）。"
+            "关闭则由 R3 Agent 完整判断入口 + 分析污点，适合需要最高准确度的场景。"
+        )
+    )
 
 
 # ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
@@ -211,6 +220,15 @@ class TaskConfig(BaseModel):
     lean_module_max_rounds: int = Field(
         default=-1,
         description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）"
+    )
+    api_filter_entry_judge: bool = Field(
+        default=True,
+        description=(
+            "启用 API_Filter 主导入口判断："
+            "Direct LLM API 在 R3 前快速判断函数是否是外部入口；"
+            "R3 仅做污点分析（不再重复判断是否入口）。"
+            "关闭则由 R3 Agent 完整判断入口 + 分析污点，适合需要最高准确度的场景。"
+        )
     )
 
     # 断点续跑：填入已有任务 ID，自动检测上次完成的轮次并从下一轮继续

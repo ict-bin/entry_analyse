@@ -893,7 +893,9 @@ class LeanPipelineEngine:
 
         # R3-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
         if func_state.r3_w_state != NodeState.PASSED:
-            await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
+            await self._run_r3_analysis_w(
+                file_hash, func_hash, file_path, dirs, state,
+                entry_confirmed=entry_confirmed)
 
         if self._cancel.is_set():
             return
@@ -903,14 +905,17 @@ class LeanPipelineEngine:
                 if func_state.r3_j_state == NodeState.PASSED:
                     break
                 passed, _ = await self._run_r3_analysis_j(
-                    file_hash, func_hash, file_path, dirs, state)
+                    file_hash, func_hash, file_path, dirs, state,
+                    entry_confirmed=entry_confirmed)
                 if passed:
                     break
                 func_state.r3_w_state = NodeState.PENDING
                 func_state.r3_w_feedback = (
                     func_state.r3_j_feedback_path or func_state.r3_j_feedback_summary or ""
                 )
-                await self._run_r3_analysis_w(file_hash, func_hash, file_path, dirs, state)
+                await self._run_r3_analysis_w(
+                    file_hash, func_hash, file_path, dirs, state,
+                    entry_confirmed=entry_confirmed)
         if self._cancel.is_set():
             return
 
@@ -1401,8 +1406,12 @@ class LeanPipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
+        entry_confirmed: bool = False,
     ) -> None:
-        """R3 Worker：外部输入分析（函数级，session 跨重试共享）。"""
+        """R3 Worker：外部输入分析（函数级，session 跨重试共享）。
+
+        entry_confirmed=True 时 prompt 知道入口已由 AF 确认，仅分析污点。
+        """
         func_state = state.files[file_hash].functions[func_hash]
         r3_max = int(getattr(self.cfg, "r3_max_rounds", -1))
         # 修复：原来误用 dirs.r4_w_session()，生成 r4-w-*.jsonl，导致 R3-W session 被误当 R4 session
@@ -1478,6 +1487,7 @@ class LeanPipelineEngine:
                         feedback="",
                         judge_result_file="",
                         body_content=_prefetched_body,
+                        entry_already_confirmed=entry_confirmed,
                     )
                 _r3w_start = time.monotonic()
                 ar = await self._call_agent(
@@ -1588,6 +1598,7 @@ class LeanPipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
+        entry_confirmed: bool = False,
     ) -> tuple[bool, str]:
         """R3 Judge 函数级（每次新 session）。返回 (passed, summary)。
 
