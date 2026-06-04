@@ -92,5 +92,6 @@ def test_worker_execute_task_records_task_started_event() -> None:
         timeline = get_task_timeline(verify, row)
         assert "task_started" in [event["event_type"] for event in timeline["events"]]
         assert "task_finished" in [event["event_type"] for event in timeline["events"]]
+        assert "task_end" not in [event["event_type"] for event in timeline["events"]]
     finally:
         verify.close()

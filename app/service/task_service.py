@@ -36,6 +36,38 @@ TASK_EVENT_SOURCE_EA = "entry_analyse"
 TASK_EVENT_SOURCE_WORKER = "worker"
 TASK_EVENT_SOURCE_SYSTEM = "system"
 
+_USER_TIMELINE_EVENT_TYPES: set[str] = {
+    "task_created",
+    "task_create_deduplicated",
+    "task_started",
+    "task_finished",
+    "task_passed",
+    "task_failed",
+    "task_cancel_requested",
+    "task_cancelled",
+    "task_deleted",
+    "task_retried",
+    "task_resumed",
+    "task_dispatched",
+    "task_dispatch_skipped_no_capacity",
+    "task_lease_taken_over",
+    "task_requeued_after_expired_lease_reconcile",
+    "task_requeued_after_orphaned_running_reconcile",
+    "task_requeued_after_dispatch_timeout",
+    "task_owner_recovered_after_restart",
+    "task_manual_continue",
+    "task_manual_retry",
+    "task_manual_cancel",
+    "task_manual_delete",
+    "task_manual_requeue",
+    "task_agent_process_manual_kill",
+    "abnormal_reason_recorded",
+    "task_database_failure",
+    "task_dispatch_failed",
+    "task_lease_lost",
+    "task_runtime_interrupted",
+}
+
 
 def _positive_int_env(name: str, default: int) -> int:
     try:
@@ -241,6 +273,23 @@ def _normalize_timeline_event(evt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def should_persist_user_timeline_event(
+    event_type: str | None,
+    source: str | None,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    normalized_type = str(event_type or "").strip()
+    if not normalized_type:
+        return False
+    if normalized_type in _USER_TIMELINE_EVENT_TYPES:
+        return True
+    # Stage/session/round level internals stay in stages_json only.
+    normalized_source = str(source or "").strip()
+    if normalized_source in {TASK_EVENT_SOURCE_EA, TASK_EVENT_SOURCE_WORKER, TASK_EVENT_SOURCE_SYSTEM}:
+        return False
+    return False
+
+
 def _create_task_event(
     db: Session,
     *,
@@ -260,6 +309,8 @@ def _create_task_event(
     payload: dict[str, Any] | None = None,
     dedupe_key: str | None = None,
 ) -> None:
+    if not should_persist_user_timeline_event(event_type, source, payload):
+        return
     key = str(dedupe_key or "").strip() or _event_dedupe_key(
         task_id,
         source,
@@ -526,6 +577,12 @@ def _sync_stage_events_to_timeline(db: Session, row: AppEaTask, events: list[dic
         if not isinstance(evt, dict):
             continue
         normalized = _normalize_timeline_event(evt)
+        if not should_persist_user_timeline_event(
+            normalized.get("event_type"),
+            normalized.get("source"),
+            normalized.get("payload"),
+        ):
+            continue
         dedupe_key = _event_dedupe_key(
             row.task_id,
             normalized["event_type"],
@@ -2895,6 +2952,21 @@ class TaskService:
 
         row.status = "pending"
         _reset_cancel_state(row)
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_retried",
+            message="任务已重试，等待重新调度",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={
+                "operator": "api",
+                "restart_mode": "fresh_start",
+                "reason_code": "manual_retry",
+            },
+            dedupe_key=_event_dedupe_key(row.task_id, "task_retried", row.updated_at, row.status),
+        )
         db.commit()
 
         self.schedule_dispatch(row.project_id)
@@ -2904,7 +2976,34 @@ class TaskService:
 
     def resume_task(self, db: Session, task_id: str) -> dict:
         """续跑（未实现，直接走 restart 全量重置逻辑）。"""
-        return self.restart_task(db, task_id)
+        row = self._get_or_404(db, task_id)
+        if row.status in ("pending", "running"):
+            from fastapi import HTTPException
+            raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
+
+        row.status = "pending"
+        _reset_cancel_state(row)
+        _safe_create_task_event(
+            db,
+            task_id=row.task_id,
+            project_id=row.project_id,
+            event_type="task_resumed",
+            message="任务已恢复，等待重新调度",
+            source=TASK_EVENT_SOURCE_EA,
+            status=row.status,
+            payload={
+                "operator": "api",
+                "restart_mode": "fresh_start",
+                "reason_code": "manual_resume",
+            },
+            dedupe_key=_event_dedupe_key(row.task_id, "task_resumed", row.updated_at, row.status),
+        )
+        db.commit()
+
+        self.schedule_dispatch(row.project_id)
+        log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
+                  task_id=task_id, project_id=row.project_id)
+        return self._row_to_dict(row, db=db)
 
     async def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)

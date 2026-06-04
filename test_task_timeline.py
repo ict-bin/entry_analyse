@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.models import AppEaTask, AppEaTaskEvent, Base
 from app.service import task_service
-from app.service.task_service import TaskService
+from app.service.task_service import TaskService, should_persist_user_timeline_event
 from app.time_utils import now_local
 
 
@@ -135,6 +135,73 @@ class EntryTaskTimelineTests(unittest.TestCase):
             self.assertEqual("r3", detail["event_summary"]["latest_stage_key"])
             self.assertEqual("main", detail["event_summary"]["latest_function_name"])
             self.assertEqual(2, detail["event_summary"]["latest_attempt"])
+        finally:
+            db.close()
+
+    def test_stage_internal_events_do_not_enter_user_timeline(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_internal_events", status="running")
+            task_service._sync_stage_events_to_timeline(
+                db,
+                task,
+                [
+                    {
+                        "event": "round_started",
+                        "message": "worker round started",
+                        "timestamp": now_local().isoformat(),
+                        "data": {"status": "running", "stage": "r1"},
+                    },
+                    {
+                        "event": "judge_completed",
+                        "message": "judge done",
+                        "timestamp": now_local().isoformat(),
+                        "data": {"status": "passed", "stage": "r3"},
+                    },
+                ],
+            )
+            db.commit()
+            timeline = self.service.get_task_timeline(db, task)
+            self.assertEqual([], timeline["events"])
+        finally:
+            db.close()
+
+    def test_timeline_filter_keeps_only_user_facing_events(self):
+        self.assertTrue(should_persist_user_timeline_event("task_dispatched", "system", {}))
+        self.assertTrue(should_persist_user_timeline_event("task_started", "worker", {}))
+        self.assertFalse(should_persist_user_timeline_event("round_started", "entry_analyse", {}))
+        self.assertFalse(should_persist_user_timeline_event("judge_completed", "worker", {}))
+
+    def test_safe_create_task_event_skips_non_user_facing_internal_events(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_filter_guard", status="running")
+            task_service._safe_create_task_event(
+                db,
+                task_id=task.task_id,
+                project_id=task.project_id,
+                event_type="round_started",
+                message="internal round",
+                source=task_service.TASK_EVENT_SOURCE_WORKER,
+                status=task.status,
+                payload={"stage": "r1"},
+                dedupe_key="internal-round",
+            )
+            task_service._safe_create_task_event(
+                db,
+                task_id=task.task_id,
+                project_id=task.project_id,
+                event_type="task_dispatched",
+                message="任务已分配给 worker",
+                source=task_service.TASK_EVENT_SOURCE_SYSTEM,
+                status=task.status,
+                payload={"dispatch_mode": "atomic_claim"},
+                dedupe_key="public-dispatch",
+            )
+            db.commit()
+
+            timeline = self.service.get_task_timeline(db, task)
+            self.assertEqual(["task_dispatched"], [event["event_type"] for event in timeline["events"]])
         finally:
             db.close()
 
@@ -300,6 +367,68 @@ class EntryTaskTimelineTests(unittest.TestCase):
             )
             self.assertTrue(bool(timeline["events"][0]["payload"]["lease_takeover"]))
             self.assertEqual("old-worker", timeline["events"][1]["payload"]["previous_owner_pod"])
+        finally:
+            db.close()
+
+    def test_restart_appends_retry_event_without_clearing_history(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_restart", status="failed")
+            task_service._safe_create_task_event(
+                db,
+                task_id=task.task_id,
+                project_id=task.project_id,
+                event_type="task_created",
+                message="任务已创建: timeline task",
+                source=task_service.TASK_EVENT_SOURCE_EA,
+                status=task.status,
+                dedupe_key="restart-created",
+            )
+            db.commit()
+
+            with patch.object(self.service, "schedule_dispatch"):
+                detail = self.service.restart_task(db, task.task_id)
+
+            self.assertEqual("pending", detail["status"])
+            timeline = self.service.get_task_timeline(db, task)
+            self.assertEqual(
+                ["task_retried", "task_created"],
+                [event["event_type"] for event in timeline["events"][:2]],
+            )
+            summary = detail["event_summary"]
+            self.assertEqual(2, summary["total_events"])
+            self.assertEqual("task_retried", summary["latest_event_type"])
+        finally:
+            db.close()
+
+    def test_resume_appends_resume_event_without_clearing_history(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_resume", status="failed")
+            task_service._safe_create_task_event(
+                db,
+                task_id=task.task_id,
+                project_id=task.project_id,
+                event_type="task_created",
+                message="任务已创建: timeline task",
+                source=task_service.TASK_EVENT_SOURCE_EA,
+                status=task.status,
+                dedupe_key="resume-created",
+            )
+            db.commit()
+
+            with patch.object(self.service, "schedule_dispatch"):
+                detail = self.service.resume_task(db, task.task_id)
+
+            self.assertEqual("pending", detail["status"])
+            timeline = self.service.get_task_timeline(db, task)
+            self.assertEqual(
+                ["task_resumed", "task_created"],
+                [event["event_type"] for event in timeline["events"][:2]],
+            )
+            summary = detail["event_summary"]
+            self.assertEqual(2, summary["total_events"])
+            self.assertEqual("task_resumed", summary["latest_event_type"])
         finally:
             db.close()
 
