@@ -156,6 +156,7 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
     feedback: str = "",
     judge_result_file: str = "",
     body_content: str = "",   # 预取函数体，提供时替代首个 bash call
+    entry_already_confirmed: bool = False,
 ) -> str:
     """
     R3-W prompt：分析单个函数是否有外部输入。
@@ -307,7 +308,11 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
         f"| name | `{func_name}` |\n"
         f"| signature | `{signature}` |\n"
         f"| \u884c\u8303\u56f4 | {start_line}~{end_line}\uff08\u5171 {body_lines} \u884c\uff09|\n"
-        f"{retry}\n"
+        + (chr(10) + "> ⚠️ **[API_Filter 预判结果]** "
+           "本函数已由 Direct LLM API 判定为外部入口，"
+           "请深入分析污点，除非有确凿证据否则 decision=keep。" + chr(10) + chr(10)
+           if entry_already_confirmed else "")
+        + f"{retry}\n"
         f"## \u8bfb\u53d6\u51fd\u6570\u4f53\n\n"
         f"{step1}\n"
         f"## \u8f93\u51fa\u8981\u6c42\n\n"
