@@ -203,11 +203,18 @@ async def _call_llm_once(
         "temperature": 0.0,
     }
 
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds, sock_read=timeout_seconds)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            # asyncio.wait_for 兜底：aiohttp ClientTimeout 对 chunked-streaming
+            # 响应的 total 超时可能不触发（chunks 持续到来时 sock_read 不重置，
+            # 但 total 计时器在部分 aiohttp 版本中仅检测连接阶段）
+            # wait_for 确保整个 resp.json() 调用在 timeout_seconds 内完成
+            data = await asyncio.wait_for(
+                resp.json(),
+                timeout=float(timeout_seconds),
+            )
             return str(data["choices"][0]["message"]["content"])
 
 

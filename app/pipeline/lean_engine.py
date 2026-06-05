@@ -1477,11 +1477,58 @@ class LeanPipelineEngine:
                 j_result_path = str(prev_j_result) if prev_j_result and prev_j_result.exists() else ""
 
                 if is_retry:
-                    # 重试轮次：只发短消息（session 已有首轮分析上下文）
-                    prompt = P.build_r3_w_retry_prompt(
-                        judge_result_file=j_result_path,
-                        feedback=r2_feedback,
-                    )
+                    # 重试轮次：仅当 session 已有有效历史时才发短 retry 消息
+                    # session 为空（上次 pi 崩溃）时改发完整 prompt，防止越权扩大分析范围
+                    _session_path = Path(session_file)
+                    _session_has_prior_context = False
+                    if _session_path.exists() and _session_path.stat().st_size > 0:
+                        try:
+                            _lines = _session_path.read_text(encoding='utf-8', errors='replace').splitlines()
+                            _session_has_prior_context = any(
+                                json.loads(l).get('message', {}).get('role') == 'user'
+                                for l in _lines if l.strip()
+                            )
+                        except Exception:
+                            pass
+                    if _session_has_prior_context:
+                        prompt = P.build_r3_w_retry_prompt(
+                            judge_result_file=j_result_path,
+                            feedback=r2_feedback,
+                        )
+                    else:
+                        logger.info(
+                            "R3-W retry session empty for %s/%s attempt=%d, "
+                            "sending full prompt to prevent scope explosion",
+                            func_hash, func_state.name, func_state.r3_w_attempts,
+                        )
+                        _prefetched_body_retry = ""
+                        try:
+                            from .funcdb import FunctionDB as _FDB3r
+                            _rec3r = await asyncio.to_thread(
+                                lambda: _FDB3r.open(dirs.r1, file_hash).get_function(func_hash)
+                            )
+                            if _rec3r:
+                                _prefetched_body_retry = str(_rec3r.get("body") or "")
+                        except Exception:
+                            pass
+                        _body_lines_retry = max(
+                            0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1
+                        )
+                        prompt = P.build_r3_w_prompt(
+                            func_hash=func_hash,
+                            func_name=func_state.name,
+                            signature=func_state.signature,
+                            start_line=func_state.start_line,
+                            end_line=func_state.end_line,
+                            body_lines=_body_lines_retry,
+                            file_path=file_path,
+                            db_path=db_path,
+                            is_retry=False,
+                            feedback="",
+                            judge_result_file="",
+                            body_content=_prefetched_body_retry,
+                            entry_already_confirmed=entry_confirmed,
+                        )
                 else:
                     body_lines = max(
                         0, (func_state.end_line or 0) - (func_state.start_line or 0) + 1

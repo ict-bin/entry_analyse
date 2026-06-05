@@ -93,6 +93,8 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         # 精简模式字段透传（与完整模式字段并列，互不影响）
         lean_mode=bool(getattr(svc, 'lean_mode', False)),
         api_filter_entry_judge=bool(getattr(svc, 'api_filter_entry_judge', True)),
+        api_filter_timeout_seconds=int(getattr(svc, 'api_filter_timeout_seconds',
+            getattr(svc, 'agent_run_timeout_seconds', 3600))),
         lean_file_max_rounds=int(getattr(svc, 'lean_file_max_rounds', -1)),
         lean_module_max_rounds=int(getattr(svc, 'lean_module_max_rounds', -1)),
     )
