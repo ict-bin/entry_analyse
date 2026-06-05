@@ -48,19 +48,31 @@ def build_r1_file_j_prompt(
     db_path: str,
     worker_result_file: str = "",
     worker_raw_file: str = "",
+    gap_source_map: "dict | None" = None,
 ) -> str:
     """R1 Judge（文件级）：文件级覆盖率验证，必须先审阅本轮 Worker 结果文件。"""
+    # Inline pre-fetched gap source content (eliminates 7 bash sed calls)
+    _gap_inline = ""
+    if gap_source_map:
+        _blocks = []
+        for _range, _src in list(gap_source_map.items())[:12]:
+            _blocks.append(f"**Gap {_range}**\n```c\n{_src[:500]}\n```")
+        _gap_inline = (
+            "\n## Gap 区间源码（已预取，无需 sed 命令）\n\n"
+            + "\n\n".join(_blocks)
+            + "\n\n> 请直接判断以上 gap 是否含有遗漏的函数定义（有 `{` 开始 `}` 结束的函数体），无需再用 `sed` 读取。\n"
+        )
+
     if gaps_file:
         gap_hint = (
-            f"源文件路径：`{ws_file_path}`\n\n"
             f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n"
             f"Worker 原始输出：`{worker_raw_file}`（若提供，可辅助理解 Worker 推理过程）\n\n"
-            f"请先读取 Worker 结果文件，再读取 gap 文件 `{gaps_file}` 并用 sed 核查各区间内容，确认 Worker 的修正是否正确。\n\n"
-            f"查看 gap 区间示例：`sed -n '<start>,<end>p' {ws_file_path}`"
+            + (_gap_inline if _gap_inline else
+               f"请先读取 Worker 结果文件，再读取 gap 文件 `{gaps_file}` 并用 sed 核查各区间内容。\n\n"
+               f"查看 gap 区间示例：`sed -n '<start>,<end>p' {ws_file_path}`")
         )
     else:
         gap_hint = (
-            f"源文件路径：`{ws_file_path}`\n\n"
             f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n"
             f"Worker 原始输出：`{worker_raw_file}`（若提供，可辅助理解 Worker 推理过程）\n\n"
             f"无 gap 文件（ctags 已完整覆盖），请先读取 Worker 结果文件，再用 "
@@ -470,31 +482,34 @@ def build_r4_func_w_prompt(
     if callers_structured:
         rows = []
         for c in callers_structured:
-            n  = (c.get("name") or c.get("caller_hash", "?"))[:30]
-            r3 = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
-            ct = c.get("call_type", "direct")
-            ch = c.get("caller_hash", "")[:12]
-            rows.append("| `" + n + "` | `" + ch + "` | " + r3 + " | " + ct + " |")
+            n   = (c.get("name") or c.get("caller_hash", "?"))[:30]
+            r3  = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
+            ct  = c.get("call_type", "direct")
+            ch  = c.get("caller_hash", "")[:12]
+            # _taints/_entry_reason pre-fetched by engine, eliminates funcdb bash queries
+            tc  = ", ".join("`" + t + "`" for t in (c.get("_taints") or [])[:4]) or "-"
+            er  = (c.get("_entry_reason") or "")[:60]
+            rows.append("| `" + n + "` | `" + ch + "` | " + r3 + " | " + tc + " | " + er + " |")
         has_r3 = any(c.get("is_r3_entry") for c in callers_structured)
         ctable = (
-            "| 调用者名 | func_hash | R3状态 | 调用方式 |\n"
-            "|---------|-----------|--------|---------|\n"
+            "| 调用者名 | func_hash | R3状态 | Taints（已预取） | 入口说明 |\n"
+            "|---------|-----------|--------|----------------|---------|\n"
             + "\n".join(rows)
         )
     else:
         has_r3 = False
         ctable = "无模块内调用者（直接外部边界）"
-
     if not has_r3:
         hint = "提示：无R3-kept调用者 → P类外部入口，quick-path已处理，此处不应出现"
     else:
         hint = (
-            "判断要点：\n"
-            "  - 保留(keep)：本函数处理调用者无法完全覆盖的外部数据子集，或可被独立触达\n"
-            "  - 过滤(filter)：本函数只是调用者处理逻辑的子步骤，调用者入口已完整覆盖本函数数据路径\n"
-            "  加载 Skill `ea-r4-callchain-query` 查询调用者的 R3 分析结果（taints/entry_reason）再做判断。"
+            "**调用者 taints 已在上表预取，无需再查 funcdb。**\n\n"
+            "判断要点（结合上表调用者 taints 和本函数 taints 分析）：\n"
+            "  - 保留(keep)：本函数 taints 与调用者 taints 不完全重叠，或存在调用者无法覆盖的独立外部数据路径\n"
+            "  - 过滤(filter)：本函数 taints 是所有 R3-kept 调用者 taints 的子集，调用者入口已完整覆盖\n"
+            "  注意：即使 taints 完全重叠，若调用者的 entry_reason 与本函数语义明显不同（如调用者是分发节点而本函数是实际处理节点），仍应 keep。\n"
+            "  加载 Skill `ea-r4-callchain-query` 仅在表中数据不足时使用。"
         )
-
     return (
         "# R4 调用链入口判断：`" + func_name + "`\n\n"
         + retry
@@ -530,6 +545,8 @@ def build_r4_j_func_prompt(
     entry_role: str = "boundary",
     callchain_db_path: str = "",
     funcdb_path: str = "",
+    func_body: str = "",
+    func_signature: str = "",
 ) -> str:
     """验证 R4-W 的 keep/filter 决策是否有充分调用链证据。"""
     r4_result_section = ""
@@ -550,43 +567,51 @@ def build_r4_j_func_prompt(
         except Exception:
             pass
 
+    # Pre-fetched func body block
+    _body_block = ""
+    if func_body:
+        _sig_line = f"签名: `{func_signature[:120]}`\n\n" if func_signature else ""
+        _body_block = (
+            "\n## 本函数体（已预取，无需读源文件）\n\n"
+            + _sig_line
+            + f"```c\n{func_body[:3000]}\n```\n"
+            + "\n> 无需再查 funcdb 获取本函数数据。\n"
+        )
+
     if callers_structured:
         rows = []
         for c in callers_structured:
-            n  = (c.get("name") or c.get("caller_hash", "?"))[:30]
-            r3 = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
-            ct = c.get("call_type", "direct")
-            rows.append("| `" + n + "` | " + r3 + " | " + ct + " |")
+            n   = (c.get("name") or c.get("caller_hash", "?"))[:30]
+            r3  = "R3-kept入口" if c.get("is_r3_entry") else "非入口"
+            ct  = c.get("call_type", "direct")
+            tc  = ", ".join("`" + t + "`" for t in (c.get("_taints") or [])[:4]) or "-"
+            er  = (c.get("_entry_reason") or "")[:70]
+            rows.append("| `" + n + "` | " + r3 + " | " + ct + " | " + tc + " | " + er + " |")
         has_r3 = any(c.get("is_r3_entry") for c in callers_structured)
         ctable = (
-            "| 调用者 | is_r3_entry | 调用方式 |\n"
-            "|--------|-------------|---------|\n"
+            "| 调用者 | is_r3_entry | 调用方式 | Taints（已预取） | 入口说明 |\n"
+            "|--------|-------------|---------|----------------|---------|\n"
             + "\n".join(rows)
         )
     else:
         has_r3 = False
         ctable = "无模块内调用者（直接外部边界）"
-
-    db_section = ""
-    if callchain_db_path or funcdb_path:
-        db_section = (
-            "\n\n## DB 路径（如需进一步核查）\n\n"
-            + ("- callchain.db: `" + callchain_db_path + "`\n" if callchain_db_path else "")
-            + ("- funcdb: `" + funcdb_path + "`\n" if funcdb_path else "")
-            + "\n加载 Skill `ea-r4-callchain-query` 了解如何查询。"
-        )
-
     no_r3_warn = ""
     if not has_r3 and r4_decision != "keep":
         no_r3_warn = "\n⚠️ 当前无 R3-kept 调用者 → filter 决策不成立\n"
 
+    _all_inline = bool(func_body and any(c.get("_taints") is not None for c in callers_structured if c.get("is_r3_entry")))
+    _no_db_hint = "\n> **函数体及调用者 taints 已预取内联，无需调用 bash/read 工具查询 funcdb。**\n" if _all_inline else ""
+
     return (
         "验证 R4-W 对函数 `" + func_name + "` 的 **" + r4_decision + "** 决策：\n\n"
+        + _no_db_hint
         + "| 字段 | 值 |\n|------|-----|\n"
         + "| func_hash | `" + func_hash + "` |\n"
         + "| entry_role | `" + entry_role + "` |\n"
         + "| R3 tag | `" + r3_tag + "` |\n"
         + r4_result_section
+        + _body_block
         + "\n\n## 调用链信息（来自 callchain.db）\n\n"
         + ctable
         + "\n\n## 验证标准\n\n"

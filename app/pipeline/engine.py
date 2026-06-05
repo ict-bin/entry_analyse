@@ -1053,6 +1053,27 @@ class PipelineEngine:
                 ws_file_path = dirs.source / _rel
                 worker_result_file = dirs.stage_result_file("r1_w", "worker", file_hash, fs.r1_attempts)
                 worker_raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, fs.r1_attempts)
+                # Pre-fetch gap source content:
+                # Eliminates 7 bash `sed -n 'N,Mp'` calls → R1-J from 5 turns to 2 turns
+                _gap_src_map: dict = {}
+                _SKIPPABLE = {"no_function_body","include_macro_block","comment_block",
+                              "struct_enum_block","forward_decl_block","extern_block"}
+                if gaps_file.exists():
+                    try:
+                        _gaps_data = json.loads(gaps_file.read_text(encoding="utf-8"))
+                        if isinstance(_gaps_data, list):
+                            _src_text = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+                            for _g in _gaps_data:
+                                if _g.get("kind") in _SKIPPABLE:
+                                    continue
+                                _gs = _g.get("start", 1)
+                                _ge = _g.get("end", _gs)
+                                _glines = _src_text[_gs - 1 : _ge]
+                                _gk = _g.get("kind", "gap")
+                                _gap_src_map[f"L{_gs}-{_ge}({_gk})"] = "\n".join(_glines[:50])
+                    except Exception as _gap_exc:
+                        logger.debug("R1-J gap prefetch %s: %s", file_hash, _gap_exc)
+
                 j_prompt = P.build_r1_file_j_prompt(
                     file_name=Path(file_path).name,
                     func_count=len(fs.functions),
@@ -1061,6 +1082,7 @@ class PipelineEngine:
                     db_path=str(db_path),
                     worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
                     worker_raw_file=str(worker_raw_file) if worker_raw_file.exists() else "",
+                    gap_source_map=_gap_src_map,
                 )
                 acfg_j = self._judge_acfg()
                 ar_j = await self._call_agent(
@@ -1715,6 +1737,46 @@ class PipelineEngine:
             except Exception as _pre_exc:
                 logger.debug("R3-J pre-validation error %s: %s", func_hash, _pre_exc)
 
+            # ── Pre-validation: P型 taints 必须是函数签名中的参数名 ──────────────────
+            try:
+                from .funcdb import FunctionDB as _FDB_pre2
+                _pre2 = _FDB_pre2.open(dirs.r1, file_hash).get_function(func_hash)
+                if _pre2:
+                    import re as _re_p, json as _j2
+                    _pa = _pre2.get("analysis") or {}
+                    if isinstance(_pa, str): _pa = _j2.loads(_pa)
+                    _tag_pre = _pa.get("tag", "")
+                    _has_ei  = _pre2.get("has_external_input") or _pa.get("has_external_input", False)
+                    _tp      = _pa.get("taints") or []
+                    _sig_pre = (_pre2.get("signature") or func_state.signature or "").strip()
+                    if _tag_pre == "P" and _has_ei and _tp and _sig_pre:
+                        _pm = _re_p.search(r"\((.+)\)", _sig_pre, _re_p.DOTALL)
+                        if _pm:
+                            _pstr = _pm.group(1).strip()
+                            if not _re_p.match(r"^\s*(void\s*)?$", _pstr):
+                                _pnames = set(_re_p.findall(r"\b([a-zA-Z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:,|$)", _pstr))
+                                _bad_p  = [t for t in _tp if t not in _pnames]
+                                if _bad_p and _pnames:
+                                    _fail_p = f"[pre-fail] P型taints中 {_bad_p[:2]} 不在函数签名参数中: {list(_pnames)[:5]}"
+                                    _rf = dirs.stage_result_file("r3_j","judge",func_hash,func_state.r3_j_attempts)
+                                    _rr = dirs.stage_raw_file(   "r3_j","judge",func_hash,func_state.r3_j_attempts)
+                                    write_stage_result_files(result_file=_rf, raw_file=_rr,
+                                        payload={"passed": False, "summary": _fail_p}, raw_text="[pre-fail:param]")
+                                    await self._aupsert(
+                                        task_id=self.task_id, stage_key="r3_j", role_kind="judge",
+                                        scope_kind="func", attempt=func_state.r3_j_attempts,
+                                        file_hash=file_hash, func_hash=func_hash,
+                                        status="failed", passed=False, summary=_fail_p,
+                                        result_file_path=str(_rf), raw_file_path=str(_rr),
+                                        tokens_input=0, tokens_output=0, duration_ms=0,
+                                    )
+                                    self._emit("r3_j_done", func_hash=func_hash, function=func_state.name,
+                                               passed=False, pre_fail=True, summary=_fail_p,
+                                               tokens_input=0, tokens_output=0, duration_ms=0)
+                                    return False, _fail_p
+            except Exception as _pre2_exc:
+                logger.debug("R3-J P-param pre-check %s: %s", func_hash, _pre2_exc)
+
             # ── 常规 agent 验证路径 ────────────────────────────────────────────
             acfg = self._judge_acfg()
             sys_prompt = self._stage_sys_prompt('r3_analysis_judge')
@@ -2118,7 +2180,30 @@ class PipelineEngine:
         except Exception:
             pass
 
-        # 3. 提供 DB 真实路径，供 skill 指导 Agent 按需查询
+        # 3. Pre-fetch each R3-kept caller's taints from funcdb
+        #    Eliminates 4-5 funcdb bash queries per R4-func-W session (6 turns → 2 turns)
+        callers_with_taints: list[dict] = []
+        for _ci in callers_structured:
+            _caller_info = dict(_ci)
+            _ch = _ci.get("caller_hash", "")
+            if _ci.get("is_r3_entry") and _ch:
+                for _fh_c, _fs_c in state.files.items():
+                    if _ch in _fs_c.functions:
+                        try:
+                            from .funcdb import FunctionDB as _FDB_r4w
+                            _cr = await asyncio.to_thread(
+                                lambda _h=_fh_c, _c=_ch: _FDB_r4w.open(dirs.r1, _h).get_function(_c)
+                            )
+                            if _cr:
+                                _ca = _cr.get("analysis") or {}
+                                if isinstance(_ca, str): _ca = json.loads(_ca)
+                                _caller_info["_taints"]      = _ca.get("taints") or []
+                                _caller_info["_entry_reason"] = (_ca.get("entry_reason") or "")[:100]
+                        except Exception: pass
+                        break
+            callers_with_taints.append(_caller_info)
+
+        # 4. 提供 DB 真实路径，供 skill 指导 Agent 按需查询
         callchain_db_path = str(dirs.callchain_db_path())
         funcdb_path = str(dirs.r1_functions_db(file_hash_for_func)) if file_hash_for_func else ""
 
@@ -2140,7 +2225,7 @@ class PipelineEngine:
                 file_path=file_path,
                 entry_role=entry_role,
                 r3_analysis=r3_analysis,
-                callers_structured=callers_structured,
+                callers_structured=callers_with_taints,
                 callchain_db_path=callchain_db_path,
                 funcdb_path=funcdb_path,
                 result_file=result_file,
@@ -2248,16 +2333,55 @@ class PipelineEngine:
         except Exception:
             pass
 
+        # Pre-fetch func body (eliminates 2-3 funcdb bash queries in R4-func-J)
+        _r4j_func_body = ""
+        _r4j_func_sig  = ""
+        try:
+            from .funcdb import FunctionDB as _FDBJ2
+            if file_hash_j:
+                _r4j_rec = await asyncio.to_thread(
+                    lambda: _FDBJ2.open(dirs.r1, file_hash_j).get_function(func_hash)
+                )
+                if _r4j_rec:
+                    _r4j_func_body = str(_r4j_rec.get("body") or "")[:4000]
+                    _r4j_func_sig  = str(_r4j_rec.get("signature") or "")
+        except Exception: pass
+
+        # Pre-fetch each R3-kept caller's R3 analysis (taints + entry_reason)
+        _r4j_callers_full: list[dict] = []
+        for _ci in callers_structured:
+            _cif = dict(_ci)
+            _ch  = _ci.get("caller_hash", "")
+            if _ch and _ci.get("is_r3_entry"):
+                for _fh_c, _fs_c in state.files.items():
+                    if _ch in _fs_c.functions:
+                        try:
+                            from .funcdb import FunctionDB as _FDBJ3
+                            _cr = await asyncio.to_thread(
+                                lambda _h=_fh_c, _c=_ch: _FDBJ3.open(dirs.r1, _h).get_function(_c)
+                            )
+                            if _cr:
+                                _ca = _cr.get("analysis") or {}
+                                if isinstance(_ca, str): _ca = json.loads(_ca)
+                                _cif["_taints"]      = _ca.get("taints") or []
+                                _cif["_entry_reason"] = (_ca.get("entry_reason") or "")[:120]
+                                _cif["_func_desc"]    = (_ca.get("function_description") or "")[:80]
+                        except Exception: pass
+                        break
+            _r4j_callers_full.append(_cif)
+
         prompt = P.build_r4_j_func_prompt(
             func_hash=func_hash,
             func_name=func_name,
             file_path=entry.get("file", ""),
             r4_result_file=str(r4_result_file) if r4_result_file.exists() else "",
-            callers_structured=callers_structured,
+            callers_structured=_r4j_callers_full,
             r3_tag=r3_tag,
             entry_role=entry.get("entry_role", "boundary"),
             callchain_db_path=str(dirs.callchain_db_path()),
             funcdb_path=str(dirs.r1_functions_db(file_hash_j)) if file_hash_j else "",
+            func_body=_r4j_func_body,
+            func_signature=_r4j_func_sig,
         )
         self._emit("r4_j_start", func_hash=func_hash, function=func_name,
                    attempt=func_state.r4_j_attempts)
