@@ -184,7 +184,50 @@ def _log_warn(msg: str) -> None:
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
-def _backoff(base_delay: float, attempt: int) -> float:
+def _truncate_session_to_last_complete_line(session_file: str | None) -> None:
+    """
+    pi 进程被 SIGKILL 后，session.jsonl 最后一行可能是未完成的部分 JSON。
+    截断到最后一个完整的 JSON 行末，防止下次重试时 pi 读到损坏 session。
+    """
+    if not session_file:
+        return
+    try:
+        p = Path(session_file)
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        content = p.read_bytes()
+        # 找最后一个完整的 JSON 行（以 \n 结尾）
+        # 逐行解析，找到最后一个可成功 parse 的行
+        lines = content.split(b"\n")
+        last_valid_pos = 0
+        pos = 0
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                try:
+                    json.loads(stripped.decode("utf-8", errors="replace"))
+                    last_valid_pos = pos + len(line) + 1  # +1 for \n
+                except Exception:
+                    pass  # incomplete JSON, stop here
+            pos += len(line) + 1
+        if last_valid_pos < len(content) and last_valid_pos > 0:
+            p.write_bytes(content[:last_valid_pos])
+            logger.debug("truncated session %s to %d bytes (was %d)",
+                         session_file, last_valid_pos, len(content))
+    except Exception as _trunc_exc:
+        logger.debug("session truncate failed %s: %s", session_file, _trunc_exc)
+
+
+_TIMEOUT_ERROR_PATTERNS = frozenset({"timeout", "timed out", "etimedout", "request timed out"})
+
+
+def _is_timeout_error(error_text: str) -> bool:
+    """判断是否是 model API 超时类错误（区别于其他 API 错误如限流、503）"""
+    lowered = (error_text or "").lower()
+    return any(pat in lowered for pat in _TIMEOUT_ERROR_PATTERNS)
+
+
+
     """指数退避，带上限。attempt 从 1 开始。"""
     return min(base_delay * (2 ** min(attempt - 1, 6)), _MAX_BACKOFF)
 
@@ -1053,25 +1096,28 @@ async def _run_with_api_retry(
                 if timeout_seconds else "agent run timed out"
             )
             result.exit_code = -1
+            # pi 进程已通过 CancelledError 被 terminate_tree SIGKILL
+            # 清理 session 文件残留（防止下次起动时读到损坏的未完成 JSON 行）
+            _truncate_session_to_last_complete_line(session_file)
+            # 立即释放 slot：超时期间不应占据 slot 做 backoff 等待
+            # 其他函数可立即获取 slot，引擎的 max_rounds 重试机制负责重试
             can_retry = timeout_retry_enabled and (
                 timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
             )
-            if not can_retry or (cancel_event and cancel_event.is_set()):
-                return result
-            delay = _backoff(retry_delay, timeout_failures)
             _log_warn(
-                f"agent 单次输入超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
-                f"{delay:.0f}s 后重试: {result.error}"
+                f"agent 超时，已 kill pi 并清理 session "
+                f"[{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
+                f"释放 slot （引擎 retry 负责重试）: {result.error}"
             )
             if on_stream:
                 on_stream(
-                    f"\n\u23f1\ufe0f 智能体执行超时，{delay:.0f}s 后重试 "
+                    f"\n\u23f1\ufe0f 已 kill pi，释放 slot，引擎重试 "
                     f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
                 )
-            if await _sleep_cancel_first(delay, cancel_event):
-                return result
-            current_stdin = continue_stdin  # 超时重试用 continue 提示
-            continue
+            # 标记 can_retry=True 到 result，供外层判断是否需要重新排队
+            if can_retry:
+                result.error = (result.error or "") + " [slot_released_for_retry]"
+            return result  # 释放 slot，不再在 slot 内 sleep
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
@@ -1162,13 +1208,25 @@ async def _run_with_api_retry(
         if _is_retryable_api_error(result):
             api_attempt += 1
             can_retry = (max_retries == -1) or (api_attempt <= max_retries)
+            label = f"{api_attempt}/{_fmt_max(max_retries)}"
+            # timeout 类错误：pi 已自然退出，清理 session 后立即释放 slot
+            # 防止占据 slot sleep 30s，其他函数可立即得到执行机会
+            if _is_timeout_error(result.error):
+                _truncate_session_to_last_complete_line(session_file)
+                _log_warn(f"API 超时错误 [{label}], 清理 session 并释放 slot: "
+                          f"{(result.error or '')[:120]}")
+                if on_stream:
+                    on_stream(f"\n\u26a0\ufe0f API 超时，释放 slot (引擎重试) ({label})...\n")
+                if can_retry:
+                    result.error = (result.error or "") + " [slot_released_for_retry]"
+                return result  # 释放 slot
+            # 非 timeout 错误（限流/503等）：保持原有 backoff 重试逻辑
             if can_retry:
                 delay = _backoff(retry_delay, api_attempt)
-                label = f"{api_attempt}/{_fmt_max(max_retries)}"
                 _log_warn(f"API 错误 [{label}], {delay:.0f}s 后重试: "
                           f"{(result.error or '')[:200]}")
                 if on_stream:
-                    on_stream(f"\n⚠️ API 错误，{delay:.0f}s 后重试 "
+                    on_stream(f"\n\u26a0\ufe0f API 错误，{delay:.0f}s 后重试 "
                               f"({label})...\n")
                 if await _sleep_cancel_first(delay, cancel_event):
                     return result
