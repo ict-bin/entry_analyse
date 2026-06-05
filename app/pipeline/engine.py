@@ -1707,16 +1707,22 @@ class PipelineEngine:
                 from .funcdb import FunctionDB as _FDB_pre
                 _pre_data = _FDB_pre.open(dirs.r1, file_hash).get_function(func_hash)
                 if _pre_data:
+                    import re as _re_pre, json as _json_pre
                     _pre_a = _pre_data.get("analysis") or {}
-                    if isinstance(_pre_a, str):
-                        import json as _json_pre; _pre_a = _json_pre.loads(_pre_a)
+                    if isinstance(_pre_a, str): _pre_a = _json_pre.loads(_pre_a)
                     _pre_taints = _pre_a.get("taints") or []
+                    # 提取 taint 路径的根标识符（-> 或 . 之前的部分）
+                    # 允许: params  /  params->rootpath  /  gresponse.stream()
+                    # 禁止: 根标识符不是合法 C 标识符（含中文/空格等）
+                    def _taint_root(t: str) -> str:
+                        root = _re_pre.split(r"->|\.", str(t))[0]
+                        return root
                     _invalid_taints = [
                         t for t in _pre_taints
-                        if not _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(t))
+                        if not _re_pre.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", _taint_root(str(t)))
                     ]
                     if _invalid_taints:
-                        _r3j_fail_summary = f"[pre-fail] taints 格式非法: {_invalid_taints[:3]}"
+                        _r3j_fail_summary = f"[pre-fail] taints 格式非法（根标识符含非法字符）: {_invalid_taints[:3]}"
                         result_file = dirs.stage_result_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
                         raw_file    = dirs.stage_raw_file("r3_j", "judge", func_hash, func_state.r3_j_attempts)
                         write_stage_result_files(result_file=result_file, raw_file=raw_file,
@@ -1755,9 +1761,14 @@ class PipelineEngine:
                             _pstr = _pm.group(1).strip()
                             if not _re_p.match(r"^\s*(void\s*)?$", _pstr):
                                 _pnames = set(_re_p.findall(r"\b([a-zA-Z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:,|$)", _pstr))
-                                _bad_p  = [t for t in _tp if t not in _pnames]
+                                # 提取每个 taint 的根标识符（-> 或 . 之前的部分）
+                                # params->rootpath → 根 params；gresponse.stream() → 根 gresponse
+                                # 只校验根标识符是否在签名参数中，允许精确到结构体成员
+                                def _root_id(t: str) -> str:
+                                    return _re_p.split(r"->|\.", str(t))[0]
+                                _bad_p  = [t for t in _tp if _root_id(t) not in _pnames]
                                 if _bad_p and _pnames:
-                                    _fail_p = f"[pre-fail] P型taints中 {_bad_p[:2]} 不在函数签名参数中: {list(_pnames)[:5]}"
+                                    _fail_p = f"[pre-fail] P型taints根标识符不在函数签名参数中: {[_root_id(t) for t in _bad_p[:2]]} (taints={_bad_p[:2]})"
                                     _rf = dirs.stage_result_file("r3_j","judge",func_hash,func_state.r3_j_attempts)
                                     _rr = dirs.stage_raw_file(   "r3_j","judge",func_hash,func_state.r3_j_attempts)
                                     write_stage_result_files(result_file=_rf, raw_file=_rr,

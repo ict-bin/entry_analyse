@@ -110,7 +110,7 @@
 |---|---|
 | `decision` | 必须是 `"keep"` 或 `"filter"`，不可省略 |
 | 自洽性 | `has_external_input=true` → `decision="keep"`；`has_external_input=false` → `decision="filter"` |
-| `taints` | `decision="keep"` 时必须是**非空数组**，元素为函数签名中真实存在的**参数名**（仅参数名，禁止含 `->` 字段访问或 `.method()` 方法调用） |
+| `taints` | `decision="keep"` 时必须是**非空数组**；元素为函数签名中的**参数名**或其**结构体成员路径**（如 `params->rootpath`），但路径的根标识符必须是签名中真实存在的参数名 |
 | `tag` | `decision="keep"` 时必须是 `"P"` 或 `"A"` |
 | `entry_role` | `decision="keep"` 时必须是 `boundary`/`callback`/`dispatch_target`/`ipc_handler` 之一 |
 
@@ -118,17 +118,20 @@
 
 ---
 
-## ⚠️ P 型 taints 常见错误（必读）
+## ⚠️ P 型 taints 格式说明（精确优于粗糙）
 
-`taints` 只填函数签名 `(...)` 中的**参数变量名**，不追踪到结构体成员或方法调用：
+`taints` 元素描述"哪个外部数据路径进入了函数"，允许以下格式：
 
-| ❌ 错误写法（会被 Judge 直接拒绝） | ✅ 正确写法 | 原因 |
-|-------------------------------|-----------|------|
-| `"params->rootpath"` | `"params"` | 参数名是 `params`，`->rootpath` 是结构体字段 |
-| `"host_spec->network_mode"` | `"host_spec"` | 参数名是 `host_spec` |
-| `"args->username"`, `"args->password"` | `"args"` | 参数名是 `args`，字段是结构体内部的 |
-| `"message->body"`, `"message->status_code"` | `"message"` | 参数名是 `message` |
-| `"gresponse.stream()"`, `"gresponse.data()"` | `"gresponse"` | 参数名是 `gresponse`，`.stream()` 是方法调用 |
-| `"request->timestamps"` | `"request"` | 参数名是 `request` |
+| 格式 | 示例 | 含义 |
+|------|------|------|
+| 参数名 | `"params"` | 整个参数承载外部数据 |
+| C 结构体成员路径 | `"params->rootpath"` | params 的 rootpath 字段是实际污点 |
+| 多级路径 | `"args->json_confs->hosts"` | 嵌套字段 |
+| C++ 成员/方法 | `"gresponse.stream()"` | gresponse 的 stream 返回外部数据 |
 
-**规则**：函数签名是 `void foo(Type *param1, OtherType &param2)` → taints 最多写 `["param1", "param2"]`，不能写结构体字段路径。即使 body 里大量使用 `param1->field`，taint 仍然只写 `"param1"`。
+**唯一限制**：路径的**根标识符**（`->` 或 `.` 之前的部分）必须是函数签名 `(...)` 中真实存在的参数名。
+
+例：签名 `void foo(rt_rm_params_t *params, const char *name)`
+- ✅ `"params->rootpath"` → 根 `params` 是参数 ✓
+- ✅ `"name"` → 参数名 ✓  
+- ❌ `"engine_ops->delete_op"` → 根 `engine_ops` 是局部变量，不是参数

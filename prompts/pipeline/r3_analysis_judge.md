@@ -42,13 +42,15 @@ sed -n '{start_line}p' {file}
 ### 第二步：验证 taints 字段
 
 **有参函数**：
-- `has_external_input=true` 且 `taints=[]` → **FAIL**（必须指出哪个参数承载外部数据）
-- `taints` 中每项必须是函数**签名中真实存在的参数名**：
+- `has_external_input=true` 且 `taints=[]` → **FAIL**（必须指出哪个数据路径承载外部数据）
+- `taints` 中每项格式允许：
+  - ✅ 参数名：`buf` / `data` / `msg` / `params` / `request` 等
+  - ✅ 结构体成员路径：`params->rootpath`、`host_spec->network_mode`（精确到字段，更准确）
+  - ✅ C++ 成员访问：`gresponse.stream()`、`request->timestamps`
+  - ❌ **根标识符不在签名中**：路径第一段（`->` 或 `.` 前）必须是签名中的参数名
+    - 例：签名有 `rt_rm_params_t *params` → `params->rootpath` ✅，`engine_ops->delete` ❌（局部变量）
   - ❌ 输出参数：`output` / `out_` / `result` / `rsp` 等
-  - ❌ 参数名不在签名中（填了局部变量名）
-  - ❌ **结构体字段访问**：`params->rootpath`、`host_spec->network_mode`、`args->username` → 应填 `params`/`host_spec`/`args`
-  - ❌ **方法调用**：`gresponse.stream()`、`gresponse.data()` → 应填 `gresponse`
-  - ✅ 输入参数：`buf` / `data` / `msg` / `packet` / `req` / `params`（参数名本身，不含 `->` 或 `.`）
+  - ❌ 路径根标识符是局部变量（不在函数签名括号内）
 
 **无参函数**（`func()` / `func(void)`）：
 - `taints=[]` 合法——无参数可填，这是正常的
