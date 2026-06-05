@@ -20,7 +20,8 @@ class EntryDispatchLeaseTests(unittest.TestCase):
     def test_acquire_dispatch_lease_is_exclusive(self):
         db = self.SessionLocal()
         try:
-            token = self.service._acquire_dispatch_lease(db, "p1")
+            with patch("app.service.task_service.get_runtime_role", return_value="worker"):
+                token = self.service._acquire_dispatch_lease(db, "p1")
             self.assertTrue(token)
 
             row = db.query(AppEaDispatchLease).filter_by(project_id="p1").one()
@@ -29,7 +30,8 @@ class EntryDispatchLeaseTests(unittest.TestCase):
             row.lease_expires_at = now_local() + timedelta(seconds=30)
             db.commit()
 
-            denied = self.service._acquire_dispatch_lease(db, "p1")
+            with patch("app.service.task_service.get_runtime_role", return_value="worker"):
+                denied = self.service._acquire_dispatch_lease(db, "p1")
             self.assertIsNone(denied)
         finally:
             db.close()
@@ -49,7 +51,8 @@ class EntryDispatchLeaseTests(unittest.TestCase):
             )
             db.commit()
 
-            token = self.service._acquire_dispatch_lease(db, "p1")
+            with patch("app.service.task_service.get_runtime_role", return_value="worker"):
+                token = self.service._acquire_dispatch_lease(db, "p1")
             self.assertTrue(token)
 
             row = db.query(AppEaDispatchLease).filter_by(project_id="p1").one()
@@ -75,12 +78,14 @@ class EntryDispatchLeaseTests(unittest.TestCase):
             db.commit()
 
             row = db.query(AppEaTask).filter_by(task_id="eat_pending").one()
-            first = self.service._claim_task_row_atomic(db, row.id)
+            with patch("app.service.task_service.get_runtime_role", return_value="worker"):
+                first = self.service._claim_task_row_atomic(db, row.id)
             self.assertIsNotNone(first)
             self.assertEqual("running", first.status)
             self.assertEqual(POD_NAME, first.owner_pod)
 
-            second = self.service._claim_task_row_atomic(db, row.id)
+            with patch("app.service.task_service.get_runtime_role", return_value="worker"):
+                second = self.service._claim_task_row_atomic(db, row.id)
             self.assertIsNone(second)
         finally:
             db.close()

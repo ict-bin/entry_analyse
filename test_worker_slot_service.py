@@ -23,7 +23,8 @@ class WorkerSlotServiceTests(unittest.TestCase):
             db.add_all([
                 AppEaWorkerSlot(
                     worker_id="worker-a",
-                    pod_name="pod-a",
+                    pod_name="secflow-app-entry-analyse-worker-aaa-111",
+                    runtime_role="worker",
                     pod_ip="10.0.0.1",
                     max_concurrent_tasks=2,
                     agent_process_limit=5,
@@ -33,7 +34,8 @@ class WorkerSlotServiceTests(unittest.TestCase):
                 ),
                 AppEaWorkerSlot(
                     worker_id="worker-b",
-                    pod_name="pod-b",
+                    pod_name="secflow-app-entry-analyse-worker-bbb-222",
+                    runtime_role="worker",
                     pod_ip="10.0.0.2",
                     max_concurrent_tasks=3,
                     last_seen_status="running",
@@ -49,7 +51,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                     module_name="mod-a",
                     prompt_content="prompt",
                     status="running",
-                    owner_pod="pod-a",
+                    owner_pod="secflow-app-entry-analyse-worker-aaa-111",
                     lease_expires_at=now + timedelta(seconds=120),
                 ),
                 AppEaTask(
@@ -77,15 +79,15 @@ class WorkerSlotServiceTests(unittest.TestCase):
 
             payload = self.service.get_cluster_snapshot(db, project_id="p1")
 
-            self.assertEqual(2, payload["worker_count"])
+            self.assertEqual(1, payload["worker_count"])
             self.assertEqual(1, payload["healthy_workers"])
-            self.assertEqual(1, payload["stale_workers"])
+            self.assertEqual(0, payload["stale_workers"])
             self.assertEqual(1, payload["stale_owner_workers"])
-            self.assertEqual(0, payload["retired_workers"])
-            self.assertEqual(5, payload["total_capacity"])
+            self.assertEqual(1, payload["retired_workers"])
+            self.assertEqual(2, payload["total_capacity"])
             self.assertEqual(1, payload["busy_slots"])
             self.assertEqual(1, payload["running_jobs"])
-            self.assertEqual(4, payload["available_slots"])
+            self.assertEqual(1, payload["available_slots"])
             self.assertEqual(5, payload["agent_total_capacity"])
             self.assertEqual(2, payload["agent_in_use"])
             self.assertEqual(3, payload["agent_available"])
@@ -94,6 +96,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
             self.assertEqual(6, payload["dispatch_available"])
             self.assertEqual(1, payload["queued_tasks"])
             self.assertEqual(1, payload["queued_jobs"])
+            self.assertEqual(1, payload["running_invalid_owner"])
             stale_owner = next(item for item in payload["workers"] if item["source"] == "stale_owner")
             self.assertEqual("ghost-pod", stale_owner["pod_name"])
             self.assertEqual("task-2", stale_owner["active_tasks"][0]["task_id"])
@@ -155,7 +158,8 @@ class WorkerSlotServiceTests(unittest.TestCase):
             db.add(
                 AppEaWorkerSlot(
                     worker_id="worker-a",
-                    pod_name="pod-a",
+                    pod_name="secflow-app-entry-analyse-worker-aaa-111",
+                    runtime_role="worker",
                     pod_ip="10.0.0.1",
                     max_concurrent_tasks=4,
                     last_seen_status="running",
@@ -171,7 +175,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                     module_name="manual-mod",
                     prompt_content="prompt",
                     status="running",
-                    owner_pod="pod-a",
+                    owner_pod="secflow-app-entry-analyse-worker-aaa-111",
                     lease_expires_at=now + timedelta(seconds=120),
                     task_origin_type="manual",
                 ),
@@ -183,7 +187,7 @@ class WorkerSlotServiceTests(unittest.TestCase):
                     module_name="binary-mod",
                     prompt_content="prompt",
                     status="running",
-                    owner_pod="pod-a",
+                    owner_pod="secflow-app-entry-analyse-worker-aaa-111",
                     lease_expires_at=now + timedelta(seconds=120),
                     task_origin_type="binary_security",
                     parent_task_id="bst_1",

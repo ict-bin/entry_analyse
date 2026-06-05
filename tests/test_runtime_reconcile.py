@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from app.db.models import AppEaTask, Base
+from app.db.models import AppEaTask, AppEaWorkerSlot, Base
 import app.db as app_db
 from app.service import scheduler_service, task_service, worker_slot_service
 from app.api import tasks as tasks_api
@@ -127,9 +127,21 @@ def test_scheduler_reconcile_expired_running_requeues_owner_missing(monkeypatch)
             module_name="m1",
             prompt_content="prompt",
             status="running",
-            owner_pod="worker-dead",
+            owner_pod="secflow-app-entry-analyse-worker-dead-123",
             owner_pod_ip="10.0.0.10",
             lease_expires_at=now - timedelta(seconds=60),
+        )
+        db.add(
+            AppEaWorkerSlot(
+                worker_id="worker-dead",
+                pod_name="secflow-app-entry-analyse-worker-dead-123",
+                runtime_role="worker",
+                pod_ip="10.0.0.20",
+                http_port=8080,
+                max_concurrent_tasks=1,
+                last_seen_status="running",
+                last_heartbeat_at=now,
+            )
         )
         db.add(row)
         db.commit()
@@ -157,7 +169,7 @@ def test_scheduler_reconcile_expired_running_requeues_owner_missing(monkeypatch)
         assert row.result_json is None
         assert row.error is None
         assert events[0]["event_type"] == "task_requeued_after_expired_lease_reconcile"
-        assert events[0]["payload"]["previous_owner_pod"] == "worker-dead"
+        assert events[0]["payload"]["previous_owner_pod"] == "secflow-app-entry-analyse-worker-dead-123"
         assert events[0]["payload"]["owner_pod_alive"] is False
         assert events[0]["payload"]["reconcile_reason"] == "expired_lease_owner_missing"
     finally:
@@ -179,8 +191,20 @@ def test_scheduler_reconcile_expired_running_requeues_live_owner(monkeypatch) ->
             module_name="m1",
             prompt_content="prompt",
             status="running",
-            owner_pod="worker-live",
+            owner_pod="secflow-app-entry-analyse-worker-live-123",
             lease_expires_at=now - timedelta(seconds=60),
+        )
+        db.add(
+            AppEaWorkerSlot(
+                worker_id="worker-live",
+                pod_name="secflow-app-entry-analyse-worker-live-123",
+                runtime_role="worker",
+                pod_ip="10.0.0.21",
+                http_port=8080,
+                max_concurrent_tasks=1,
+                last_seen_status="running",
+                last_heartbeat_at=now,
+            )
         )
         db.add(row)
         db.commit()
@@ -191,7 +215,7 @@ def test_scheduler_reconcile_expired_running_requeues_live_owner(monkeypatch) ->
             "get_worker_slot_service",
             lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
         )
-        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: {"worker-live"})
+        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: {"secflow-app-entry-analyse-worker-live-123"})
         events = []
         monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
 
@@ -213,15 +237,16 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     now = now_local()
     healthy_worker = SimpleNamespace(
         worker_id="w1",
-        pod_name="pod-a",
+        pod_name="secflow-app-entry-analyse-worker-poda-111",
         pod_ip="10.0.0.1",
         max_concurrent_tasks=4,
+        runtime_role="worker",
         last_seen_status="running",
         last_heartbeat_at=now,
     )
     valid_running = SimpleNamespace(
         task_id="eat_live",
-        owner_pod="pod-a",
+        owner_pod="secflow-app-entry-analyse-worker-poda-111",
         parent_stage_item_id=None,
         parent_stage_item_key=None,
         module_name="m1",
@@ -245,7 +270,7 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["claimed_running_tasks"] == 1
     assert snapshot["ghost_running_tasks"] == 0
     assert snapshot["registry_visible_workers"] == 1
-    assert snapshot["live_pod_count"] == 0
+    assert snapshot["live_pod_count"] == 1
     assert snapshot["registry_missing_live_pods"] == 0
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
@@ -885,10 +910,10 @@ def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:
     assert snapshot["processes"][0]["runtime_kind"] == "codex"
     assert snapshot["processes"][0]["match_source"] == "session_arg_path"
     assert snapshot["processes"][0]["task_id"] == "eat_1"
-    assert snapshot["processes"][0]["owner_kind"] == "unknown"
+    assert snapshot["processes"][0]["owner_kind"] == "tracked_inferred"
     assert snapshot["summary"]["claimed_running_tasks"] == 1
-    assert snapshot["summary"]["runtime_observed_task_count"] == 0
-    assert snapshot["summary"]["ghost_running_tasks"] == 1
+    assert snapshot["summary"]["runtime_observed_task_count"] == 1
+    assert snapshot["summary"]["ghost_running_tasks"] == 0
 
 
 def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch) -> None:
@@ -952,11 +977,11 @@ def test_agent_snapshot_prefers_running_task_with_more_specific_root(monkeypatch
 
     snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
     assert snapshot["processes"][0]["task_id"] == "eat_new"
-    assert snapshot["processes"][0]["owner_kind"] == "unknown"
+    assert snapshot["processes"][0]["owner_kind"] == "tracked_inferred"
     assert snapshot["summary"]["claimed_running_tasks"] == 2
-    assert snapshot["summary"]["runtime_observed_task_count"] == 0
-    assert snapshot["summary"]["ghost_running_tasks"] == 2
-    assert snapshot["summary"]["active_processes"] == 0
+    assert snapshot["summary"]["runtime_observed_task_count"] == 1
+    assert snapshot["summary"]["ghost_running_tasks"] == 1
+    assert snapshot["summary"]["active_processes"] == 1
     assert snapshot["summary"]["residual_processes"] == 0
 
 
