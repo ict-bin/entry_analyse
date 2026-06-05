@@ -46,7 +46,9 @@ sed -n '{start_line}p' {file}
 - `taints` 中每项必须是函数**签名中真实存在的参数名**：
   - ❌ 输出参数：`output` / `out_` / `result` / `rsp` 等
   - ❌ 参数名不在签名中（填了局部变量名）
-  - ✅ 输入参数：`buf` / `data` / `msg` / `packet` / `req` 等
+  - ❌ **结构体字段访问**：`params->rootpath`、`host_spec->network_mode`、`args->username` → 应填 `params`/`host_spec`/`args`
+  - ❌ **方法调用**：`gresponse.stream()`、`gresponse.data()` → 应填 `gresponse`
+  - ✅ 输入参数：`buf` / `data` / `msg` / `packet` / `req` / `params`（参数名本身，不含 `->` 或 `.`）
 
 **无参函数**（`func()` / `func(void)`）：
 - `taints=[]` 合法——无参数可填，这是正常的
