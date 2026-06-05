@@ -938,7 +938,12 @@ async def _run_with_api_retry(
         on_event=on_slot_event,
     ) as slot_lease:
       # slot 已获取，所有重试（超时/API错误）均在此作用域内进行
+            # _current_handle: 当前 pi 进程句柄，用于超时时精确 kill 对应进程
+      _current_handle: "AgentProcessHandle | None" = None
+      api_timeout_count = 0  # 连续 timeout 类错误计数
+
       while True:
+        _current_handle = None  # 每次拉起前重置
         result = AgentResult()
 
         # ── 拉起子进程（OSError 由外层 catch）──
@@ -949,7 +954,7 @@ async def _run_with_api_retry(
         stderr_text = ""
 
         async def _execute() -> AgentResult:
-            nonlocal stderr_text
+            nonlocal stderr_text, _current_handle
             handle = await AgentProcessHandle.spawn(
                 *_spawn_args,
                 cwd=cwd,
@@ -960,6 +965,7 @@ async def _run_with_api_retry(
                 label="entry-agent",
             )
             proc = handle.proc
+            _current_handle = handle
             slot_lease.bind_pid(getattr(proc, "pid", None))
             with contextlib.suppress(Exception):
                 _get_worker_service().register_live_agent_process(
@@ -1097,6 +1103,14 @@ async def _run_with_api_retry(
             )
             result.exit_code = -1
             # pi 进程已通过 CancelledError 被 terminate_tree SIGKILL
+            # 显式 kill 对应的 pi 进程（精确，只 kill 该进程组，不影响其他并发 pi）
+            if _current_handle is not None:
+                try:
+                    await _current_handle.terminate_tree(
+                        reason=f"run_timeout_explicit n={timeout_failures}")
+                except Exception:
+                    pass
+                _current_handle = None
             # 清理 session 文件残留（防止下次起动时读到损坏的未完成 JSON 行）
             _truncate_session_to_last_complete_line(session_file)
             # 立即释放 slot：超时期间不应占据 slot 做 backoff 等待
@@ -1209,18 +1223,32 @@ async def _run_with_api_retry(
             api_attempt += 1
             can_retry = (max_retries == -1) or (api_attempt <= max_retries)
             label = f"{api_attempt}/{_fmt_max(max_retries)}"
-            # timeout 类错误：pi 已自然退出，清理 session 后立即释放 slot
-            # 防止占据 slot sleep 30s，其他函数可立即得到执行机会
+            # timeout 类错误：pi 已自然退出，按连续次数决定重试策略
             if _is_timeout_error(result.error):
+                api_timeout_count += 1
                 _truncate_session_to_last_complete_line(session_file)
-                _log_warn(f"API 超时错误 [{label}], 清理 session 并释放 slot: "
-                          f"{(result.error or '')[:120]}")
+                at_limit = not (timeout_max_retries < 0 or api_timeout_count <= timeout_max_retries)
+                if at_limit or (cancel_event and cancel_event.is_set()):
+                    # 连续超时超过阈值：释放 slot，引擎 max_rounds 负责重试
+                    _log_warn(
+                        f"API 超时 [{api_timeout_count}/{_fmt_max(timeout_max_retries)}] 超限，"
+                        f"释放 slot，引擎 max_rounds 负责重试"
+                    )
+                    return result  # 释放 slot
+                # 未超阈值：持有 slot，回退到 last user message 重发
+                _retry_stdin = _extract_last_user_message(session_file) or current_stdin
+                _log_warn(
+                    f"API 超时 [{api_timeout_count}/{_fmt_max(timeout_max_retries)}]，"
+                    f"持有 slot 重发 last user message: {(result.error or '')[:80]}"
+                )
                 if on_stream:
-                    on_stream(f"\n\u26a0\ufe0f API 超时，释放 slot (引擎重试) ({label})...\n")
-                if can_retry:
-                    result.error = (result.error or "") + " [slot_released_for_retry]"
-                return result  # 释放 slot
-            # 非 timeout 错误（限流/503等）：保持原有 backoff 重试逻辑
+                    on_stream(
+                        f"\n\u26a0\ufe0f API \u8d85\u65f6 {api_timeout_count} \u6b21\uff0c\u91cd\u53d1 last user message...\n"
+                    )
+                current_stdin = _retry_stdin
+                continue
+            # 非 timeout 错误（限流/503等）：重置连续 timeout 计数，保持 backoff 重试
+            api_timeout_count = 0
             if can_retry:
                 delay = _backoff(retry_delay, api_attempt)
                 _log_warn(f"API 错误 [{label}], {delay:.0f}s 后重试: "
