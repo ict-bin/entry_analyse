@@ -433,7 +433,7 @@ class PipelineEngine:
         self._r4_j_confirmed: bool = False
         # API_Filter result cache for current run. Direct API calls are now part of
         # the full pipeline and share pod-level AgentProcessSlotManager capacity.
-        self._api_filter_results: dict[str, bool] = {}
+        self._api_filter_results: dict[str, dict] = {}
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -570,11 +570,14 @@ class PipelineEngine:
             _entry_confirmed = False
             if _af_enabled:
                 if func_hash not in self._api_filter_results:
-                    _af_passed = await self._run_api_filter(
+                    _af_result = await self._run_api_filter(
                         file_hash, func_hash, file_path, dirs, state
                     )
-                    self._api_filter_results[func_hash] = _af_passed
-                if not self._api_filter_results.get(func_hash, True):
+                    self._api_filter_results[func_hash] = _af_result
+                _af_cached = self._api_filter_results.get(func_hash, {})
+                if _af_cached.get("skipped"):
+                    return  # API_Filter skip（timeout/parse 上限），保守 keep 已由 _run_api_filter 处理
+                if _af_cached.get("is_entry") is False:
                     return  # API_Filter 判定为非入口，跳过 R3/R4/R5
                 _entry_confirmed = True  # AF 确认是入口，R3 仅做污点分析
 
@@ -2645,7 +2648,7 @@ class PipelineEngine:
         except Exception as _af_exc:
             logger.debug("api_filter body prefetch failed %s: %s", func_hash, _af_exc)
 
-        self._emit("api_filter_start", func_hash=func_hash, function=func_name)
+        self._emit("api_filter_start", func_hash=func_hash, function=func_name, file_hash=file_hash)
         _af_start = time.monotonic()
 
         def _emit_slot_event(event_type: str, payload: dict[str, Any]) -> None:
@@ -2661,36 +2664,60 @@ class PipelineEngine:
                 cancel_event=self._cancel,
                 on_event=_emit_slot_event,
             ):
-                is_entry, _af_llm_dur = await api_filter_function(
+                result = await api_filter_function(
                     func_name=func_name,
                     signature=signature,
                     body=body,
                     model=model,
                     cancel_event=self._cancel,
-                    timeout_seconds=int(getattr(self.cfg, "agent_run_timeout_seconds", 3600)),
+                    timeout_seconds=int(getattr(self.cfg, "api_filter_timeout_seconds", 120) or 120),
                     session_file=str(dirs.af_session(func_hash)),
                 )
             _af_wall_dur = self._dur(_af_start)  # 含槽位等待 + API semaphore 等待
+            if result.get("skipped"):
+                self._emit(
+                    "api_filter_skipped",
+                    func_hash=func_hash, function=func_name, file_hash=file_hash,
+                    attempt=int(result.get("attempts", 0) or 0),
+                    duration_ms=int(result.get("duration_ms", 0) or 0),
+                    error_kind=result.get("error_kind"),
+                    error_message=str(result.get("error_message", "") or "")[:200],
+                    skipped=True, skip_reason=result.get("skip_reason"),
+                )
+            elif not result.get("completed"):
+                self._emit(
+                    "api_filter_failed",
+                    func_hash=func_hash, function=func_name, file_hash=file_hash,
+                    attempt=int(result.get("attempts", 0) or 0),
+                    duration_ms=int(result.get("duration_ms", 0) or 0),
+                    error_kind=result.get("error_kind"),
+                    error_message=str(result.get("error_message", "") or "")[:200],
+                    skipped=False,
+                )
             self._emit(
                 "api_filter_done",
-                func_hash=func_hash,
-                function=func_name,
-                is_entry=int(is_entry),
-                duration_ms=_af_llm_dur,          # 实际 LLM 调用时间（不含排队）
-                wall_duration_ms=_af_wall_dur,    # 含 AgentProcessSlot/API semaphore 等待
+                func_hash=func_hash, function=func_name,
+                is_entry=None if result.get("is_entry") is None else int(bool(result.get("is_entry"))),
+                skipped=bool(result.get("skipped")),
+                skip_reason=result.get("skip_reason"),
+                duration_ms=int(result.get("duration_ms", 0) or 0),
+                wall_duration_ms=_af_wall_dur,
             )
-            return bool(is_entry)
+            return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("api_filter failed for %s, keeping: %s", func_hash, exc)
             self._emit(
-                "api_filter_error",
-                func_hash=func_hash,
-                function=func_name,
-                error=str(exc)[:100],
+                "api_filter_failed",
+                func_hash=func_hash, function=func_name, file_hash=file_hash,
+                error_kind="exception", error_message=str(exc)[:200], skipped=False,
             )
-            return True
+            return {
+                "completed": False, "is_entry": True, "skipped": False,
+                "skip_reason": "", "error_kind": "exception",
+                "error_message": str(exc), "attempts": 0, "duration_ms": 0,
+            }
 
     async def _aupsert(self, **kwargs) -> None:
         """async wrapper for upsert_stage_result_index。
