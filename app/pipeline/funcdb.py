@@ -425,6 +425,23 @@ class FunctionDB:
                 pass
         return d
 
+    def get_next_boundary_line(self, file_hash: str, start_line: int) -> int | None:
+        """返回同一文件中 start_line 之后最近一个函数的 start_line。
+
+        用于为 end_line=0 的函数确定安全扫描上界：
+            bounded_end = get_next_boundary_line(fh, start) - 1
+        若不存在后续函数（当前函数是文件最后一个），返回 None（调用方用 EOF）。
+        """
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """SELECT MIN(f.start_line) FROM functions f
+                   WHERE f.file_hash = ?
+                     AND f.start_line > ?""",
+                (file_hash, start_line),
+            ).fetchone()
+        val = row[0] if row else None
+        return int(val) if val else None
+
     def get_all_meta(self) -> list[dict]:
         """
         查询全量元数据（不含 body）。

@@ -86,49 +86,98 @@ def build_r1_file_j_prompt(
     )
 
 
-def build_r2_j_prompt(  # 正确命名：R2-J 行号准确性验证
+def build_r2_j_prompt(
     func_hash: str,
     func_name: str,
     start_line: int,
     end_line: int,
     file_path: str,
     worker_result_file: str = "",
+    bounded_end: "int | None" = None,
 ) -> str:
     """
-    R2 Judge：验证 ctags 提取的函数行号是否正确（J-first，J 失败后 W 修正）。
-    用 bash sed 而非 read+offset（消除 off-by-one）。
-    """
-    basename = os.path.basename(file_path)
-    return (
-        f"# R2 Judge — ctags 行号准确性验证\n\n"
-        f"| 字段       | 值                |\n"
-        f"|------------|-------------------|\n"
-        f"| func_hash  | `{func_hash}`     |\n"
-        f"| name       | `{func_name}`     |\n"
-        f"| start_line | {start_line}      |\n"
-        f"| end_line   | {end_line}        |\n"
-        f"| 源文件     | `{basename}`      |\n\n"
-        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）\n\n"
-        f"## 验证步骤（必须用 bash，不要用 read 工具计数）\n\n"
-        f"**步骤 1**：用 bash 精确读取 ctags 记录的行范围：\n"
-        f"```bash\n"
-        f"sed -n '{start_line},{end_line}p' {file_path}\n"
-        f"```\n\n"
-        f"**步骤 2**：判断 bash 输出的**第一行**：\n"
-        f"- ✅ **通过条件**：第一行包含函数名 `{func_name}` 且不是注释行（`/*`、`*`、`*/`、`//`）\n"
-        f"- ❌ **失败条件**：第一行是注释行、空行或仅含 `{{`\n\n"
-        f"**步骤 3（仅当步骤 2 失败时）**：grep 定位真实函数签名行：\n"
-        f"```bash\n"
-        f"grep -n '{func_name}(' {file_path} | head -5\n"
-        f"```\n\n"
-        f"## 输出格式\n\n"
-        f"```\n"
-        f"通过: <是/否>\n"
-        f'反馈: <若不通过：start_line={start_line} 实际对应 "..." 行，'
+    R2 Judge：验证 ctags 提取的函数行号是否正确。
 
-        f"应修正为 start_line=N（来自 grep 结果）>\n"
-        f"```\n"
+    bounded_end = 下一个函数/gap 的 start_line - 1，限定扫描上界，由 engine 传入。
+    end_line=0 时只允许在 [start_line, scan_upper] 范围内扫描；范围内不平衡 → 立即丢弃。
+    禁止向超出 scan_upper 的行号探索（消除对整个文件的无限扫描）。
+    """
+    import os as _os
+    basename = _os.path.basename(file_path)
+
+    if end_line and end_line > 0:
+        scan_upper = end_line
+        range_note = f"{start_line}~{end_line}"
+    elif bounded_end and bounded_end > start_line:
+        scan_upper = bounded_end
+        range_note = f"{start_line}~{bounded_end}"
+    else:
+        scan_upper = start_line + 800
+        range_note = f"{start_line}~{start_line + 800}"
+
+    end_zero_extra = ""
+    if not end_line or end_line <= 0:
+        end_zero_extra = (
+            "\n"
+            "> ⚠️ **end_line=0**（ctags 未识别结束行）。"
+            f"安全扫描上界已设为 `{scan_upper}` 行（下一个函数/gap 起始行 - 1）。\n"
+            f"> **只允许在 `{start_line}~{scan_upper}` 范围内扫描，绝对禁止越界。**\n"
+            "> 若在此范围内花括号不平衡 → **立即输出 `通过: 丢弃`，禁止继续向后探索**。\n"
+        )
+
+    awk_cmd = (
+        f"awk 'NR>={start_line}&&NR<={scan_upper}"
+        "{for(i=1;i<=length($0);i++){c=substr($0,i,1);"
+        'if(c=="{" )d++;else if(c=="}"&&--d==0){print NR;exit}}}'
+        f"' {file_path}"
     )
+
+    parts = [
+        "# R2 Judge — ctags 行号准确性验证", "",
+        "| 字段         | 值                |",
+        "|--------------|-------------------",
+        f"| func_hash    | `{func_hash}`     |",
+        f"| name         | `{func_name}`     |",
+        f"| start_line   | {start_line}      |",
+        f"| end_line     | {end_line}        |",
+        f"| 安全扫描范围 | `{range_note}` |",
+        f"| 源文件       | `{basename}`      |",
+        end_zero_extra,
+        "",
+        f"Worker 结果文件：`{worker_result_file}`（若提供，请先读取后再审核）",
+        "",
+        "## 验证步骤", "",
+        f"**步骤 1**：确认第 `{start_line}` 行包含函数名：",
+        "```bash",
+        f"sed -n '{start_line},{start_line}p' {file_path}",
+        "```",
+        f"- ✅ 包含 `{func_name}` 且不是注释行 → 继续步骤 2",
+        f"- ❌ 不包含 → `grep -n '{func_name}(' {file_path} | head -5` 找真实行",
+        "",
+        f"**步骤 2**：在安全范围 `{start_line}~{scan_upper}` 内统计花括号：",
+        "```bash",
+        f"sed -n '{start_line},{scan_upper}p' {file_path} | tr -cd '{{' | wc -c",
+        f"sed -n '{start_line},{scan_upper}p' {file_path} | tr -cd '}}' | wc -c",
+        "```",
+        "- 平衡 → `通过: 是`；不平衡 → 步骤 3",
+        "",
+        "**步骤 3**（仅当步骤 2 不平衡时）：awk 在安全范围内找闭合括号：",
+        "```bash",
+        awk_cmd,
+        "```",
+        "- awk 输出行号 N → end_line=N，`通过: 是`",
+        f"- **awk 无输出（`{start_line}~{scan_upper}` 内找不到闭合）→ 函数截断/损坏，立即 `通过: 丢弃`**",
+        "",
+        "## 输出格式", "",
+        "```",
+        "通过: <是/否/丢弃>",
+        "反馈: <简述结论；若需修正则给出修正后的 start_line/end_line>",
+        "```",
+        "",
+        "> `通过: 丢弃` = 函数截断/损坏，后续阶段自动跳过，无需进一步分析。",
+    ]
+    return "\n".join(parts)
+
 
 
 # ─── R3 Worker ──────────────────────────────────────────────────────────────

@@ -208,8 +208,9 @@ def _extract_result(output: str) -> str:
 
 
 # R2-J 特殊裁定：函数不存在，应从 funcdb 删除
-J_VERDICT_DELETE = "__DELETE__"
-J_VERDICT_SKIP   = "__SKIP__"   # 源文件函数体不完整，永久跳过
+J_VERDICT_DELETE  = "__DELETE__"
+J_VERDICT_SKIP    = "__SKIP__"    # 源文件函数体不完整，永久跳过
+J_VERDICT_DISCARD = "__DISCARD__" # 函数截断/损坏（end_line=0 且 bounded 内不平衡），永久跳过
 
 
 def _r2_j_script_check(
@@ -318,6 +319,14 @@ def _parse_j_result(output: str) -> tuple[bool, str]:
             m = re.search(r"feedback[：:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
         feedback = (m.group(1).strip() if m else text[:500])
         return False, J_VERDICT_SKIP + feedback
+
+    # R2-J 丢弃裁定：通过: 丢弃（bounded 范围内找不到闭合，函数截断/损坏）
+    if re.search(r"\u901a\u8fc7[\uff1a:]\s*\u4e22\u5f03|verdict[\uff1a:]\s*discard", text, re.IGNORECASE):
+        m = re.search(r"\u53cd\u9988[\uff1a:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if not m:
+            m = re.search(r"feedback[\uff1a:](.*?)(?=\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        feedback = (m.group(1).strip() if m else text[:500])
+        return False, J_VERDICT_DISCARD + feedback
 
     passed = False
     # BUG-R2C Fix: 支持模型输出的多种变体格式
@@ -1250,6 +1259,19 @@ class PipelineEngine:
                            verdict=_script_verdict, reason=_script_reason[:100])
             else:
                 # ── Step 2: 苹果类基线 agent 处理边界情况 ────────────────────────
+                _bounded_end = None
+                if not func_state.end_line or func_state.end_line <= 0:
+                    try:
+                        from .funcdb import FunctionDB as _FDB_R2
+                        _next = await asyncio.to_thread(
+                            lambda: _FDB_R2.open(dirs.r1, file_hash).get_next_boundary_line(
+                                file_hash, func_state.start_line
+                            )
+                        )
+                        if _next and _next > func_state.start_line:
+                            _bounded_end = _next - 1
+                    except Exception as _be_e:
+                        pass
                 acfg = self._judge_acfg()
                 sys_prompt = self._stage_sys_prompt('r2_judge')
                 prompt = P.build_r2_j_prompt(
@@ -1259,6 +1281,7 @@ class PipelineEngine:
                     end_line=func_state.end_line,
                     file_path=file_path,
                     worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
+                    bounded_end=_bounded_end,
                 )
                 ar = await self._call_agent(
                     prompt=prompt, system_prompt=sys_prompt,
@@ -1285,6 +1308,24 @@ class PipelineEngine:
 
             # SKIP 裁定：源文件函数体不完整，永久跳过后续阶段
             skip_verdict = (not delete_verdict) and feedback.startswith(J_VERDICT_SKIP)
+            discard_verdict = (not delete_verdict and not skip_verdict) and feedback.startswith(J_VERDICT_DISCARD)
+            if discard_verdict:
+                real_feedback = feedback[len(J_VERDICT_DISCARD):]
+                logger.info("R2-J DISCARD verdict for %s (%s): %s",
+                            func_state.name, func_hash, real_feedback[:100])
+                func_state.r2_source_incomplete = True
+                func_state.r2_j_state    = NodeState.FAILED
+                func_state.r2_j_feedback = "[DISCARD] " + real_feedback
+                await asyncio.to_thread(state.save, dirs.state_file)
+                self._emit("r2_source_incomplete",
+                           func_hash=func_hash, function=func_state.name,
+                           file=Path(file_path).name,
+                           feedback=("[DISCARD] " + real_feedback)[:200], attempt=attempt)
+                self._emit("r2_j_done", func_hash=func_hash,
+                           function=func_state.name, passed=False,
+                           source_incomplete=True,
+                           feedback=("[DISCARD] " + real_feedback)[:200], attempt=attempt)
+                return True  # break outer while
             if skip_verdict:
                 real_feedback = feedback[len(J_VERDICT_SKIP):]
                 logger.info("R2-J SKIP verdict for %s (%s): %s",

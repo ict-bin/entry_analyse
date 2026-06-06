@@ -14,49 +14,43 @@
 
 ## 校正步骤
 
-### Step 1：读取当前记录的函数体
+### Step 1：读取当前记录的函数第一行
 
 ```bash
-sed -n '{start_line},{end_line}p' {source_file}
+sed -n '{start_line},{start_line}p' {source_file}
 ```
 
 检查第一行是否包含函数名（不是注释行 `/*` `*` `//`）。
-若不是，用 grep 找到正确的 start_line：
+若不是，用 grep 在「**局限范围内**」找到正确的 start_line：
 
 ```bash
-grep -n 'funcname(' {source_file}
+grep -n 'funcname(' {source_file} | head -5
 ```
 
-### Step 2：统计花括号平衡
+### Step 2：在局限范围内统计花括号平衡
+
+> ⚠️ **所有扫描只允许在 `{start_line}~{scan_upper}` 范围内，绝对禁止越界。**
 
 ```bash
-sed -n '{start_line},{end_line}p' {source_file} | tr -cd '{' | wc -c
-sed -n '{start_line},{end_line}p' {source_file} | tr -cd '}' | wc -c
+sed -n '{start_line},{scan_upper}p' {source_file} | tr -cd '{' | wc -c
+sed -n '{start_line},{scan_upper}p' {source_file} | tr -cd '}' | wc -c
 ```
 
 **若平衡**：行号正确，无需修正 → 输出 `<result>NO_CORRECTIONS</result>`
 
 **若不平衡**：end_line 可能截断了函数体，执行 Step 3。
 
-### Step 3：花括号不平衡时——向后搜索正确的 end_line
+### Step 3：在局限范围内向后搜索正确的 end_line
 
-用 awk 从 start_line 向后扫描，找到花括号平衡的行：
+> ⚠️ **扫描不得超过 `{scan_upper}` 行。**
 
 ```bash
-awk -v start={start_line} '
-  NR >= start {
-    for (i=1; i<=length($0); i++) {
-      c = substr($0,i,1)
-      if (c == "{") depth++
-      else if (c == "}") { depth--; if (depth == 0) { print NR; exit } }
-    }
-  }
-' {source_file}
+awk 'NR>={start_line}&&NR<={scan_upper}{for(i=1;i<=length($0);i++){c=substr($0,i,1);if(c=="{" )d++;else if(c=="}"&&--d==0){print NR;exit}}}' {source_file}
 ```
 
-- **若 awk 输出了行号 N**：end_line 应为 N，输出修正 JSON（见下方格式）
-- **若 awk 无输出（扫到文件末尾仍未平衡）**：源文件本身截断，无法修复
-  → 输出 `<result>SOURCE_INCOMPLETE</result>`，并在 feedback 中说明 opens/closes 数量
+- **awk 输出了行号 N**：end_line 应为 N，输出修正 JSON（见下方格式）
+- **awk 无输出**（局限范围内找不到平衡）→ 函数截断/损坏，无法修复
+  → 输出 `<result>SOURCE_INCOMPLETE</result>`，说明原因
 
 ## 输出规范
 
