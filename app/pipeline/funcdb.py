@@ -25,8 +25,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
     from .extractor import FunctionExtract
@@ -96,13 +97,21 @@ class FunctionDB:
 
     # ── 连接管理 ───────────────────────────────────────────────────────────────
 
-    def _get_conn(self) -> sqlite3.Connection:
-        """获取带 WAL 模式的连接（每次调用新建，用 with 语句自动 commit/rollback）。"""
+    @contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
+        """获取带 WAL 模式的连接；退出上下文时显式 close，避免 FD 泄漏。"""
         conn = sqlite3.connect(str(self._path), timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.row_factory = sqlite3.Row
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

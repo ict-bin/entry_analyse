@@ -227,7 +227,47 @@ def _is_timeout_error(error_text: str) -> bool:
     return any(pat in lowered for pat in _TIMEOUT_ERROR_PATTERNS)
 
 
+def _extract_last_user_message(session_file: str | None) -> bytes | None:
+    """从 session.jsonl 中提取最后一条 user 消息，用于超时后回退重发。"""
+    if not session_file:
+        return None
+    try:
+        p = Path(session_file)
+        if not p.exists() or p.stat().st_size == 0:
+            return None
+        last_user_text: str | None = None
+        for raw_line in p.read_bytes().splitlines():
+            raw = raw_line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            msg = obj.get("message") or {}
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content", "") or ""
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = str(item.get("text") or "")
+                        if text.strip():
+                            parts.append(text)
+                text = "\n".join(parts)
+            else:
+                text = str(content)
+            if text.strip():
+                last_user_text = text
+        if last_user_text:
+            return last_user_text.encode("utf-8")
+    except Exception as exc:
+        logger.debug("extract_last_user_message failed %s: %s", session_file, exc)
+    return None
 
+
+def _backoff(base_delay: float, attempt: int) -> float:
     """指数退避，带上限。attempt 从 1 开始。"""
     return min(base_delay * (2 ** min(attempt - 1, 6)), _MAX_BACKOFF)
 
@@ -938,7 +978,7 @@ async def _run_with_api_retry(
         on_event=on_slot_event,
     ) as slot_lease:
       # slot 已获取，所有重试（超时/API错误）均在此作用域内进行
-            # _current_handle: 当前 pi 进程句柄，用于超时时精确 kill 对应进程
+      # _current_handle: 当前 pi 进程句柄，用于超时时精确 kill 对应进程
       _current_handle: "AgentProcessHandle | None" = None
       api_timeout_count = 0  # 连续 timeout 类错误计数
 
@@ -1102,8 +1142,7 @@ async def _run_with_api_retry(
                 if timeout_seconds else "agent run timed out"
             )
             result.exit_code = -1
-            # pi 进程已通过 CancelledError 被 terminate_tree SIGKILL
-            # 显式 kill 对应的 pi 进程（精确，只 kill 该进程组，不影响其他并发 pi）
+            # 精确 kill 当前这一次 _execute 拉起的 pi 进程组，不影响其他并发 pi。
             if _current_handle is not None:
                 try:
                     await _current_handle.terminate_tree(
@@ -1111,27 +1150,28 @@ async def _run_with_api_retry(
                 except Exception:
                     pass
                 _current_handle = None
-            # 清理 session 文件残留（防止下次起动时读到损坏的未完成 JSON 行）
             _truncate_session_to_last_complete_line(session_file)
-            # 立即释放 slot：超时期间不应占据 slot 做 backoff 等待
-            # 其他函数可立即获取 slot，引擎的 max_rounds 重试机制负责重试
             can_retry = timeout_retry_enabled and (
                 timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
             )
+            if not can_retry or (cancel_event and cancel_event.is_set()):
+                _log_warn(
+                    f"agent 超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}] 超限，"
+                    f"释放 slot，引擎 max_rounds 负责重新排队"
+                )
+                return result
+            # 未超阈值：继续持有 slot，回退到 session 最后一条 user 消息重发。
+            _retry_stdin = _extract_last_user_message(session_file) or current_stdin or continue_stdin
             _log_warn(
-                f"agent 超时，已 kill pi 并清理 session "
-                f"[{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
-                f"释放 slot （引擎 retry 负责重试）: {result.error}"
+                f"agent 超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}]，"
+                f"kill 当前 pi 后重发 last user message"
             )
             if on_stream:
                 on_stream(
-                    f"\n\u23f1\ufe0f 已 kill pi，释放 slot，引擎重试 "
-                    f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
+                    f"\n\u23f1\ufe0f 超时 {timeout_failures} 次，重发 last user message...\n"
                 )
-            # 标记 can_retry=True 到 result，供外层判断是否需要重新排队
-            if can_retry:
-                result.error = (result.error or "") + " [slot_released_for_retry]"
-            return result  # 释放 slot，不再在 slot 内 sleep
+            current_stdin = _retry_stdin
+            continue
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
@@ -1236,7 +1276,7 @@ async def _run_with_api_retry(
                     )
                     return result  # 释放 slot
                 # 未超阈值：持有 slot，回退到 last user message 重发
-                _retry_stdin = _extract_last_user_message(session_file) or current_stdin
+                _retry_stdin = _extract_last_user_message(session_file) or current_stdin or continue_stdin
                 _log_warn(
                     f"API 超时 [{api_timeout_count}/{_fmt_max(timeout_max_retries)}]，"
                     f"持有 slot 重发 last user message: {(result.error or '')[:80]}"
