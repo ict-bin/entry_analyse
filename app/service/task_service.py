@@ -2621,13 +2621,30 @@ class TaskService:
 
         functions_list: list[str] = []
         functions_list_markdown: str | None = None
+        functions_list_items: list[dict] = []
         if functions_list_path:
             text, err = _read_text_if_exists(functions_list_path)
             if err:
                 warnings.append(err)
             else:
                 functions_list_markdown = text
-                functions_list = [line.strip() for line in (text or "").splitlines() if line.strip()]
+                raw_text = (text or "").strip()
+                if raw_text:
+                    try:
+                        parsed = json.loads(raw_text)
+                        if isinstance(parsed, list):
+                            functions_list_items = [item for item in parsed if isinstance(item, dict)]
+                            functions_list = [
+                                str(item.get("function") or "").strip()
+                                for item in functions_list_items
+                                if str(item.get("function") or "").strip()
+                            ]
+                        else:
+                            warnings.append("functions.list 不是合法 JSON 数组")
+                    except Exception as _e:
+                        warnings.append(f"functions.list 解析失败: {_e}")
+                if not functions_list and text:
+                    functions_list = [line.strip() for line in text.splitlines() if line.strip()]
 
         entry_details: list[dict] = []
         if entry_details_path and entry_details_path.is_file():
@@ -2653,7 +2670,7 @@ class TaskService:
         rounds = (run_result_json or {}).get("rounds") if isinstance(run_result_json, dict) else []
         rounds = rounds if isinstance(rounds, list) else []
         passed_rounds = sum(1 for item in rounds if isinstance(item, dict) and item.get("passed"))
-        available = bool(result_markdown or functions_list or run_report_markdown or run_result_json)
+        available = bool(result_markdown or functions_list_items or functions_list or run_report_markdown or run_result_json)
         if row.status in ("pending", "running") and not available:
             available = False
 
@@ -2669,6 +2686,7 @@ class TaskService:
             "run_result_path": str(run_result_path) if run_result_path else None,
             "result_markdown": result_markdown,
             "functions_list_markdown": functions_list_markdown,
+            "functions_list_items": functions_list_items,
             "functions": functions_list,
             "entry_details": entry_details,
             "run_report_markdown": run_report_markdown,
@@ -2676,7 +2694,7 @@ class TaskService:
             "result_json": run_result_json,
             "summary": {
                 "module_name": row.module_name,
-                "function_count": len(functions_list),
+                "function_count": len(functions_list_items) if functions_list_items else len(functions_list),
                 "round_count": len(rounds),
                 "passed_round_count": passed_rounds,
                 "total_duration_ms": (run_result_json or {}).get("total_duration_ms") if isinstance(run_result_json, dict) else None,

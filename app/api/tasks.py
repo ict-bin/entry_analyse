@@ -155,6 +155,26 @@ class AppEaTaskTimelineResponse(BaseModel):
     events: list[AppEaTaskEventResponse] = Field(default_factory=list)
 
 
+class TaskResultFunctionListItemResponse(BaseModel):
+    tag: Optional[str] = None
+    file: Optional[str] = None
+    line: Optional[int] = None
+    function: str
+    taints: list[str] = Field(default_factory=list)
+    entry_source_lines: list[dict[str, Any]] = Field(default_factory=list)
+    function_description: Optional[str] = None
+    entry_reason: Optional[str] = None
+    taint_details: list[dict[str, Any]] = Field(default_factory=list)
+    func_hash: Optional[str] = None
+    signature: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    body_lines: Optional[int] = None
+    entry_category: Optional[str] = None
+    entry_role: Optional[str] = None
+    entry_confidence: Optional[float] = None
+
+
 class TaskResultResponse(BaseModel):
     task_id: str
     available: bool
@@ -168,6 +188,7 @@ class TaskResultResponse(BaseModel):
     final_report_markdown: Optional[str] = None
     result_markdown: Optional[str] = None
     functions_list_markdown: Optional[str] = None
+    functions_list_items: list[TaskResultFunctionListItemResponse] = Field(default_factory=list)
     functions: list[str] = Field(default_factory=list)
     entry_details: list[dict[str, Any]] = Field(default_factory=list)
     run_report_markdown: Optional[str] = None
