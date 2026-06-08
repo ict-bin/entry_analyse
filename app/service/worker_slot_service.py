@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask, AppEaWorkerSlot
 from app.models import normalize_max_concurrent_tasks
+from app.service.pod_metrics import fetch_pod_resource_map
 from app.service.runtime_role import RUNTIME_ROLE_WORKER
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 from app.service.task_service import _is_valid_worker_owner, _load_svc_config_from_db, _owner_role_guess, _project_dispatch_limit_filter
@@ -75,6 +76,15 @@ class WorkerSlotSnapshot:
     worker_role_state: str
     source: str
     error: str | None
+    pod_created_at: str | None
+    pod_started_at: str | None
+    pod_metrics_at: str | None
+    pod_cpu_usage_millicores: int | None
+    pod_memory_usage_bytes: int | None
+    pod_cpu_request_millicores: int | None
+    pod_memory_request_bytes: int | None
+    pod_cpu_limit_millicores: int | None
+    pod_memory_limit_bytes: int | None
     active_tasks: list[dict[str, Any]]
     claimed_running_tasks: int
     ghost_running_tasks: int
@@ -355,6 +365,10 @@ class WorkerSlotService:
         retired_workers_payload: list[dict[str, Any]] = []
         live_stale_workers = 0
         retired_workers = 0
+        pod_resource_map = fetch_pod_resource_map(
+            pod_names=[str(getattr(row, "pod_name", "") or "").strip() for row in worker_rows],
+            namespace=K8S_NAMESPACE,
+        )
         registry_pods: set[str] = set()
         for row in worker_rows:
             pod_name = str(row.pod_name or "").strip()
@@ -379,6 +393,7 @@ class WorkerSlotService:
             claimed_running_tasks = len(claimed_by_owner.get(pod_name, []))
             ghost_tasks = max(0, claimed_running_tasks - running_tasks)
             available_slots = max(0, int(row.max_concurrent_tasks) - running_tasks)
+            pod_metrics = pod_resource_map.get(pod_name, {})
             payload = WorkerSlotSnapshot(
                 worker_id=row.worker_id,
                 pod_name=row.pod_name,
@@ -407,6 +422,15 @@ class WorkerSlotService:
                 worker_role_state=worker_role_state,
                 source=source,
                 error=error,
+                pod_created_at=pod_metrics.get("pod_created_at"),
+                pod_started_at=pod_metrics.get("pod_started_at"),
+                pod_metrics_at=pod_metrics.get("pod_metrics_at"),
+                pod_cpu_usage_millicores=pod_metrics.get("pod_cpu_usage_millicores"),
+                pod_memory_usage_bytes=pod_metrics.get("pod_memory_usage_bytes"),
+                pod_cpu_request_millicores=pod_metrics.get("pod_cpu_request_millicores"),
+                pod_memory_request_bytes=pod_metrics.get("pod_memory_request_bytes"),
+                pod_cpu_limit_millicores=pod_metrics.get("pod_cpu_limit_millicores"),
+                pod_memory_limit_bytes=pod_metrics.get("pod_memory_limit_bytes"),
                 active_tasks=active_tasks,
                 claimed_running_tasks=claimed_running_tasks,
                 ghost_running_tasks=ghost_tasks,
@@ -444,6 +468,15 @@ class WorkerSlotService:
                 worker_role_state="owner_missing",
                 source="stale_owner",
                 error="owner pod has running tasks but no live worker heartbeat",
+                pod_created_at=None,
+                pod_started_at=None,
+                pod_metrics_at=None,
+                pod_cpu_usage_millicores=None,
+                pod_memory_usage_bytes=None,
+                pod_cpu_request_millicores=None,
+                pod_memory_request_bytes=None,
+                pod_cpu_limit_millicores=None,
+                pod_memory_limit_bytes=None,
                 active_tasks=sorted(active_tasks, key=lambda item: item["task_id"]),
                 claimed_running_tasks=len(active_tasks),
                 ghost_running_tasks=len(active_tasks),
@@ -541,6 +574,15 @@ class WorkerSlotService:
             "worker_role_state": worker.worker_role_state,
             "source": worker.source,
             "error": worker.error,
+            "pod_created_at": worker.pod_created_at,
+            "pod_started_at": worker.pod_started_at,
+            "pod_metrics_at": worker.pod_metrics_at,
+            "pod_cpu_usage_millicores": worker.pod_cpu_usage_millicores,
+            "pod_memory_usage_bytes": worker.pod_memory_usage_bytes,
+            "pod_cpu_request_millicores": worker.pod_cpu_request_millicores,
+            "pod_memory_request_bytes": worker.pod_memory_request_bytes,
+            "pod_cpu_limit_millicores": worker.pod_cpu_limit_millicores,
+            "pod_memory_limit_bytes": worker.pod_memory_limit_bytes,
             "active_tasks": worker.active_tasks,
             "claimed_running_tasks": worker.claimed_running_tasks,
             "ghost_running_tasks": worker.ghost_running_tasks,

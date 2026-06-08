@@ -375,6 +375,15 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
     worker_role_state: str = "healthy"
     source: str = "worker_registry"
     error: Optional[str] = None
+    pod_created_at: Optional[str] = None
+    pod_started_at: Optional[str] = None
+    pod_metrics_at: Optional[str] = None
+    pod_cpu_usage_millicores: Optional[int] = None
+    pod_memory_usage_bytes: Optional[int] = None
+    pod_cpu_request_millicores: Optional[int] = None
+    pod_memory_request_bytes: Optional[int] = None
+    pod_cpu_limit_millicores: Optional[int] = None
+    pod_memory_limit_bytes: Optional[int] = None
     active_tasks: list[EntryAnalyseActiveTaskRefResponse] = Field(default_factory=list)
     active_jobs: list[dict[str, Any]] = Field(default_factory=list)
 
