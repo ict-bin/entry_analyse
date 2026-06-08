@@ -102,6 +102,13 @@ def _request_json(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _looks_like_pod_list(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    items = payload.get("items")
+    return isinstance(items, list)
+
+
 def _container_resources(pod: dict[str, Any], pod_metrics: dict[str, Any] | None) -> dict[str, Any]:
     spec_containers = pod.get("spec", {}).get("containers") or []
     metric_containers = {
@@ -170,7 +177,7 @@ def fetch_pod_resource_map(*, pod_names: list[str], namespace: str | None = None
     pods_payload = _request_json(
         f"/api/v1/namespaces/{runtime_namespace}/pods?fieldSelector={urllib.parse.quote('metadata.name in (' + selector + ')')}"
     )
-    if pods_payload is None:
+    if not _looks_like_pod_list(pods_payload):
         pods_payload = _request_json(f"/api/v1/namespaces/{runtime_namespace}/pods")
     metrics_payload = _request_json(f"/apis/metrics.k8s.io/v1beta1/namespaces/{runtime_namespace}/pods")
     metric_items = {
