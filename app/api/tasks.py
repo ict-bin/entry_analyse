@@ -281,6 +281,7 @@ class TaskSessionIndexResponse(BaseModel):
     edges: list[TaskSessionIndexEdgeResponse] = Field(default_factory=list)
     groups: list[TaskSessionIndexGroupResponse] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    session_metrics: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TaskSessionFileResponse(BaseModel):
