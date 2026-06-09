@@ -150,12 +150,10 @@ class SessionMetricsDB:
                     d["exec_ms"] = int((d["completed_at"] - d["acquired_at"]) * 1000)
                 result.append(d)
             jp = Path(self._path).with_name("session_metrics.json")
-            tmp = jp.with_suffix(".tmp")
-            import json as _json, os as _os2
-            tmp.write_text(_json.dumps(result, ensure_ascii=False), encoding="utf-8")
-            _os2.replace(str(tmp), str(jp))
+            import json as _json
+            jp.write_text(_json.dumps(result, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
-            logger.debug("metrics json flush failed: %s", exc)
+            logger.warning("session_metrics json flush failed: %s", exc)
 
     def query_all(self) -> list[dict]:
         conn = self._get_conn()
