@@ -641,6 +641,7 @@ async def _run_with_context_overflow_recovery(
         stage_key=stage_key,
         role_kind=role_kind,
         on_slot_event=on_slot_event,
+        session_file=session_file,
     )
     if not _is_context_overflow_error(result.error):
         return result
@@ -682,6 +683,7 @@ async def _run_with_context_overflow_recovery(
             stage_key=stage_key,
             role_kind=role_kind,
             on_slot_event=on_slot_event,
+            session_file=session_file,
         )
 
     if single_input_tokens > single_input_limit:
@@ -713,6 +715,7 @@ async def _run_with_context_overflow_recovery(
         timeout_max_retries=timeout_max_retries,
         max_consecutive_empty_responses=max_consecutive_empty_responses,
         priority=priority,
+        session_file=session_file,
     )
 
 
@@ -849,6 +852,7 @@ async def _run_with_pi_retry(
     stage_key: str | None = None,
     role_kind: str | None = None,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
+    session_file: str | None = None,  # 透传 session_file 给 _run_with_api_retry（修复 NameError）
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     pi_attempt = 0
@@ -875,6 +879,7 @@ async def _run_with_pi_retry(
                 stage_key=stage_key,
                 role_kind=role_kind,
                 on_slot_event=on_slot_event,
+                session_file=session_file,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -954,6 +959,7 @@ async def _run_with_api_retry(
     stage_key: str | None = None,
     role_kind: str | None = None,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
+    session_file: str | None = None,  # 新增：供 agent_process_slot/_truncate_session 使用
 ) -> AgentResult:
     """内层循环：启动 pi 子进程，处理 API 级错误重试。
 
