@@ -2736,9 +2736,9 @@ class TaskService:
                     mdb = get_session_metrics_db(str(sessions_root))
                     all_metrics = mdb.query_all()
                     result["session_metrics"] = all_metrics
-        except Exception:
-            pass
-        return result
+        except Exception as exc:
+            import logging
+            logging.getLogger("ea.task_service").warning("session_metrics load for %s failed: %s", task_id, exc)
 
     def get_task_runtime_summary(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
