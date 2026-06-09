@@ -2805,6 +2805,7 @@ class PipelineEngine:
                 role_kind="api",
                 cancel_event=self._cancel,
                 on_event=_emit_slot_event,
+                session_path=str(dirs.af_session(func_hash)),
             ):
                 result = await api_filter_function(
                     func_name=func_name,

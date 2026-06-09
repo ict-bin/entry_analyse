@@ -127,6 +127,18 @@ class SessionMetricsDB:
                  error[:256] if error else "", stop_reason[:32]),
             )
             conn.commit()
+            self._flush_json_snapshot()
+
+    def _flush_json_snapshot(self) -> None:
+        try:
+            snapshot = self.query_all()
+            jp = Path(self._path).with_name("session_metrics.json")
+            tmp = jp.with_suffix(".tmp")
+            import json as _json, os as _os2
+            tmp.write_text(_json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            _os2.replace(str(tmp), str(jp))
+        except Exception:
+            pass
 
     def query_all(self) -> list[dict]:
         conn = self._get_conn()

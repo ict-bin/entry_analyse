@@ -2726,8 +2726,12 @@ class TaskService:
         try:
             sessions_root = _task_sessions_root(row)
             if sessions_root and sessions_root.is_dir():
-                metrics_path = sessions_root / "session_metrics.db"
-                if metrics_path.exists():
+                json_path = sessions_root / "session_metrics.json"
+                db_path = sessions_root / "session_metrics.db"
+                if json_path.exists():
+                    import json as _json
+                    result["session_metrics"] = _json.loads(json_path.read_text(encoding="utf-8"))
+                elif db_path.exists():
                     from app.service.session_metrics import get_session_metrics_db
                     mdb = get_session_metrics_db(str(sessions_root))
                     all_metrics = mdb.query_all()
