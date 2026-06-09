@@ -934,6 +934,7 @@ class WorkerService:
         agent_snapshot: dict[str, Any],
         heartbeat_duration_ms: float,
         heartbeat_failure_count: int,
+        runtime_role: str | None = None,
     ) -> None:
         from app.service.worker_slot_service import get_worker_slot_service
 

@@ -243,7 +243,7 @@ class PipelineDirs:
                   self.stage_results, self.sessions, self.stage_cwd_root):
             d.mkdir(parents=True, exist_ok=True)
         # 创建各阶段 cwd 根目录（不含 .pi/skills，由 setup_stage_skills 负责）
-        for stage in ("r1_w", "r1_j", "r2_w", "r2_j",
+        for stage in ("r1_w", "r2_w", "r2_j",
                       "r3_w", "r3_j", "r4_func_w", "r5_w", "r5_j"):
             self.stage_cwd(stage).mkdir(parents=True, exist_ok=True)
 

@@ -4,9 +4,9 @@ entry_analyse — Round 1 Workers（v3）
 拆分为两步，各司其职：
 
   run_r1_worker（文件级覆盖率）：
-    1. 静态提取（ctags/宏扫描/regex）→ 直接写 funcdb（不经 JSON）
-    2. LLM 检查覆盖率 → 输出新增/删除修正 → apply_corrections 直写 DB
-    3. 同步到 ModuleDB
+    1. 静态提取（tree-sitter/regex/宏扫描）→ 直接写 funcdb（不经 JSON）
+    2. 脚本过滤 gap → 将疑似包含函数体的完整 gap 并行交给 R1-W Agent
+    3. 汇总新增/删除修正 → apply_corrections 直写 DB
 
   run_r2_worker（函数级准确性）：
     1. 读 funcdb 中单函数当前记录
@@ -21,6 +21,7 @@ entry_analyse — Round 1 Workers（v3）
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -48,100 +49,91 @@ logger = logging.getLogger("ea.pipeline.r1_worker")
 
 # ─── Gap 计算（R1-W 轻量化）────────────────────────────────────────────────────
 
-# 单个 gap 超过此行数时按空行切分
-MAX_GAP_CHUNK = 80
-
-
-def _split_gap_at_blanks(
-    lines_data: list[str],
-    start: int,
-    end: int,
-    min_size: int = 8,
-) -> list[tuple[int, int]]:
-    """
-    将超大 gap 在空行处切分为小片段，每段不小于 min_size 行。
-
-    避免单一 gap 包含整个文件导致 agent 一次性处理过大范围。
-    """
-    if end - start + 1 <= MAX_GAP_CHUNK:
-        return [(start, end)]
-
-    chunks: list[tuple[int, int]] = []
-    chunk_start = start
-    for i in range(start, end + 1):
-        line = lines_data[i - 1]  # 1-indexed -> 0-indexed
-        is_blank = not line.strip()
-        chunk_len = i - chunk_start
-        if is_blank and chunk_len >= min_size:
-            # 切分点：当前空行之前的内容作为一个 chunk
-            if i - 1 >= chunk_start:
-                chunks.append((chunk_start, i - 1))
-            chunk_start = i + 1  # 跳过空行本身
-    # 最后一段
-    if chunk_start <= end:
-        last_len = end - chunk_start + 1
-        if last_len >= min_size:
-            chunks.append((chunk_start, end))
-        elif chunks:
-            # 最后一小段太短，合并到前一个 chunk
-            chunks[-1] = (chunks[-1][0], end)
-
-    return chunks if chunks else [(start, end)]
-
-
+# 单个 gap 保持完整，不再按空行切分。R1-W 会对脚本筛出的疑似函数 gap 并行分析。
 # ─── Gap 分类（R1 预筛优化）─────────────────────────────────────────────────────
 
-_SKIPPABLE_KINDS = frozenset({
-    "extern_block", "include_macro_block", "comment_block",
-    "struct_enum_block", "forward_decl_block",
-    "no_function_body",   # gap 内无大括号，函数体不可能存在
-})
+
+def _strip_comments_and_strings(text: str) -> str:
+    """Lightweight C/C++ masking so gap filtering does not match comments/strings."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    state = "code"
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line_comment"; out.append(" "); out.append(" "); i += 2; continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"; out.append(" "); out.append(" "); i += 2; continue
+            if ch == '"':
+                state = "string"; out.append(" "); i += 1; continue
+            if ch == "'":
+                state = "char"; out.append(" "); i += 1; continue
+            out.append(ch); i += 1; continue
+        if state == "line_comment":
+            out.append("\n" if ch == "\n" else " ")
+            if ch == "\n": state = "code"
+            i += 1; continue
+        if state == "block_comment":
+            out.append("\n" if ch == "\n" else " ")
+            if ch == "*" and nxt == "/":
+                out.append(" "); i += 2; state = "code"
+            else:
+                i += 1
+            continue
+        if state in {"string", "char"}:
+            out.append("\n" if ch == "\n" else " ")
+            if ch == "\\":
+                if i + 1 < n:
+                    out.append("\n" if text[i + 1] == "\n" else " ")
+                i += 2; continue
+            if (state == "string" and ch == '"') or (state == "char" and ch == "'"):
+                state = "code"
+            i += 1; continue
+    return "".join(out)
 
 
-def _classify_gap(lines_data: list[str], start: int, end: int) -> str:
+def _looks_like_function_gap(lines_data: list[str], start: int, end: int) -> tuple[bool, str, float]:
     """
-    程序化判断 gap 区间类型，不调用 LLM。
+    Conservative script filter for complete gaps.
 
-    返回值：
-      'extern_block'        - 连续 extern 声明
-      'include_macro_block' - include/define/pragma 块
-      'comment_block'       - 注释块
-      'struct_enum_block'   - typedef/struct/enum 定义（无函数体花括号）
-      'forward_decl_block'  - 函数前向声明（行尾分号，无函数体）
-      'likely_function'     - 疑似含函数体（有匹配的 { 和 }）
-      'ambiguous'           - 无法确定
+    Returns (maybe_function, reason, score). The filter favors recall but masks
+    comments/strings and rejects declarations, initializers and control blocks.
     """
-    seg = [l for l in lines_data[start - 1 : end] if l.strip()]
-    if not seg:
-        return "comment_block"
+    raw = "\n".join(lines_data[start - 1:end])
+    code = _strip_comments_and_strings(raw)
+    nonempty = [l.strip() for l in code.splitlines() if l.strip()]
+    if not nonempty:
+        return False, "empty_or_comment", 0.0
+    joined = "\n".join(nonempty)
+    if "{" not in joined or "}" not in joined:
+        if re.search(r"\)\s*;", joined):
+            return False, "declaration_only", 0.05
+        return False, "no_balanced_body", 0.0
 
-    total       = len(seg)
-    extern_n    = sum(1 for l in seg if l.strip().startswith("extern "))
-    include_n   = sum(1 for l in seg if l.strip().startswith(
-        ("#include", "#define", "#pragma", "#undef",
-         "#ifdef", "#ifndef", "#endif", "#if ")))
-    comment_n   = sum(1 for l in seg if l.strip().startswith(
-        ("//", "/*", " *", "*/")))
-    typedef_n   = sum(1 for l in seg if re.match(r'\s*(typedef|struct|enum|union)\b', l))
-    forward_n   = sum(1 for l in seg
-                      if re.match(r'\s*\w[\w\s\*]+\(', l)
-                      and l.rstrip().endswith(';')
-                      and '{' not in l)
-    brace_open  = sum(1 for l in seg if '{' in l)
-    brace_close = sum(1 for l in seg if '}' in l)
+    # Reject common non-function blocks when the first code line is a control/top-level keyword
+    reject_head = re.compile(r"^(if|for|while|switch|do|else|case|default|typedef|struct|enum|union|namespace|class)\b")
+    if nonempty and reject_head.match(nonempty[0]):
+        return False, "control_or_type_block", 0.1
 
-    if extern_n  >= total * 0.6: return "extern_block"
-    if include_n >= total * 0.6: return "include_macro_block"
-    if comment_n >= total * 0.8: return "comment_block"
-    if typedef_n > 0 and brace_open <= 2: return "struct_enum_block"
-    if forward_n >= total * 0.4 and brace_open <= 2: return "forward_decl_block"
-    if brace_open >= 2 and brace_close >= 2: return "likely_function"
-
-    # 无大括号 → 函数体不可能存在（只有声明/注释/宏/数据），可安全跳过
-    if brace_open == 0:
-        return "no_function_body"
-
-    return "ambiguous"
+    candidate_re = re.compile(
+        r"(?m)^\s*(?:[A-Za-z_~][\w:<>,~*&\s\[\]]+\s+)+"
+        r"(?:[A-Za-z_~][\w:~]*::)*[A-Za-z_~][\w:~]*\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:->\s*[^{}]+\s*)?\{"
+    )
+    macro_candidate_re = re.compile(
+        r"(?m)^\s*[A-Z_][A-Z0-9_]*\s*\([^\n;{}]*\)\s*(?:[A-Za-z_~][\w:~]*\s*)?\([^;{}]*\)\s*\{"
+    )
+    if candidate_re.search(code):
+        return True, "function_signature", 0.95
+    if macro_candidate_re.search(code):
+        return True, "macro_function_signature", 0.75
+    if re.search(r"(?m)^\s*(?:static\s+)?(?:inline\s+)?[A-Za-z_~][\w:<>,~*&\s]+\([^;{}]*\)\s*\{", code):
+        return True, "loose_signature", 0.65
+    if joined.count("{") >= 2 and joined.count("}") >= 2 and re.search(r"\w+\s*\([^;{}]*\)\s*\{", joined):
+        return True, "nested_possible_signature", 0.55
+    return False, "no_function_signature", 0.15
 
 
 def _compute_gaps(
@@ -181,6 +173,7 @@ def _compute_gaps(
 
     gaps: list[dict] = []
     prev_end = 0
+    gap_id = 0
     for seg_start, seg_end in merged + [(total + 1, total + 1)]:
         gap_start = prev_end + 1
         gap_end   = seg_start - 1
@@ -191,10 +184,18 @@ def _compute_gaps(
                 for l in snippet
             )
             if has_code:
-                # 超大 gap 按空行切分，避免 agent 一次性面对整个文件
-                for cs, ce in _split_gap_at_blanks(lines, gap_start, gap_end, min_size=min_gap):
-                    kind = _classify_gap(lines, cs, ce)
-                    gaps.append({"start": cs, "end": ce, "lines": ce - cs + 1, "kind": kind})
+                gap_id += 1
+                maybe_func, reason, score = _looks_like_function_gap(lines, gap_start, gap_end)
+                gaps.append({
+                    "id": f"gap-{gap_id}",
+                    "start": gap_start,
+                    "end": gap_end,
+                    "lines": gap_end - gap_start + 1,
+                    "kind": "maybe_function" if maybe_func else reason,
+                    "maybe_function": maybe_func,
+                    "filter_reason": reason,
+                    "score": score,
+                })
         prev_end = seg_end
 
     return gaps
@@ -236,299 +237,70 @@ def _parse_r1_corrections(output: str) -> list[dict] | None | str:
     return []
 
 
-# ─── R1-W Prompt 构建 ──────────────────────────────────────────────────────────
+# ─── R1-W Per-Gap Prompt ────────────────────────────────────────────────────
 
-def build_r1_w_initial_prompt(
+def build_r1_gap_prompt(
+    *,
     file_path: str,
+    file_hash: str,
+    gap: dict,
+    gap_source: str,
     func_count: int,
-    file_hash: str,
-    dirs: "PipelineDirs",
-    gaps_file_path: "Path | None" = None,
-    gaps_llm_file_path: "Path | None" = None,
-    skipped_n: int = 0,
-    gaps: "list | None" = None,  # deprecated, ignored
-) -> str:
-    """
-    R1-W 首次 prompt：文件级覆盖率检查（Gap 内嵌模式）。
-
-    v5 改进：gap 代码直接嵌入 prompt（每个 gap 最多嵌入 80 行），
-    消除首轮 'cat gaps_file' + N次 'sed -n' bash call。
-    超出嵌入限制的 gap 保留 sed 指引。
-
-    gaps_llm_file_path: 经预筛后只含 LLM 需审查条目的 gaps 文件，若提供则 W 使用此文件而非全量文件。
-    """
-    import json as _json
-    basename = os.path.basename(file_path)
-    abs_path = os.path.abspath(file_path)
-    db_path  = dirs.r1_functions_db(file_hash)
-
-    if func_count > 0:
-        status_text = f"ctags 已预提取 **{func_count}** 个函数，结果存于 `{db_path}`。"
-    else:
-        status_text = (
-            f"ctags 未提取到函数，`{db_path}` 当前为空（或只有完函数），"
-            f"需检查 gap 区间是否有遗漏函数。"
-        )
-
-    # W 优先使用预筛后的 LLM gaps 文件；如果无预筛文件则退化到全量文件
-    _display_gap_file = gaps_llm_file_path or gaps_file_path
-    _has_gap_file     = bool(_display_gap_file and _display_gap_file.exists())
-
-    # 预读 gap 文件内容 + 源文件行，构建内嵌块
-    _INLINE_MAX_GAPS    = 30   # 内嵌最多 30 个 gap
-    _INLINE_MAX_LINES   = 80   # 单个 gap 最多嵌入 80 行
-    _INLINE_TOTAL_CHARS = 12000  # 总内嵌字符上限
-
-    gap_instruction = ""
-    if _has_gap_file:
-        _skipped_hint = (
-            f"（已预筛：{skipped_n} 个 gap 确认为 extern/macro/comment/typedef，无需检查）\n\n"
-            if skipped_n > 0 else ""
-        )
-        try:
-            _gaps_data = _json.loads(_display_gap_file.read_text(encoding="utf-8"))
-        except Exception:
-            _gaps_data = []
-
-        # 尝试预读源文件行
-        try:
-            _src_lines = Path(abs_path).read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            _src_lines = []
-
-        if _gaps_data and _src_lines:
-            # 内嵌 gap 代码段
-            _inline_parts: list[str] = []
-            _fallback_gaps: list[dict] = []
-            _total_chars = 0
-            for _g in _gaps_data[:_INLINE_MAX_GAPS]:
-                _gs, _ge = int(_g.get("start", 0)), int(_g.get("end", 0))
-                _glines  = _ge - _gs + 1
-                if _glines <= 0:
-                    continue
-                if len(_inline_parts) < _INLINE_MAX_GAPS and _total_chars < _INLINE_TOTAL_CHARS:
-                    _snippet = _src_lines[_gs - 1: min(_ge, _gs + _INLINE_MAX_LINES - 1)]
-                    _truncated = _ge - _gs + 1 > _INLINE_MAX_LINES
-                    _snippet_text = "\n".join(_snippet)
-                    _total_chars += len(_snippet_text)
-                    _label = f"Gap L{_gs}-{_ge} ({_glines}行, kind={_g.get('kind','?')})"
-                    if _truncated:
-                        _label += f" [展示前{_INLINE_MAX_LINES}行，剩余用 sed -n '{_gs},{_ge}p' {abs_path}]"
-                    _inline_parts.append(f"### {_label}\n```c\n{_snippet_text}\n```")
-                else:
-                    _fallback_gaps.append(_g)
-
-            _inline_block = "\n\n".join(_inline_parts)
-            _fallback_block = ""
-            if _fallback_gaps:
-                _fb_lines = []
-                for _fg in _fallback_gaps:
-                    _fs, _fe = _fg["start"], _fg["end"]
-                    _fb_lines.append(
-                        f"- L{_fs}-{_fe} ({_fg.get('lines','?')}行, kind={_fg.get('kind','?')}): "
-                        f"`sed -n '{_fs},{_fe}p' {abs_path}`"
-                    )
-                _fallback_block = (
-                    f"\n\n### 剩余 Gap（请用 sed 查看）\n" + "\n".join(_fb_lines)
-                )
-
-            gap_instruction = (
-                f"## Gap 区间（ctags 未覆盖的行）\n\n"
-                f"{_skipped_hint}"
-                f"共 {len(_gaps_data)} 个 gap，代码已内嵌如下（无需额外读取）：\n\n"
-                f"{_inline_block}"
-                f"{_fallback_block}\n\n"
-                f"确认某函数是否已在 funcdb：\n"
-                f"```bash\n"
-                f"python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>\n"
-                f"python3 /opt/entry_analyse/scripts/ea_db.py between-lines {db_path} <start> <end>\n"
-                f"```\n"
-                f"⚠️ 不要用 `grep` / `strings` 直接扫描 `.db` 文件。"
-            )
-        else:
-            # 异常回退到旧模式
-            gap_instruction = (
-                f"## Gap 文件（ctags 未覆盖的行区间）\n\n"
-                f"{_skipped_hint}"
-                f"请读取 gap 信息文件：\n\n"
-                f"```bash\nclecat {_display_gap_file}\n```\n\n"
-                f"对每个 gap 用 sed 查看：`sed -n '<start>,<end>p' {abs_path}`\n"
-                f"确认函数：`python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>`\n"
-            )
-    else:
-        gap_instruction = (
-            f"## Gap 检查\n\n"
-            f"无可视 gap（ctags 已覆盖全部内容）。"
-            f"优先用以下命令确认列表：\n\n"
-            f"```bash\n"
-            f"python3 /opt/entry_analyse/scripts/ea_db.py list-meta {db_path}\n"
-            f"```\n\n"
-            f"不要用 `grep` / `strings` 直接扫描 `.db` 文件；若看起来完整则输出 `NO_CORRECTIONS`。"
-        )
-
-    return (
-        f"# Round 1a \u2014 函数覆盖率检查：`{basename}`\n\n"
-        f"## 当前状态\n\n{status_text}\n\n"
-        f"## 任务\n\n"
-        f"**只检查覆盖率（全不全），不检查行号精确性（准不准）。**\n\n"
-        f"行号精确性由 R2 阶段单独处理。\n\n"
-        f"{gap_instruction}\n\n"
-        f"## 检查步骤\n\n"
-        f"1. 读取 gap 文件，批量用 sed 查看多个 gap 区间内容（**建议每次 bash 调用同时检查 4～6 个 gap，效率更高**）\n"
-        f"2. 判断是否有遗漏的函数定义\n"
-        f"3. 在 `<result>` 中输出修正（**只允许 new 和 delete，不允许行号修正**）：\n\n"
-        f"   ```json\n"
-        f"   [\n"
-        f"     {{\"func_hash\": \"new\", \"name\": \"<完整限定名>\", "
-        f"\"signature\": \"<完整签名>\", \"start_line\": <起始行>, \"end_line\": 0}},\n"
-        f"     {{\"func_hash\": \"<已有hash>\", \"delete\": true}}\n"
-        f"   ]\n"
-        f"   ```\n\n"
-        f"   **无需修正时**：`<result>NO_CORRECTIONS</result>`\n\n"
-        f"   ⚠️ 不要修正行号，不要包含 body 字段。\n\n"
-        f"## 输出前必须执行：格式自检\n\n"
-        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
-        f"引擎仅读取 `<result>...</result>` 标签内的内容，标签外的任何 JSON 都会被静默丢弃。\n"
-    )
-
-
-def build_r1_w_retry_prompt(
-    file_path: str,
-    file_hash: str,
     dirs: PipelineDirs,
-    feedback: str,
 ) -> str:
-    """R1-W 重试 prompt（文件级覆盖率 J 失败后）。"""
-    db_path = dirs.r1_functions_db(file_hash)
-    gaps_file = dirs.r1_gaps_file(file_hash)
-    abs_path = os.path.abspath(file_path)
-    return (
-        f"# Round 1a — 覆盖率修正（重试）\n\n"
-        f"Judge 评审意见：\n\n{feedback}\n\n"
-        f"## 当前输入\n\n"
-        f"- 源文件：`{abs_path}`\n"
-        f"- gap 文件：`{gaps_file}`\n"
-        f"- funcdb：`{db_path}`\n\n"
-        f"## 重要规则\n\n"
-        f"1. **优先核查 Judge 指出的 gap 区间，不要重新全文件漫游**。\n"
-        f"2. 数据库查询默认使用 `python3 /opt/entry_analyse/scripts/ea_db.py`。\n"
-        f"3. **禁止** 用 `grep` / `strings` 直接扫描 `.db` 文件。\n"
-        f"4. `ea_db.py` 的正常空结果会返回结构化 JSON（如 `rows: []`、`found: false`、`row_count: 0`），这表示**查询成功但未命中**，不是工具出错。\n"
-        f"5. `sqlite3` 只作为最后逃生出口，不是默认路径。\n\n"
-        f"## 推荐命令\n\n"
-        f"### 查看 Judge 指出的 gap 原文\n"
-        f"```bash\n"
-        f"cat {gaps_file}\n"
-        f"sed -n '<start>,<end>p' {abs_path}\n"
-        f"```\n\n"
-        f"### 检查某个函数是否已在 funcdb 中\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py find-name {db_path} <func_name>\n"
-        f"```\n\n"
-        f"### 检查某个 gap 区间附近已有函数\n"
-        f"```bash\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py between-lines {db_path} <start> <end>\n"
-        f"python3 /opt/entry_analyse/scripts/ea_db.py around-line {db_path} <line_no> 30\n"
-        f"```\n\n"
-        f"## 任务\n\n"
-        f"请根据 Judge 意见修正函数列表，仍只输出新增/删除修正。\n"
-        f"如果 Judge 指出的函数已在 funcdb 中，则不要重复新增；如果确实缺失，则输出 `new` 修正。\n\n"
-        f"在 `<result>` 中输出修正列表（或 `NO_CORRECTIONS`）。\n\n"
-        f"## 输出前必须执行：格式自检\n\n"
-        f"加载 Skill `ea-output-format`，按其要求检查你的结果是否被 `<result>` 标签包裹。\n"
-        f"引擎仅读取 `<result>...</result>` 标签内的内容，标签外的任何 JSON 都会被静默丢弃。\n"
-    )
-
-
-# ─── R2-W Prompt 构建 ──────────────────────────────────────────────────────────
-
-def build_r2_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
-    """
-    R2-W 重试轮次短消息。Session 已有首轮 sed 验证上下文，无需重发全量提示。
-    """
-    if judge_result_file:
-        return (
-            "## 评审未通过，请修正\n\n"
-            f"Judge 评审意见已写入：`{judge_result_file}`\n"
-            "请用 `read` 工具阅读，然后修正并重新输出 `<result>...</result>`。\n"
-        )
-    if feedback:
-        return (
-            "## 评审未通过，请修正\n\n"
-            f"Judge 意见：{feedback}\n\n"
-            "请根据以上意见修正并重新输出 `<result>...</result>`。\n"
-        )
-    return "评审未通过，请修正并重新输出 `<result>...</result>`。\n"
-
-
-def build_r2_w_prompt(
-    func_hash: str,
-    func_name: str,
-    start_line: int,
-    end_line: int,
-    file_path: str,
-    is_retry: bool = False,
-    feedback: str = "",
-    judge_result_file: str = "",
-    body_content: str = "",  # 预取函数体，提供时替代首个 sed
-) -> str:
-    """
-    R2-W prompt：单函数行号/签名准确性校正。
-
-    body_content 提供时，直接嵌入函数体内容，无需首个 sed 读取。
-    """
+    """R1-W per-gap prompt. Source fully embedded; read tool disabled."""
     basename = os.path.basename(file_path)
-    abs_path = os.path.abspath(file_path)
-
-    retry_section = ""
-    if is_retry and feedback:
-        retry_section = f"\n**Judge 意见**：{feedback}\n"
-    if is_retry and judge_result_file:
-        retry_section += f"\n**上一轮 Judge 结果文件**：`{judge_result_file}`（请先读取该文件再修正）\n"
-
-    # 嵌入预取的函数体（最多 120 行，超出时保留 sed 指引）
-    if body_content and not is_retry:
-        _body_lines_n = body_content.count('\n') + 1
-        if _body_lines_n <= 120:
-            _body_block = (
-                f"**函数体**（已预加载，共 {_body_lines_n} 行）：\n"
-                f"```c\n{body_content[:6000]}\n```\n"
-                f"如上方内容不完整，请用 `sed -n '{start_line},{end_line}p' {abs_path}` 重新获取。\n"
-            )
-        else:
-            _body_block = (
-                f"**步骤 1**：读取当前范围内容：\n"
-                f"```bash\nsed -n '{start_line},{end_line}p' {abs_path}\n```\n"
-            )
-    else:
-        _body_block = (
-            f"**步骤 1**：读取当前范围内容：\n"
-            f"```bash\nsed -n '{start_line},{end_line}p' {abs_path}\n```\n"
-        )
-
+    start = int(gap.get("start") or 0)
+    end = int(gap.get("end") or start)
+    gid = str(gap.get("id") or f"L{start}-{end}")
+    total = end - start + 1
+    source = gap_source
+    if len(source) > 32000:
+        source = source[:32000] + "\n/* >>> gap truncated at 32KB — remaining lines omitted <<< */"
     return (
-        f"# Round 1b — 函数准确性校正：`{func_name}` in `{basename}`\n\n"
-        f"当前记录：start_line={start_line}, end_line={end_line}\n"
-        f"{retry_section}\n"
-        f"## 执行步骤\n\n"
-        f"{_body_block}\n"
-        f"2. 确认：\n"
-        f"   - 第一行是否包含函数名（不是注释行）\n"
-        f"   - 最后一行是否是 `}}` 闭合括号\n"
-        f"   - 花括号是否匹配\n\n"
-        f"3. 在 `<result>` 中输出修正（或 NO_CORRECTIONS）：\n\n"
-        f"   ```json\n"
-        f"   [{{\n"
-        f"     \"func_hash\": \"{func_hash}\",\n"
-        f"     \"start_line\": <修正后起始行>,\n"
-        f"     \"end_line\": <修正后结束行>,\n"
-        f"     \"name\": \"<若需修正限定名>\",\n"
-        f"     \"signature\": \"<若需修正签名>\"\n"
-        f"   }}]\n"
-        f"   ```\n\n"
-        f"   **准确时**输出：`<result>NO_CORRECTIONS</result>`\n\n"
-        f"   ⚠️ 使用 bash sed（1-indexed），不要用 read 工具计数行号。\n"
+        "# R1-W — 遗漏函数检测：gap " + gid + "\n\n"
+        "## 背景\n"
+        f"源文件 `{basename}`，{func_count} 个函数已由 tree-sitter 提取入 funcdb。\n"
+        f"当前 gap：源文件第 {start}-{end} 行（共 {total} 行）。\n"
+        f"脚本预筛：score={gap.get('score', 0):.2f}  reason={gap.get('filter_reason') or gap.get('kind')}\n\n"
+        "## 规则\n"
+        "1. **你只能分析下方嵌入的 gap 源码**，严禁读取源文件。read 工具已禁用。\n"
+        "2. **宁可误报，不可漏报**：不确定是不是函数定义 → 上报。后续阶段会过滤。\n"
+        "3. gap 末尾可能有**截断函数**（有开头无结尾）：end_line 直接填 gap 的终止行。\n"
+        "4. 以下不是函数定义：声明（行尾`;`无`{...}`）、if/for/while/switch/typedef/struct/enum。\n\n"
+        "## Gap 源码（共 " + str(total) + " 行，行号 = gap 内相对行号）\n"
+        "```c\n" + source + "\n```\n\n"
+        "## 输出格式（严格 JSON + 相对行号）\n\n"
+        "**无遗漏**：`<result>NO_CORRECTIONS</result>`\n\n"
+        "**有遗漏**（每函数一条，必须含全部字段）：\n"
+        "```\n<result>[\n"
+        "  {\n"
+        "    \"start_line\": <gap 内起始行，1-indexed，必填>,\n"
+        "    \"end_line\":   <gap 内结束行，1-indexed，必填>,\n"
+        "    \"name\":       \"<函数名>\",\n"
+        "    \"signature\":  \"<完整签名>\"\n"
+        "  }\n"
+        "]</result>\n```\n\n"
+        "**行号说明**：gap 第 1 行 = start_line:1，第 N 行 = end_line:N。\n"
+        f"如函数在 gap 末尾被截断，end_line={total}。\n"
+        "脚本会将相对行号转为源文件绝对行号并提取 body，你无需做任何转换。\n"
     )
+
+
+def _gap_retry_prompt(original_gid: str, reasons: str) -> str:
+    """Short retry message injected into the same session after validation failure."""
+    return (
+        f"## ⚠️ 上一轮输出校验失败，请修正\n\n"
+        f"{reasons}\n\n"
+        f"请重新检查 gap {original_gid} 的源码（在本次会话开头已提供），"
+        f"输出修正后的 `<result>...</result>`。"
+        f"必须使用 gap 内相对行号，所有字段必填。"
+    )
+
+
+def _gap_session_path(dirs: PipelineDirs, file_hash: str, gap: dict) -> Path:
+    gid = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(gap.get("id") or f"{gap.get('start')}-{gap.get('end')}"))
+    return dirs.sessions / f"r1-w-{file_hash}-{gid}.jsonl"
 
 
 # ─── run_r1_worker ──────────────────────────────────────────────────────────
@@ -549,281 +321,283 @@ async def run_r1_worker(
     priority: int = SemPriority.R1_W,
 ) -> tuple[TokenUsage, list[FunctionExtract], list[str]]:
     """
-    执行 Round 1a Worker（文件级覆盖率）。
+    R1 Worker: static extraction + per-gap parallel gap-filling.
 
-    首次：静态提取 → 写 funcdb → LLM 覆盖率检查 → apply_corrections
-    重试：LLM 根据 J 反馈重新检查覆盖率
-
-    Returns:
-        (token_usage, funcs, func_hashes) 从 funcdb 最终读取。
+    New architecture:
+      1. tree-sitter/regex/macro scan -> write FuncDB;
+      2. compute complete gaps (no splitting);
+      3. script-filter to find maybe_function gaps;
+      4. each suspicious gap independently analysed by a per-gap R1-W Agent;
+      5. corrections aggregated and written to FuncDB. R1-J is deprecated.
     """
     from .funcdb import FunctionDB
     from .module_db import ModuleDB
 
-    basename  = os.path.basename(file_path)
+    basename = os.path.basename(file_path)
     file_hash = compute_file_hash(file_path)
-    session_f = str(dirs.r1_w_session(file_hash))
-    workspace = str(dirs.stage_cwd("r1_w"))  # R1-W 专属 cwd（.pi/skills/ 已预置）       list[FunctionExtract] = []
-    func_hashes_static: list[str] = []
-
+    workspace = str(dirs.stage_cwd("r1_w"))
     db = FunctionDB.open(dirs.r1, file_hash)
 
-    if not is_retry:
-        _safe_emit(on_event, "r1_static_extract", task_id,
-                   file=basename, file_hash=file_hash)
-        static_funcs = extract_functions_static(file_path)
-        func_hashes_static = [
-            compute_func_hash(file_path, fe.name, fe.start_line)
-            for fe in static_funcs
-        ]
+    static_funcs: list[FunctionExtract] = []
+    func_hashes_static: list[str] = []
+    total_usage = TokenUsage()
+    all_corrections: list[dict] = []
+    raw_outputs: list[str] = []
 
-        # ── 直接写 funcdb（不经 JSON）──────────────────────────────────────
-        rel = (
-            os.path.relpath(os.path.abspath(file_path), source_dir)
-            if source_dir
-            else os.path.basename(file_path)
+    def _current_funcs():
+        all_meta = db.get_all_meta()
+        funcs_out = []
+        hashes_out = []
+        for item in all_meta:
+            fh = item.get("func_hash", "")
+            if not fh:
+                continue
+            funcs_out.append(FunctionExtract(
+                name=item.get("name", ""),
+                signature=item.get("signature", ""),
+                start_line=item.get("start_line", 0),
+                end_line=item.get("end_line", 0),
+                body="",
+            ))
+            hashes_out.append(fh)
+        if not funcs_out and static_funcs:
+            return static_funcs, func_hashes_static
+        return funcs_out, hashes_out
+
+    def _sync_module_db(funcs_out, hashes_out):
+        try:
+            module_db = ModuleDB.open(dirs.workspace)
+            module_db.sync_file(
+                file_hash,
+                os.path.abspath(file_path),
+                os.path.relpath(os.path.abspath(file_path), source_dir) if source_dir else basename,
+                len(funcs_out),
+            )
+            module_db.sync_functions(file_hash, [
+                {
+                    "func_hash": fh,
+                    "name": fe.name,
+                    "signature": fe.signature,
+                    "start_line": fe.start_line,
+                    "end_line": fe.end_line,
+                    "body_lines": max(0, (fe.end_line or 0) - (fe.start_line or 0) + 1),
+                }
+                for fe, fh in zip(funcs_out, hashes_out)
+            ])
+        except Exception as exc:
+            logger.warning("R1-W: ModuleDB sync failed for %s: %s", basename, exc)
+
+    _safe_emit(on_event, "r1_static_extract", task_id, file=basename, file_hash=file_hash)
+    static_funcs = extract_functions_static(file_path)
+    func_hashes_static = [compute_func_hash(file_path, fe.name, fe.start_line) for fe in static_funcs]
+    rel = os.path.relpath(os.path.abspath(file_path), source_dir) if source_dir else basename
+    db.write_functions(file_hash, file_path, static_funcs, func_hashes_static, rel_path=rel)
+    _safe_emit(on_event, "r1_static_done", task_id, file=basename, file_hash=file_hash, count=len(static_funcs))
+
+    # Complete gaps, no splitting. Script filter for maybe_function gaps.
+    gaps_file = dirs.r1_gaps_file(file_hash)
+    gaps_list = _compute_gaps(static_funcs, file_path)
+    llm_gaps = [g for g in gaps_list if bool(g.get("maybe_function"))]
+    skipped_n = len(gaps_list) - len(llm_gaps)
+    import json as _json
+    if gaps_list:
+        gaps_file.write_text(_json.dumps(gaps_list, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif gaps_file.exists():
+        gaps_file.unlink()
+    gaps_llm_file = gaps_file.with_name(f"{file_hash}_gaps_llm.json")
+    if llm_gaps:
+        gaps_llm_file.write_text(_json.dumps(llm_gaps, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif gaps_llm_file.exists():
+        gaps_llm_file.unlink()
+
+    _safe_emit(on_event, "r1_w_start", task_id, file=basename, file_hash=file_hash,
+               is_retry=False, retry_reason="", gap_count=len(gaps_list), llm_gap_count=len(llm_gaps))
+
+    if llm_gaps:
+        try:
+            source_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            source_lines = []
+
+        r1_gap_parallelism = max(1, int(os.environ.get("EA_R1_GAP_PARALLELISM", "8")))
+        sem = asyncio.Semaphore(r1_gap_parallelism)
+        db_lock = asyncio.Lock()  # per-file SQLite write serialisation
+        r1_timeout = min(
+            int(getattr(cfg, "agent_run_timeout_seconds", 3600) or 3600),
+            int(os.environ.get("EA_R1_GAP_TIMEOUT_SECONDS", "300")),
         )
-        db.write_functions(
-            file_hash, file_path, static_funcs, func_hashes_static,
-            rel_path=rel,
-        )
-        _safe_emit(on_event, "r1_static_done", task_id,
-                   file=basename, file_hash=file_hash,
-                   count=len(static_funcs))
 
-        # 计算 gaps 并写入文件（不嵌入 prompt，避免大文件时 prompt 超大）
-        gaps_file = dirs.r1_gaps_file(file_hash)
-        gaps_list = _compute_gaps(static_funcs, file_path)
-        llm_gaps  = [g for g in gaps_list if g.get("kind") not in _SKIPPABLE_KINDS]
-        skipped_n = len(gaps_list) - len(llm_gaps)
+        # R1-W gap tools: never allow read/write/edit (source is embedded in prompt)
+        _gap_tools = [t for t in (acfg.tools or cfg.workers.default_tools) if t not in ("read", "edit", "write")]
 
-        # 写全量 gaps（R1-J 核查用，包含 kind 字段）
-        import json as _json
-        if gaps_list:
-            gaps_file.write_text(
-                _json.dumps(gaps_list, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-        elif gaps_file.exists():
-            gaps_file.unlink()
-
-        # 写 LLM 专用 gaps（只含需要 LLM 审查的条目）
-        gaps_llm_file = gaps_file.with_name(f"{file_hash}_gaps_llm.json")
-        if llm_gaps:
-            gaps_llm_file.write_text(
-                _json.dumps(llm_gaps, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-        elif gaps_llm_file.exists():
-            gaps_llm_file.unlink()
-
-        # 快速路径：所有 gap 均可程序化确认为非函数体，跳过 LLM
-        if not llm_gaps:
-            logger.info(
-                "R1-W: %d/%d gaps pre-classified non-function, skip LLM for %s",
-                skipped_n, len(gaps_list), basename,
-            )
-            _safe_emit(on_event, "r1_w_start", task_id,
-                       file=basename, file_hash=file_hash, is_retry=False, retry_reason="")
-            _safe_emit(on_event, "r1_w_done", task_id,
-                       file=basename, file_hash=file_hash, tokens_in=0, tokens_out=0, error="")
-            _rp = {
-                "stage": "r1_w", "attempt": 1, "scope": "file",
-                "file_hash": file_hash, "source_file": os.path.abspath(file_path),
-                "status": "ok", "result_type": "corrections", "result": [],
-                "note": f"pre-screened: {len(gaps_list)} gaps ({skipped_n} skipped), 0 need LLM",
-            }
-            _rf  = dirs.stage_result_file("r1_w", "worker", file_hash, 1)
-            _raw = dirs.stage_raw_file("r1_w", "worker", file_hash, 1)
-            write_stage_result_files(result_file=_rf, raw_file=_raw, payload=_rp, raw_text="")
-            upsert_stage_result_index(
-                task_id=task_id, stage_key="r1_w", role_kind="worker", scope_kind="file",
-                attempt=1, file_hash=file_hash, status="ok",
-                summary=f"pre-screened:{len(gaps_list)}gaps,{skipped_n}skipped",
-                result_file_path=str(_rf), raw_file_path=str(_raw),
-            )
-            all_meta = db.get_all_meta()
-            _fo: list[FunctionExtract] = []
-            _ho: list[str] = []
-            for item in all_meta:
-                fh = item.get("func_hash", "")
-                if not fh:
+        async def _parse_and_validate(output: str, gap_abs_start: int, gap_abs_end: int) -> tuple[list[dict], str]:
+            """Convert relative line numbers to absolute, validate bounds. Returns (parsed, error_reason)."""
+            raw_items = _parse_r1_corrections(output)
+            if raw_items is None:
+                return [], ""
+            if not isinstance(raw_items, list):
+                return [], "parse_failed"
+            parsed = []
+            errors = []
+            for i, item in enumerate(raw_items):
+                if not isinstance(item, dict):
                     continue
-                _fo.append(FunctionExtract(
-                    name=item.get("name", ""), signature=item.get("signature", ""),
-                    start_line=item.get("start_line", 0), end_line=item.get("end_line", 0), body="",
-                ))
-                _ho.append(fh)
-            if not _fo and static_funcs:
-                _fo, _ho = static_funcs, func_hashes_static
-            try:
-                _mdb = ModuleDB.open(dirs.workspace)
-                _mdb.sync_file(
-                    file_hash, os.path.abspath(file_path),
-                    os.path.relpath(os.path.abspath(file_path), source_dir) if source_dir else basename,
-                    len(_fo),
+                rel_start = int(item.get("start_line") or 0)
+                rel_end   = int(item.get("end_line") or 0)
+                name = str(item.get("name") or "").strip()
+                signature = str(item.get("signature") or name).strip()
+                if not name:
+                    errors.append(f"item[{i}]: name empty, skipped")
+                    continue
+                if rel_start <= 0 or rel_end <= 0:
+                    errors.append(f"item[{i}] {name}: start_line or end_line missing")
+                    continue
+                if rel_start > rel_end:
+                    errors.append(f"item[{i}] {name}: start_line({rel_start}) > end_line({rel_end})")
+                    continue
+                abs_start = gap_abs_start + rel_start - 1
+                abs_end   = gap_abs_start + rel_end   - 1
+                gap_len   = gap_abs_end - gap_abs_start + 1
+                if abs_start < gap_abs_start or abs_start > gap_abs_end:
+                    errors.append(
+                        f"item[{i}] {name}: absolute start_line={abs_start} outside gap "
+                        f"[{gap_abs_start}, {gap_abs_end}] (your rel {rel_start} → abs {abs_start})")
+                    continue
+                if abs_end < gap_abs_start or abs_end > gap_abs_end:
+                    # Allow end_line == gap_abs_end (truncated function at gap boundary)
+                    if abs_end != gap_abs_end:
+                        errors.append(
+                            f"item[{i}] {name}: absolute end_line={abs_end} outside gap "
+                            f"[{gap_abs_start}, {gap_abs_end}] (your rel {rel_end} → abs {abs_end})")
+                        continue
+                # end_line exactly at gap boundary → truncation, keep it
+                if abs_end == gap_abs_end and rel_end != gap_len:
+                    pass  # truncation at gap end is intentional per prompt rules
+                parsed.append({
+                    "func_hash": "new",
+                    "name": name,
+                    "signature": signature,
+                    "start_line": abs_start,
+                    "end_line": abs_end,
+                })
+            error_reason = "; ".join(errors) if errors else ""
+            if errors and not parsed:
+                return [], error_reason
+            return parsed, error_reason
+
+        async def _run_one_gap(gap):
+            async with sem:
+                gap_abs_start = int(gap.get("start") or 1)
+                gap_abs_end   = int(gap.get("end") or gap_abs_start)
+                gap_source = "\n".join(source_lines[gap_abs_start - 1:gap_abs_end]) if source_lines else ""
+                session_path = str(_gap_session_path(dirs, file_hash, gap))
+                gid = gap.get("id") or f"L{gap_abs_start}-{gap_abs_end}"
+                total_usage = TokenUsage()
+
+                async def _invoke(prompt_text: str, is_retry: bool = False):
+                    return await run_agent(
+                        prompt=prompt_text,
+                        model=acfg.model,
+                        tools=_gap_tools,  # read/edit/write excluded
+                        system_prompt=system_prompt,
+                        cwd=workspace,
+                        thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
+                        session_file=session_path,
+                        cancel_event=cancel_event,
+                        max_retries=cfg.agent_max_retries,
+                        retry_delay=cfg.agent_retry_delay,
+                        run_timeout_seconds=r1_timeout,
+                        timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+                        timeout_max_retries=cfg.agent_timeout_max_retries,
+                        pi_max_retries=cfg.pi_max_retries,
+                        pi_retry_delay=cfg.pi_retry_delay,
+                        max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
+                        task_id=task_id,
+                        stage_key="r1_w",
+                        role_kind="worker",
+                        priority=priority,
+                    )
+
+                prompt = build_r1_gap_prompt(
+                    file_path=file_path, file_hash=file_hash, gap=gap,
+                    gap_source=gap_source, func_count=len(static_funcs), dirs=dirs,
                 )
-                _mdb.sync_functions(file_hash, [
-                    {"func_hash": fh, "name": fe.name, "signature": fe.signature,
-                     "start_line": fe.start_line, "end_line": fe.end_line,
-                     "body_lines": max(0, (fe.end_line or 0) - (fe.start_line or 0) + 1)}
-                    for fe, fh in zip(_fo, _ho)
-                ])
-            except Exception as exc:
-                logger.warning("R1-W: ModuleDB sync failed (fast path) for %s: %s", basename, exc)
-            return TokenUsage(), _fo, _ho
+                ar = await _invoke(prompt)
+                total_usage += ar.token_usage
+                parsed, validation_error = await _parse_and_validate(ar.output, gap_abs_start, gap_abs_end)
 
-        prompt = build_r1_w_initial_prompt(
-            file_path, len(static_funcs), file_hash, dirs,
-            gaps_file_path=gaps_file if gaps_list else None,
-            gaps_llm_file_path=gaps_llm_file if llm_gaps else None,
-            skipped_n=skipped_n,
-        )
-    else:
-        current_count = db.stats().get("total", 0)
-        if current_count == 0:
-            # funcdb 为空（可能 pod kill 导致 WAL 丢失）—降级为 fresh start
-            logger.warning("R1-W: funcdb empty on retry for %s, falling back to fresh start", basename)
-            _safe_emit(on_event, "r1_static_extract", task_id,
-                       file=basename, file_hash=file_hash)
-            static_funcs = extract_functions_static(file_path)
-            func_hashes_static = [
-                compute_func_hash(file_path, fe.name, fe.start_line)
-                for fe in static_funcs
-            ]
-            rel = (
-                os.path.relpath(os.path.abspath(file_path), source_dir)
-                if source_dir else os.path.basename(file_path)
-            )
-            db.write_functions(file_hash, file_path, static_funcs, func_hashes_static, rel_path=rel)
-            gaps_file  = dirs.r1_gaps_file(file_hash)
-            gaps_list2 = _compute_gaps(static_funcs, file_path)
-            llm_gaps2  = [g for g in gaps_list2 if g.get("kind") not in _SKIPPABLE_KINDS]
-            skipped_n2 = len(gaps_list2) - len(llm_gaps2)
-            import json as _json2
-            if gaps_list2:
-                gaps_file.write_text(_json2.dumps(gaps_list2, ensure_ascii=False, indent=2), encoding="utf-8")
-            gaps_llm_file2 = gaps_file.with_name(f"{file_hash}_gaps_llm.json")
-            if llm_gaps2:
-                gaps_llm_file2.write_text(_json2.dumps(llm_gaps2, ensure_ascii=False, indent=2), encoding="utf-8")
-            elif gaps_llm_file2.exists():
-                gaps_llm_file2.unlink()
-            prompt = build_r1_w_initial_prompt(
-                file_path, len(static_funcs), file_hash, dirs,
-                gaps_file_path=gaps_file if gaps_list2 else None,
-                gaps_llm_file_path=gaps_llm_file2 if llm_gaps2 else None,
-                skipped_n=skipped_n2,
-            )
-        else:
-            prompt = build_r1_w_retry_prompt(file_path, file_hash, dirs, feedback)
+                # Retry once on validation failure (same session, retry message appended)
+                if validation_error and not parsed and ar.exit_code == 0:
+                    retry_prompt = _gap_retry_prompt(gid, validation_error)
+                    logger.warning("R1-W gap %s validation failed, retrying: %s", gid, validation_error)
+                    ar2 = await _invoke(retry_prompt, is_retry=True)
+                    total_usage += ar2.token_usage
+                    parsed2, _ = await _parse_and_validate(ar2.output, gap_abs_start, gap_abs_end)
+                    if parsed2:
+                        parsed = parsed2
+                elif validation_error:
+                    logger.warning("R1-W gap %s validation warning (items kept): %s", gid, validation_error)
 
-    _safe_emit(on_event, "r1_w_start", task_id,
-               file=basename, file_hash=file_hash, is_retry=is_retry,
-               retry_reason="judge_failed" if is_retry else "")
+                # write per-gap corrections immediately
+                if parsed:
+                    async with db_lock:
+                        db.apply_corrections(parsed, file_path)
+                    logger.info("R1-W gap %s applied %d correction(s)", gid, len(parsed))
+                return total_usage, parsed, ar.output or ""
 
-    attempt_no = 2 if is_retry else 1
+        _results = await asyncio.gather(*[_run_one_gap(g) for g in llm_gaps])
+        for usage, corrections, raw in _results:
+            total_usage += usage
+            all_corrections.extend(corrections)
+            if raw:
+                raw_outputs.append(raw)
 
-    ar: AgentResult = await run_agent(
-        prompt=prompt,
-        model=acfg.model,
-        tools=acfg.tools or cfg.workers.default_tools,
-        system_prompt=system_prompt,
-        cwd=workspace,
-        thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
-        session_file=session_f,
-        cancel_event=cancel_event,
-        max_retries=cfg.agent_max_retries,
-        retry_delay=cfg.agent_retry_delay,
-        run_timeout_seconds=cfg.agent_run_timeout_seconds,
-        timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
-        timeout_max_retries=cfg.agent_timeout_max_retries,
-        pi_max_retries=cfg.pi_max_retries,
-        pi_retry_delay=cfg.pi_retry_delay,
-        max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
-        task_id=task_id,
-        stage_key="r1_w",
-        role_kind="worker",
-        priority=priority,
-    )
+    # all_corrections collected for result_payload stats only; actual writes done per-gap above
 
-    _safe_emit(on_event, "r1_w_done", task_id,
-               file=basename, file_hash=file_hash,
-               tokens_in=ar.token_usage.input,
-               tokens_out=ar.token_usage.output,
-               error=ar.error or "")
-
-    # 解析并应用修正（直接写 funcdb，不经 JSON）
-    corrections = _parse_r1_corrections(ar.output)
     result_payload = {
         "stage": "r1_w",
-        "attempt": attempt_no,
+        "attempt": 1,
         "scope": "file",
         "file_hash": file_hash,
         "source_file": os.path.abspath(file_path),
-        "status": "ok" if (corrections is None or isinstance(corrections, list)) else "parse_failed",
+        "status": "ok",
         "result_type": "corrections",
-        "result": [] if corrections is None else (corrections or []),
+        "result": all_corrections,
+        "gap_count": len(gaps_list),
+        "llm_gap_count": len(llm_gaps),
+        "skipped_gap_count": skipped_n,
+        "note": "R1-J disabled; complete gaps filtered by script and suspicious gaps analysed in parallel by R1-W",
     }
-    result_file = dirs.stage_result_file("r1_w", "worker", file_hash, attempt_no)
-    raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, attempt_no)
-    write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-    upsert_stage_result_index(
-        task_id=task_id, stage_key="r1_w", role_kind="worker", scope_kind="file",
-        attempt=attempt_no, file_hash=file_hash, status=result_payload["status"],
-        summary=f"corrections={len(result_payload['result'])}",
-        result_file_path=str(result_file), raw_file_path=str(raw_file),
+    result_file = dirs.stage_result_file("r1_w", "worker", file_hash, 1)
+    raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, 1)
+    write_stage_result_files(
+        result_file=result_file,
+        raw_file=raw_file,
+        payload=result_payload,
+        raw_text="\n\n--- GAP OUTPUT ---\n\n".join(raw_outputs),
     )
-    if corrections is None:
-        logger.info("R1-W: no corrections needed for %s", basename)
-    elif corrections:
-        logger.info("R1-W: applying %d corrections for %s", len(corrections), basename)
-        db.apply_corrections(corrections, file_path)
-    else:
-        logger.warning("R1-W: could not parse corrections for %s", basename)
+    upsert_stage_result_index(
+        task_id=task_id,
+        stage_key="r1_w",
+        role_kind="worker",
+        scope_kind="file",
+        attempt=1,
+        file_hash=file_hash,
+        status="ok",
+        summary=f"gaps={len(gaps_list)}, llm_gaps={len(llm_gaps)}, corrections={len(all_corrections)}",
+        result_file_path=str(result_file),
+        raw_file_path=str(raw_file),
+        tokens_input=total_usage.input,
+        tokens_output=total_usage.output,
+    )
 
-    # 从 funcdb 读取最终结果
-    all_meta = db.get_all_meta()
-    funcs_out:  list[FunctionExtract] = []
-    hashes_out: list[str] = []
-    for item in all_meta:
-        fh = item.get("func_hash", "")
-        if not fh:
-            continue
-        funcs_out.append(FunctionExtract(
-            name=item.get("name", ""),
-            signature=item.get("signature", ""),
-            start_line=item.get("start_line", 0),
-            end_line=item.get("end_line", 0),
-            body="",   # R1-W 不需要 body，body 在 funcdb 中
-        ))
-        hashes_out.append(fh)
+    _safe_emit(on_event, "r1_w_done", task_id, file=basename, file_hash=file_hash,
+               tokens_in=total_usage.input, tokens_out=total_usage.output, error="",
+               gap_count=len(gaps_list), llm_gap_count=len(llm_gaps), corrections=len(all_corrections))
 
-    # 降级：funcdb 为空时用静态结果
-    if not funcs_out and static_funcs:
-        logger.warning("R1-W: funcdb empty for %s, falling back to static results", basename)
-        funcs_out  = static_funcs
-        hashes_out = func_hashes_static
-
-    # 同步到 ModuleDB（仅元数据，无 body）
-    try:
-        module_db = ModuleDB.open(dirs.workspace)
-        module_db.sync_file(
-            file_hash, os.path.abspath(file_path),
-            os.path.relpath(os.path.abspath(file_path), source_dir) if source_dir else basename,
-            len(funcs_out),
-        )
-        module_db.sync_functions(file_hash, [
-            {"func_hash": fh, "name": fe.name, "signature": fe.signature,
-             "start_line": fe.start_line, "end_line": fe.end_line,
-             "body_lines": max(0, (fe.end_line or 0) - (fe.start_line or 0) + 1)}
-            for fe, fh in zip(funcs_out, hashes_out)
-        ])
-    except Exception as exc:
-        logger.warning("R1-W: ModuleDB sync failed for %s: %s", basename, exc)
-
-    return ar.token_usage, funcs_out, hashes_out
-
-
+    funcs_out, hashes_out = _current_funcs()
+    _sync_module_db(funcs_out, hashes_out)
+    return total_usage, funcs_out, hashes_out
 # ─── run_r2_w_worker ─────────────────────────────────────────────────────────
 
 async def run_r2_w_worker(

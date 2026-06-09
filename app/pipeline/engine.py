@@ -45,8 +45,6 @@ _STAGE_SKILLS: dict[str, list[Path]] = {
                   _EA_SKILLS_DIR / "shared" / "query-functions-db",
                   _EA_SKILLS_DIR / "shared" / "write-functions-list",
                   _EA_SKILLS_DIR / "shared" / "write-entry-list-json"],
-    "r1_j":      [_EA_SKILLS_DIR / "shared" / "query-functions-db",
-                  _EA_SKILLS_DIR / "r1-judge" / "ea-r1-judge-guide"],
     "r2_w":      [_EA_SKILLS_DIR / "worker" / "ea-output-format",
                   _EA_SKILLS_DIR / "shared" / "query-functions-db"],
     "r2_j":      [_EA_SKILLS_DIR / "shared" / "query-functions-db"],
@@ -89,7 +87,7 @@ from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
 
-# 函数数超过此阈值时跳过 R2-J（ctags 对大文件整体可靠）
+# 函数数超过此阈值时跳过 R2-J（tree-sitter 对大文件整体可靠）
 R2J_SKIP_THRESHOLD = int(os.getenv("EA_R2J_SKIP_THRESHOLD", "80"))
 
 
@@ -554,7 +552,7 @@ class PipelineEngine:
                 _maybe_set_all_r2_done()
                 return
 
-            # ── R2: ctags 行号准确性验证 ──────────────────────────────────
+            # ── R2: tree-sitter 行号准确性验证 ──────────────────────────────
             # 用信号量限制同时进入 R2 的函数数（防止任务风暴）
             # 关键：R2 完成后立即释放信号量，R3/CC/R4 不在信号量内
             # 否则会死锁（持有槽的函数等 all_r2_done，但被槽阻拦的函数无法完成 R2）
@@ -752,7 +750,7 @@ class PipelineEngine:
 
         return final_entries
 
-    # ── Phase 1 文件单元：R1（文件级 W+J）+ R2（ctags 行号准确性）──────────────
+    # ── Phase 1 文件单元：R1（静态提取 + per-gap 并行补全）+ R2（行号准确性）──────
 
     async def _run_file_r1(
         self,
@@ -988,7 +986,7 @@ class PipelineEngine:
             logger.debug("_build_caller_context_for_r3 err %s: %s", func_hash, exc)
             return {"direct_callers": [], "ancestors": [], "has_any_caller": False}
 
-    # ── Phase 4: R3-J 文件级汇总 ──────────────────────────────────────────
+    # ── Phase 1 单文件 R1：静态提取 + per-gap 并行（R1-J 已废弃）────────────────
 
     async def _run_r1(
         self,
@@ -997,142 +995,46 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R1：文件级覆盖率 W+J 循环。"""
+        """R1：一次调用即完成（R1-W per-gap 并行已内建，不再需要 J 验证循环）。"""
         fs = state.files[file_hash]
         r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
-
-        while _should_continue(fs.r1_attempts, r1_max, self._cancel):
-            if fs.r1_j_state == NodeState.PASSED:
-                break
-
-            # R1-W
-            fs.r1_w_state = NodeState.RUNNING
-            fs.r1_attempts += 1
-            await asyncio.to_thread(state.save, dirs.state_file)
-
-            try:
-                acfg = self.cfg.workers.agents[0]
-                is_retry = fs.r1_attempts > 1
-                token_usage, funcs, func_hashes = await run_r1_worker(
-                        file_path=file_path,
-                        dirs=dirs,
-                        acfg=acfg,
-                        cfg=self.cfg,
-                        task_id=self.task_id,
-                        on_event=self._on_event,
-                        cancel_event=self._cancel,
-                        source_dir=self._source_dir,
-                        is_retry=is_retry,
-                        feedback=fs.r1_feedback if is_retry else "",
-                        system_prompt=self._stage_sys_prompt('r1_worker'),
-                        priority=SemPriority.R1_W,
-                    )
-
-                state.register_functions(
-                    file_hash,
-                    [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
-                     for fe, fh in zip(funcs, func_hashes)],
-                )
-                fs.r1_w_state = NodeState.PASSED
-                await asyncio.to_thread(state.save, dirs.state_file)
-
-            except Exception as exc:
-                logger.error("R1-W failed for %s: %s", file_path, exc)
-                fs.r1_w_state = NodeState.FAILED
-                await asyncio.to_thread(state.save, dirs.state_file)
-                break
-
-            if self._cancel.is_set():
-                break
-
-            # R1-J（文件级覆盖率验证）
-            j_session = str(dirs.r1_j_session(file_hash, fs.r1_attempts))
-            self._emit("r1_j_start", file_hash=file_hash,
-                       file=Path(file_path).name, attempt=fs.r1_attempts)
-            try:
-                db_path   = dirs.r1_functions_db(file_hash)
-                gaps_file = dirs.r1_gaps_file(file_hash)
-                # 计算源文件在 workspace/source 内的路径（保留子目录结构）
-                try:
-                    _rel = os.path.relpath(os.path.abspath(file_path), self._source_dir)
-                    if _rel.startswith(".."):
-                        _rel = Path(file_path).name
-                except ValueError:
-                    _rel = Path(file_path).name
-                ws_file_path = dirs.source / _rel
-                worker_result_file = dirs.stage_result_file("r1_w", "worker", file_hash, fs.r1_attempts)
-                worker_raw_file = dirs.stage_raw_file("r1_w", "worker", file_hash, fs.r1_attempts)
-                # Pre-fetch gap source content:
-                # Eliminates 7 bash `sed -n 'N,Mp'` calls → R1-J from 5 turns to 2 turns
-                _gap_src_map: dict = {}
-                _SKIPPABLE = {"no_function_body","include_macro_block","comment_block",
-                              "struct_enum_block","forward_decl_block","extern_block"}
-                if gaps_file.exists():
-                    try:
-                        _gaps_data = json.loads(gaps_file.read_text(encoding="utf-8"))
-                        if isinstance(_gaps_data, list):
-                            _src_text = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
-                            for _g in _gaps_data:
-                                if _g.get("kind") in _SKIPPABLE:
-                                    continue
-                                _gs = _g.get("start", 1)
-                                _ge = _g.get("end", _gs)
-                                _glines = _src_text[_gs - 1 : _ge]
-                                _gk = _g.get("kind", "gap")
-                                _gap_src_map[f"L{_gs}-{_ge}({_gk})"] = "\n".join(_glines[:50])
-                    except Exception as _gap_exc:
-                        logger.debug("R1-J gap prefetch %s: %s", file_hash, _gap_exc)
-
-                j_prompt = P.build_r1_file_j_prompt(
-                    file_name=Path(file_path).name,
-                    func_count=len(fs.functions),
-                    ws_file_path=str(ws_file_path),
-                    gaps_file=str(gaps_file) if gaps_file.exists() else "",
-                    db_path=str(db_path),
-                    worker_result_file=str(worker_result_file) if worker_result_file.exists() else "",
-                    worker_raw_file=str(worker_raw_file) if worker_raw_file.exists() else "",
-                    gap_source_map=_gap_src_map,
-                )
-                acfg_j = self._judge_acfg()
-                ar_j = await self._call_agent(
-                    prompt=j_prompt,
-                    system_prompt=self._stage_sys_prompt('r1_judge'),
-                    session_file=j_session,
-                    cwd=str(dirs.stage_cwd("r1_j")),
-                    context=f"r1_j:{file_hash}",
-                    acfg=acfg_j,
-                    priority=SemPriority.R1_J,
-                )
-                j_passed, j_feedback = _parse_j_result(ar_j.output)
-                fs.r1_j_state = NodeState.PASSED if j_passed else NodeState.FAILED
-                fs.r1_feedback = j_feedback
-                await asyncio.to_thread(state.save, dirs.state_file)
-                self._emit("r1_j_done", file_hash=file_hash,
-                           file=Path(file_path).name, passed=j_passed,
-                           feedback=j_feedback[:200])
-                if not j_passed:
-                    self._emit("r1_retry_scheduled", file_hash=file_hash,
-                               file=Path(file_path).name,
-                               attempt=fs.r1_attempts + 1,
-                               reason="judge_failed",
-                               feedback=j_feedback[:200])
-                if j_passed:
-                    break
-            except Exception as exc:
-                logger.error("R1-J failed for %s: %s", file_hash, exc)
-                # J 异常 → 标记 FAILED，交由 max_rounds 控制重试
-                fs.r1_j_state = NodeState.FAILED
-                fs.r1_feedback = f"judge exception: {str(exc)[:300]}"
-                await asyncio.to_thread(state.save, dirs.state_file)
-                break
-
-        # max_rounds=0 → 跳过（直接 PASS）
         if r1_max == 0:
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED
             await asyncio.to_thread(state.save, dirs.state_file)
+            return
+        try:
+            acfg = self.cfg.workers.agents[0]
+            token_usage, funcs, func_hashes = await run_r1_worker(
+                file_path=file_path,
+                dirs=dirs,
+                acfg=acfg,
+                cfg=self.cfg,
+                task_id=self.task_id,
+                on_event=self._on_event,
+                cancel_event=self._cancel,
+                source_dir=self._source_dir,
+                is_retry=False,
+                feedback="",
+                system_prompt=self._stage_sys_prompt("r1_worker"),
+                priority=SemPriority.R1_W,
+            )
+            state.register_functions(
+                file_hash,
+                [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
+                 for fe, fh in zip(funcs, func_hashes)],
+            )
+            fs.r1_w_state = NodeState.PASSED
+            fs.r1_j_state = NodeState.PASSED  # no separate J
+            await asyncio.to_thread(state.save, dirs.state_file)
+        except Exception as exc:
+            logger.error("R1-W failed for %s: %s", file_path, exc)
+            fs.r1_w_state = NodeState.FAILED
+            fs.r1_j_state = NodeState.FAILED
+            await asyncio.to_thread(state.save, dirs.state_file)
 
-    # ── R2（ctags 行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
+    # ── R2（行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
+# ── R2（ctags 行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
 
     async def _run_r2_w(
         self,
@@ -1142,7 +1044,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R2-W：J 判定失败后，带 J 反馈修正 ctags 行号并写回 funcdb。"""
+        """R2-W：J 判定失败后，带 J 反馈修正行号并写回 funcdb。"""
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_w_state = NodeState.RUNNING
         func_state.r2_w_attempts += 1
@@ -1195,7 +1097,7 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> bool:
-        """R2-J：验证 ctags 提取的函数行号是否正确，返回 passed。
+        """R2-J：验证 tree-sitter 提取的函数行号是否正确，返回 passed。
 
         v5 改进：首先走脚本化检查（_r2_j_script_check），预期覆盖 90%+ 案例。
         只有自动检查不能确定的边界情况才走 agent。
