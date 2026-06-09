@@ -193,6 +193,70 @@ def trigger_instant_cancel(task_id: str) -> bool:
     return ok1 or ok2
 
 
+def kill_resident_pi_processes(*, label: str) -> int:
+    """杀本 pod 上所有 pi/node 残留进程（不区分 ppid，不要求 reaper）。
+
+    设计原则：
+      - 一个 worker pod 同时只跑一个任务，所有 comm=="pi" 或 exe=="node" 进程都是该任务的 agent。
+      - 跳过自己（保护当前 Python 进程），其他全部 kill。
+      - 不依赖 PID 1 是不是 reaper，不要求 ppid==1。
+      - 阻塞调用，每个进程 os.killpg 立即返回，最多 ~5s。
+      - 不会跨 pod 影响。
+
+    Hook 调用位置：
+      - task_service.cancel_task  : 取消后杀本 pod 上所有 agent
+      - task_service.restart_task : 重启前杀
+      - task_service.resume_task  : 续跑前杀
+      - task_service.create_task  : 新任务入库后、调度前杀
+      - worker_service._execute_task finally 块：任务真正结束（passed/error/cancelled）后杀
+    """
+    killed = 0
+    my_pid = os.getpid()
+    my_pgid = os.getpgid(0)
+    proc_root = pathlib.Path("/proc")
+    for proc_dir in proc_root.iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            pid = int(proc_dir.name)
+            if pid == my_pid:
+                continue
+            comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+            exe = os.path.basename(os.readlink(proc_dir / "exe"))
+        except Exception:
+            continue
+        if comm != "pi" and exe != "node":
+            continue
+        try:
+            pgid = int(
+                subprocess.check_output(
+                    ["sh", "-lc", f"awk '{{print $5}}' /proc/{pid}/stat"],
+                    text=True,
+                ).strip()
+            )
+        except Exception:
+            pgid = None
+        if pgid is not None and pgid == my_pgid:
+            # 跳过本进程组（worker 主进程及其直接子进程）
+            continue
+        logger.warning(
+            f"cleaning resident pi process [{label}] pid={pid} pgid={pgid if pgid is not None else 'unknown'} comm={comm} exe={exe}"
+        )
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+    if killed:
+        logger.warning("killed %d resident pi/python process(es) on this pod label=%s", killed, label)
+    return killed
+
+
 async def _wait_cancel_first(delay: float, cancel_event: asyncio.Event | None) -> bool:
     if delay <= 0:
         return bool(cancel_event and cancel_event.is_set())
@@ -2375,6 +2439,15 @@ class WorkerService:
                         await bg_task
                     except asyncio.CancelledError:
                         pass
+            # 任务结束（passed/error/cancelled/worker_stopping 任一）后杀本 pod 上所有残留 pi/python 进程。
+            # 顺序：必须等所有 bg_task 退出（避免 watcher 还在读进程状态）、再杀。
+            # worker_stopping 场景下不杀：进程由后续接管的新 pod 重建；本 pod 即将退出，杀了反而让新 pod 错过提早可用的资源池。
+            # 但 lease 已被另一 pod 接管，本 pod 不会重新启动该任务，所以这层是安全的。
+            if self._running:
+                try:
+                    kill_resident_pi_processes(label=f"ea_task_end_{task_id[:12]}")
+                except Exception as _kill_exc:
+                    logger.warning("task end: resident pi cleanup failed (ignored): %s", _kill_exc)
             _running_tasks.pop(task_id, None)
             if project_id:
                 task_mod.get_task_service().schedule_dispatch(project_id)

@@ -28,6 +28,7 @@ from app.service.session_index import build_session_catalog
 from app.service.runtime_role import RUNTIME_ROLE_WORKER, get_runtime_role, role_enabled
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 from app.agent_process import cleanup_task_pi_processes
+from app.service.worker_service import kill_resident_pi_processes
 
 logger = logging.getLogger("ea.task_service")
 
@@ -3185,6 +3186,12 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_created"),
         )
         db.commit(); db.refresh(row)
+        # Hook: 新任务入库后、调度前，杀本 pod 上所有残留 pi/python 进程。
+        # 一个 pod 同时只跑一个任务，所以全杀安全。
+        try:
+            kill_resident_pi_processes(label="ea_create_task")
+        except Exception as _kill_exc:
+            logger.warning("create_task: resident pi cleanup failed (ignored): %s", _kill_exc)
         self.schedule_dispatch(project_id)
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
@@ -3225,6 +3232,14 @@ class TaskService:
         )
         db.commit()
 
+        # Hook: restart 前杀本 pod 上所有孤儿 pi/python 进程。
+        # 一个 worker pod 同时只跑一个任务，所以杀所有本 pod 残留是安全的（不会误杀其他 pod 的同 task_id 进程）。
+        # 必须在 db.commit() 之后调，避免抢占后插队的状态造成状态不一致。
+        try:
+            kill_resident_pi_processes(label="ea_restart_task")
+        except Exception as _kill_exc:
+            logger.warning("restart_task: resident pi cleanup failed (ignored): %s", _kill_exc)
+
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
@@ -3255,6 +3270,12 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_resumed", row.updated_at, row.status),
         )
         db.commit()
+
+        # Hook: resume 前杀本 pod 上所有孤儿 pi/python 进程（同 restart）
+        try:
+            kill_resident_pi_processes(label="ea_resume_task")
+        except Exception as _kill_exc:
+            logger.warning("resume_task: resident pi cleanup failed (ignored): %s", _kill_exc)
 
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
@@ -3328,16 +3349,13 @@ class TaskService:
                 dedupe_key=_event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
             )
         db.commit(); db.refresh(row)
-        if row.status == "running":
-            try:
-                cleanup_task_pi_processes(
-                    logger.warning,
-                    label="ea_cancel_task",
-                    task_id=row.task_id,
-                    task_roots=task_roots,
-                )
-            except Exception as exc:
-                logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
+        # Hook: cancel 后杀本 pod 上所有孤儿 pi/python 进程。
+        # 一个 pod 一个任务，直接全杀本 pod 上残留的智能体进程。
+        # 包括 running 状态、pending 状态、以及 owner_pod 在本 pod 上的所有场景。
+        try:
+            kill_resident_pi_processes(label="ea_cancel_task")
+        except Exception as exc:
+            logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
         # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
         if owner_pod_ip and row.status == "running":
             import asyncio as _asyncio
