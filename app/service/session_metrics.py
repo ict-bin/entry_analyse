@@ -88,6 +88,7 @@ class SessionMetricsDB:
                 (session_path, time.time()),
             )
             conn.commit()
+            self._flush_json_snapshot()
 
     def upsert_first_token(self, session_path: str) -> None:
         with self._lock:
