@@ -204,7 +204,9 @@ def build_r3_w_retry_prompt(judge_result_file: str, feedback: str = "") -> str:
     return "评审未通过，请根据上一轮结果和分析历史修正并重新输出 `<result>...</result>`。\n"
 
 
-def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
+# ─── R3-W Phase 1: 入口判断（两阶段，同一 session） ───────────────────────────
+
+def build_r3_w_prompt(
     func_hash: str,
     func_name: str,
     signature: str,
@@ -216,16 +218,10 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
     is_retry: bool = False,
     feedback: str = "",
     judge_result_file: str = "",
-    body_content: str = "",   # 预取函数体，提供时替代首个 bash call
+    body_content: str = "",
     entry_already_confirmed: bool = False,
 ) -> str:
-    """
-    R3-W prompt：分析单个函数是否有外部输入。
-
-    - body_content 提供时：直接嵌入函数体，剪去首个 bash 读取步骤（减少 1-2 次 tool call）
-    - body_content 为空：保留原有三档策略（sed/python3/awk）
-    - retry feedback 格式：【评审摘要：xxx】详细见文件：path（由 engine 注入）
-    """
+    """R3-W Phase 1: entry detection only. Lightweight, single verdict."""
     basename = os.path.basename(file_path)
     retry = _retry_section(feedback) if is_retry else ""
     if is_retry and judge_result_file:
@@ -238,150 +234,123 @@ def build_r3_w_prompt(  # 正确命名：R3-W 外部输入分析
         "'fread','getline','MsgReceive','Receive','accept']"
     )
 
-    # ── 三档策略 ──────────────────────────────────────────────────────────────
-    # 预取 body 存在时：直接嵌入，跳过 bash step1
     if body_content and not is_retry:
-        # 限制嵌入长度（最多 200 行 / 8000 字符），超出部分需要 Agent 自行读取
         body_lines_capped = body_content.count('\n') + 1
         if body_lines_capped <= 200:
             _body_escaped = body_content[:8000]
             step1 = (
-                f"## 函数体（已预加载，共 {body_lines_capped} 行）\n"
-                f"```c\n{_body_escaped}\n```\n"
-                f"\n**函数体已预加载，无需读取源文件或 funcdb。直接根据上方内容分析；如内容有疑问（截断或乱码），最多进行 1 次 bash 确认。**\n"
+                "## 函数体（已预加载，共 %d 行）\n" % body_lines_capped
+                + "```c\n" + _body_escaped + "\n```\n"
+                + "\n**函数体已预加载，无需读取源文件。直接根据上方内容分析。**\n"
             )
         else:
-            # 大函数：不嵌入全体，改用 awk 扫描
             step1 = (
-                f"**步骤 1**：awk 行级扫描外部 I/O 调用（共 {body_lines} 行，只返回命中行）：\n"
-                f"```bash\n"
-                f"awk 'NR>={start_line} && NR<={end_line} && \\\n"
-                f"     /{_AWK_REGEX}/ \\\n"
-                f"     {{print NR" + chr(34) + f": " + chr(34) + f"$0}}' {file_path}\n"
-                f"```\n"
-                f"并读取函数签名行：\n"
-                f"```bash\n"
-                f"sed -n '{start_line}p' {file_path}\n"
-                f"```\n"
+                "**步骤 1**：awk 行级扫描外部 I/O 调用（共 %d 行，只返回命中行）：\n" % body_lines
+                + "```bash\n"
+                + "awk 'NR>=%d && NR<=%d && \\\n" % (start_line, end_line)
+                + "     /" + _AWK_REGEX + "/ \\\n"
+                + '     {print NR": "$0}' + "' " + file_path + "\n"
+                + "```\n"
+                + "并读取函数签名行：\n```bash\nsed -n '%dp' %s\n```\n" % (start_line, file_path)
             )
     elif body_lines <= 60:
         step1 = (
-            f"**步骤 1**：读取完整函数体（共 {body_lines} 行）：\n"
-            f"```bash\n"
-            f"sed -n '{start_line},{end_line}p' {file_path}\n"
-            f"```\n"
+            "**步骤 1**：读取完整函数体（共 %d 行）：\n" % body_lines
+            + "```bash\nsed -n '%d,%dp' %s\n```\n" % (start_line, end_line, file_path)
         )
     elif body_lines <= 200:
         step1 = (
-            f"**步骤 1**：扫描函数内外部 I/O 调用（共 {body_lines} 行，仅返回命中行）：\n"
-            f"```bash\n"
-            f'python3 -c "\n'
-
-            f"lines = open('{file_path}').readlines()[{start_line}-1:{end_line}]\n"
-            f"for i, l in enumerate(lines, {start_line}):\n"
-            f"    if any(p in l for p in {_PY_PATTERNS}):\n"
-            f"        print(i, l.rstrip())\n"
-            f'"\n'
-
-            f"```\n"
-            f"并读取函数签名行确认入参：\n"
-            f"```bash\n"
-            f"sed -n '{start_line}p' {file_path}\n"
-            f"```\n"
+            "**步骤 1**：扫描函数内外部 I/O 调用（共 %d 行，仅返回命中行）：\n" % body_lines
+            + "```bash\n"
+            + "python3 -c \"\n"
+            + "lines = open('%s').readlines()[%d-1:%d]\n" % (file_path, start_line, end_line)
+            + "for i, l in enumerate(lines, %d):\n" % start_line
+            + "    if any(p in l for p in " + _PY_PATTERNS + "):\n"
+            + "        print(i, l.rstrip())\n"
+            + '"\n```\n'
+            + "并读取函数签名行确认入参：\n```bash\nsed -n '%dp' %s\n```\n" % (start_line, file_path)
         )
     else:
         step1 = (
-            f"**步骤 1**：awk 行级扫描外部 I/O 调用（共 {body_lines} 行，只返回命中行）：\n"
-            f"```bash\n"
-            f"awk 'NR>={start_line} && NR<={end_line} && \\\n"
-            f"     /{_AWK_REGEX}/ \\\n"
-            f"     {{print NR" + chr(34) + f": " + chr(34) + f"$0}}' {file_path}\n"
-
-            f"```\n"
-            f"并读取函数签名行：\n"
-            f"```bash\n"
-            f"sed -n '{start_line}p' {file_path}\n"
-            f"```\n"
+            "**步骤 1**：awk 行级扫描外部 I/O 调用（共 %d 行，只返回命中行）：\n" % body_lines
+            + "```bash\n"
+            + "awk 'NR>=%d && NR<=%d && \\\n" % (start_line, end_line)
+            + "     /" + _AWK_REGEX + "/ \\\n"
+            + '     {print NR": "$0}' + "' " + file_path + "\n"
+            + "```\n"
+            + "并读取函数签名行：\n```bash\nsed -n '%dp' %s\n```\n" % (start_line, file_path)
         )
 
     if body_lines <= 60:
         step2 = (
-            f"**步骤 2**：分析是否有外部输入：\n\n"
-            f"   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
-            f"   **主动型（A）**：函数体调用 {_PATTERNS} 等\n"
-            f"\n"
-            f"   **⚠️ 请求-响应模式不得 filter（此规则优先于下方排除规则）：**\n"
-            f"   若函数同时满足以下 3 个特征，即使调用了 SendXxx/AckMsg，**必须 keep**：\n"
-            f"   1. 函数名含 `Proc`+`Msg`、`Handle`+`Msg` 或 `OnMsg`\n"
-            f"   2. 签名有 `*message`/`*msg`/`*request` 类型参数\n"
-            f"   3. 函数日志有 `\"Received\"`/`\"Recv\"`/`\"Recvd\"` 字样\n\n"
-            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true\n"
-            f"   （判断依据是函数体行为，不是函数名）：**\n"
-            f"   - 函数体的主要行为是构造、填充或发送数据：\n"
-            f"     分配 output buffer、写入字段、调用发送/写出 API，\n"
-            f"     而非从外部来源读取或解析数据\n"
-            f"   - 函数的上下文/状态参数只携带内部机器状态，\n"
-            f"     不携带来自外部的消息 payload（依据是函数体操作，不是参数名）\n"
-            f"   - 参数虽含 message/request 字样，但函数体只做内部状态查询或字段更新，\n"
-            f"     没有对该参数所指数据做解析或安全相关的分支处理\n"
-            f"   **服务生命周期函数必须 filter（即使参数含 socket/callback）：**\n"
-            f"   满足下列全部特征时必须输出 filter，不论参数名如何：\n"
-            f"   ① 函数名含 `*_init`/`*_start`/`*_stop`/`*_free`/`*_register`/`*_setup`/`*_bind` 等生命周期标志\n"
-            f"   ② 函数体内无 recv/recvfrom/recvmsg/read/accept/MsgReceive 等接收外部数据的调用\n"
-            f"   ③ 参数中的 socket 是路径字符串（用于 bind/listen）或参数是函数指针/回调指针\n"
-            f"   → 这类函数是服务启动配置，参数是配置值，不是 HTTP/IPC 请求 payload，必须 filter\n"
+            "**步骤 2**：判断是否有外部输入：\n\n"
+            "   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
+            "   **主动型（A）**：函数体调用 %s 等\n\n" % _PATTERNS
+            + "   **服务生命周期函数必须 filter**：函数名含 *_init/*_start/*_stop/*_free/*_register/*_setup 且无外部 I/O 调用 → false\n\n"
+            "   **请求-响应模式不得 filter**：函数名含 Proc+Msg/Handle+Msg/OnMsg + 签名有 *message/*msg/*request 参数 + 日志有 Received/Recv → true\n"
         )
     else:
         step2 = (
-            f"**步骤 2**：分析结果：\n\n"
-            f"   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet 类名称\n"
-            f"     → `has_external_input: false`\n"
-            f"   - 有命中行：精确定位（`sed -n '<行号>p' {file_path}`）确认后分析 taint\n"
-            f"   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）\n"
-            f"\n"
-            f"   **⚠️ 请求-响应模式不得 filter（此规则优先于下方排除规则）：**\n"
-            f"   若函数同时满足以下 3 个特征，即使调用了 SendXxx/AckMsg，**必须 keep**：\n"
-            f"   1. 函数名含 `Proc`+`Msg`、`Handle`+`Msg` 或 `OnMsg`\n"
-            f"   2. 签名有 `*message`/`*msg`/`*request` 类型参数\n"
-            f"   3. 函数日志有 `\"Received\"`/`\"Recv\"`/`\"Recvd\"` 字样\n\n"
-            f"   **以下情况即使参数名含 message/request，也不应判定为 has_external_input=true\n"
-            f"   （判断依据是函数体行为，不是函数名）：**\n"
-            f"   - 函数体的主要行为是构造、填充或发送数据：\n"
-            f"     分配 output buffer、写入字段、调用发送/写出 API，\n"
-            f"     而非从外部来源读取或解析数据\n"
-            f"   - 函数的上下文/状态参数只携带内部机器状态，\n"
-            f"     不携带来自外部的消息 payload（依据是函数体操作，不是参数名）\n"
-            f"   - 参数虽含 message/request 字样，但函数体只做内部状态查询或字段更新，\n"
-            f"     没有对该参数所指数据做解析或安全相关的分支处理\n"
-            f"   **服务生命周期函数必须 filter（即使参数含 socket/callback）：**\n"
-            f"   满足下列全部特征时必须输出 filter，不论参数名如何：\n"
-            f"   ① 函数名含 `*_init`/`*_start`/`*_stop`/`*_free`/`*_register`/`*_setup`/`*_bind` 等生命周期标志\n"
-            f"   ② 函数体内无 recv/recvfrom/recvmsg/read/accept/MsgReceive 等接收外部数据的调用\n"
-            f"   ③ 参数中的 socket 是路径字符串（用于 bind/listen）或参数是函数指针/回调指针\n"
-            f"   → 这类函数是服务启动配置，参数是配置值，不是 HTTP/IPC 请求 payload，必须 filter\n"
+            "**步骤 2**：分析结果：\n\n"
+            "   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet 类名称 → false\n"
+            "   - 有命中行：确认后分析\n"
+            "   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）→ true\n\n"
+            "   **服务生命周期函数必须 filter**\n"
+            "   **请求-响应模式不得 filter**\n"
         )
 
     return (
-        f"# \u51fd\u6570\u5206\u6790\n\n"
-        f"| \u5b57\u6bb5 | \u5024 |\n"
-        f"|---|---|\n"
-        f"| func_hash | `{func_hash}` |\n"
-        f"| name | `{func_name}` |\n"
-        f"| signature | `{signature}` |\n"
-        f"| \u884c\u8303\u56f4 | {start_line}~{end_line}\uff08\u5171 {body_lines} \u884c\uff09|\n"
-        + (chr(10) + "> ⚠️ **[API_Filter 预判结果]** "
-           "本函数已由 Direct LLM API 判定为外部入口，"
-           "请深入分析污点，除非有确凿证据否则 decision=keep。" + chr(10) + chr(10)
-           if entry_already_confirmed else "")
-        + f"{retry}\n"
-        f"## \u8bfb\u53d6\u51fd\u6570\u4f53\n\n"
-        f"{step1}\n"
-        f"## \u8f93\u51fa\u8981\u6c42\n\n"
-        f"\u5c06\u5206\u6790\u7ed3\u679c\u5199\u5728 `<result>...</result>` \u6807\u7b7e\u5185"
-        f"\uff08**\u5f15\u64ce\u4ec5\u8bfb\u6807\u7b7e\u5185\u5185\u5bb9**\uff0c\u6807\u7b7e\u5916\u5185\u5bb9\u88ab\u9759\u9ed8\u4e22\u5f03\uff09\uff1a\n"
-        f"- \u6709\u5916\u90e8\u8f93\u5165\u4e14 keep\uff1aJSON \u5305\u542b"
-        f" has_external_input/decision/tag/entry_role/taints/entry_source_lines/function_description/entry_reason/taint_details \u5b57\u6bb5\n"
-        f"- \u65e0\u5916\u90e8\u8f93\u5165\uff1a`{{\"has_external_input\": false, \"decision\": \"filter\"}}`\n"
+        "# 入口判断：`%s` in `%s`\n\n" % (func_name, basename)
+        + "| 字段 | 值 |\n|---|---|\n"
+        + "| func_hash | `%s` |\n" % func_hash
+        + "| name | `%s` |\n" % func_name
+        + "| signature | `%s` |\n" % signature
+        + "| 行范围 | %d~%d（共 %d 行）|\n" % (start_line, end_line, body_lines)
+        + retry + "\n"
+        + step1 + "\n"
+        + step2 + "\n\n"
+        + "## 输出（仅判断入口，不做污点分析）\n\n"
+        + "```\n<result>{\"has_external_input\": <true|false>}</result>\n```\n"
+    )
+
+
+def build_r3_w_taint_prompt(
+    func_hash: str,
+    func_name: str,
+    signature: str,
+    start_line: int,
+    end_line: int,
+    file_path: str,
+) -> str:
+    """R3-W Phase 2: taint analysis for confirmed entries. Same session, second user message."""
+    _PATTERNS = "recv,recvfrom,recvmsg,mmap,ioctl,fgets,fread,getline,MsgReceive,Receive,accept"
+    basename = os.path.basename(file_path)
+    return (
+        "# 污点分析：`%s`\n\n" % func_name
+        + "上一轮已确认本函数是外部入口。现在深入分析污点：\n\n"
+        + "## 分析要点\n\n"
+        + "**1. 确定类型**：\n"
+        + "   - **tag=P**（被动）：外部数据通过参数传入\n"
+        + "   - **tag=A**（主动）：函数体内直接调用 %s 等接收数据\n\n" % _PATTERNS
+        + "**2. 确定 entry_role**：boundary / callback / dispatch_target / ipc_handler\n\n"
+        + "**3. 列举 taints**：哪些参数/变量携带外部数据（参数名，不含路径）\n\n"
+        + "**4. 描述**：function_description（一句话功能）、entry_reason（为什么是入口）、taint_details（逐参数说明来源）\n\n"
+        + "**以下情况应 filter（非独立入口）**：\n"
+        + "- 函数主体行为是构造/填充/发送数据，而非接收/解析外部数据\n"
+        + "- 参数中的 message/request 只做内部状态查询，无安全相关分支处理\n"
+        + "- 服务生命周期函数（*_init/*_start/*_stop/*_free/*_register/*_setup）且无接收调用\n\n"
+        + "## 输出\n\n"
+        + "```\n<result>{\n"
+        + "  \"has_external_input\": true,\n"
+        + "  \"decision\": \"keep\",\n"
+        + "  \"tag\": \"P|A\",\n"
+        + "  \"entry_role\": \"boundary|callback|dispatch_target|ipc_handler\",\n"
+        + "  \"taints\": [\"param_or_var_name\"],\n"
+        + "  \"entry_source_lines\": [123],\n"
+        + "  \"function_description\": \"...\",\n"
+        + "  \"entry_reason\": \"...\",\n"
+        + "  \"taint_details\": [{\"param\": \"...\", \"source\": \"...\", \"description\": \"...\"}]\n"
+        + "}</result>\n```\n"
     )
 
 

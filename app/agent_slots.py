@@ -233,7 +233,7 @@ class AgentProcessSlotManager:
             self._sequence += 1
             ticket = AgentSlotTicket(
                 sequence=self._sequence,
-                priority=int(priority),
+                priority=float(priority),
                 task_id=str(task_id or "").strip() or None,
                 stage_key=str(stage_key or "").strip() or None,
                 role_kind=str(role_kind or "").strip() or None,

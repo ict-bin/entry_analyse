@@ -569,19 +569,7 @@ class LeanPipelineEngine:
             if func_state is None or func_state.r2_j_state != NodeState.PASSED:
                 return
 
-            # ── API_Filter: 直接 LLM API 预筛（精简模式专用）───────────────────
-            if func_hash not in self._api_filter_results:
-                _af_result = await self._run_api_filter(
-                    file_hash, func_hash, file_path, dirs, state
-                )
-                self._api_filter_results[func_hash] = _af_result
-            _af_cached = self._api_filter_results.get(func_hash, {})
-            if _af_cached.get("skipped"):
-                return
-            if _af_cached.get("is_entry") is False:
-                return  # API_Filter 判定为非入口，跳过 R3/R4
-
-            # ── R3 分析: 外部输入分析 W+J（与 CC 并行，不等 CC）────────────────
+            # ── R3 分析: 入口判断 + 污点分析 W+J（与 CC 并行）────────────────
             await self._run_r3_analysis(
                 func_hash, file_hash, file_path, dirs, state)
             if self._cancel.is_set():
@@ -915,28 +903,33 @@ class LeanPipelineEngine:
         # R3-W+J（外部输入分析 W+J 循环，使用 r3_w/j_state 字段）
         if func_state.r3_w_state != NodeState.PASSED:
             await self._run_r3_analysis_w(
-                file_hash, func_hash, file_path, dirs, state,
-                entry_confirmed=entry_confirmed)
+                file_hash, func_hash, file_path, dirs, state)
 
         if self._cancel.is_set():
             return
         if func_state.r3_w_state == NodeState.PASSED:
-            r3_j_max = int(getattr(self.cfg, "r3_j_max_rounds", -1))
-            while _should_continue(func_state.r3_j_attempts, r3_j_max, self._cancel):
-                if func_state.r3_j_state == NodeState.PASSED:
-                    break
-                passed, _ = await self._run_r3_analysis_j(
-                    file_hash, func_hash, file_path, dirs, state,
-                    entry_confirmed=entry_confirmed)
-                if passed:
-                    break
-                func_state.r3_w_state = NodeState.PENDING
-                func_state.r3_w_feedback = (
-                    func_state.r3_j_feedback_path or func_state.r3_j_feedback_summary or ""
-                )
-                await self._run_r3_analysis_w(
-                    file_hash, func_hash, file_path, dirs, state,
-                    entry_confirmed=entry_confirmed)
+            # ── Fast path: has_external_input=false → skip J ───────────────────
+            if not func_state.has_external_input:
+                func_state.r3_j_state = NodeState.PASSED
+                await asyncio.to_thread(state.save, dirs.state_file)
+                logger.debug("R3-J fast-skip for %s (has_external_input=false)", func_hash)
+                self._emit("r3_j_done", func_hash=func_hash, function=func_state.name,
+                           passed=True, fast_path=True, reason="no_external_input")
+            else:
+                r3_j_max = int(getattr(self.cfg, "r3_j_max_rounds", -1))
+                while _should_continue(func_state.r3_j_attempts, r3_j_max, self._cancel):
+                    if func_state.r3_j_state == NodeState.PASSED:
+                        break
+                    passed, _ = await self._run_r3_analysis_j(
+                        file_hash, func_hash, file_path, dirs, state)
+                    if passed:
+                        break
+                    func_state.r3_w_state = NodeState.PENDING
+                    func_state.r3_w_feedback = (
+                        func_state.r3_j_feedback_path or func_state.r3_j_feedback_summary or ""
+                    )
+                    await self._run_r3_analysis_w(
+                        file_hash, func_hash, file_path, dirs, state)
         if self._cancel.is_set():
             return
 
@@ -1353,7 +1346,6 @@ class LeanPipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
-        entry_confirmed: bool = False,
     ) -> None:
         """R3 Worker：外部输入分析（函数级，session 跨重试共享）。
 
@@ -1451,7 +1443,6 @@ class LeanPipelineEngine:
                             feedback="",
                             judge_result_file="",
                             body_content=_prefetched_body_retry,
-                            entry_already_confirmed=entry_confirmed,
                         )
                 else:
                     body_lines = max(
@@ -1481,7 +1472,6 @@ class LeanPipelineEngine:
                         feedback="",
                         judge_result_file="",
                         body_content=_prefetched_body,
-                        entry_already_confirmed=entry_confirmed,
                     )
                 _r3w_start = time.monotonic()
                 ar = await self._call_agent(
@@ -1492,6 +1482,31 @@ class LeanPipelineEngine:
                 )
                 _r3w_dur = self._dur(_r3w_start)
                 _r3w_ti, _r3w_to = self._tok(ar)
+
+                                # ── Phase 2: Phase 1 passed (has_external_input=true) → taint analysis ──
+                _hei_p1 = _parse_has_external_input(ar.output)
+                if _hei_p1:
+                    _p2 = P.build_r3_w_taint_prompt(
+                        func_hash=func_hash,
+                        func_name=func_state.name,
+                        signature=func_state.signature,
+                        start_line=func_state.start_line,
+                        end_line=func_state.end_line,
+                        file_path=file_path,
+                    )
+                    _p2_start = time.monotonic()
+                    ar2 = await self._call_agent(
+                        prompt=_p2, system_prompt=sys_prompt,
+                        session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
+                        context=f"r3_w_p2:{func_hash}", acfg=acfg,
+                        priority=SemPriority.R3_J if is_retry else SemPriority.R3_W,
+                    )
+                    _p2_dur = self._dur(_p2_start)
+                    _p2_ti, _p2_to = self._tok(ar2)
+                    _r3w_dur += _p2_dur
+                    _r3w_ti += _p2_ti
+                    _r3w_to += _p2_to
+                    ar = ar2  # use Phase 2 output for downstream parsing
 
                 analysis = _parse_r2_analysis(ar.output)
                 result_payload = {
@@ -1592,7 +1607,6 @@ class LeanPipelineEngine:
         file_path: str,
         dirs: PipelineDirs,
         state: PipelineState,
-        entry_confirmed: bool = False,
     ) -> tuple[bool, str]:
         """R3 Judge 函数级（每次新 session）。返回 (passed, summary)。
 
