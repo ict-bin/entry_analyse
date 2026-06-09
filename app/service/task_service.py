@@ -2739,6 +2739,7 @@ class TaskService:
         except Exception as exc:
             import logging
             logging.getLogger("ea.task_service").warning("session_metrics load for %s failed: %s", task_id, exc)
+        return result
 
     def get_task_runtime_summary(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
