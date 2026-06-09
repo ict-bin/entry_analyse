@@ -154,8 +154,8 @@ class SessionMetricsDB:
             import json as _json, os as _os2
             tmp.write_text(_json.dumps(result, ensure_ascii=False), encoding="utf-8")
             _os2.replace(str(tmp), str(jp))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("metrics json flush failed: %s", exc)
 
     def query_all(self) -> list[dict]:
         conn = self._get_conn()
