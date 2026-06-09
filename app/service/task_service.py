@@ -28,7 +28,8 @@ from app.service.session_index import build_session_catalog
 from app.service.runtime_role import RUNTIME_ROLE_WORKER, get_runtime_role, role_enabled
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 from app.agent_process import cleanup_task_pi_processes
-from app.service.worker_service import kill_resident_pi_processes
+# Note: kill_resident_pi_processes is defined in worker_service but imported lazily
+# to avoid circular import (worker_service imports task_service via _get_worker_service).
 
 logger = logging.getLogger("ea.task_service")
 
@@ -138,6 +139,13 @@ def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
     if not text:
         return None
     return {"key": key, "label": label, "value": text}
+
+
+def _kill_resident_pi_processes(label: str) -> int:
+    """懒加载版 helper：避免 task_service ↔ worker_service 循环导入。
+    真实定义在 worker_service.kill_resident_pi_processes，行为一致。"""
+    from app.service.worker_service import kill_resident_pi_processes
+    return kill_resident_pi_processes(label=label)
 
 
 def _task_abnormal_reason(row: AppEaTask) -> dict | None:
@@ -3189,7 +3197,7 @@ class TaskService:
         # Hook: 新任务入库后、调度前，杀本 pod 上所有残留 pi/python 进程。
         # 一个 pod 同时只跑一个任务，所以全杀安全。
         try:
-            kill_resident_pi_processes(label="ea_create_task")
+            _kill_resident_pi_processes(label="ea_create_task")
         except Exception as _kill_exc:
             logger.warning("create_task: resident pi cleanup failed (ignored): %s", _kill_exc)
         self.schedule_dispatch(project_id)
@@ -3236,7 +3244,7 @@ class TaskService:
         # 一个 worker pod 同时只跑一个任务，所以杀所有本 pod 残留是安全的（不会误杀其他 pod 的同 task_id 进程）。
         # 必须在 db.commit() 之后调，避免抢占后插队的状态造成状态不一致。
         try:
-            kill_resident_pi_processes(label="ea_restart_task")
+            _kill_resident_pi_processes(label="ea_restart_task")
         except Exception as _kill_exc:
             logger.warning("restart_task: resident pi cleanup failed (ignored): %s", _kill_exc)
 
@@ -3273,7 +3281,7 @@ class TaskService:
 
         # Hook: resume 前杀本 pod 上所有孤儿 pi/python 进程（同 restart）
         try:
-            kill_resident_pi_processes(label="ea_resume_task")
+            _kill_resident_pi_processes(label="ea_resume_task")
         except Exception as _kill_exc:
             logger.warning("resume_task: resident pi cleanup failed (ignored): %s", _kill_exc)
 
@@ -3353,7 +3361,7 @@ class TaskService:
         # 一个 pod 一个任务，直接全杀本 pod 上残留的智能体进程。
         # 包括 running 状态、pending 状态、以及 owner_pod 在本 pod 上的所有场景。
         try:
-            kill_resident_pi_processes(label="ea_cancel_task")
+            _kill_resident_pi_processes(label="ea_cancel_task")
         except Exception as exc:
             logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
         # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
