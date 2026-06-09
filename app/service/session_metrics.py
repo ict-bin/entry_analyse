@@ -130,12 +130,28 @@ class SessionMetricsDB:
             self._flush_json_snapshot()
 
     def _flush_json_snapshot(self) -> None:
+        """Atomically rewrite JSON snapshot from DB (no lock needed, called within lock)."""
         try:
-            snapshot = self.query_all()
+            conn = self._conn
+            if conn is None:
+                return
+            rows = conn.execute(
+                "SELECT session_path, stage_key, queued_at, acquired_at, first_token_at, completed_at, input_tokens, output_tokens, total_tokens, error, stop_reason FROM session_metrics"
+            ).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                if d.get("queued_at") and d.get("acquired_at"):
+                    d["queue_ms"] = int((d["acquired_at"] - d["queued_at"]) * 1000)
+                if d.get("acquired_at") and d.get("first_token_at"):
+                    d["ttft_ms"] = int((d["first_token_at"] - d["acquired_at"]) * 1000)
+                if d.get("acquired_at") and d.get("completed_at"):
+                    d["exec_ms"] = int((d["completed_at"] - d["acquired_at"]) * 1000)
+                result.append(d)
             jp = Path(self._path).with_name("session_metrics.json")
             tmp = jp.with_suffix(".tmp")
             import json as _json, os as _os2
-            tmp.write_text(_json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(_json.dumps(result, ensure_ascii=False), encoding="utf-8")
             _os2.replace(str(tmp), str(jp))
         except Exception:
             pass
