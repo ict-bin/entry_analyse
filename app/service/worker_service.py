@@ -1894,6 +1894,17 @@ class WorkerService:
     async def _execute_task(self, task_id: str) -> None:
         from app.service import task_service as task_mod
 
+        # Hook 1: 任务开始前，杀本 pod 上上一轮任务残留的 pi/python 进程。
+        # 场景：上一个任务在错误/异常状态退出后未走完 cleanup_agent_processes，
+        # 导致 pi 进程仍占 agent slot。本函数在独立线程中运行（start_task），
+        # 杀进程是本 pod 上 worker 进程上下文。kill 失败不影响主流程。
+        try:
+            _killed = kill_resident_pi_processes(label=f"ea_task_start_{task_id[:12]}")
+            if _killed:
+                logger.warning("R1 task start killed %d leftover pi/python process(es)", _killed)
+        except Exception as _start_kill_exc:
+            logger.warning("task start: resident pi cleanup failed (ignored): %s", _start_kill_exc)
+
         event_buffer: list[dict] = []
         project_id: str | None = None
         lease_stop_event: "threading.Event" = __import__("threading").Event()
