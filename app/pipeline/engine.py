@@ -1507,32 +1507,6 @@ class PipelineEngine:
                 _r3w_dur = self._dur(_r3w_start)
                 _r3w_ti, _r3w_to = self._tok(ar)
 
-                # ── Phase 2: Phase 1 passed (has_external_input=true) → taint analysis ──
-                # Phase 1 output is {"has_external_input": bool}; Phase 2 adds taint fields.
-                _hei_p1 = _parse_has_external_input(ar.output)
-                if _hei_p1:
-                    _p2 = P.build_r3_w_taint_prompt(
-                        func_hash=func_hash,
-                        func_name=func_state.name,
-                        signature=func_state.signature,
-                        start_line=func_state.start_line,
-                        end_line=func_state.end_line,
-                        file_path=file_path,
-                    )
-                    _p2_start = time.monotonic()
-                    ar2 = await self._call_agent(
-                        prompt=_p2, system_prompt=sys_prompt,
-                        session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
-                        context=f"r3_w_p2:{func_hash}", acfg=acfg,
-                        priority=SemPriority.R3_J if is_retry else SemPriority.R3_W,
-                    )
-                    _p2_dur = self._dur(_p2_start)
-                    _p2_ti, _p2_to = self._tok(ar2)
-                    _r3w_dur += _p2_dur
-                    _r3w_ti += _p2_ti
-                    _r3w_to += _p2_to
-                    ar = ar2  # use Phase 2 output for downstream parsing
-
                 analysis = _parse_r2_analysis(ar.output)
                 result_payload = {
                     "stage": "r3_w",
