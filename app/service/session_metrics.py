@@ -136,6 +136,7 @@ class SessionMetricsDB:
             conn = self._conn
             if conn is None:
                 return
+            conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT session_path, stage_key, queued_at, acquired_at, first_token_at, completed_at, input_tokens, output_tokens, total_tokens, error, stop_reason FROM session_metrics"
             ).fetchall()
