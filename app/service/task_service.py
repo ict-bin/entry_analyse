@@ -2033,7 +2033,10 @@ class TaskService:
         )
 
     def schedule_dispatch(self, project_id: str) -> None:
-        if not role_enabled("worker"):
+        # 修复：原先用 role_enabled('worker')，在 runtime_role=all 的 API pod 上也会返回 True，
+        # 导致 API pod 调度后被 _acquire_dispatch_lease 拒绝（log: dispatch lease denied for non-worker）。
+        # 改为：仅 worker 角色的 pod 才主动调度；API pod 不调度（只同步状态）。
+        if not _worker_runtime_enforced():
             return
         self._schedule_pending_dispatch(project_id)
 
