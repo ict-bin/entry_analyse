@@ -2737,6 +2737,19 @@ class PipelineEngine:
                 )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Pipeline fatal error [{context}]: {ar.error}")
+        # Record session timing metrics
+        try:
+            from ..service.session_metrics import get_session_metrics_db
+            import os as _os
+            _rel = _os.path.basename(session_file) if session_file else ""
+            if _rel:
+                _ti, _to = self._tok(ar)
+                _error = getattr(ar, "error", "") or ""
+                get_session_metrics_db(
+                    _os.path.dirname(session_file)
+                ).upsert_completed(_rel, input_tokens=_ti, output_tokens=_to, total_tokens=_ti + _to, error=_error, stop_reason="stop" if not _error else "error")
+        except Exception:
+            pass
         return ar
 
     def _emit(self, etype: str, **data) -> None:
@@ -2832,6 +2845,16 @@ class PipelineEngine:
                 duration_ms=int(result.get("duration_ms", 0) or 0),
                 wall_duration_ms=_af_wall_dur,
             )
+            # Record AF session metrics
+            try:
+                from ..service.session_metrics import get_session_metrics_db
+                _af_session = str(dirs.af_session(func_hash))
+                _af_rel = __import__('os').path.basename(_af_session)
+                _af_dur = int(result.get("duration_ms", 0) or 0)
+                get_session_metrics_db(str(dirs.sessions)).upsert_completed(
+                    _af_rel, total_tokens=0, error="" if result.get("completed") else (result.get("error_kind") or "unknown"))
+            except Exception:
+                pass
             return result
         except asyncio.CancelledError:
             raise

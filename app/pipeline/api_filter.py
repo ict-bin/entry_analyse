@@ -319,7 +319,10 @@ _USER_TMPL = """\
 # ─── 主调用函数 ───────────────────────────────────────────────────────────────
 
 
-# ─── JSONL 会话日志 ─────────────────────────────────────────────────────
+# ─── JSONL 会话日志（统一 pi agent 格式）──────────────────────────────────
+
+_AF_SESSION_COUNTER = 0
+
 
 def _write_af_session(
     session_file: 'str | None',
@@ -330,36 +333,38 @@ def _write_af_session(
     parsed_result: 'bool | None',
     duration_ms: int,
     error: 'str | None',
+    model_id: str = "",
+    provider: str = "",
+    error_kind: str = "",
 ) -> None:
     """
-    追加写入一条 API_Filter 会话记录到 JSONL 文件。
-
-    每行一个 JSON 对象，包含：
-      ts / func_name / attempt / request_msgs / response_raw /
-      parsed_is_entry (0/1/null) / duration_ms / error
-
-    session_file=None 时跳过，不影响主流程。
+    写入 pi agent 兼容 JSONL 格式的 AF 会话记录。
     """
     if not session_file:
         return
-    import json as _json
-    import time as _time
-    import pathlib as _pl
-    record = {
-        'ts':              _time.time(),
-        'func_name':       func_name,
-        'attempt':         attempt,
-        'request_msgs':    messages,
-        'response_raw':    response_raw,
-        'parsed_is_entry': None if parsed_result is None else int(parsed_result),
-        'duration_ms':     duration_ms,
-        'error':           error,
-    }
+    import json as _json, time as _time, pathlib as _pl, uuid as _uuid
+
+    global _AF_SESSION_COUNTER
+    _AF_SESSION_COUNTER += 1
+    session_id = str(_uuid.uuid4())
+    now_iso = _time.strftime("%Y-%m-%dT%H:%M:%S.", _time.gmtime()) + f"{_time.time() % 1:.3f}"[2:5] + "Z"
+
     try:
         p = _pl.Path(session_file)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open('a', encoding='utf-8') as f:
-            f.write(_json.dumps(record, ensure_ascii=False) + chr(10))
+            f.write(_json.dumps({"type": "session", "version": 3, "id": session_id, "timestamp": now_iso}, ensure_ascii=False) + chr(10))
+            f.write(_json.dumps({"type": "model_change", "id": _uuid.uuid4().hex[:8], "parentId": None, "timestamp": now_iso, "provider": str(provider or "api_filter"), "modelId": str(model_id or "api_filter_model")}, ensure_ascii=False) + chr(10))
+            # user message
+            user_text = messages[1]["content"] if len(messages) > 1 else (messages[0]["content"] if messages else "")
+            user_id = _uuid.uuid4().hex[:8]
+            f.write(_json.dumps({"type": "message", "id": user_id, "parentId": None, "timestamp": now_iso, "message": {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}}, ensure_ascii=False) + chr(10))
+            # assistant message
+            stop_reason = "stop"
+            if error:
+                stop_reason = "error" if error_kind != "timeout" else "timeout"
+            usage = {"input": max(1, (len(str(user_text)) + 3) // 4), "output": max(0, (len(str(response_raw or "")) + 3) // 4) if response_raw else 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": (len(str(user_text)) + len(str(response_raw or "")) + 6) // 4, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+            f.write(_json.dumps({"type": "message", "id": _uuid.uuid4().hex[:8], "parentId": user_id, "timestamp": now_iso, "message": {"role": "assistant", "content": [{"type": "text", "text": str(response_raw or "")}] if response_raw else [], "api": "openai-completions", "provider": str(provider or "api_filter"), "model": str(model_id or "api_filter"), "usage": usage, "stopReason": stop_reason, "errorMessage": str(error)[:256] if error else "", "timestamp": int(_time.time() * 1000)}}, ensure_ascii=False) + chr(10))
     except Exception as _e:
         logger.debug('af session write failed %s: %s', session_file, _e)
 
@@ -433,6 +438,7 @@ async def api_filter_function(
         base_url, api_key, model_id = await asyncio.to_thread(
             _load_provider_config, model
         )
+        _provider_name = model.split("/", 1)[0] if "/" in (model or "") else "api_filter"
     except Exception as exc:
         logger.warning("api_filter: provider load failed: %s, keeping %s", exc, func_name)
         _write_af_session(session_file, func_name, 0, messages, None, True, 0,
@@ -455,7 +461,8 @@ async def api_filter_function(
                 _dur = max(0, int((time.monotonic() - _llm_start) * 1000))
                 result = _parse_is_entry(resp_text)
                 _write_af_session(session_file, func_name, attempt, messages, resp_text,
-                                  result, _dur, error=None)
+                                  result, _dur, error=None,
+                                  model_id=model_id, provider=_provider_name)
                 if result is None:
                     parse_failures += 1
                     logger.debug(
@@ -492,7 +499,8 @@ async def api_filter_function(
                     func_name, attempt, exc
                 )
                 _write_af_session(session_file, func_name, attempt, messages, None,
-                                  None, _dur, error=str(exc))
+                                  None, _dur, error=str(exc),
+                                  model_id=model_id, provider=_provider_name, error_kind=error_kind)
                 if error_kind == "timeout" and _SKIP_ON_TIMEOUT and timeout_failures >= _MAX_TIMEOUTS:
                     logger.warning(
                         "api_filter: timeout for %s reached limit=%d, skipping function",

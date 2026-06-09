@@ -108,10 +108,6 @@ def _looks_like_function_gap(lines_data: list[str], start: int, end: int) -> tup
     if not nonempty:
         return False, "empty_or_comment", 0.0
     joined = "\n".join(nonempty)
-    if "{" not in joined or "}" not in joined:
-        if re.search(r"\)\s*;", joined):
-            return False, "declaration_only", 0.05
-        return False, "no_balanced_body", 0.0
 
     # Reject common non-function blocks when the first code line is a control/top-level keyword
     reject_head = re.compile(r"^(if|for|while|switch|do|else|case|default|typedef|struct|enum|union|namespace|class)\b")
@@ -125,11 +121,18 @@ def _looks_like_function_gap(lines_data: list[str], start: int, end: int) -> tup
     macro_candidate_re = re.compile(
         r"(?m)^\s*[A-Z_][A-Z0-9_]*\s*\([^\n;{}]*\)\s*(?:[A-Za-z_~][\w:~]*\s*)?\([^;{}]*\)\s*\{"
     )
+    loose_re = re.compile(r"(?m)^\s*(?:static\s+)?(?:inline\s+)?[A-Za-z_~][\w:<>,~*&\s]+\([^;{}]*\)\s*\{")
+
+    if "{" not in joined or "}" not in joined:
+        if re.search(r"\)\s*;", joined):
+            return False, "declaration_only", 0.05
+        return False, "no_balanced_body", 0.0
+
     if candidate_re.search(code):
         return True, "function_signature", 0.95
     if macro_candidate_re.search(code):
         return True, "macro_function_signature", 0.75
-    if re.search(r"(?m)^\s*(?:static\s+)?(?:inline\s+)?[A-Za-z_~][\w:<>,~*&\s]+\([^;{}]*\)\s*\{", code):
+    if loose_re.search(code):
         return True, "loose_signature", 0.65
     if joined.count("{") >= 2 and joined.count("}") >= 2 and re.search(r"\w+\s*\([^;{}]*\)\s*\{", joined):
         return True, "nested_possible_signature", 0.55
@@ -139,14 +142,14 @@ def _looks_like_function_gap(lines_data: list[str], start: int, end: int) -> tup
 def _compute_gaps(
     funcs: list["FunctionExtract"],
     file_path: str,
-    min_gap: int = 8,
+    min_gap: int = 1,
 ) -> list[dict]:
     """
     计算源文件中不被任何已知函数覆盖的行区间（gap）。
+    min_gap 默认为 1，不做最小行数限制。
 
     Returns:
-        [{start, end, lines, has_code}, ...]
-        不嵌入代码内容（内容单独写入 gaps.json 使用 sed 读取）。
+        [{id, start, end, lines, kind, maybe_function, filter_reason, score}, ...]
     """
     try:
         lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()

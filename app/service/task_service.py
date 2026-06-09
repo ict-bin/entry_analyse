@@ -2714,7 +2714,7 @@ class TaskService:
     def get_task_session_index(self, db: Session, task_id: str, *, refresh: bool = False) -> dict:
         row = self._get_or_404(db, task_id)
         catalog = self._build_session_catalog(row, force_refresh=refresh)
-        return {
+        result = {
             "task_id": catalog.get("task_id") or row.task_id,
             "status": catalog.get("status") or row.status,
             "sessions_root": catalog.get("sessions_root"),
@@ -2722,6 +2722,19 @@ class TaskService:
             "generated_at": catalog.get("generated_at"),
             **(catalog.get("index") or {}),
         }
+        # Attach session timing metrics if available
+        try:
+            sessions_root = _task_sessions_root(row)
+            if sessions_root and sessions_root.is_dir():
+                metrics_path = sessions_root / "session_metrics.db"
+                if metrics_path.exists():
+                    from app.service.session_metrics import get_session_metrics_db
+                    mdb = get_session_metrics_db(str(sessions_root))
+                    all_metrics = mdb.query_all()
+                    result["session_metrics"] = all_metrics
+        except Exception:
+            pass
+        return result
 
     def get_task_runtime_summary(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)

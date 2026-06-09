@@ -212,10 +212,22 @@ class AgentProcessSlotManager:
         role_kind: str | None = None,
         cancel_event: asyncio.Event | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        session_path: str | None = None,
     ) -> AgentSlotLease:
         requested_at = time.time()
         entered_slow_path = False
         loop = asyncio.get_running_loop()
+
+        # Record queued_at to session metrics if session_path provided
+        if session_path:
+            try:
+                from app.service.session_metrics import get_session_metrics_db
+                import os as _os
+                _sdir = _os.path.dirname(session_path)
+                _rel = _os.path.basename(session_path)
+                get_session_metrics_db(_sdir).upsert_queued(_rel, str(stage_key or ""))
+            except Exception:
+                pass
 
         with self._lock:
             self._sequence += 1
@@ -248,6 +260,12 @@ class AgentProcessSlotManager:
                     waited=False,
                 )
                 self._leases[id(lease)] = lease
+                if session_path:
+                    try:
+                        _rel2 = __import__('os').path.basename(session_path)
+                        get_session_metrics_db(__import__('os').path.dirname(session_path)).upsert_acquired(_rel2)
+                    except Exception:
+                        pass
                 return lease
 
             # ── 慢速路径：入堆等待 ──
@@ -348,6 +366,12 @@ class AgentProcessSlotManager:
                         waited=True,
                     )
                     self._leases[id(lease)] = lease
+                    if session_path:
+                        try:
+                            _rel3 = __import__('os').path.basename(session_path)
+                            get_session_metrics_db(__import__('os').path.dirname(session_path)).upsert_acquired(_rel3)
+                        except Exception:
+                            pass
                     if on_event:
                         on_event(
                             "agent_slot_wait_released",
@@ -470,6 +494,7 @@ async def agent_process_slot(
     role_kind: str | None = None,
     cancel_event: asyncio.Event | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    session_path: str | None = None,
 ):
     lease = await get_agent_process_slot_manager().acquire(
         priority=priority,
@@ -478,6 +503,7 @@ async def agent_process_slot(
         role_kind=role_kind,
         cancel_event=cancel_event,
         on_event=on_event,
+        session_path=session_path,
     )
     try:
         yield lease

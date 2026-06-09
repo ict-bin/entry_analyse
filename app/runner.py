@@ -976,6 +976,7 @@ async def _run_with_api_retry(
         role_kind=role_kind,
         cancel_event=cancel_event,
         on_event=on_slot_event,
+        session_path=session_file,
     ) as slot_lease:
       # slot 已获取，所有重试（超时/API错误）均在此作用域内进行
       # _current_handle: 当前 pi 进程句柄，用于超时时精确 kill 对应进程

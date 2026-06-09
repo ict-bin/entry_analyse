@@ -195,6 +195,15 @@ def _infer_path_descriptor(relative_path: str) -> dict:
                      "parent_relative_path": f"r2-w-{fh}.jsonl",
                      "family_key": f"r2::{fh}", "flow_kind": "parallel"})
         return desc
+    # API_Filter（per-func 直接 API 调用）
+    af_match = re.fullmatch(r"af-([0-9a-f]+)\.jsonl", normalized)
+    if af_match:
+        fh = af_match.group(1)
+        desc.update({"stage_key": "api_filter", "stage_label": "API Filter",
+                     "stage_order": 6, "family_key": f"af::{fh}",
+                     "role": "worker", "role_label": "Filter",
+                     "flow_kind": "parallel"})
+        return desc
     # R4 per-func-W
     r4fw_match = re.fullmatch(r"r4-func-w-([0-9a-f]+)\.jsonl", normalized)
     if r4fw_match:
