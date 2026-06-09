@@ -1064,20 +1064,31 @@ async def _run_with_api_retry(
             try:
                 assert proc.stdout is not None
                 buffer = b""
+                last_activity_at = time.monotonic()
+
+                def _mark_activity() -> None:
+                    nonlocal last_activity_at
+                    last_activity_at = time.monotonic()
                 while True:
-                    chunk = await proc.stdout.read(4096)
+                    try:
+                        chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if timeout_seconds and (time.monotonic() - last_activity_at) >= timeout_seconds:
+                            raise asyncio.TimeoutError
+                        continue
                     if not chunk:
                         break
+                    _mark_activity()
                     buffer += chunk
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         _process_line(
                             line.decode("utf-8", errors="replace"),
-                            exec_result, on_stream)
+                            exec_result, on_stream, _mark_activity)
                 if buffer.strip():
                     _process_line(
                         buffer.decode("utf-8", errors="replace"),
-                        exec_result, on_stream)
+                        exec_result, on_stream, _mark_activity)
 
                 assert proc.stderr is not None
                 _stderr_data = await proc.stderr.read()
@@ -1130,16 +1141,12 @@ async def _run_with_api_retry(
 
         # ── 执行（只对执行计时，不包括排队等候）──
         try:
-            result = (
-                await asyncio.wait_for(_execute(), timeout=timeout_seconds)
-                if timeout_seconds else
-                await _execute()
-            )
+            result = await _execute()
         except asyncio.TimeoutError:
             timeout_failures += 1
             result.error = (
-                f"agent run timed out after {timeout_seconds:.0f}s"
-                if timeout_seconds else "agent run timed out"
+                f"agent run idle timed out after {timeout_seconds:.0f}s"
+                if timeout_seconds else "agent run idle timed out"
             )
             result.exit_code = -1
             # 精确 kill 当前这一次 _execute 拉起的 pi 进程组，不影响其他并发 pi。
@@ -1156,19 +1163,19 @@ async def _run_with_api_retry(
             )
             if not can_retry or (cancel_event and cancel_event.is_set()):
                 _log_warn(
-                    f"agent 超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}] 超限，"
+                    f"agent 空闲超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}] 超限，"
                     f"释放 slot，引擎 max_rounds 负责重新排队"
                 )
                 return result
             # 未超阈值：继续持有 slot，回退到 session 最后一条 user 消息重发。
             _retry_stdin = _extract_last_user_message(session_file) or current_stdin or continue_stdin
             _log_warn(
-                f"agent 超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}]，"
+                f"agent 空闲超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}]，"
                 f"kill 当前 pi 后重发 last user message"
             )
             if on_stream:
                 on_stream(
-                    f"\n\u23f1\ufe0f 超时 {timeout_failures} 次，重发 last user message...\n"
+                    f"\n\u23f1\ufe0f 空闲超时 {timeout_failures} 次，重发 last user message...\n"
                 )
             current_stdin = _retry_stdin
             continue
@@ -1318,11 +1325,14 @@ async def _run_with_api_retry(
 def _process_line(
     line: str, result: AgentResult,
     on_stream: Callable[[str], None] | None,
+    on_activity: Callable[[], None] | None = None,
 ) -> None:
     """解析 pi --mode json 输出的单行 JSON 事件。"""
     line = line.strip()
     if not line:
         return
+    if on_activity:
+        on_activity()
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
