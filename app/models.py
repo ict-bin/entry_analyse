@@ -11,7 +11,6 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 MAX_ROUNDS_EXCEEDED_ACTIONS = {
     "treat_as_passed",
     "treat_as_failed",
@@ -24,13 +23,11 @@ AGENT_PROCESS_LIMIT_LIMIT = 128
 MASTER_SHARD_SIZE_DEFAULT = 10
 MASTER_SHARD_PARALLELISM_DEFAULT = 4
 
-
 def normalize_max_rounds_exceeded_action(value: str | None) -> str:
     candidate = str(value or "").strip().lower()
     if candidate in MAX_ROUNDS_EXCEEDED_ACTIONS:
         return candidate
     return "treat_as_passed"
-
 
 def normalize_max_concurrent_tasks(value: int | str | None) -> int:
     try:
@@ -41,7 +38,6 @@ def normalize_max_concurrent_tasks(value: int | str | None) -> int:
         return 1
     return min(candidate, MAX_CONCURRENT_TASKS_LIMIT)
 
-
 def normalize_agent_process_limit(value: int | str | None) -> int:
     try:
         candidate = int(value)
@@ -51,13 +47,11 @@ def normalize_agent_process_limit(value: int | str | None) -> int:
         return 1
     return min(candidate, AGENT_PROCESS_LIMIT_LIMIT)
 
-
 class AgentInstanceConfig(BaseModel):
     model: str = Field(..., description="该实例使用的 LLM 模型")
     tools: Optional[list[str]] = Field(default=None)
     system_prompt: Optional[str] = Field(default=None)
     thinking_level: Optional[str] = Field(default=None)
-
 
 class RoleConfig(BaseModel):
     default_model: str = Field(default="")
@@ -65,7 +59,6 @@ class RoleConfig(BaseModel):
     system_prompt_dir: str = Field(default="./prompts/workers")
     default_thinking_level: str = Field(default="off")
     agents: list[AgentInstanceConfig] = Field(default_factory=list)
-
 
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
@@ -117,18 +110,6 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    lean_mode: bool = Field(
-        default=False,
-        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J",
-    )
-    lean_file_max_rounds: int = Field(
-        default=-1,
-        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）",
-    )
-    lean_module_max_rounds: int = Field(
-        default=-1,
-        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）",
-    )
     api_filter_entry_judge: bool = Field(
         default=True,
         description=(
@@ -141,7 +122,6 @@ class ServiceConfig(BaseModel):
     api_filter_timeout_seconds: int = Field(default=120, description="API_Filter 单次 LLM 请求超时时间（秒）")
     api_filter_max_timeouts: int = Field(default=2, description="API_Filter 超时达到该次数后跳过该函数")
     api_filter_parse_max_retries: int = Field(default=1, description="API_Filter 不可解析响应最大重试次数")
-
 
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
@@ -193,18 +173,6 @@ class TaskConfig(BaseModel):
     report_func_max_rounds: int = Field(default=-1, description="Report per-func W+J 最大轮次（-1=无限）")
     report_final_max_rounds: int = Field(default=-1, description="Report final W+J 最大轮次（-1=无限）")
 
-    lean_mode: bool = Field(
-        default=False,
-        description="精简模式：跳过 R2/CC/per-func R3-R4，改用脚本驱动的文件级并行 W+J + 模块级 W+J",
-    )
-    lean_file_max_rounds: int = Field(
-        default=-1,
-        description="精简模式文件级 W+J 最大轮次（-1=无限，0=跳过）",
-    )
-    lean_module_max_rounds: int = Field(
-        default=-1,
-        description="精简模式模块级 W+J 最大轮次（-1=无限，0=跳过）",
-    )
     api_filter_entry_judge: bool = Field(
         default=True,
         description=(
@@ -228,7 +196,6 @@ class TaskConfig(BaseModel):
     def judge_count(self) -> int:
         return len(self.judges.agents)
 
-
 class TokenUsage(BaseModel):
     input: int = 0
     output: int = 0
@@ -244,7 +211,6 @@ class TokenUsage(BaseModel):
         self.cost += other.cost
         return self
 
-
 class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -252,7 +218,6 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
     ERROR = "error"
     CANCELLED = "cancelled"
-
 
 class WorkerResult(BaseModel):
     worker_id: str
@@ -262,7 +227,6 @@ class WorkerResult(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
 
-
 class WorkerEvaluation(BaseModel):
     worker_id: str
     passed: bool = False
@@ -270,12 +234,10 @@ class WorkerEvaluation(BaseModel):
     feedback: str = ""
     refinement: str = ""
 
-
 class JudgeSummary(BaseModel):
     best_worker_id: str = ""
     reasoning: str = ""
     overall_passed: bool = False
-
 
 class JudgeRoundResult(BaseModel):
     judge_id: str
@@ -284,7 +246,6 @@ class JudgeRoundResult(BaseModel):
     evaluations: list[WorkerEvaluation] = Field(default_factory=list)
     summary: Optional[JudgeSummary] = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
-
 
 class RoundResult(BaseModel):
     round: int
@@ -295,7 +256,6 @@ class RoundResult(BaseModel):
     passed: bool = False
     best_worker_id: str = ""
     feedback_to_workers: str = ""
-
 
 class TaskResult(BaseModel):
     task_id: str
@@ -311,12 +271,10 @@ class TaskResult(BaseModel):
     api_filter_summary: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
-
 class SwarmEvent(BaseModel):
     type: str
     task_id: str
     data: dict = Field(default_factory=dict)
-
 
 def make_id() -> str:
     return f"task-{int(time.time())}-{uuid.uuid4().hex[:8]}"

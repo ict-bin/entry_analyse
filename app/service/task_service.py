@@ -995,54 +995,6 @@ def _cancel_phase(row: AppEaTask) -> str | None:
     return None
 
 
-def _build_lean_file_catalog(lean_state_path: "Path") -> list[dict]:
-    """精简模式下从 lean_pipeline_state.json 构建文件级目录（替代完整模式的函数级目录）。"""
-    try:
-        payload = json.loads(lean_state_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    files_raw = payload.get("files") if isinstance(payload, dict) else {}
-    if not isinstance(files_raw, dict):
-        return []
-    items: list[dict] = []
-    for file_hash, fs in files_raw.items():
-        if not isinstance(fs, dict):
-            continue
-        original_path = str(fs.get("original_path") or "")
-        file_name = Path(original_path).name if original_path else ""
-        w_state  = str(fs.get("w_state",  "pending"))
-        j_state  = str(fs.get("j_state",  "pending"))
-        j_passed = j_state == "passed"
-        items.append({
-            # 精简模式返回文件级记录，用 file_hash 作为 func_hash 供前端区分
-            "func_hash":    file_hash,
-            "file_hash":    file_hash,
-            "file":         file_name,
-            "original_path": original_path,
-            "name":         file_name,   # 前端显示文件名为函数名
-            "signature":    "",
-            "start_line":   0,
-            "end_line":     0,
-            "is_lean_file": True,        # 前端标志字段，区分精简/完整模式
-            "static_done":  bool(fs.get("static_done", False)),
-            "w_state":      w_state,
-            "w_attempts":   int(fs.get("w_attempts", 0)),
-            "j_state":      j_state,
-            "j_attempts":   int(fs.get("j_attempts", 0)),
-            "feedback":     str(fs.get("feedback", ""))[:200],
-            # 共用字段（展示层）
-            "r2_state":     j_state,
-            "r2j_state":    j_state,
-            "r3_state":     "passed" if j_passed else "pending",
-            "r4_state":     "passed" if j_passed else "pending",
-            "rep_state":    "pending",
-            "has_external_input": j_passed if j_passed else None,
-            "entry_role":   "",
-            "r4_decision":  "keep" if j_passed else "",
-            "is_entry":     j_passed,
-        })
-    items.sort(key=lambda x: x.get("file") or "")
-    return items
 
 
 def _build_function_catalog(row: AppEaTask) -> list[dict]:
@@ -1937,9 +1889,7 @@ _TASK_CONFIG_OVERRIDE_FIELDS = {
     "r4_func_j_max_rounds",
     "r4_final_max_rounds",
     "report_func_max_rounds",
-    "report_final_max_rounds",
-    "lean_mode",
-    "lean_file_max_rounds",
+    "report_final_max_rounds""lean_file_max_rounds",
     "lean_module_max_rounds",
     "master_merge_mode",
     "master_shard_size",
@@ -3604,12 +3554,6 @@ class TaskService:
             "result_json": _lightweight_result_json(row, row.result_json),
             "stages_json": _stages_json_light(db, row.task_id) if db is not None else _stages_json_summary(row.stages_json),
             "task_config_json": _parse_task_config(row.task_config_json),
-            "lean_mode": bool(
-                _parse_task_config(row.task_config_json).get(
-                    "lean_mode",
-                    (_parse_task_config(row.task_config_json).get("project_config_snapshot") or {}).get("lean_mode", False),
-                )
-            ),
             "abnormal_reason_history": _abnormal_reason_history(row),
             "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
         })

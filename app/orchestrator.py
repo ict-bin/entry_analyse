@@ -248,18 +248,9 @@ class Orchestrator:
                        task=cfg.task, module=cfg.module_name,
                        files=resolved_files, agents=agents_desc)
 
-            # ── 2. 运行流水线（lean_mode 选精简引擎，完整模式 engine.py 零改动）──
-            if getattr(cfg, 'lean_mode', False):
-                from .pipeline.lean_engine import LeanPipelineEngine
-                engine = LeanPipelineEngine(
-                    cfg=cfg,
-                    task_id=task_id,
-                    on_event=self.on_event,
-                    cancel_event=self._cancel_event,
-                )
-            else:
-                from .pipeline.engine import PipelineEngine
-                engine = PipelineEngine(
+            # ── 2. 运行流水线 ──
+            from .pipeline.engine import PipelineEngine
+            engine = PipelineEngine(
                     cfg=cfg,
                     task_id=task_id,
                     on_event=self.on_event,

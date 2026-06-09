@@ -43,11 +43,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "report_final_max_rounds": -1,
     # 并发控制
     "agent_process_limit": 8,
-    # 精简模式（与完整模式配置并列，互不影响）
-    "lean_mode": False,
-    "lean_file_max_rounds": -1,
-    "lean_module_max_rounds": -1,
-    "master_merge_mode": "hierarchical",
+    # 精简模式（与完整模式配置并列，互不影响）    "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
     "workers": {
@@ -146,7 +142,6 @@ class ConfigService:
             normalized["master_shard_parallelism"] = 4
         mode = str(normalized.get("master_merge_mode") or "hierarchical").strip().lower()
         normalized["master_merge_mode"] = mode if mode in {"single", "hierarchical"} else "hierarchical"
-        normalized["lean_mode"] = bool(normalized.get("lean_mode", False))
         for stale_key in (
             "worker_parallel",
             "worker_parallelism",
