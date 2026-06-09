@@ -2349,11 +2349,40 @@ class TaskService:
         existing = _dispatch_tasks.get(project_id)
         if existing and not existing.done():
             return
-        task = asyncio.create_task(
-            self._dispatch_pending_tasks(project_id),
-            name=f"ea_dispatch_{project_id}",
-        )
-        _dispatch_tasks[project_id] = task
+        # 修复：sync API handler 会在 FastAPI threadpool 中调用本函数，无 event loop。
+        # 改为检测：若主线程或当前线程有 running loop，就直接 create_task；
+        # 否则用独立线程 + asyncio.run() 隔离（仅作为 fire-and-forget 调度）。
+        try:
+            _current_loop = asyncio.get_running_loop()
+            task = asyncio.create_task(
+                self._dispatch_pending_tasks(project_id),
+                name=f"ea_dispatch_{project_id}",
+            )
+            _dispatch_tasks[project_id] = task
+        except RuntimeError:
+            # 无 running loop（如 FastAPI threadpool 调同步 handler 后转 worker 路径）。
+            # 在新线程中独立运行业务逻辑。fire-and-forget，错误不外传。
+            import threading as _threading
+            def _run_dispatch() -> None:
+                try:
+                    _loop2 = asyncio.new_event_loop()
+                    try:
+                        asyncio.set_event_loop(_loop2)
+                        _loop2.run_until_complete(
+                            self._dispatch_pending_tasks(project_id)
+                        )
+                    finally:
+                        try:
+                            _loop2.close()
+                        except Exception:
+                            pass
+                except Exception as _dispatch_exc:
+                    logger.warning("isolated dispatch thread failed for %s: %s",
+                                   project_id, _dispatch_exc)
+            _t = _threading.Thread(
+                target=_run_dispatch, name=f"ea_dispatch_iso_{project_id}", daemon=True
+            )
+            _t.start()
 
     async def _dispatch_pending_tasks(self, project_id: str) -> None:
         from app.db import get_db
