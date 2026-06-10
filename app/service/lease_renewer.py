@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Standalone lease renewal process.
+Standalone lease renewal process — with detailed diagnostic logging.
 
 Launched by the worker per-task via subprocess.Popen.
 Uses pymysql directly -- does NOT share the worker's SQLAlchemy pool.
 Exits automatically when the parent process dies (checked via --parent_pid).
 
-Usage:
-    python3 lease_renewer.py \\
-        --task_id <tid> --pod_name <name> \\
-        --host <h> --port <p> --user <u> --password <pw> --database <db> \\
-        --interval 30 --duration 300 --parent_pid <ppid>
+All logs go to stdout (not stderr) so that kubectl logs can capture them.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,6 +16,11 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"[lease_renewer {ts}] {msg}", flush=True)
+
 
 def _parent_alive(pid: int) -> bool:
     if pid <= 0:
@@ -31,8 +33,8 @@ def _parent_alive(pid: int) -> bool:
 
 
 def _renew(conn_kwargs: dict, task_id: str, pod_name: str, duration: int) -> bool:
-    """Return True on success, False on failure."""
-    import pymysql  # imported lazily to avoid slow startup on import error
+    """Return (True, msg) on success, (False, reason) on failure."""
+    import pymysql
 
     deadline = datetime.now() + timedelta(seconds=duration)
     conn = None
@@ -51,9 +53,33 @@ def _renew(conn_kwargs: dict, task_id: str, pod_name: str, duration: int) -> boo
                 (deadline, task_id, pod_name),
             )
         conn.commit()
-        return affected > 0
+        if affected == 0:
+            # Diagnose WHY it failed — check current DB state
+            _log(f"RENEWAL FAILED: affected=0. task={task_id} pod={pod_name}")
+            try:
+                with conn.cursor() as diag:
+                    diag.execute(
+                        "SELECT owner_pod, status, lease_expires_at "
+                        "FROM secflow_app_ea_tasks WHERE task_id=%s",
+                        (task_id,),
+                    )
+                    row = diag.fetchone()
+                    if row:
+                        db_owner, db_status, db_lease = row
+                        _log(f"DB state: owner={db_owner} status={db_status} "
+                             f"lease_expires={db_lease} (expected owner={pod_name})")
+                        if db_owner != pod_name:
+                            _log(f"MISMATCH: renewer pod={pod_name} != DB owner={db_owner}")
+                        if db_status != "running":
+                            _log(f"STATUS CHANGE: task status={db_status}, not running")
+                    else:
+                        _log(f"TASK NOT FOUND in DB: task_id={task_id}")
+            except Exception as diag_exc:
+                _log(f"diagnostic query failed: {diag_exc}")
+            return False
+        return True
     except Exception as exc:
-        print(f"[lease_renewer] renewal error: {exc}", file=sys.stderr, flush=True)
+        _log(f"RENEWAL ERROR: {exc} (host={conn_kwargs.get('host')}:{conn_kwargs.get('port')})")
         return False
     finally:
         if conn:
@@ -85,47 +111,35 @@ def main() -> None:
         database=args.database,
     )
 
-    print(
-        f"[lease_renewer] started task={args.task_id} pod={args.pod_name} "
-        f"interval={args.interval}s duration={args.duration}s pid={os.getpid()}",
-        file=sys.stderr, flush=True,
-    )
+    _log(f"START task={args.task_id} pod={args.pod_name} "
+         f"interval={args.interval}s duration={args.duration}s "
+         f"parent_pid={args.parent_pid} my_pid={os.getpid()}")
 
     consecutive_failures = 0
-    max_failures = 5  # abort after 5 consecutive failures
+    max_failures = 5
+    attempt = 0
 
     while True:
         time.sleep(args.interval)
+        attempt += 1
 
         # Exit if parent is dead
         if not _parent_alive(args.parent_pid):
-            print(
-                f"[lease_renewer] parent pid={args.parent_pid} is dead, exiting",
-                file=sys.stderr, flush=True,
-            )
+            _log(f"EXIT: parent pid={args.parent_pid} is dead")
             sys.exit(0)
 
         ok = _renew(conn_kwargs, args.task_id, args.pod_name, args.duration)
         if ok:
             consecutive_failures = 0
-            print(
-                f"[lease_renewer] renewed task={args.task_id} "
-                f"deadline={datetime.now() + timedelta(seconds=args.duration)}",
-                file=sys.stderr, flush=True,
-            )
+            _log(f"OK attempt={attempt} task={args.task_id} "
+                 f"deadline={datetime.now() + timedelta(seconds=args.duration)}")
         else:
             consecutive_failures += 1
-            print(
-                f"[lease_renewer] renewal failed task={args.task_id} "
-                f"consecutive_failures={consecutive_failures}",
-                file=sys.stderr, flush=True,
-            )
+            _log(f"FAIL attempt={attempt} consecutive={consecutive_failures}/{max_failures} "
+                 f"task={args.task_id}")
             if consecutive_failures >= max_failures:
-                print(
-                    f"[lease_renewer] too many consecutive failures "
-                    f"({consecutive_failures}), exiting",
-                    file=sys.stderr, flush=True,
-                )
+                _log(f"EXIT: {consecutive_failures} consecutive failures, giving up "
+                     f"task={args.task_id}")
                 sys.exit(1)
 
 

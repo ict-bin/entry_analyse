@@ -1705,8 +1705,8 @@ class WorkerService:
                     "--duration", str(duration),
                     "--parent_pid", str(_os.getpid()),
                 ],
-                stdout=_sp.DEVNULL,
-                stderr=_sp.PIPE,
+                stdout=_sp.PIPE,
+                stderr=_sp.DEVNULL,
                 close_fds=True,
             )
             logger.info(
@@ -1717,11 +1717,11 @@ class WorkerService:
             # Monitor thread: watch subprocess and set stop_event when it exits
             def _monitor() -> None:
                 try:
-                    _, stderr_data = proc.communicate(timeout=None)
+                    stdout_data, _ = proc.communicate(timeout=None)
                     rc = proc.returncode
-                    if stderr_data:
-                        for line in stderr_data.decode("utf-8", errors="replace").splitlines()[-20:]:
-                            logger.debug("lease_renewer[%s]: %s", task_id, line)
+                    if stdout_data:
+                        for line in stdout_data.decode("utf-8", errors="replace").splitlines()[-30:]:
+                            logger.info("lease_renewer[%s]: %s", task_id, line)
                     if rc != 0:
                         logger.warning(
                             "lease_renewer subprocess exited abnormally task=%s pid=%s rc=%s",
