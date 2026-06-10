@@ -465,7 +465,7 @@ def _build_args(
         args.extend(["--model", _resolve_model_for_pi(model)])
     if tools:
         args.extend(["--tools", ",".join(tools)])
-    if thinking_level and thinking_level != "off":
+    if thinking_level:
         args.extend(["--thinking", thinking_level])
     # 注意：prompt 不拼入命令行参数，而是通过 stdin 发送，
     # 以避免超出 Linux ARG_MAX 命令行长度限制。
