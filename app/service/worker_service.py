@@ -1691,6 +1691,7 @@ class WorkerService:
 
             import os as _os
             script = _os.path.join(_os.path.dirname(__file__), "lease_renewer.py")
+            _env = {**_os.environ, "PYTHONUNBUFFERED": "1"}  # force stdout flush for real-time logging
             proc = _sp.Popen(
                 [
                     sys.executable, script,
@@ -1707,6 +1708,7 @@ class WorkerService:
                 ],
                 stdout=_sp.PIPE,
                 stderr=_sp.DEVNULL,
+                env=_env,
                 close_fds=True,
             )
             logger.info(
