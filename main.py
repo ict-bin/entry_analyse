@@ -23,6 +23,35 @@ load_dotenv()
 _CANCEL_SERVER_PORT = int(os.environ.get("EA_CANCEL_SERVER_PORT", "3001"))
 
 
+def _start_healthz_thread() -> None:
+    """Thread-based healthz server on port 18080, independent of the asyncio event loop."""
+    import threading
+    import http.server
+
+    class HealthzHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/healthz", "/readyz"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+        def log_message(self, format, *args):
+            pass  # suppress log noise
+
+    def _serve():
+        try:
+            server = http.server.HTTPServer(("0.0.0.0", 18080), HealthzHandler)
+            server.serve_forever()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_serve, daemon=True, name="healthz-server")
+    t.start()
+
+
 async def _handle_cancel_request(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
@@ -59,6 +88,7 @@ async def _run_background_runtime() -> None:
     # 内置 cancel HTTP server（只在 worker role 下启动）
     cancel_server = None
     if role_enabled("worker"):
+        _start_healthz_thread()  # independent thread-based health check, not blocked by event loop
         cancel_server = await asyncio.start_server(
             _handle_cancel_request, "0.0.0.0", _CANCEL_SERVER_PORT
         )
