@@ -1714,14 +1714,15 @@ class WorkerService:
                 task_id, proc.pid, interval, duration,
             )
 
-            # Monitor thread: watch subprocess and set stop_event when it exits
+            # Monitor thread: read renewer stdout line-by-line, capture exit code
             def _monitor() -> None:
                 try:
-                    stdout_data, _ = proc.communicate(timeout=None)
+                    # Read stdout line-by-line in real time (communicate() blocks until exit)
+                    for raw_line in proc.stdout:
+                        line = raw_line.decode("utf-8", errors="replace").rstrip()
+                        logger.info("lease_renewer[%s]: %s", task_id, line)
+                    proc.wait()
                     rc = proc.returncode
-                    if stdout_data:
-                        for line in stdout_data.decode("utf-8", errors="replace").splitlines()[-30:]:
-                            logger.info("lease_renewer[%s]: %s", task_id, line)
                     if rc != 0:
                         logger.warning(
                             "lease_renewer subprocess exited abnormally task=%s pid=%s rc=%s",
