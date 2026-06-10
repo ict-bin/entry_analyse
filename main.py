@@ -23,6 +23,10 @@ load_dotenv()
 _CANCEL_SERVER_PORT = int(os.environ.get("EA_CANCEL_SERVER_PORT", "3001"))
 
 
+def _external_probe_process_enabled() -> bool:
+    return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _start_healthz_thread() -> None:
     """Thread-based healthz server on port 18080, independent of the asyncio event loop."""
     import threading
@@ -88,7 +92,8 @@ async def _run_background_runtime() -> None:
     # 内置 cancel HTTP server（只在 worker role 下启动）
     cancel_server = None
     if role_enabled("worker"):
-        _start_healthz_thread()  # independent thread-based health check, not blocked by event loop
+        if not _external_probe_process_enabled():
+            _start_healthz_thread()
         cancel_server = await asyncio.start_server(
             _handle_cancel_request, "0.0.0.0", _CANCEL_SERVER_PORT
         )

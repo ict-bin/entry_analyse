@@ -46,7 +46,7 @@ ENV RESULT_DIR=/data/output
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
+    CMD curl -f http://localhost:18080/healthz || exit 1
 
 # ═══ 入口脚本 ═════════════════════════════════════════════════════════════════
 COPY scripts/entrypoint.sh /entrypoint.sh
@@ -54,4 +54,4 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认 REST API，覆盖: python3 cli.py "分析xxx模块的外部入口"
-CMD ["python3", "main.py"]
+CMD ["./scripts/start-with-probe.sh", "python3", "main.py"]

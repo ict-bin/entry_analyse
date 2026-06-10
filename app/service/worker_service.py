@@ -64,6 +64,10 @@ WORKER_LEASE_EXPIRED_WARNING_SECONDS = max(5, int(os.environ.get("EA_WORKER_LEAS
 ORPHAN_PROCESS_GRACE_SECONDS = max(30, int(os.environ.get("EA_ORPHAN_PROCESS_GRACE_SECONDS", "900")))
 
 
+def _external_probe_process_enabled() -> bool:
+    return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class WorkerRuntimeConfigSnapshot:
     max_concurrent_tasks: int = 1
@@ -661,6 +665,8 @@ class WorkerService:
                 pass
 
     def _start_health_server(self) -> None:
+        if _external_probe_process_enabled():
+            return
         if self._health_server_thread and self._health_server_thread.is_alive():
             return
         self._health_server_started.clear()
@@ -673,6 +679,8 @@ class WorkerService:
         self._health_server_thread.start()
 
     def _stop_health_server(self) -> None:
+        if _external_probe_process_enabled():
+            return
         self._health_server_stop.set()
         httpd = self._health_server_httpd
         if httpd is not None:
