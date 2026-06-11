@@ -1741,7 +1741,6 @@ class WorkerService:
                         stop_event.set()  # signal task to abort
                 except Exception as _e:
                     logger.warning("lease_renewer monitor error task=%s: %s", task_id, _e)
-                finally:
                     stop_event.set()
 
             monitor_t = threading.Thread(
