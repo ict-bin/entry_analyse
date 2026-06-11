@@ -487,7 +487,7 @@ class WorkerService:
             snap.guard_reason = self._guard_state.reason
             snap.main_api_loop_age_seconds = max(0.0, now_ts - float(self._main_loop_last_tick_at or now_ts))
             snap.health_server_loop_age_seconds = 0.0 if snap.health_server_last_success_at <= 0 else max(0.0, now_ts - snap.health_server_last_success_at)
-            snap.bootstrapped = bool(self._running and self._started_at > 0 and self._heartbeat_health.success_total > 0)
+            snap.bootstrapped = bool(self._running and self._started_at > 0)
             if snap.shutting_down:
                 snap.worker_probe_safe_ready = False
             elif self._guard_state.state == "unhealthy":
@@ -531,8 +531,6 @@ class WorkerService:
             if snap.shutting_down:
                 return HTTPStatus.SERVICE_UNAVAILABLE
             if self._guard_state.state == "unhealthy":
-                return HTTPStatus.SERVICE_UNAVAILABLE
-            if self._heartbeat_health.consecutive_failures >= WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD:
                 return HTTPStatus.SERVICE_UNAVAILABLE
             if self._lease_health.consecutive_failures >= WORKER_GUARD_LEASE_FAILURE_THRESHOLD:
                 return HTTPStatus.SERVICE_UNAVAILABLE
@@ -1298,10 +1296,6 @@ class WorkerService:
         if local_running > 0:
             if self._lease_health.consecutive_failures >= WORKER_GUARD_LEASE_FAILURE_THRESHOLD:
                 reason = f"lease failures={self._lease_health.consecutive_failures}"
-            elif self._heartbeat_health.consecutive_failures >= WORKER_GUARD_HEARTBEAT_FAILURE_THRESHOLD:
-                reason = f"heartbeat failures={self._heartbeat_health.consecutive_failures}"
-            elif heartbeat_age > (2 * WORKER_SLOT_HEARTBEAT_SECONDS):
-                reason = f"heartbeat age={round(heartbeat_age, 1)}s"
             elif lease_age > (2 * task_mod.LEASE_RENEW_INTERVAL_SECONDS):
                 reason = f"lease age={round(lease_age, 1)}s"
         if not reason:
@@ -1408,9 +1402,6 @@ class WorkerService:
             target=self._maintenance_thread_body, name="ea_worker_maintenance", daemon=True)
         self._guard_thread = threading.Thread(
             target=self._guard_thread_body, name="ea_worker_guard", daemon=True)
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_thread_main, name="ea_worker_slot_heartbeat", daemon=True)
-
         # Keep legacy references for compatibility
         self._task = self._loop_thread
         self._maintenance_task = self._maintenance_thread
@@ -1418,12 +1409,11 @@ class WorkerService:
         self._guard_task = self._guard_thread
 
         for t in (self._loop_thread, self._runtime_config_thread,
-                  self._maintenance_thread, self._guard_thread,
-                  self._heartbeat_thread):
+                  self._maintenance_thread, self._guard_thread):
             t.start()
         # Start independent heartbeat subprocess (bypasses event loop / thread issues)
         self._start_heartbeat_subprocess()
-        logger.info("Entry-analysis worker started (poll=%ss, all infra loops are threads)", WORKER_POLL_SECONDS)
+        logger.info("Entry-analysis worker started (poll=%ss, heartbeat_mode=subprocess_only)", WORKER_POLL_SECONDS)
 
     def stop(self) -> None:
         self._running = False
@@ -1435,8 +1425,7 @@ class WorkerService:
         self._infra_stop.set()  # signals all infra threads to stop
         # Wait briefly for threads to notice the stop signal
         for t in (self._loop_thread, self._runtime_config_thread,
-                  self._maintenance_thread, self._guard_thread,
-                  self._heartbeat_thread):
+                  self._maintenance_thread, self._guard_thread):
             if t and t.is_alive():
                 t.join(timeout=2.0)
         self._stop_health_server()
