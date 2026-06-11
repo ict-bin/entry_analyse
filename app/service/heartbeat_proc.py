@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Standalone heartbeat process — independent of the asyncio event loop."""
 import argparse, os, sys, time, pymysql, traceback
-from datetime import datetime
 
 def main():
     p = argparse.ArgumentParser()
@@ -18,7 +17,6 @@ def main():
 
     while True:
         time.sleep(args.interval)
-        # Check parent alive
         if args.parent_pid > 0:
             try: os.kill(args.parent_pid, 0)
             except (ProcessLookupError, PermissionError): sys.exit(0)
@@ -30,30 +28,22 @@ def main():
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO secflow_app_ea_worker_slots "
-                    "(worker_id, pod_name, runtime_role, last_seen_status, "
-                    "last_heartbeat_at, max_concurrent_tasks, agent_process_limit, "
-                    "agent_process_in_use, agent_process_available, agent_waiting_requests, "
-                    "agent_waiting_tasks, agent_queue_oldest_wait_seconds, "
-                    "agent_rss_total_bytes, agent_rss_max_bytes, "
-                    "heartbeat_duration_ms, heartbeat_failure_count, http_port) "
-                    "VALUES (%s,%s,%s,%s,NOW(),%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s) "
+                    "(worker_id, pod_name, runtime_role, pod_ip, http_port, "
+                    "max_concurrent_tasks, agent_process_limit, "
+                    "agent_process_in_use, agent_process_available, "
+                    "agent_waiting_requests, agent_waiting_tasks, "
+                    "agent_queue_oldest_wait_seconds, agent_rss_total_bytes, "
+                    "agent_rss_max_bytes, agent_snapshot_at, "
+                    "last_seen_status, heartbeat_error, "
+                    "heartbeat_duration_ms, heartbeat_failure_count, "
+                    "last_heartbeat_at, created_at, updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, NOW(),NOW(),NOW()) "
                     "ON DUPLICATE KEY UPDATE "
                     "last_seen_status=VALUES(last_seen_status), "
-                    "last_heartbeat_at=NOW(), "
-                    "max_concurrent_tasks=VALUES(max_concurrent_tasks), "
-                    "agent_process_limit=VALUES(agent_process_limit), "
-                    "agent_process_in_use=VALUES(agent_process_in_use), "
-                    "agent_process_available=VALUES(agent_process_available), "
-                    "agent_waiting_requests=VALUES(agent_waiting_requests), "
-                    "agent_waiting_tasks=VALUES(agent_waiting_tasks), "
-                    "agent_queue_oldest_wait_seconds=VALUES(agent_queue_oldest_wait_seconds), "
-                    "agent_rss_total_bytes=VALUES(agent_rss_total_bytes), "
-                    "agent_rss_max_bytes=VALUES(agent_rss_max_bytes), "
-                    "heartbeat_duration_ms=VALUES(heartbeat_duration_ms), "
-                    "heartbeat_failure_count=VALUES(heartbeat_failure_count), "
-                    "http_port=VALUES(http_port)",
-                    (args.worker_id, args.pod_name, "worker", "running", 1, 8,
-                     0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 8080))
+                    "last_heartbeat_at=NOW()",
+                    (args.worker_id, args.pod_name, "worker", "", 8080,
+                     1, 8, 0, 0, 0, 0, 0, 0, 0, None,
+                     "running", None, 1, 0))
             conn.commit()
             conn.close()
         except Exception as exc:
