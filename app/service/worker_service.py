@@ -1724,14 +1724,22 @@ class WorkerService:
                 task_id, proc.pid, interval, duration,
             )
 
-            # Monitor thread: read renewer stdout line-by-line, capture exit code
+            # Monitor thread: read renewer stdout line-by-line, capture exit code.
             def _monitor() -> None:
                 try:
-                    # Read stdout line-by-line in real time (communicate() blocks until exit)
+                    while proc.poll() is None:
+                        line_bytes = proc.stdout.readline()
+                        if line_bytes:
+                            line = line_bytes.decode("utf-8", errors="replace").rstrip()
+                            logger.info("lease_renewer[%s]: %s", task_id, line)
+                        else:
+                            # Empty read with process alive = pipe temporarily empty, wait
+                            time.sleep(0.1)
+                    # Process exited, drain remaining output
                     for raw_line in proc.stdout:
                         line = raw_line.decode("utf-8", errors="replace").rstrip()
-                        logger.info("lease_renewer[%s]: %s", task_id, line)
-                    proc.wait()
+                        if line:
+                            logger.info("lease_renewer[%s]: %s", task_id, line)
                     rc = proc.returncode
                     if rc != 0:
                         logger.warning(
