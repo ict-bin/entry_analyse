@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Standalone heartbeat process — independent of the asyncio event loop."""
-import argparse, os, sys, time, pymysql
+import argparse, os, sys, time, pymysql, traceback
 from datetime import datetime
 
 def main():
@@ -56,7 +56,8 @@ def main():
             conn.commit()
             conn.close()
         except Exception as exc:
-            print(f"[heartbeat_proc] ERROR: {exc}", flush=True)
+            print(f"[heartbeat_proc] ERROR: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
 
 if __name__ == "__main__":
     main()

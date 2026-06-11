@@ -1348,7 +1348,7 @@ class WorkerService:
                  "--database", str(url.database or ""),
                  "--interval", "20",
                  "--parent_pid", str(_os.getpid())],
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, close_fds=True)
+                stdout=_sp.DEVNULL, stderr=open("/tmp/heartbeat_proc.log", "a"), close_fds=True)
             logger.info("heartbeat subprocess started pod=%s", pod)
         except Exception as exc:
             logger.warning("heartbeat subprocess failed: %s", exc)
