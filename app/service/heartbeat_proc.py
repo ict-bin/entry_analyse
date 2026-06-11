@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Standalone heartbeat process — independent of the asyncio event loop."""
 import argparse, os, sys, time, pymysql, traceback
-from datetime import datetime, timedelta, timezone
-
-UTC_PLUS_8 = timezone(timedelta(hours=8), name="UTC+8")
 
 
-def _now_local_db_string() -> str:
-    return datetime.now(UTC_PLUS_8).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+DB_LOCAL_TIME_SQL = "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR)"
 
 def main():
     p = argparse.ArgumentParser()
@@ -28,7 +24,6 @@ def main():
             try: os.kill(args.parent_pid, 0)
             except (ProcessLookupError, PermissionError): sys.exit(0)
         try:
-            now_local = _now_local_db_string()
             conn = pymysql.connect(
                 host=args.host, port=args.port, user=args.user,
                 password=args.password, database=args.database,
@@ -45,14 +40,14 @@ def main():
                     "last_seen_status, heartbeat_error, "
                     "heartbeat_duration_ms, heartbeat_failure_count, "
                     "last_heartbeat_at, created_at, updated_at) "
-                    "VALUES (%s,%s,%s,%s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s,%s) "
+                    f"VALUES (%s,%s,%s,%s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, {DB_LOCAL_TIME_SQL},{DB_LOCAL_TIME_SQL},{DB_LOCAL_TIME_SQL}) "
                     "ON DUPLICATE KEY UPDATE "
                     "last_seen_status=VALUES(last_seen_status), "
                     "last_heartbeat_at=VALUES(last_heartbeat_at), "
                     "updated_at=VALUES(updated_at)",
                     (args.worker_id, args.pod_name, "worker", "", 8080,
                      1, 8, 0, 0, 0, 0, 0, 0, 0, None,
-                     "running", None, 1, 0, now_local, now_local, now_local))
+                     "running", None, 1, 0))
             conn.commit()
             conn.close()
         except Exception as exc:

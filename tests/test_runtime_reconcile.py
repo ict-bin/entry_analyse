@@ -256,7 +256,6 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     db = _FakeDb([
         [healthy_worker],
         [valid_running],
-        [valid_running],
         [SimpleNamespace(), SimpleNamespace()],
     ])
     monkeypatch.setattr(worker_slot_service, "_load_svc_config_from_db", lambda _db, _project_id: SimpleNamespace(max_concurrent_tasks=4))
@@ -267,15 +266,14 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["queued_jobs"] == 2
     assert snapshot["busy_slots"] == 1
     assert snapshot["available_slots"] == 3
-    assert snapshot["claimed_running_tasks"] == 1
-    assert snapshot["ghost_running_tasks"] == 0
-    assert snapshot["registry_visible_workers"] == 1
-    assert snapshot["live_pod_count"] == 1
-    assert snapshot["registry_missing_live_pods"] == 0
+    assert snapshot["worker_count"] == 1
+    assert snapshot["healthy_workers"] == 1
+    assert snapshot["stale_workers"] == 0
+    assert snapshot["stale_owner_workers"] == 0
     assert len(snapshot["workers"]) == 1
     assert snapshot["workers"][0]["running_tasks"] == 1
-    assert snapshot["workers"][0]["claimed_running_tasks"] == 1
-    assert snapshot["workers"][0]["ghost_running_tasks"] == 0
+    assert len(snapshot["workers"][0]["active_tasks"]) == 1
+    assert snapshot["workers"][0]["worker_role_state"] == "healthy"
 
 
 def test_metrics_expose_expired_running_lease_diagnostics(monkeypatch) -> None:
