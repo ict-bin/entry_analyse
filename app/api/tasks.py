@@ -98,6 +98,11 @@ class TaskCreateRequest(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    agent_task_key_id: Optional[str] = None
+    agent_task_key_name: Optional[str] = None
+    agent_task_key_prefix: Optional[str] = None
+    agent_task_key_secret: Optional[str] = None
+    agent_task_key_source: Optional[str] = None
 
 
 class GeneratePromptRequest(BaseModel):
@@ -1077,6 +1082,25 @@ async def create_task(
         parent_stage_name=body.parent_stage_name,
         parent_stage_item_id=body.parent_stage_item_id,
         parent_stage_item_key=body.parent_stage_item_key,
+        task_config_json={
+            **({
+                "agent_task_key": {
+                    "id": body.agent_task_key_id,
+                    "name": body.agent_task_key_name,
+                    "prefix": body.agent_task_key_prefix,
+                    "secret": body.agent_task_key_secret,
+                    "source": body.agent_task_key_source,
+                }
+            } if any(
+                value is not None for value in (
+                    body.agent_task_key_id,
+                    body.agent_task_key_name,
+                    body.agent_task_key_prefix,
+                    body.agent_task_key_secret,
+                    body.agent_task_key_source,
+                )
+            ) else {}),
+        } or None,
         created_by=current_user.get("username") or current_user.get("name") or "system",
     )
 

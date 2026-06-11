@@ -381,14 +381,27 @@ def _find_pi_command() -> list[str]:
     return find_pi_command()
 
 
-def _pi_config_dir() -> Path:
-    raw = os.environ.get("PI_CODING_AGENT_DIR")
+def _pi_config_dir(task_pi_dir: str | None = None) -> Path:
+    raw = str(task_pi_dir or "").strip() or os.environ.get("PI_CODING_AGENT_DIR")
     if raw:
         return Path(raw)
     return Path.home() / ".pi" / "agent"
 
 
-def _resolve_model_for_pi(model: str) -> str:
+def _build_agent_env(
+    base_env: dict[str, str] | None,
+    *,
+    task_pi_dir: str | None = None,
+) -> dict[str, str] | None:
+    payload = dict(base_env or os.environ)
+    normalized = str(task_pi_dir or "").strip()
+    if normalized:
+        payload["PI_CODING_AGENT_DIR"] = normalized
+        payload["PI_MODELS_JSON"] = str(Path(normalized) / "models.json")
+    return payload or None
+
+
+def _resolve_model_for_pi(model: str, *, task_pi_dir: str | None = None) -> str:
     """
     将项目配置中的模型名解析成 pi 能稳定识别的 provider/model 形式。
 
@@ -400,7 +413,7 @@ def _resolve_model_for_pi(model: str) -> str:
     if not requested:
         return requested
 
-    models_path = _pi_config_dir() / "models.json"
+    models_path = _pi_config_dir(task_pi_dir) / "models.json"
     try:
         data = json.loads(models_path.read_text(encoding="utf-8"))
     except Exception:
@@ -450,7 +463,7 @@ def _resolve_model_for_pi(model: str) -> str:
 
 def _build_args(
     pi_cmd: list[str], model: str, tools: list[str],
-    thinking_level: str, session_file: str | None,
+    thinking_level: str, session_file: str | None, task_pi_dir: str | None = None,
 ) -> list[str]:
     """构造 pi 命令行参数（不含 system prompt 和 prompt）。
 
@@ -462,7 +475,7 @@ def _build_args(
     else:
         args.append("--no-session")
     if model:
-        args.extend(["--model", _resolve_model_for_pi(model)])
+        args.extend(["--model", _resolve_model_for_pi(model, task_pi_dir=task_pi_dir)])
     if tools:
         args.extend(["--tools", ",".join(tools)])
     if thinking_level:
@@ -620,10 +633,12 @@ async def _run_with_context_overflow_recovery(
     stage_key: str | None = None,
     role_kind: str | None = None,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
+    env: dict[str, str] | None = None,
 ) -> AgentResult:
     result = await _run_with_pi_retry(
         args=args,
         cwd=cwd,
+        env=env,
         stdin_data=stdin_data,
         continue_stdin=continue_stdin,
         cancel_event=cancel_event,
@@ -661,11 +676,12 @@ async def _run_with_context_overflow_recovery(
         _log_warn(msg)
         if on_stream:
             on_stream(f"\n⚠️ {msg}\n")
-        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file, task_pi_dir)
         _comp_stdin = _COMPACTION_TRIGGER_PROMPT.encode("utf-8")
         await _run_with_pi_retry(
             args=compaction_args,
             cwd=cwd,
+            env=env,
             stdin_data=_comp_stdin,
             continue_stdin=_comp_stdin,
             cancel_event=cancel_event,
@@ -702,6 +718,7 @@ async def _run_with_context_overflow_recovery(
     return await _run_with_pi_retry(
         args=args,
         cwd=cwd,
+        env=env,
         stdin_data=stdin_data,
         continue_stdin=continue_stdin,
         cancel_event=cancel_event,
@@ -748,6 +765,7 @@ async def run_agent(
     role_kind: str | None = None,
     priority: int = SemPriority.DEFAULT,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
+    task_pi_dir: str | None = None,
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
@@ -768,7 +786,8 @@ async def run_agent(
         r.fatal = True
         return r
 
-    args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+    env = _build_agent_env(None, task_pi_dir=task_pi_dir)
+    args = _build_args(pi_cmd, model, tools, thinking_level, session_file, task_pi_dir)
 
     # System Prompt → 临时文件
     tmp_dir: str | None = None
@@ -819,6 +838,7 @@ async def run_agent(
             stage_key=stage_key,
             role_kind=role_kind,
             on_slot_event=on_slot_event,
+            env=env,
         )
     finally:
         if tmp_file and os.path.exists(tmp_file):
@@ -837,6 +857,7 @@ async def run_agent(
 
 async def _run_with_pi_retry(
     *, args: list[str], cwd: str,
+    env: dict[str, str] | None,
     stdin_data: bytes,
     continue_stdin: bytes,
     cancel_event: asyncio.Event | None,
@@ -866,6 +887,7 @@ async def _run_with_pi_retry(
         try:
             result = await _run_with_api_retry(
                 args=args, cwd=cwd,
+                env=env,
                 stdin_data=stdin_data,
                 continue_stdin=continue_stdin,
                 cancel_event=cancel_event, on_stream=on_stream,
@@ -945,6 +967,7 @@ async def _run_with_pi_retry(
 
 async def _run_with_api_retry(
     *, args: list[str], cwd: str,
+    env: dict[str, str] | None,
     stdin_data: bytes,
     continue_stdin: bytes,
     cancel_event: asyncio.Event | None,
@@ -1005,6 +1028,7 @@ async def _run_with_api_retry(
             handle = await AgentProcessHandle.spawn(
                 *_spawn_args,
                 cwd=cwd,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE,

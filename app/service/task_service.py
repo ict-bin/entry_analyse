@@ -1784,6 +1784,18 @@ def _preferred_files_list_path(row: AppEaTask) -> str | None:
     return str(legacy_files_list)
 
 
+def _agent_runtime_payload(row: AppEaTask) -> dict[str, object]:
+    task_config = _parse_task_config(row.task_config_json)
+    agent_task_key = task_config.get("agent_task_key") if isinstance(task_config.get("agent_task_key"), dict) else {}
+    secret = str(agent_task_key.get("secret") or "").strip()
+    return {
+        "has_agent_task_key": bool(secret),
+        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
+        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+        "agent_runtime_mode": "task_scoped" if secret else "global",
+    }
+
+
 def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task_id: Optional[str], parent_stage_name: Optional[str]) -> bool:
     del parent_task_id, parent_stage_name
     return str(task_origin_type or "").strip() == "binary_security"
@@ -3588,6 +3600,7 @@ class TaskService:
             "task_config_json": _parse_task_config(row.task_config_json),
             "abnormal_reason_history": _abnormal_reason_history(row),
             "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
+            **_agent_runtime_payload(row),
         })
         if include_function_catalog:
             payload["function_catalog"] = _build_function_catalog(row)

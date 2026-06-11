@@ -2713,6 +2713,7 @@ class PipelineEngine:
                     pi_max_retries=self.cfg.pi_max_retries,
                     pi_retry_delay=self.cfg.pi_retry_delay,
                     max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
+                    task_pi_dir=getattr(self.cfg, "task_pi_dir", ""),
                     task_id=self.task_id,
                     stage_key=stage_key,
                     role_kind=role_kind,

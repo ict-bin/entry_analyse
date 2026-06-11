@@ -519,6 +519,7 @@ async def run_r1_worker(
                         stage_key="r1_w",
                         role_kind="worker",
                         priority=priority,
+                        task_pi_dir=getattr(cfg, "task_pi_dir", ""),
                     )
 
                 prompt = build_r1_gap_prompt(
@@ -691,6 +692,7 @@ async def run_r2_w_worker(
         stage_key="r2_w",
         role_kind="worker",
         priority=priority,
+        task_pi_dir=getattr(cfg, "task_pi_dir", ""),
     )
 
     corrections = _parse_r1_corrections(ar.output)

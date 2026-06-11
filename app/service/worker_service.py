@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import threading
 import time
 import traceback
@@ -31,6 +32,47 @@ from app.time_utils import now_local
 
 logger = logging.getLogger("ea.worker")
 WORKER_RUNTIME_ROLE = get_runtime_role()
+
+
+def _task_agent_key(task_config_json: dict | None) -> dict | None:
+    if not isinstance(task_config_json, dict):
+        return None
+    payload = task_config_json.get("agent_task_key")
+    return payload if isinstance(payload, dict) else None
+
+
+def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None) -> tuple[str | None, str]:
+    secret = str((agent_task_key or {}).get("secret") or "").strip()
+    if not secret or not task_root:
+        return None, "global"
+    task_pi_dir = pathlib.Path(task_root) / ".pi" / "agent"
+    task_pi_dir.mkdir(parents=True, exist_ok=True)
+    global_pi_dir = pathlib.Path(os.environ.get("PI_CODING_AGENT_DIR") or (pathlib.Path.home() / ".pi" / "agent"))
+    models_src = pathlib.Path(os.environ.get("PI_MODELS_JSON") or (global_pi_dir / "models.json"))
+    settings_src = global_pi_dir / "settings.json"
+    if models_src.is_file():
+        shutil.copy2(models_src, task_pi_dir / "models.json")
+    else:
+        (task_pi_dir / "models.json").write_text(json.dumps({"providers": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
+    if settings_src.is_file():
+        shutil.copy2(settings_src, task_pi_dir / "settings.json")
+    elif not (task_pi_dir / "settings.json").exists():
+        (task_pi_dir / "settings.json").write_text("{}", encoding="utf-8")
+    (task_pi_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
+                "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
+                "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
+                "agent_task_key_secret": secret,
+                "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return str(task_pi_dir), "task_scoped"
 
 
 async def _schedule_dispatch_async(svc, project_id: str) -> None:
@@ -2012,6 +2054,28 @@ class WorkerService:
                 module_name=task_snapshot.module_name or "",
                 source_path=task_snapshot.source_path or "",
                 resume_task_id=tcfg.get("resume_task_id", ""),
+            )
+            task_root = str(pathlib.Path(task_snapshot.output_path or "") / task_id) if task_snapshot.output_path else ""
+            agent_task_key = _task_agent_key(tcfg)
+            task_pi_dir, agent_runtime_mode = _materialize_task_pi_runtime(
+                task_root=task_root,
+                agent_task_key=agent_task_key,
+            )
+            cfg.task_pi_dir = task_pi_dir or ""
+            task_mod._safe_create_task_event(
+                db,
+                task_id=task_id,
+                project_id=task_snapshot.project_id,
+                event_type="task_agent_runtime_materialized" if task_pi_dir else "task_agent_runtime_fallback_to_global",
+                message="已生成任务级 PI runtime" if task_pi_dir else "未提供任务级 key，回退到全局 PI runtime",
+                source="ea_worker",
+                status=task_snapshot.status,
+                payload={
+                    "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
+                    "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
+                    "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
+                    "agent_runtime_mode": agent_runtime_mode,
+                },
             )
 
             # 在任务启动时保存本轮前的历史事件快照（用于最终写入，避免与 _flush_stages 叠加翻倍）

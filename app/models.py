@@ -132,6 +132,7 @@ class TaskConfig(BaseModel):
     module_name: str = Field(default="", description="从 prompt 解析出的模块名")
     cwd: str = Field(default="/data/target", description="模块目录（含 files.list 或子模块目录）")
     source_path: Optional[str] = Field(default=None, description="源码根目录（用于解析files.list中的文件路径；为None时使用cwd）")
+    task_pi_dir: str = Field(default="", description="任务级 PI runtime 目录")
 
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")

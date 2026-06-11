@@ -250,6 +250,7 @@ class AgentProcessHandle:
         cls,
         *args: str,
         cwd: str,
+        env: dict[str, str] | None,
         stdout,
         stderr,
         stdin,
@@ -259,6 +260,7 @@ class AgentProcessHandle:
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=cwd,
+            env=env,
             stdout=stdout,
             stderr=stderr,
             stdin=stdin,
