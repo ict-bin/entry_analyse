@@ -16,7 +16,6 @@ logger = logging.getLogger("ea.llm_sync")
 # pi 的 models.json 写入目录（与 Dockerfile 中 PI_CODING_AGENT_DIR 一致）
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
-_DEFAULT_MAX_TOKENS = 8192
 
 
 def _provider_api(provider_type: str) -> str:
@@ -51,7 +50,7 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
     )
     max_tokens = _as_positive_int(
         provider.get("max_tokens") or provider.get("maxTokens") or extra_config.get("max_tokens") or extra_config.get("maxTokens"),
-        _DEFAULT_MAX_TOKENS,
+        0,
     )
     pi_models = extra_config.get("pi_models")
     raw_models = pi_models if isinstance(pi_models, list) else (
@@ -67,7 +66,8 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         entry.setdefault("reasoning", False)
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
-        entry.setdefault("maxTokens", max_tokens)
+        if max_tokens > 0:
+            entry.setdefault("maxTokens", max_tokens)
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
         models.append(entry)
     return models
