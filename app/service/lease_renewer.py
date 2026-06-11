@@ -115,6 +115,17 @@ def main() -> None:
          f"interval={args.interval}s duration={args.duration}s "
          f"parent_pid={args.parent_pid} my_pid={os.getpid()}")
 
+    # Install signal handlers to capture what kills us
+    import signal as _signal
+    def _on_signal(signum, frame):
+        _log(f"SIGNAL received: {_signal.Signals(signum).name} ({signum})")
+        sys.exit(128 + signum)
+    for _sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP, _signal.SIGPIPE, _signal.SIGUSR1, _signal.SIGUSR2):
+        try:
+            _signal.signal(_sig, _on_signal)
+        except Exception:
+            pass
+
     consecutive_failures = 0
     max_failures = 5
     attempt = 0
