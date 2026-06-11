@@ -35,8 +35,8 @@ def main():
                     "agent_process_in_use, agent_process_available, agent_waiting_requests, "
                     "agent_waiting_tasks, agent_queue_oldest_wait_seconds, "
                     "agent_rss_total_bytes, agent_rss_max_bytes, "
-                    "heartbeat_duration_ms, heartbeat_failure_count) "
-                    "VALUES (%s,%s,%s,%s,NOW(),%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s) "
+                    "heartbeat_duration_ms, heartbeat_failure_count, http_port) "
+                    "VALUES (%s,%s,%s,%s,NOW(),%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s) "
                     "ON DUPLICATE KEY UPDATE "
                     "last_seen_status=VALUES(last_seen_status), "
                     "last_heartbeat_at=NOW(), "
@@ -50,9 +50,10 @@ def main():
                     "agent_rss_total_bytes=VALUES(agent_rss_total_bytes), "
                     "agent_rss_max_bytes=VALUES(agent_rss_max_bytes), "
                     "heartbeat_duration_ms=VALUES(heartbeat_duration_ms), "
-                    "heartbeat_failure_count=VALUES(heartbeat_failure_count)",
+                    "heartbeat_failure_count=VALUES(heartbeat_failure_count), "
+                    "http_port=VALUES(http_port)",
                     (args.worker_id, args.pod_name, "worker", "running", 1, 8,
-                     0, 0, 0, 0, 0, 0, 0, 0, 1, 0))
+                     0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 8080))
             conn.commit()
             conn.close()
         except Exception as exc:
