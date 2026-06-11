@@ -1749,22 +1749,6 @@ class WorkerService:
                 target=_monitor, name=f"ea_lease_monitor_{task_id}", daemon=True)
             monitor_t.start()
 
-            # Also hook stop_event: when task stops, terminate the subprocess
-            def _stopper() -> None:
-                stop_event.wait()
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    
-            stopper_t = threading.Thread(
-                target=_stopper, name=f"ea_lease_stopper_{task_id}", daemon=True)
-            stopper_t.start()
-
             return proc
         except Exception as exc:
             logger.error("Failed to start lease_renewer subprocess task=%s: %s", task_id, exc)
