@@ -1849,19 +1849,20 @@ class WorkerService:
                     db_gen = get_db()
                     db: Session = next(db_gen)
                     try:
+                        logger.info("lease_renewer[%s]: _watch_task_control polling", task_id)
                         row = (
                             db.query(AppEaTask)
                             .filter(AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False))
                             .first()
                         )
                         if row is None:
-                            logger.warning("lease_renewer[%s]: stop_event set by _watch_task_control (row is None)", task_id)
+                            logger.warning("lease_renewer[%s]: _watch_task_control: row is None (deleted?)", task_id)
                             stop_event.set()
                             cancel_event.set()
                             orch.abort()
                             return
                         if row.owner_pod != task_mod.POD_NAME:
-                            logger.warning("lease_renewer[%s]: stop_event set by _watch_task_control (owner_pod mismatch: DB=%s, local=%s)", task_id, row.owner_pod, task_mod.POD_NAME)
+                            logger.warning("lease_renewer[%s]: _watch_task_control: owner mismatch DB=%s local=%s", task_id, row.owner_pod, task_mod.POD_NAME)
                             stop_event.set()
                             cancel_event.set()
                             orch.abort()
