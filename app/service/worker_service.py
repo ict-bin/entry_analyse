@@ -1714,7 +1714,7 @@ class WorkerService:
                     "--duration", str(duration),
                     "--parent_pid", str(_os.getpid()),
                 ],
-                stdout=_sp.PIPE,
+                stdout=_sp.DEVNULL,  # self-managed: no pipe monitoring needed
                 stderr=_sp.DEVNULL,
                 env=_env,
                 close_fds=True,
@@ -1724,38 +1724,11 @@ class WorkerService:
                 task_id, proc.pid, interval, duration,
             )
 
-            # Monitor thread: read renewer stdout line-by-line, capture exit code.
-            def _monitor() -> None:
-                try:
-                    while proc.poll() is None:
-                        line_bytes = proc.stdout.readline()
-                        if line_bytes:
-                            line = line_bytes.decode("utf-8", errors="replace").rstrip()
-                            logger.info("lease_renewer[%s]: %s", task_id, line)
-                        else:
-                            # Empty read with process alive = pipe temporarily empty, wait
-                            time.sleep(0.1)
-                    # Process exited, drain remaining output
-                    for raw_line in proc.stdout:
-                        line = raw_line.decode("utf-8", errors="replace").rstrip()
-                        if line:
-                            logger.info("lease_renewer[%s]: %s", task_id, line)
-                    rc = proc.returncode
-                    if rc != 0:
-                        logger.warning(
-                            "lease_renewer subprocess exited abnormally task=%s pid=%s rc=%s",
-                            task_id, proc.pid, rc,
-                        )
-                        stop_event.set()  # signal task to abort
-                        logger.warning("lease_renewer[%s]: stop_event set by _monitor (rc=%s)", task_id, rc)
-                except Exception as _e:
-                    logger.warning("lease_renewer monitor error task=%s: %s", task_id, _e)
-                    stop_event.set()
-                    logger.warning("lease_renewer[%s]: stop_event set by _monitor exception", task_id)
-
-            monitor_t = threading.Thread(
-                target=_monitor, name=f"ea_lease_monitor_{task_id}", daemon=True)
-            monitor_t.start()
+            # The renewer subprocess is entirely self-managed:
+            # - It renews the lease via its own pymysql connection.
+            # - It exits when parent_pid dies (os.kill).
+            # - No pipe monitoring, no stop_event, no _stopper.
+            # - If it truly fails, lease expires naturally and scheduler reclaims.
 
             return proc
         except Exception as exc:
