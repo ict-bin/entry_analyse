@@ -1051,41 +1051,65 @@ class WorkerService:
         heartbeat_failure_count: int,
         runtime_role: str | None = None,
     ) -> None:
-        from app.service.worker_slot_service import get_worker_slot_service
+        """Write heartbeat directly via pymysql — bypasses SQLAlchemy pool exhaustion."""
+        import pymysql as _pymysql, json as _json
+        from app.db import _engine as _db_engine
+
+        url = _db_engine.url
+        host = str(url.host or "127.0.0.1")
+        port = int(url.port or 3306)
+        user = str(url.username or "")
+        password = str(url.password or "")
+        database = str(url.database or "")
 
         phase_started = time.perf_counter()
-        db_gen = get_db()
-        self._record_phase_duration(self._heartbeat_health, phase="db_session_open", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
-        db: Session = next(db_gen)
         try:
-            phase_started = time.perf_counter()
-            get_worker_slot_service().upsert_heartbeat(
-                db,
-                worker_id=worker_id,
-                pod_name=pod_name,
-                pod_ip=pod_ip,
-                http_port=http_port,
-                max_concurrent_tasks=max_concurrent_tasks,
-                agent_process_limit=int(agent_snapshot.get("capacity") or 0),
-                agent_process_in_use=int(agent_snapshot.get("in_use") or 0),
-                agent_process_available=int(agent_snapshot.get("available") or 0),
-                agent_waiting_requests=int(agent_snapshot.get("waiting_requests") or 0),
-                agent_waiting_tasks=int(agent_snapshot.get("waiting_tasks") or 0),
-                agent_queue_oldest_wait_seconds=float(agent_snapshot.get("oldest_wait_seconds") or 0.0),
-                agent_rss_total_bytes=int(agent_snapshot.get("rss_total_bytes") or 0),
-                agent_rss_max_bytes=int(agent_snapshot.get("rss_max_bytes") or 0),
-                agent_snapshot_at=str(agent_snapshot.get("snapshot_at") or ""),
-                status="running",
-                heartbeat_error=None,
-                heartbeat_duration_ms=heartbeat_duration_ms,
-                heartbeat_failure_count=heartbeat_failure_count,
+            conn = _pymysql.connect(
+                host=host, port=port, user=user, password=password, database=database,
+                connect_timeout=10, read_timeout=15, write_timeout=15,
             )
-            self._record_phase_duration(self._heartbeat_health, phase="db_upsert_or_update", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
+            with conn.cursor() as cur:
+                deadline = _json.dumps(str(int(time.time() + 300)))
+                cur.execute(
+                    "INSERT INTO secflow_app_ea_worker_slots "
+                    "(worker_id, pod_name, runtime_role, pod_ip, http_port, "
+                    "max_concurrent_tasks, agent_process_limit, agent_process_in_use, "
+                    "agent_process_available, agent_waiting_requests, agent_waiting_tasks, "
+                    "agent_queue_oldest_wait_seconds, agent_rss_total_bytes, agent_rss_max_bytes, "
+                    "agent_snapshot_at, last_seen_status, heartbeat_error, "
+                    "heartbeat_duration_ms, heartbeat_failure_count, last_heartbeat_at) "
+                    "VALUES (%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s, NOW()) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "runtime_role=VALUES(runtime_role), pod_ip=VALUES(pod_ip), http_port=VALUES(http_port), "
+                    "max_concurrent_tasks=VALUES(max_concurrent_tasks), "
+                    "agent_process_limit=VALUES(agent_process_limit), "
+                    "agent_process_in_use=VALUES(agent_process_in_use), "
+                    "agent_process_available=VALUES(agent_process_available), "
+                    "agent_waiting_requests=VALUES(agent_waiting_requests), "
+                    "agent_waiting_tasks=VALUES(agent_waiting_tasks), "
+                    "agent_queue_oldest_wait_seconds=VALUES(agent_queue_oldest_wait_seconds), "
+                    "agent_rss_total_bytes=VALUES(agent_rss_total_bytes), "
+                    "agent_rss_max_bytes=VALUES(agent_rss_max_bytes), "
+                    "agent_snapshot_at=VALUES(agent_snapshot_at), "
+                    "last_seen_status=VALUES(last_seen_status), "
+                    "heartbeat_error=VALUES(heartbeat_error), "
+                    "heartbeat_duration_ms=VALUES(heartbeat_duration_ms), "
+                    "heartbeat_failure_count=VALUES(heartbeat_failure_count), "
+                    "last_heartbeat_at=NOW()",
+                    (worker_id, pod_name, str(runtime_role or "worker"), pod_ip or "", http_port,
+                     max_concurrent_tasks, int(agent_snapshot.get("capacity") or 0),
+                     int(agent_snapshot.get("in_use") or 0), int(agent_snapshot.get("available") or 0),
+                     int(agent_snapshot.get("waiting_requests") or 0), int(agent_snapshot.get("waiting_tasks") or 0),
+                     float(agent_snapshot.get("oldest_wait_seconds") or 0.0),
+                     int(agent_snapshot.get("rss_total_bytes") or 0), int(agent_snapshot.get("rss_max_bytes") or 0),
+                     str(agent_snapshot.get("snapshot_at") or ""), "running", None,
+                     heartbeat_duration_ms, heartbeat_failure_count),
+                )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        self._record_phase_duration(self._heartbeat_health, phase="db_pymysql", duration_ms=(time.perf_counter() - phase_started) * 1000.0)
 
     def _discover_active_projects_sync(self) -> list[str]:
         """Sync version of project discovery — safe to call from threads."""
