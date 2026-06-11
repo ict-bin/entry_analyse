@@ -1724,11 +1724,22 @@ class WorkerService:
                 task_id, proc.pid, interval, duration,
             )
 
-            # The renewer subprocess is entirely self-managed:
-            # - It renews the lease via its own pymysql connection.
-            # - It exits when parent_pid dies (os.kill).
-            # - No pipe monitoring, no stop_event, no _stopper.
-            # - If it truly fails, lease expires naturally and scheduler reclaims.
+            # The renewer subprocess outlives the task: it is killed when stop_event fires
+            # (task completion, owner mismatch, or cancel). No pipe monitoring needed.
+            def _stopper() -> None:
+                stop_event.wait()
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            stopper_t = threading.Thread(
+                target=_stopper, name=f"ea_lease_stopper_{task_id}", daemon=True)
+            stopper_t.start()
 
             return proc
         except Exception as exc:
