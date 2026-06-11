@@ -1739,9 +1739,11 @@ class WorkerService:
                             task_id, proc.pid, rc,
                         )
                         stop_event.set()  # signal task to abort
+                        logger.warning("lease_renewer[%s]: stop_event set by _monitor (rc=%s)", task_id, rc)
                 except Exception as _e:
                     logger.warning("lease_renewer monitor error task=%s: %s", task_id, _e)
                     stop_event.set()
+                    logger.warning("lease_renewer[%s]: stop_event set by _monitor exception", task_id)
 
             monitor_t = threading.Thread(
                 target=_monitor, name=f"ea_lease_monitor_{task_id}", daemon=True)
@@ -1877,11 +1879,13 @@ class WorkerService:
                             .first()
                         )
                         if row is None:
+                            logger.warning("lease_renewer[%s]: stop_event set by _watch_task_control (row is None)", task_id)
                             stop_event.set()
                             cancel_event.set()
                             orch.abort()
                             return
                         if row.owner_pod != task_mod.POD_NAME:
+                            logger.warning("lease_renewer[%s]: stop_event set by _watch_task_control (owner_pod mismatch: DB=%s, local=%s)", task_id, row.owner_pod, task_mod.POD_NAME)
                             stop_event.set()
                             cancel_event.set()
                             orch.abort()
