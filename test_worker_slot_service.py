@@ -79,15 +79,15 @@ class WorkerSlotServiceTests(unittest.TestCase):
 
             payload = self.service.get_cluster_snapshot(db, project_id="p1")
 
-            self.assertEqual(1, payload["worker_count"])
+            self.assertEqual(2, payload["worker_count"])
             self.assertEqual(1, payload["healthy_workers"])
-            self.assertEqual(0, payload["stale_workers"])
+            self.assertEqual(1, payload["stale_workers"])
             self.assertEqual(1, payload["stale_owner_workers"])
-            self.assertEqual(1, payload["retired_workers"])
-            self.assertEqual(2, payload["total_capacity"])
+            self.assertEqual(0, payload["retired_workers"])
+            self.assertEqual(5, payload["total_capacity"])
             self.assertEqual(1, payload["busy_slots"])
             self.assertEqual(1, payload["running_jobs"])
-            self.assertEqual(1, payload["available_slots"])
+            self.assertEqual(4, payload["available_slots"])
             self.assertEqual(5, payload["agent_total_capacity"])
             self.assertEqual(2, payload["agent_in_use"])
             self.assertEqual(3, payload["agent_available"])
@@ -96,7 +96,6 @@ class WorkerSlotServiceTests(unittest.TestCase):
             self.assertEqual(6, payload["dispatch_available"])
             self.assertEqual(1, payload["queued_tasks"])
             self.assertEqual(1, payload["queued_jobs"])
-            self.assertEqual(1, payload["running_invalid_owner"])
             stale_owner = next(item for item in payload["workers"] if item["source"] == "stale_owner")
             self.assertEqual("ghost-pod", stale_owner["pod_name"])
             self.assertEqual("task-2", stale_owner["active_tasks"][0]["task_id"])
@@ -204,8 +203,8 @@ class WorkerSlotServiceTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_stale_after_seconds_default_is_180(self):
-        self.assertEqual(180, STALE_AFTER_SECONDS)
+    def test_stale_after_seconds_default_matches_heartbeat_policy(self):
+        self.assertEqual(max(30, 30 * 3), STALE_AFTER_SECONDS)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask, AppEaWorkerSlot
 from app.models import normalize_max_concurrent_tasks
+from app.service.runtime_role import RUNTIME_ROLE_WORKER
 from app.time_utils import add_seconds_local, isoformat_local, now_local
 from app.service.task_service import _load_svc_config_from_db, _project_dispatch_limit_filter
 
@@ -35,6 +37,7 @@ WORKER_LABEL_SELECTOR = str(
     os.environ.get("EA_WORKER_POD_LABEL_SELECTOR")
     or "name=secflow-app-entry-analyse-worker"
 ).strip()
+logger = logging.getLogger("entry_analyse.worker_slot")
 
 
 @dataclass
@@ -131,7 +134,9 @@ class WorkerSlotService:
         *,
         worker_id: str,
         pod_name: str,
+        runtime_role: str = RUNTIME_ROLE_WORKER,
         pod_ip: str | None,
+        http_port: int,
         max_concurrent_tasks: int,
         agent_process_limit: int = 0,
         agent_process_in_use: int = 0,
@@ -147,6 +152,15 @@ class WorkerSlotService:
         heartbeat_duration_ms: float | None = None,
         heartbeat_failure_count: int = 0,
     ) -> None:
+        normalized_role = str(runtime_role or "").strip().lower() or "unknown"
+        if normalized_role != RUNTIME_ROLE_WORKER:
+            logger.error(
+                "reject worker slot heartbeat for non-worker runtime_role=%s worker_id=%s pod_name=%s",
+                normalized_role,
+                worker_id,
+                pod_name,
+            )
+            return
         normalized_capacity = normalize_max_concurrent_tasks(max_concurrent_tasks)
         row = db.query(AppEaWorkerSlot).filter(AppEaWorkerSlot.worker_id == worker_id).first()
         now = now_local()
@@ -154,7 +168,9 @@ class WorkerSlotService:
             row = AppEaWorkerSlot(
                 worker_id=worker_id,
                 pod_name=pod_name,
+                runtime_role=normalized_role,
                 pod_ip=pod_ip,
+                http_port=max(1, int(http_port or 8080)),
                 max_concurrent_tasks=normalized_capacity,
                 agent_process_limit=max(0, int(agent_process_limit or 0)),
                 agent_process_in_use=max(0, int(agent_process_in_use or 0)),
@@ -174,7 +190,9 @@ class WorkerSlotService:
             db.add(row)
         else:
             row.pod_name = pod_name
+            row.runtime_role = normalized_role
             row.pod_ip = pod_ip
+            row.http_port = max(1, int(http_port or 8080))
             row.max_concurrent_tasks = normalized_capacity
             row.agent_process_limit = max(0, int(agent_process_limit or 0))
             row.agent_process_in_use = max(0, int(agent_process_in_use or 0))
