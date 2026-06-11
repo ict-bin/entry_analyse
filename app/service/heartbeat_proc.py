@@ -31,17 +31,32 @@ def main():
                 cur.execute(
                     "INSERT INTO secflow_app_ea_worker_slots "
                     "(worker_id, pod_name, runtime_role, last_seen_status, "
-                    "last_heartbeat_at, max_concurrent_tasks) "
-                    "VALUES (%s,%s,%s,%s,NOW(),%s) "
+                    "last_heartbeat_at, max_concurrent_tasks, agent_process_limit, "
+                    "agent_process_in_use, agent_process_available, agent_waiting_requests, "
+                    "agent_waiting_tasks, agent_queue_oldest_wait_seconds, "
+                    "agent_rss_total_bytes, agent_rss_max_bytes, "
+                    "heartbeat_duration_ms, heartbeat_failure_count) "
+                    "VALUES (%s,%s,%s,%s,NOW(),%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s) "
                     "ON DUPLICATE KEY UPDATE "
                     "last_seen_status=VALUES(last_seen_status), "
                     "last_heartbeat_at=NOW(), "
-                    "max_concurrent_tasks=VALUES(max_concurrent_tasks)",
-                    (args.worker_id, args.pod_name, "worker", "running", 1))
+                    "max_concurrent_tasks=VALUES(max_concurrent_tasks), "
+                    "agent_process_limit=VALUES(agent_process_limit), "
+                    "agent_process_in_use=VALUES(agent_process_in_use), "
+                    "agent_process_available=VALUES(agent_process_available), "
+                    "agent_waiting_requests=VALUES(agent_waiting_requests), "
+                    "agent_waiting_tasks=VALUES(agent_waiting_tasks), "
+                    "agent_queue_oldest_wait_seconds=VALUES(agent_queue_oldest_wait_seconds), "
+                    "agent_rss_total_bytes=VALUES(agent_rss_total_bytes), "
+                    "agent_rss_max_bytes=VALUES(agent_rss_max_bytes), "
+                    "heartbeat_duration_ms=VALUES(heartbeat_duration_ms), "
+                    "heartbeat_failure_count=VALUES(heartbeat_failure_count)",
+                    (args.worker_id, args.pod_name, "worker", "running", 1, 8,
+                     0, 0, 0, 0, 0, 0, 0, 0, 1, 0))
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[heartbeat_proc] ERROR: {exc}", flush=True)
 
 if __name__ == "__main__":
     main()
