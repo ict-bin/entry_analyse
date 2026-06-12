@@ -170,10 +170,10 @@ def _kill_all_task_processes(
             pid, pgid, comm, cwd, task_id,
         )
         try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
+            # CRITICAL: use os.kill(pid) NOT os.killpg().  killpg sends
+            # SIGKILL to the entire process group, which can kill the
+            # main worker process if a leftover child shares its pgid.
+            os.kill(pid, signal.SIGKILL)
             killed += 1
         except (ProcessLookupError, PermissionError):
             continue
@@ -614,9 +614,14 @@ class WorkerService:
         self._task_abort_callbacks[task_id] = orch.abort
         self._task_lease_started_at[task_id] = time.time()
 
-        # ── Step 4: Lease renewal thread ──────────────────────────────────
+        # ── Step 4: Lease renewal (thread + independent subprocess) ──────
         stop_lease = threading.Event()
+        lease_proc = None
 
+        # 4a. Independent subprocess (pymysql, survives worker crash)
+        lease_proc = _start_lease_renewer_subprocess(task_id, stop_lease)
+
+        # 4b. In-thread renewal as primary (updates lease_expires_at directly)
         def _renew_lease() -> None:
             failures = 0
             while not stop_lease.wait(timeout=LEASE_RENEW_INTERVAL_SECONDS):
@@ -734,6 +739,15 @@ class WorkerService:
         stop_lease.set()
         lease_thread.join(timeout=5.0)
         cancel_thread.join(timeout=3.0)
+        if lease_proc is not None:
+            try:
+                lease_proc.terminate()
+                lease_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    lease_proc.kill()
+                except Exception:
+                    pass
 
         # ── Step 8: Environment cleanup ───────────────────────────────────
         if task_roots:
@@ -1096,6 +1110,70 @@ class WorkerService:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _start_lease_renewer_subprocess(
+    task_id: str, stop_event: threading.Event,
+) -> subprocess.Popen | None:
+    """Launch lease_renewer.py as an independent subprocess.
+
+    Uses pymysql directly (no shared SQLAlchemy pool), survives worker
+    crashes, and provides a second layer of lease renewal protection.
+    """
+    from app.db import _engine as _db_engine
+    from app.service import task_service as task_mod
+
+    try:
+        url = _db_engine.url if _db_engine is not None else None
+        if url is None:
+            return None
+
+        script = os.path.join(os.path.dirname(__file__), "lease_renewer.py")
+        proc = subprocess.Popen(
+            [
+                sys.executable, script,
+                "--task_id", task_id,
+                "--pod_name", POD_NAME,
+                "--host", str(url.host or "127.0.0.1"),
+                "--port", str(url.port or 3306),
+                "--user", str(url.username or ""),
+                "--password", str(url.password or ""),
+                "--database", str(url.database or ""),
+                "--interval", str(LEASE_RENEW_INTERVAL_SECONDS),
+                "--duration", str(LEASE_DURATION_SECONDS),
+                "--parent_pid", str(os.getpid()),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        logger.info(
+            "lease_renewer subprocess started task=%s pid=%s",
+            task_id, proc.pid,
+        )
+
+        def _monitor() -> None:
+            try:
+                _, stderr_data = proc.communicate(timeout=None)
+                if proc.returncode != 0:
+                    logger.warning(
+                        "lease_renewer exited abnormally task=%s rc=%s",
+                        task_id, proc.returncode,
+                    )
+                    stop_event.set()
+            except Exception:
+                pass
+            finally:
+                stop_event.set()
+
+        threading.Thread(
+            target=_monitor, name=f"ea_lease_mon_{task_id}", daemon=True,
+        ).start()
+
+        return proc
+    except Exception as exc:
+        logger.warning("lease_renewer subprocess failed: %s", exc)
+        return None
+
 
 def _task_roots_from_row(task_id: str, output_path: str | None, input_path: str | None) -> list[str]:
     """Compute task filesystem roots for process cleanup matching."""
