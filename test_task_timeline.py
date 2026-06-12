@@ -169,8 +169,38 @@ class EntryTaskTimelineTests(unittest.TestCase):
     def test_timeline_filter_keeps_only_user_facing_events(self):
         self.assertTrue(should_persist_user_timeline_event("task_dispatched", "system", {}))
         self.assertTrue(should_persist_user_timeline_event("task_started", "worker", {}))
+        self.assertTrue(should_persist_user_timeline_event("task_rate_limited_retrying", "worker", {"http_status": 429}))
         self.assertFalse(should_persist_user_timeline_event("round_started", "entry_analyse", {}))
         self.assertFalse(should_persist_user_timeline_event("judge_completed", "worker", {}))
+
+    def test_safe_create_task_event_persists_rate_limited_timeline_event(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_rate_limit", status="running")
+            task_service._safe_create_task_event(
+                db,
+                task_id=task.task_id,
+                project_id=task.project_id,
+                event_type="task_rate_limited_retrying",
+                message="智能体请求被 429 限流，30 秒后自动重试",
+                source=task_service.TASK_EVENT_SOURCE_WORKER,
+                status=task.status,
+                payload={
+                    "http_status": 429,
+                    "retry_delay_seconds": 30,
+                    "consecutive_rate_limit_count": 10,
+                    "stage": "r3_w",
+                },
+                dedupe_key="rate-limit-r3-w",
+            )
+            db.commit()
+
+            timeline = self.service.get_task_timeline(db, task)
+            self.assertEqual(["task_rate_limited_retrying"], [event["event_type"] for event in timeline["events"]])
+            self.assertEqual(429, timeline["events"][0]["payload"]["http_status"])
+            self.assertEqual(30, timeline["events"][0]["payload"]["retry_delay_seconds"])
+        finally:
+            db.close()
 
     def test_safe_create_task_event_skips_non_user_facing_internal_events(self):
         db = self.SessionLocal()

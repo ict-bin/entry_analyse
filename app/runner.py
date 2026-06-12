@@ -154,6 +154,10 @@ class AgentResult:
         self.exit_code: int = 0
         self.error: str | None = None
         self.fatal: bool = False  # 致命错误（配置/环境问题，不可重试）
+        self.rate_limited: bool = False
+        self.consecutive_rate_limit_count: int = 0
+        self.retry_delay_seconds: int = 0
+        self.rate_limit_event_due: bool = False
 
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
@@ -216,6 +220,11 @@ def _truncate_session_to_last_complete_line(session_file: str | None) -> None:
                          session_file, last_valid_pos, len(content))
     except Exception as _trunc_exc:
         logger.debug("session truncate failed %s: %s", session_file, _trunc_exc)
+
+
+def _should_emit_rate_limit_event(streak: int) -> bool:
+    streak = max(0, int(streak or 0))
+    return streak == 1 or (streak > 0 and streak % 10 == 0)
 
 
 _TIMEOUT_ERROR_PATTERNS = frozenset({"timeout", "timed out", "etimedout", "request timed out"})
@@ -995,6 +1004,7 @@ async def _run_with_api_retry(
     timeout_failures = 0
     query_engine_401_failures = 0
     empty_response_failures = 0
+    rate_limit_streak = 0
     current_stdin = stdin_data
 
     # 排队无超时：永久等候，直到获得 slot
@@ -1298,6 +1308,30 @@ async def _run_with_api_retry(
 
         # ── API 可重试错误 ──
         if _is_retryable_api_error(result):
+            err_lower = (result.error or "").lower()
+            is_rate_limit = any(
+                pattern in err_lower for pattern in ("rate limit", "429", "too many requests")
+            )
+            if is_rate_limit:
+                rate_limit_streak += 1
+                delay = 30
+                result.rate_limited = True
+                result.consecutive_rate_limit_count = rate_limit_streak
+                result.retry_delay_seconds = delay
+                result.rate_limit_event_due = _should_emit_rate_limit_event(rate_limit_streak)
+                _log_warn(
+                    f"API 限流 [{rate_limit_streak}], {delay:.0f}s 后重试: "
+                    f"{(result.error or '')[:200]}"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n\u26a0\ufe0f API 限流，{delay:.0f}s 后重试 "
+                        f"(连续第 {rate_limit_streak} 次)...\n"
+                    )
+                if await _sleep_cancel_first(delay, cancel_event):
+                    return result
+                continue
+            rate_limit_streak = 0
             api_attempt += 1
             can_retry = (max_retries == -1) or (api_attempt <= max_retries)
             label = f"{api_attempt}/{_fmt_max(max_retries)}"
