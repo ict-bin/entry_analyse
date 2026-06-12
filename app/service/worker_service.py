@@ -551,7 +551,8 @@ class WorkerService:
                 d.mkdir(parents=True, exist_ok=True)
 
         # DB: clear runtime fields, stage_result_index
-        _db2 = next(get_db())
+        _db2_gen = get_db()
+        _db2 = next(_db2_gen)
         try:
             _r2 = _db2.query(AppEaTask).filter_by(task_id=task_id).first()
             if _r2:
@@ -566,12 +567,13 @@ class WorkerService:
             _db2.commit()
         finally:
             try:
-                next(_db2)
+                next(_db2_gen)
             except StopIteration:
                 pass
 
         # DB: emit task_started
-        _db3 = next(get_db())
+        _db3_gen = get_db()
+        _db3 = next(_db3_gen)
         try:
             _r3 = (
                 _db3.query(AppEaTask)
@@ -596,7 +598,7 @@ class WorkerService:
                 _db3.commit()
         finally:
             try:
-                next(_db3)
+                next(_db3_gen)
             except StopIteration:
                 pass
 
