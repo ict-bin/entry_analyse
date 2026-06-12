@@ -78,15 +78,13 @@ class SchedulerService:
         )
 
         alive_owner_pods = _alive_entry_analysis_owner_pods(db, now)
-        registry_pods = _worker_registry_pods(db, now)
-        invalid_reconciled, invalid_owner_alive = _requeue_invalid_owner_running_tasks(
-            db,
-            now,
-            limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
-            scheduler_instance="scheduler",
-            alive_owner_pods=alive_owner_pods,
-            worker_registry_pods=registry_pods,
-        )
+        # NOTE: _requeue_invalid_owner_running_tasks removed from regular reconcile.
+        # It was causing a race condition where newly dispatched tasks got
+        # requeued before the worker's first heartbeat appeared in AppEaWorkerSlot.
+        # Lease-based expiry (_requeue_expired_running_tasks) is sufficient: if the
+        # worker is alive, it renews the lease; if dead, the lease expires within
+        # LEASE_DURATION_SECONDS and the task is recovered then.
+        invalid_reconciled, invalid_owner_alive = 0, 0
         reconciled, owner_alive = _requeue_expired_running_tasks(
             db,
             now,
