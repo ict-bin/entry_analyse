@@ -1142,8 +1142,8 @@ def _start_lease_renewer_subprocess(
                 "--duration", str(LEASE_DURATION_SECONDS),
                 "--parent_pid", str(os.getpid()),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             close_fds=True,
         )
         logger.info(
@@ -1153,11 +1153,15 @@ def _start_lease_renewer_subprocess(
 
         def _monitor() -> None:
             try:
-                _, stderr_data = proc.communicate(timeout=None)
+                stdout_data, _ = proc.communicate(timeout=None)
                 if proc.returncode != 0:
+                    out_tail = ""
+                    if stdout_data:
+                        lines = stdout_data.decode("utf-8", errors="replace").splitlines()
+                        out_tail = " | ".join(lines[-5:])
                     logger.warning(
-                        "lease_renewer exited abnormally task=%s rc=%s",
-                        task_id, proc.returncode,
+                        "lease_renewer exited abnormally task=%s rc=%s output=%s",
+                        task_id, proc.returncode, out_tail[:500],
                     )
                     stop_event.set()
             except Exception:
