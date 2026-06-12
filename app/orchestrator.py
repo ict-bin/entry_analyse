@@ -418,6 +418,18 @@ class Orchestrator:
                     _log.getLogger("ea.orchestrator").warning(
                         "funcdb copy to output failed: %s", _fdb_exc)
 
+        # ── 归档本地 ModuleDB → output/（避免 NFS SQLite 锁）──────────
+        try:
+            import shutil as _shutil2, tempfile, pathlib
+            _local_mdb = pathlib.Path(tempfile.gettempdir()) / f"ea_module_{task_id}" / "module_functions.db"
+            if _local_mdb.exists():
+                _mdb_dst = out_dir / "module_functions.db"
+                _shutil2.copy2(str(_local_mdb), str(_mdb_dst))
+                _shutil2.rmtree(str(_local_mdb.parent), ignore_errors=True)
+        except Exception as _mdb_exc:
+            import logging as _log
+            _log.getLogger("ea.orchestrator").warning("ModuleDB archive failed: %s", _mdb_exc)
+
         self._emit("task_end", task_id,
                    status=result.status.value,
                    run_dir=str(run_dir),

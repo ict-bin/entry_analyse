@@ -369,7 +369,7 @@ async def run_r1_worker(
 
     def _sync_module_db(funcs_out, hashes_out):
         try:
-            module_db = ModuleDB.open(dirs.workspace)
+            module_db = ModuleDB.open(dirs.workspace, task_id)
             module_db.sync_file(
                 file_hash,
                 os.path.abspath(file_path),
