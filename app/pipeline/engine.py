@@ -983,7 +983,13 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R1：一次调用即完成（R1-W per-gap 并行已内建，不再需要 J 验证循环）。"""
+        """R1：一次调用即完成（R1-W per-gap 并行已内建，不再需要 J 验证循环）。
+
+        Wrapped in asyncio.to_thread + asyncio.wait_for to prevent sync blocking
+        operations (tree-sitter, ctags, SQLite writes) from stalling the event loop
+        and to enforce a per-file timeout so one stuck file does not block the
+        entire pipeline.
+        """
         fs = state.files[file_hash]
         r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
         if r1_max == 0:
@@ -991,9 +997,14 @@ class PipelineEngine:
             fs.r1_j_state = NodeState.PASSED
             await asyncio.to_thread(state.save, dirs.state_file)
             return
-        try:
+
+        # Per-file timeout: 10 minutes for the first attempt (tree-sitter +
+        # ctags + LLM gap-filling), generous enough for large files.
+        _r1_timeout = int(os.environ.get("EA_R1_FILE_TIMEOUT_SECONDS", "600"))
+
+        async def _run_r1_wrapped():
             acfg = self.cfg.workers.agents[0]
-            token_usage, funcs, func_hashes = await run_r1_worker(
+            return await run_r1_worker(
                 file_path=file_path,
                 dirs=dirs,
                 acfg=acfg,
@@ -1007,6 +1018,11 @@ class PipelineEngine:
                 system_prompt=self._stage_sys_prompt("r1_worker"),
                 priority=SemPriority.R1_W,
             )
+
+        try:
+            token_usage, funcs, func_hashes = await asyncio.wait_for(
+                _run_r1_wrapped(), timeout=_r1_timeout,
+            )
             state.register_functions(
                 file_hash,
                 [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
@@ -1014,6 +1030,14 @@ class PipelineEngine:
             )
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
+            await asyncio.to_thread(state.save, dirs.state_file)
+        except asyncio.TimeoutError:
+            logger.error(
+                "R1-W timeout for %s after %ss, marking failed",
+                file_path, _r1_timeout,
+            )
+            fs.r1_w_state = NodeState.FAILED
+            fs.r1_j_state = NodeState.FAILED
             await asyncio.to_thread(state.save, dirs.state_file)
         except Exception as exc:
             logger.error("R1-W failed for %s: %s", file_path, exc)

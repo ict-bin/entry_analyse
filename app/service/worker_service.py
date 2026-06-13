@@ -463,13 +463,18 @@ class WorkerService:
         event_buffer: list[dict] = []
         task_roots: list[str] = []
         cancel_requested = False
+        last_progress_time = time.time()
+        _progress_lock = threading.Lock()
 
         def _on_event(event: Any) -> None:
+            nonlocal last_progress_time
             ts = task_mod._time.time()
             event_buffer.append({
                 "ts": ts, "type": event.type,
                 "data": dict(getattr(event, "data", {})),
             })
+            with _progress_lock:
+                last_progress_time = time.time()
             if len(event_buffer) % 5 == 0:
                 task_mod._flush_stages(task_id, event_buffer)
 
@@ -625,6 +630,21 @@ class WorkerService:
         def _renew_lease() -> None:
             failures = 0
             while not stop_lease.wait(timeout=LEASE_RENEW_INTERVAL_SECONDS):
+                # ── Pipeline progress watchdog ───────────────────────────
+                with _progress_lock:
+                    stall_seconds = time.time() - last_progress_time
+                # Allow 15 min grace for first R1 file (tree-sitter + LLM),
+                # 5 min thereafter.
+                stall_limit = 900 if last_progress_time == self._task_lease_started_at.get(task_id, 0) else 300
+                if stall_seconds > stall_limit:
+                    logger.error(
+                        "pipeline stalled: no progress for %ds (limit=%ds), aborting task=%s",
+                        stall_seconds, stall_limit, task_id,
+                    )
+                    orch.abort()
+                    stop_lease.set()
+                    return
+                # ── Lease renewal ────────────────────────────────────────
                 try:
                     _lg = get_db()
                     _ld = next(_lg)
