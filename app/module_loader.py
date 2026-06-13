@@ -39,6 +39,8 @@ import shutil
 from pathlib import Path
 from typing import NamedTuple
 
+from app.copy_utils import safe_copy2
+
 
 class ModuleInfo(NamedTuple):
     """模块元信息"""
@@ -249,7 +251,7 @@ def _link_file(src: str, dst: Path) -> str:
         pass
 
     # ── 策略 3：拷贝（兜底）────────────────────────────────────────
-    shutil.copy2(real_src, str(dst))
+    safe_copy2(real_src, str(dst))
     return "copy"
 
 

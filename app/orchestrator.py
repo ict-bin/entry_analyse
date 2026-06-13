@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from .copy_utils import safe_copy2
 from .functions_list import auto_fix_functions_list, validate_functions_list
 
 
@@ -393,7 +394,7 @@ class Orchestrator:
         _inc_dst = out_dir / "incomplete_functions.json"
         if _inc_src.exists():
             import shutil as _shutil
-            _shutil.copy2(str(_inc_src), str(_inc_dst))
+            safe_copy2(str(_inc_src), str(_inc_dst))
         else:
             _inc_dst.write_text("[]", encoding="utf-8")
 
@@ -412,7 +413,7 @@ class Orchestrator:
                     for _db_file in _funcdb_src.glob("*_functions.db"):
                         _dst_file = _funcdb_dst / _db_file.name
                         if not _dst_file.exists():
-                            _shutil.copy2(str(_db_file), str(_dst_file))
+                            safe_copy2(str(_db_file), str(_dst_file))
                 except Exception as _fdb_exc:
                     import logging as _log
                     _log.getLogger("ea.orchestrator").warning(
