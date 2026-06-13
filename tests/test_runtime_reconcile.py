@@ -258,14 +258,14 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
         [valid_running],
         [SimpleNamespace(), SimpleNamespace()],
     ])
-    monkeypatch.setattr(worker_slot_service, "_load_svc_config_from_db", lambda _db, _project_id: SimpleNamespace(max_concurrent_tasks=4))
-    monkeypatch.setattr(WorkerSlotService, "_active_running_count", lambda self, _db, _project_id: 1)
-
     snapshot = WorkerSlotService().get_cluster_snapshot(db, project_id="p1")
 
     assert snapshot["queued_jobs"] == 2
     assert snapshot["busy_slots"] == 1
     assert snapshot["available_slots"] == 3
+    assert snapshot["dispatch_limit"] == 4
+    assert snapshot["dispatch_running"] == 1
+    assert snapshot["dispatch_available"] == 3
     assert snapshot["worker_count"] == 1
     assert snapshot["healthy_workers"] == 1
     assert snapshot["stale_workers"] == 0
@@ -420,12 +420,10 @@ def test_scheduler_reconcile_invalid_owner_running_task(monkeypatch) -> None:
         changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
         db.refresh(row)
 
-        assert changed == 1
-        assert row.status == "pending"
-        assert row.owner_pod is None
-        assert events[0]["event_type"] == "task_invalid_owner_detected"
-        assert events[1]["event_type"] == "task_requeued_after_invalid_owner_reconcile"
-        assert events[1]["payload"]["reconcile_reason"] == "invalid_owner_alive"
+        assert changed == 0
+        assert row.status == "running"
+        assert row.owner_pod == "secflow-app-entry-analyse-api-pod"
+        assert events == []
     finally:
         db.close()
 
@@ -512,7 +510,7 @@ def test_worker_runtime_health_snapshot_includes_lease_and_guard() -> None:
     assert snapshot["guard"]["state"] == "healthy"
 
 
-def test_active_running_count_excludes_binary_security_origin_tasks() -> None:
+def test_active_running_count_includes_binary_security_origin_tasks() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -549,9 +547,68 @@ def test_active_running_count_excludes_binary_security_origin_tasks() -> None:
         ])
         db.commit()
 
-        assert task_service.TaskService._active_running_count(db, "p1") == 1
+        assert task_service.TaskService._active_running_count(db, "p1") == 2
     finally:
         db.close()
+
+
+def test_dispatch_pending_tasks_ignores_project_max_concurrency(monkeypatch) -> None:
+    claimed_rows = []
+    started_tasks = []
+    candidate_row = SimpleNamespace(id=11, task_id="eat_pending_1")
+    claimed_task = SimpleNamespace(task_id="eat_pending_1")
+
+    class _DispatchQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [candidate_row]
+
+    class _DispatchDb:
+        def query(self, model):
+            del model
+            return _DispatchQuery()
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(app_db, "get_db", lambda: _db_generator(_DispatchDb()))
+    monkeypatch.setattr(task_service, "_requeue_expired_running_tasks", lambda *args, **kwargs: (0, 0))
+    monkeypatch.setattr(
+        task_service,
+        "_load_svc_config_from_db",
+        lambda _db, _project_id: SimpleNamespace(max_concurrent_tasks=0),
+    )
+
+    worker = SimpleNamespace(
+        local_running_count=lambda: 0,
+        has_local_task=lambda _task_id: False,
+        start_task=lambda task_id: started_tasks.append(task_id),
+    )
+    monkeypatch.setattr(
+        __import__("app.service.worker_service", fromlist=["get_worker_service"]),
+        "get_worker_service",
+        lambda: worker,
+    )
+
+    service = task_service.TaskService()
+    monkeypatch.setattr(
+        service,
+        "_claim_task_row_atomic",
+        lambda _db, row_id: claimed_rows.append(row_id) or claimed_task,
+    )
+
+    asyncio.run(service._dispatch_pending_tasks("p1"))
+
+    assert claimed_rows == [11]
+    assert started_tasks == ["eat_pending_1"]
 
 
 class _DeleteTaskQuery:

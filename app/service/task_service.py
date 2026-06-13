@@ -21,9 +21,8 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppEaDispatchLease, AppEaTask, AppEaTaskEvent, AppEaStageResultIndex, AppEaWorkerSlot
+from app.db.models import AppEaTask, AppEaTaskEvent, AppEaStageResultIndex, AppEaWorkerSlot
 from app.logging_utils import log_event
-from app.models import normalize_max_concurrent_tasks
 from app.service.session_index import build_session_catalog
 from app.service.runtime_role import RUNTIME_ROLE_WORKER, get_runtime_role, role_enabled
 from app.time_utils import add_seconds_local, isoformat_local, now_local
@@ -93,7 +92,6 @@ LEASE_DURATION_SECONDS = int(os.environ.get("EA_TASK_LEASE_SECONDS", "300"))
 LEASE_RENEW_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_LEASE_RENEW_INTERVAL_SECONDS", "30"))
 CANCEL_POLL_INTERVAL_SECONDS = int(os.environ.get("EA_TASK_CANCEL_POLL_INTERVAL_SECONDS", "3"))
 DISPATCH_CLAIM_BATCH_SIZE = _positive_int_env("EA_WORKER_DISPATCH_CLAIM_BATCH_SIZE", 1)
-DISPATCH_LEASE_SECONDS = _positive_int_env("EA_DISPATCH_LEASE_SECONDS", 30)
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
     or os.environ.get("POD_NAME")
@@ -662,18 +660,9 @@ def _lease_deadline() -> datetime:
     return add_seconds_local(now_local(), LEASE_DURATION_SECONDS)
 
 
-def _dispatch_lease_deadline() -> datetime:
-    return add_seconds_local(now_local(), DISPATCH_LEASE_SECONDS)
-
-
 def _lease_expired_expr():
     now = now_local()
     return or_(AppEaTask.lease_expires_at.is_(None), AppEaTask.lease_expires_at < now)
-
-
-def _dispatch_lease_expired_expr():
-    now = now_local()
-    return or_(AppEaDispatchLease.lease_expires_at.is_(None), AppEaDispatchLease.lease_expires_at < now)
 
 
 def _current_runtime_role() -> str:
@@ -1839,13 +1828,6 @@ def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task
     return str(task_origin_type or "").strip() == "binary_security"
 
 
-def _project_dispatch_limit_filter():
-    return or_(
-        AppEaTask.task_origin_type.is_(None),
-        AppEaTask.task_origin_type != "binary_security",
-    )
-
-
 def _normalize_entry_input_contract(input_contract: Optional[dict[str, Any]]) -> dict[str, Any]:
     return dict(input_contract) if isinstance(input_contract, dict) else {}
 
@@ -2099,62 +2081,6 @@ class TaskService:
         return lock
 
     @staticmethod
-    def _acquire_dispatch_lease(db: Session, project_id: str) -> str | None:
-        if not _worker_runtime_enforced():
-            logger.error(
-                "dispatch lease denied for non-worker runtime_role=%s pod=%s project_id=%s",
-                _current_runtime_role(),
-                POD_NAME,
-                project_id,
-            )
-            db.rollback()
-            return None
-        now = now_local()
-        token = uuid.uuid4().hex
-        lease_deadline = _dispatch_lease_deadline()
-        row = (
-            db.query(AppEaDispatchLease)
-            .filter(AppEaDispatchLease.project_id == project_id)
-            .with_for_update()
-            .first()
-        )
-        if row is None:
-            row = AppEaDispatchLease(
-                project_id=project_id,
-                lease_owner=POD_NAME,
-                lease_token=token,
-                operation="dispatch",
-                lease_expires_at=lease_deadline,
-                heartbeat_at=now,
-            )
-            db.add(row)
-            db.commit()
-            return token
-        if row.lease_owner == POD_NAME or row.lease_expires_at < now:
-            row.lease_owner = POD_NAME
-            row.lease_token = token
-            row.operation = "dispatch"
-            row.lease_expires_at = lease_deadline
-            row.heartbeat_at = now
-            db.commit()
-            return token
-        db.rollback()
-        return None
-
-    @staticmethod
-    def _release_dispatch_lease(db: Session, project_id: str, token: str) -> None:
-        db.execute(
-            update(AppEaDispatchLease)
-            .where(
-                AppEaDispatchLease.project_id == project_id,
-                AppEaDispatchLease.lease_owner == POD_NAME,
-                AppEaDispatchLease.lease_token == token,
-            )
-            .values(lease_expires_at=now_local(), heartbeat_at=now_local())
-        )
-        db.commit()
-
-    @staticmethod
     def _claim_task_row(db: Session, row_id: int) -> AppEaTask | None:
         if not _worker_runtime_enforced():
             logger.error(
@@ -2387,7 +2313,6 @@ class TaskService:
             .filter(
                 AppEaTask.project_id == project_id,
                 AppEaTask.is_deleted.is_(False),
-                _project_dispatch_limit_filter(),
                 AppEaTask.status == "running",
                 AppEaTask.cancel_requested.is_(False),
                 AppEaTask.lease_expires_at.is_not(None),
@@ -2444,11 +2369,7 @@ class TaskService:
         async with lock:
             db_gen = get_db()
             db: Session = next(db_gen)
-            dispatch_token: str | None = None
             try:
-                dispatch_token = self._acquire_dispatch_lease(db, project_id)
-                if not dispatch_token:
-                    return
                 reclaimed_count, reclaimed_owner_alive = _requeue_expired_running_tasks(
                     db,
                     project_id=project_id,
@@ -2463,16 +2384,13 @@ class TaskService:
                         project_id,
                         reclaimed_owner_alive,
                     )
-                svc = _load_svc_config_from_db(db, project_id)
-                max_concurrent_tasks = normalize_max_concurrent_tasks(
-                    getattr(svc, "max_concurrent_tasks", None)
-                )
                 from app.service.worker_service import get_worker_service
                 worker_service = get_worker_service()
                 local_running_count = worker_service.local_running_count()
-                if local_running_count >= max_concurrent_tasks:
+                worker_available_slots = max(0, 1 - local_running_count)
+                if worker_available_slots <= 0:
                     return
-                claim_slots = min(max_concurrent_tasks - local_running_count, DISPATCH_CLAIM_BATCH_SIZE)
+                claim_slots = min(worker_available_slots, DISPATCH_CLAIM_BATCH_SIZE)
                 if claim_slots <= 0:
                     return
                 candidate_rows = (
@@ -2492,12 +2410,11 @@ class TaskService:
                 )
                 claimed_count = 0
                 for row in candidate_rows:
-                    if local_running_count >= max_concurrent_tasks or claimed_count >= claim_slots:
+                    if local_running_count >= 1 or claimed_count >= claim_slots:
                         break
                     if worker_service.has_local_task(row.task_id):
                         continue
-                    # per-pod 限制：本 pod 已运行任务数 ≥ max_concurrent_tasks 则不再领取
-                    if worker_service.local_running_count() >= max_concurrent_tasks:
+                    if worker_service.local_running_count() >= 1:
                         break
                     claimed = self._claim_task_row_atomic(db, row.id)
                     if claimed is None:
@@ -2508,15 +2425,6 @@ class TaskService:
             except Exception as exc:
                 logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)
             finally:
-                if dispatch_token:
-                    try:
-                        self._release_dispatch_lease(db, project_id, dispatch_token)
-                    except Exception as release_exc:
-                        logger.warning(
-                            "release entry-analysis dispatch lease failed for %s: %s",
-                            project_id,
-                            release_exc,
-                        )
                 _dispatch_tasks.pop(project_id, None)
                 try:
                     next(db_gen)

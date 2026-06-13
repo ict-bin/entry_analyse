@@ -14,10 +14,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.models import AppEaTask, AppEaWorkerSlot
-from app.models import normalize_max_concurrent_tasks
 from app.service.runtime_role import RUNTIME_ROLE_WORKER
 from app.time_utils import add_seconds_local, isoformat_local, now_local
-from app.service.task_service import _load_svc_config_from_db, _project_dispatch_limit_filter
 
 HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("EA_WORKER_SLOT_HEARTBEAT_SECONDS", "30")))
 STALE_AFTER_SECONDS = max(
@@ -77,7 +75,6 @@ class WorkerSlotService:
     def _active_running_count(self, db: Session, project_id: str | None) -> int:
         query = db.query(AppEaTask).filter(
             AppEaTask.is_deleted.is_(False),
-            _project_dispatch_limit_filter(),
             AppEaTask.status == "running",
             AppEaTask.cancel_requested.is_(False),
             AppEaTask.lease_expires_at.is_not(None),
@@ -86,12 +83,6 @@ class WorkerSlotService:
         if str(project_id or "").strip():
             query = query.filter(AppEaTask.project_id == project_id)
         return int(query.count())
-
-    def _configured_dispatch_limit(self, db: Session, project_id: str) -> int:
-        if not str(project_id or "").strip():
-            return 0
-        svc = _load_svc_config_from_db(db, project_id)
-        return normalize_max_concurrent_tasks(getattr(svc, "max_concurrent_tasks", None))
 
     def _list_live_worker_pods(self) -> set[str]:
         if not K8S_SERVICE_HOST:
@@ -161,7 +152,7 @@ class WorkerSlotService:
                 pod_name,
             )
             return
-        normalized_capacity = normalize_max_concurrent_tasks(max_concurrent_tasks)
+        normalized_capacity = max(1, int(max_concurrent_tasks or 1))
         row = db.query(AppEaWorkerSlot).filter(AppEaWorkerSlot.worker_id == worker_id).first()
         now = now_local()
         if row is None:
@@ -367,9 +358,9 @@ class WorkerSlotService:
         agent_rss_max_bytes = max((int(item.get("agent_rss_max_bytes") or 0) for item in live_workers), default=0)
         agent_queue_oldest_wait_seconds = max((float(item.get("agent_queue_oldest_wait_seconds") or 0.0) for item in live_workers), default=0.0)
         healthy_workers = sum(1 for item in live_workers if item["healthy"])
-        dispatch_limit = self._configured_dispatch_limit(db, project_id)
-        dispatch_running = self._active_running_count(db, project_id) if dispatch_limit > 0 else 0
-        dispatch_available = max(0, dispatch_limit - dispatch_running)
+        dispatch_limit = total_capacity
+        dispatch_running = busy_slots
+        dispatch_available = max(0, total_capacity - busy_slots)
         return {
             "worker_count": len(live_workers),
             "healthy_workers": healthy_workers,

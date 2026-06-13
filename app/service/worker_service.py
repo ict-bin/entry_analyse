@@ -79,7 +79,7 @@ def trigger_instant_cancel(task_id: str) -> bool:
 # 常量
 # ═══════════════════════════════════════════════════════════════════════════════
 
-WORKER_POLL_SECONDS           = int(os.environ.get("EA_WORKER_POLL_SECONDS", "5"))
+WORKER_POLL_SECONDS           = int(os.environ.get("EA_WORKER_POLL_SECONDS", "10"))
 CANCEL_POLL_INTERVAL_SECONDS  = int(os.environ.get("EA_TASK_CANCEL_POLL_INTERVAL_SECONDS", "3"))
 LEASE_RENEW_INTERVAL_SECONDS  = int(os.environ.get("EA_TASK_LEASE_RENEW_INTERVAL_SECONDS", "30"))
 LEASE_DURATION_SECONDS        = int(os.environ.get("EA_TASK_LEASE_SECONDS", "300"))
