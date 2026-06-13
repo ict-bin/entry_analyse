@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -433,14 +434,20 @@ class PipelineEngine:
     ) -> None:
         self.cfg = cfg
         self.task_id = task_id
-        self._on_event = on_event or (lambda e: None)
         self._cancel = cancel_event or asyncio.Event()
         self._source_dir: str = ""
-        self._out_dir: Path | None = None  # 输出目录（per-func report 使用）
+        self._out_dir: Path | None = None
         self._r4_j_confirmed: bool = False
-        # API_Filter result cache for current run. Direct API calls are now part of
-        # the full pipeline and share pod-level AgentProcessSlotManager capacity.
         self._api_filter_results: dict[str, dict] = {}
+        # Thread-safe _on_event: R1 runs in threads via asyncio.to_thread(),
+        # so _on_event must be callable from any thread.  Lock once at init.
+        self._on_event_lock = threading.Lock()
+        _raw = on_event or (lambda e: None)
+        _lock = self._on_event_lock
+        def _ts_emit(evt: Any) -> None:
+            with _lock:
+                _raw(evt)
+        self._on_event = _ts_emit
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
 
@@ -706,9 +713,28 @@ class PipelineEngine:
         ) -> None:
             if self._cancel.is_set():
                 return
-            # R1: 覆盖率 W+J（用信号量限制并发，防止 CPU/NFS IO 饱和）
+            # R1: 覆盖率 W+J — 在独立线程中运行，不阻塞主事件循环
+            # _r1_sem 限制并发线程数（防止 CPU/NFS IO 饱和）
+            _r1_timeout = int(os.environ.get("EA_R1_FILE_TIMEOUT_SECONDS", "600"))
             async with _r1_sem:
-                await self._run_file_r1(file_hash, file_path, dirs, state)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._run_file_r1_thread,
+                            file_hash, file_path, dirs, state,
+                        ),
+                        timeout=_r1_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "R1 thread timeout for %s after %ss, marking failed",
+                        file_path, _r1_timeout,
+                    )
+                    fs2 = state.files.get(file_hash)
+                    if fs2 is not None:
+                        fs2.r1_w_state = NodeState.FAILED
+                        fs2.r1_j_state = NodeState.FAILED
+                        await asyncio.to_thread(state.save, dirs.state_file)
             # 更新 R1 完成计数（动态 total_funcs）
             fs = state.files.get(file_hash)
             if fs is None or fs.r1_j_state != NodeState.PASSED:
@@ -756,6 +782,22 @@ class PipelineEngine:
             await self._run_r1(file_hash, file_path, dirs, state)
         if self._cancel.is_set() or fs.r1_j_state != NodeState.PASSED:
             return
+
+    def _run_file_r1_thread(
+        self,
+        file_hash: str,
+        file_path: str,
+        dirs: PipelineDirs,
+        state: PipelineState,
+    ) -> None:
+        """R1 in dedicated thread — zero asyncio on the main event loop.
+
+        Called via asyncio.to_thread(). Creates a fresh event loop in this
+        thread and runs the async _run_r1 inside it.  Tree-sitter, ctags,
+        FuncDB/ModuleDB SQLite writes all happen in this thread; the main
+        uvicorn event loop is never blocked.
+        """
+        asyncio.run(self._run_r1(file_hash, file_path, dirs, state))
 
     async def _run_r2(
         self,
@@ -991,28 +1033,21 @@ class PipelineEngine:
         dirs: PipelineDirs,
         state: PipelineState,
     ) -> None:
-        """R1：一次调用即完成（R1-W per-gap 并行已内建，不再需要 J 验证循环）。
-
-        Wrapped in asyncio.to_thread + asyncio.wait_for to prevent sync blocking
-        operations (tree-sitter, ctags, SQLite writes) from stalling the event loop
-        and to enforce a per-file timeout so one stuck file does not block the
-        entire pipeline.
-        """
+        """R1：一次调用即完成。在独立线程的 event loop 中运行。"""
         fs = state.files[file_hash]
+        # 防超时竞态：外层 asyncio.wait_for 可能已将此文件标记为 FAILED，
+        # 但本线程仍在后台运行。不再覆盖 FAILED 状态。
+        if fs.r1_j_state == NodeState.FAILED:
+            return
         r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
         if r1_max == 0:
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            state.save(dirs.state_file)
             return
-
-        # Per-file timeout: 10 minutes for the first attempt (tree-sitter +
-        # ctags + LLM gap-filling), generous enough for large files.
-        _r1_timeout = int(os.environ.get("EA_R1_FILE_TIMEOUT_SECONDS", "600"))
-
-        async def _run_r1_wrapped():
+        try:
             acfg = self.cfg.workers.agents[0]
-            return await run_r1_worker(
+            token_usage, funcs, func_hashes = await run_r1_worker(
                 file_path=file_path,
                 dirs=dirs,
                 acfg=acfg,
@@ -1026,11 +1061,6 @@ class PipelineEngine:
                 system_prompt=self._stage_sys_prompt("r1_worker"),
                 priority=SemPriority.R1_W,
             )
-
-        try:
-            token_usage, funcs, func_hashes = await asyncio.wait_for(
-                _run_r1_wrapped(), timeout=_r1_timeout,
-            )
             state.register_functions(
                 file_hash,
                 [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
@@ -1038,20 +1068,12 @@ class PipelineEngine:
             )
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
-            await asyncio.to_thread(state.save, dirs.state_file)
-        except asyncio.TimeoutError:
-            logger.error(
-                "R1-W timeout for %s after %ss, marking failed",
-                file_path, _r1_timeout,
-            )
-            fs.r1_w_state = NodeState.FAILED
-            fs.r1_j_state = NodeState.FAILED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            state.save(dirs.state_file)
         except Exception as exc:
             logger.error("R1-W failed for %s: %s", file_path, exc)
             fs.r1_w_state = NodeState.FAILED
             fs.r1_j_state = NodeState.FAILED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            state.save(dirs.state_file)
 
     # ── R2（行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
 # ── R2（ctags 行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
