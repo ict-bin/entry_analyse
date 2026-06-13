@@ -10,6 +10,7 @@ import re
 import tempfile
 import time as _time
 import uuid
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -107,7 +108,9 @@ POD_IP = (
 WORKER_OWNER_POD_RE = re.compile(r"^secflow-app-entry-analyse-worker(?:-adaptive)?-[a-z0-9]+-[a-z0-9]+$")
 
 _dispatch_tasks: dict[str, asyncio.Task] = {}
-_dispatch_locks: dict[str, asyncio.Lock] = {}
+_dispatch_lock_registry: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
 
 _TASK_LIST_SORT_COLUMNS = {
     "created_at": AppEaTask.created_at,
@@ -2074,10 +2077,15 @@ class TaskService:
 
     @staticmethod
     def _get_dispatch_lock(project_id: str) -> asyncio.Lock:
-        lock = _dispatch_locks.get(project_id)
+        loop = asyncio.get_running_loop()
+        loop_locks = _dispatch_lock_registry.get(loop)
+        if loop_locks is None:
+            loop_locks = {}
+            _dispatch_lock_registry[loop] = loop_locks
+        lock = loop_locks.get(project_id)
         if lock is None:
             lock = asyncio.Lock()
-            _dispatch_locks[project_id] = lock
+            loop_locks[project_id] = lock
         return lock
 
     @staticmethod

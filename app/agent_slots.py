@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.models import AGENT_PROCESS_LIMIT_DEFAULT, normalize_agent_process_limit
+from app.asyncio_compat import wait_event_cross_loop_safe
 
 
 # ─── 优先级常量（原 priority_semaphore.SemPriority，合并至此）─────────────────
@@ -291,7 +292,9 @@ class AgentProcessSlotManager:
             tasks: set[asyncio.Future | asyncio.Task[Any]] = {ticket.future} if ticket.future is not None else set()
             cancel_task: asyncio.Task[Any] | None = None
             if cancel_event is not None:
-                cancel_task = asyncio.create_task(cancel_event.wait())
+                cancel_task = asyncio.create_task(
+                    wait_event_cross_loop_safe(cancel_event)
+                )
                 tasks.add(cancel_task)
 
             try:
@@ -395,6 +398,13 @@ class AgentProcessSlotManager:
     async def release(self, lease: AgentSlotLease) -> None:
         with self._lock:
             self._leases.pop(id(lease), None)
+            # Capacity may have been reduced while this lease was active.
+            # In that case we must retire the released slot first instead of
+            # immediately transferring it to a waiter, otherwise in_use can
+            # stay above the configured capacity indefinitely.
+            if self._in_use > self.capacity:
+                self._in_use = max(0, self._in_use - 1)
+                return
             # 尝试将槽位直接转移给优先级最高的 waiter
             if self._award_next_waiter():
                 # 槽位转移：_in_use 不变（release 方的 -1 与 waiter 方的 +1 相消）

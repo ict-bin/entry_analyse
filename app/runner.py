@@ -32,6 +32,7 @@ from typing import Any, Callable, Optional
 
 from .agent_process import AgentProcessHandle, find_pi_command, process_group_id
 from .agent_slots import agent_process_slot, SemPriority
+from .asyncio_compat import wait_event_cross_loop_safe
 from .models import TokenUsage
 
 logger = logging.getLogger("ea.runner")
@@ -136,7 +137,10 @@ async def _sleep_cancel_first(delay: float, cancel_event: asyncio.Event | None) 
     if cancel_event.is_set():
         return True
     try:
-        await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+        await asyncio.wait_for(
+            wait_event_cross_loop_safe(cancel_event),
+            timeout=delay,
+        )
         return True
     except asyncio.TimeoutError:
         return cancel_event.is_set()
@@ -1074,7 +1078,7 @@ async def _run_with_api_retry(
             _cancel_task: asyncio.Task[Any] | None = None
             if cancel_event:
                 async def _cancel_monitor() -> None:
-                    await cancel_event.wait()
+                    await wait_event_cross_loop_safe(cancel_event)
                     with contextlib.suppress(Exception):
                         _get_worker_service().mark_live_agent_process_terminating(
                             getattr(proc, "pid", None),

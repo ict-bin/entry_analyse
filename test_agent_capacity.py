@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import sys
 import time
 import unittest
@@ -82,6 +83,37 @@ class AgentCapacityTests(unittest.TestCase):
             await third.release()
 
         asyncio.run(run_case())
+
+    def test_agent_process_slot_manager_cancel_event_can_cross_event_loops(self):
+        manager = AgentProcessSlotManager(capacity=1)
+        cross_loop_event_holder: dict[str, asyncio.Event] = {}
+
+        async def bind_event_on_first_loop() -> None:
+            event = asyncio.Event()
+            cross_loop_event_holder["event"] = event
+            waiter = asyncio.create_task(event.wait())
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiter
+
+        asyncio.run(bind_event_on_first_loop())
+
+        async def acquire_on_second_loop() -> None:
+            first = await manager.acquire(task_id="slot-holder")
+            acquire_task = asyncio.create_task(
+                manager.acquire(
+                    task_id="cross-loop-cancel",
+                    cancel_event=cross_loop_event_holder["event"],
+                )
+            )
+            await asyncio.sleep(0.05)
+            cross_loop_event_holder["event"].set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(acquire_task, timeout=1)
+            await first.release()
+
+        asyncio.run(acquire_on_second_loop())
 
 
 if __name__ == "__main__":
