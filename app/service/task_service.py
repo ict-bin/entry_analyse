@@ -222,6 +222,42 @@ def _event_dedupe_key(*parts: object) -> str:
     return raw
 
 
+DB_TIMELINE_EVENT_LIMIT = 10_000
+
+
+def _trim_task_timeline_events(db: Session, task_id: str, *, limit: int | None = None) -> int:
+    normalized_limit = max(0, int(DB_TIMELINE_EVENT_LIMIT if limit is None else limit))
+    if normalized_limit <= 0:
+        return 0
+    total = int(
+        db.query(AppEaTaskEvent)
+        .filter(AppEaTaskEvent.task_id == task_id)
+        .count()
+        or 0
+    )
+    trim_count = max(0, total - normalized_limit)
+    if trim_count <= 0:
+        return 0
+    old_event_ids = [
+        row.id
+        for row in (
+            db.query(AppEaTaskEvent.id)
+            .filter(AppEaTaskEvent.task_id == task_id)
+            .order_by(AppEaTaskEvent.created_at.asc(), AppEaTaskEvent.id.asc())
+            .limit(trim_count)
+            .all()
+        )
+    ]
+    if not old_event_ids:
+        return 0
+    deleted = (
+        db.query(AppEaTaskEvent)
+        .filter(AppEaTaskEvent.id.in_(old_event_ids))
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
+
+
 def _normalize_timeline_event(evt: dict[str, Any]) -> dict[str, Any]:
     data = evt.get("data") if isinstance(evt.get("data"), dict) else {}
     stage_key = (
@@ -354,6 +390,7 @@ def _create_task_event(
     event.payload = payload or {}
     db.add(event)
     db.flush()
+    _trim_task_timeline_events(db, task_id)
 
 
 def _safe_create_task_event(db: Session, **kwargs: Any) -> None:

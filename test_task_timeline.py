@@ -235,6 +235,38 @@ class EntryTaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_task_timeline_auto_trims_oldest_events_when_limit_exceeded(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_trim", status="running")
+            with patch.object(task_service, "DB_TIMELINE_EVENT_LIMIT", 3):
+                for idx in range(4):
+                    task_service._safe_create_task_event(
+                        db,
+                        task_id=task.task_id,
+                        project_id=task.project_id,
+                        event_type="task_dispatched",
+                        message=f"event-{idx}",
+                        source=task_service.TASK_EVENT_SOURCE_SYSTEM,
+                        status=task.status,
+                        dedupe_key=f"trim-{idx}",
+                    )
+                db.commit()
+
+            rows = (
+                db.query(AppEaTaskEvent)
+                .filter(AppEaTaskEvent.task_id == task.task_id)
+                .order_by(AppEaTaskEvent.created_at.asc(), AppEaTaskEvent.id.asc())
+                .all()
+            )
+            self.assertEqual(3, len(rows))
+            self.assertEqual(
+                ["event-1", "event-2", "event-3"],
+                [row.message for row in rows],
+            )
+        finally:
+            db.close()
+
     def test_clear_and_delete_single_timeline_event_return_counts(self):
         db = self.SessionLocal()
         try:
