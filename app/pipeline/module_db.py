@@ -315,11 +315,6 @@ class ModuleDB:
     # ── 工厂方法 ───────────────────────────────────────────────────────────────
 
     @classmethod
-    def open(cls, workspace_dir: Path, task_id: str = "") -> "ModuleDB":
-        """打开（或创建）模块级中心数据库。task_id 非空时使用本地 /tmp 避免 NFS 锁。"""
-        if task_id:
-            import tempfile, os
-            local_dir = Path(tempfile.gettempdir()) / f"ea_module_{task_id}"
-            local_dir.mkdir(parents=True, exist_ok=True)
-            return cls(local_dir / "module_functions.db")
+    def open(cls, workspace_dir: Path) -> "ModuleDB":
+        """打开（或创建）模块级中心数据库。"""
         return cls(workspace_dir / "module_functions.db")

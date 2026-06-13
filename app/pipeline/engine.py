@@ -506,6 +506,13 @@ class PipelineEngine:
         # 防止 336 个函数同时提交 asyncio.to_thread 任务风暴导致 health probe 超时
         # R3/CC/R4 不受此限制（不会造成死锁）
         _r2_sem = asyncio.Semaphore(max(1, int(os.environ.get('EA_R2_CONCURRENCY', '32'))))
+        # R1 并发信号量：限制同时进行 R1 处理（tree-sitter + ctags + gap LLM）的文件数。
+        # tree-sitter 和 ctags 是 CPU/IO 密集型操作，过多并发会导致：
+        #   - 事件循环被 sync 操作长时间阻塞，health probe 超时
+        #   - NFS IO 饱和，所有文件处理变慢
+        #   - ModuleDB SQLite 锁竞争（210 个文件同时写同一个 DB）
+        # 默认 8，可按 pod CPU/NFS 性能通过环境变量调整。
+        _r1_sem = asyncio.Semaphore(max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8'))))
 
         # 无文件时直接解锁
         if total_files == 0:
@@ -699,8 +706,9 @@ class PipelineEngine:
         ) -> None:
             if self._cancel.is_set():
                 return
-            # R1: 覆盖率 W+J
-            await self._run_file_r1(file_hash, file_path, dirs, state)
+            # R1: 覆盖率 W+J（用信号量限制并发，防止 CPU/NFS IO 饱和）
+            async with _r1_sem:
+                await self._run_file_r1(file_hash, file_path, dirs, state)
             # 更新 R1 完成计数（动态 total_funcs）
             fs = state.files.get(file_hash)
             if fs is None or fs.r1_j_state != NodeState.PASSED:
