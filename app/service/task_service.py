@@ -68,6 +68,7 @@ _USER_TIMELINE_EVENT_TYPES: set[str] = {
     "task_lease_lost",
     "task_runtime_interrupted",
     "task_rate_limited_retrying",
+    "task_api_retrying",
     "api_filter_started",
     "api_filter_timed_out",
     "api_filter_skipped",

@@ -2784,6 +2784,16 @@ class PipelineEngine:
                 role_kind=role_kind,
                 model=acfg.model,
             )
+        if getattr(ar, "api_retry_event_due", False):
+            self._emit(
+                "task_api_retrying",
+                stage=stage_key,
+                retry_delay_seconds=int(getattr(ar, "retry_delay_seconds", 30) or 30),
+                consecutive_api_retry_count=int(getattr(ar, "consecutive_api_retry_count", 0) or 0),
+                reason=str(getattr(ar, "api_retry_reason", "") or ""),
+                role_kind=role_kind,
+                model=acfg.model,
+            )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Pipeline fatal error [{context}]: {ar.error}")
         # Record session timing metrics

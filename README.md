@@ -224,7 +224,7 @@ FLAG=$(cat /path/to/output/flag)
     "max_rounds": 3,
     "min_rounds": 1,
     "pass_threshold": 1,
-    "agent_max_retries": 100,
+    "agent_max_retries": -1,
     "agent_retry_delay": 30,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,

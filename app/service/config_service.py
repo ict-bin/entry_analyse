@@ -24,7 +24,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pass_threshold": 0,
     "max_concurrent_tasks": 8,
     "agent_process_limit": 8,
-    "agent_max_retries": 100,
+    "agent_max_retries": -1,
     "agent_retry_delay": 30,
     "agent_run_timeout_seconds": 1800,
     "agent_timeout_retry_enabled": True,

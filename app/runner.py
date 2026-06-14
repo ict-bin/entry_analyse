@@ -162,6 +162,9 @@ class AgentResult:
         self.consecutive_rate_limit_count: int = 0
         self.retry_delay_seconds: int = 0
         self.rate_limit_event_due: bool = False
+        self.api_retry_event_due: bool = False
+        self.consecutive_api_retry_count: int = 0
+        self.api_retry_reason: str | None = None
 
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
@@ -188,6 +191,12 @@ def _log_warn(msg: str) -> None:
     logger.warning(msg)
     ts = time.strftime("%H:%M:%S")
     print(f"  ⚠️  [{ts}] {msg}", file=sys.stderr, flush=True)
+
+
+def _should_emit_api_retry_event(consecutive_retries: int, delay_seconds: float) -> bool:
+    retries = max(0, int(consecutive_retries or 0))
+    delay = max(0.0, float(delay_seconds or 0))
+    return delay >= 30.0 and retries > 0 and retries % 10 == 0
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -1337,7 +1346,7 @@ async def _run_with_api_retry(
                 continue
             rate_limit_streak = 0
             api_attempt += 1
-            can_retry = (max_retries == -1) or (api_attempt <= max_retries)
+            can_retry = True
             label = f"{api_attempt}/{_fmt_max(max_retries)}"
             # timeout 类错误：pi 已自然退出，按连续次数决定重试策略
             if _is_timeout_error(result.error):
@@ -1367,6 +1376,10 @@ async def _run_with_api_retry(
             api_timeout_count = 0
             if can_retry:
                 delay = _backoff(retry_delay, api_attempt)
+                result.retry_delay_seconds = int(delay)
+                result.consecutive_api_retry_count = int(api_attempt)
+                result.api_retry_reason = str(result.error or "").strip()[:500] or None
+                result.api_retry_event_due = _should_emit_api_retry_event(api_attempt, delay)
                 _log_warn(f"API 错误 [{label}], {delay:.0f}s 后重试: "
                           f"{(result.error or '')[:200]}")
                 if on_stream:
@@ -1375,12 +1388,6 @@ async def _run_with_api_retry(
                 if await _sleep_cancel_first(delay, cancel_event):
                     return result
                 continue
-            else:
-                _log_error(f"API 重试耗尽 [{api_attempt}/{max_retries}]: "
-                           f"{(result.error or '')[:200]}")
-                result.error = (result.error or "") + \
-                    f" [API 重试耗尽: {api_attempt} 次失败]"
-                return result
 
         # ── 成功或不可重试的未知错误 ──
         if result.exit_code != 0 and result.error:
