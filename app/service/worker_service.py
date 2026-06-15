@@ -713,18 +713,25 @@ class WorkerService:
         cancel_requested = False
         last_progress_time = time.time()
         _progress_lock = threading.Lock()
+        # 本地事件文件：写在 run/ 目录下，与 pipeline_state.json 同级。
+        # API Pod 通过 PVC 读取，Worker 不再推送 MySQL。
+        _events_path: _pl.Path | None = None
 
         def _on_event(event: Any) -> None:
             nonlocal last_progress_time
             ts = task_mod._time.time()
-            event_buffer.append({
-                "ts": ts, "type": event.type,
-                "data": dict(getattr(event, "data", {})),
-            })
+            entry = {"ts": ts, "type": event.type, "data": dict(getattr(event, "data", {}))}
+            event_buffer.append(entry)
+            # 写本地 JSONL（每行一个 event，即时 flush）
+            if _events_path is not None:
+                try:
+                    with open(str(_events_path), "a", encoding="utf-8") as _ef:
+                        _ef.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                        _ef.flush()
+                except Exception:
+                    pass
             with _progress_lock:
                 last_progress_time = time.time()
-            if len(event_buffer) % 5 == 0:
-                task_mod._flush_stages(task_id, event_buffer)
 
         # ── Step 0: Claim the task in DB ──────────────────────────────────
         db_gen = get_db()
@@ -812,13 +819,16 @@ class WorkerService:
                         raise
                 d.mkdir(parents=True, exist_ok=True)
 
+        # 初始化本地事件文件（写在 run/ 下，API Pod 通过 PVC 读取）
+        if task_snapshot.output_path:
+            _events_path = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id / "run" / "events.jsonl"
+
         # DB: clear runtime fields, stage_result_index
         _db2_gen = get_db()
         _db2 = next(_db2_gen)
         try:
             _r2 = _db2.query(AppEaTask).filter_by(task_id=task_id).first()
             if _r2:
-                _r2.stages_json = None
                 _r2.result_json = None
                 _r2.error = None
                 _r2.finished_at = None
@@ -1092,8 +1102,21 @@ class WorkerService:
                 task_id,
             )
 
-        # ── Step 9: Finalize DB ───────────────────────────────────────────
-        task_mod._flush_stages(task_id, event_buffer)
+        # ── Step 9: Finalize events file ──────────────────────────────────
+        # 写入最终事件（含 final 标记）到本地 JSONL，不再推送 MySQL。
+        if _events_path is not None:
+            try:
+                final_entry = {"ts": time.time(), "type": "done", "data": {"status": result.status.value if result else "error"}}
+                with open(str(_events_path), "a", encoding="utf-8") as _ef:
+                    # 写入缓冲区中未落盘的事件
+                    for _evt in event_buffer:
+                        _ef.write(json.dumps(_evt, ensure_ascii=False) + "\n")
+                    _ef.write(json.dumps(final_entry, ensure_ascii=False) + "\n")
+                    _ef.flush()
+            except Exception as _exc:
+                logger.warning("Failed to write final events.jsonl: %s", _exc)
+
+        # ── Step 10: Finalize DB status ───────────────────────────────────
 
         _fg = get_db()
         _fd = next(_fg)
@@ -1122,8 +1145,6 @@ class WorkerService:
             _fr.owner_pod_ip = None
             _fr.lease_expires_at = None
             _fr.cancel_requested = False
-            _fr.stages_json = {"events": event_buffer, "final": True}
-            task_mod._sync_stage_events_to_timeline(_fd, _fr, event_buffer)
             reason, changed = task_mod._sync_task_abnormal_reason(_fr)
             task_mod._record_abnormal_reason(_fr, reason, changed=changed)
             task_mod._safe_create_task_event(

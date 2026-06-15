@@ -1668,64 +1668,51 @@ def get_task_logs(
     db: Session = Depends(get_db),
     _=Depends(get_current_user),
 ):
-    """Return stages_json events for the task.
+    """Return pipeline events from local events.jsonl (no MySQL push).
 
-    Use ``since`` (default 0) to fetch only events after a known offset,
-    enabling incremental polling: clients send back the ``total_event_count``
-    they last received, and the server returns only the new tail.
-
-    When ``since >= total_event_count`` a lightweight MySQL query is used so
-    the full stages_json blob is never loaded into Python memory.
+    Uses ``since`` (default 0) to fetch only events after a known offset,
+    enabling incremental polling.
     """
-    from sqlalchemy import text as _sa_text
     from fastapi import HTTPException
+    from pathlib import Path as _Path
     from app.db.models import AppEaTask
 
-    # --- Step 1: cheap pre-check via JSON_LENGTH (no blob loading) ----------
-    row_light = db.execute(
-        _sa_text(
-            "SELECT task_id, status, "
-            "JSON_LENGTH(stages_json, '$.events') AS event_count, "
-            "JSON_VALUE(stages_json, '$.final') AS is_final "
-            "FROM secflow_app_ea_tasks "
-            "WHERE task_id = :tid AND is_deleted = 0"
-        ),
-        {"tid": task_id},
-    ).fetchone()
-    if not row_light:
-        raise HTTPException(404, f"任务不存在: {task_id}")
-
-    # column order: task_id=0, status=1, event_count=2, is_final=3
-    task_status = str(row_light[1] or "")
-    total = int(row_light[2] or 0)
-    is_final = bool(row_light[3] and str(row_light[3]).lower() not in ("0", "false", "null"))
-
-    # --- Step 2: if no new events, return immediately (no blob load) --------
-    if since >= total:
-        return {
-            "task_id": task_id,
-            "status": task_status,
-            "total_event_count": total,
-            "final": is_final,
-            "events": [],
-        }
-
-    # --- Step 3: new events exist – load full blob only now -----------------
     row = db.query(AppEaTask).filter(
         AppEaTask.task_id == task_id,
         AppEaTask.is_deleted.is_(False),
     ).first()
     if not row:
         raise HTTPException(404, f"任务不存在: {task_id}")
-    payload = row.stages_json if isinstance(row.stages_json, dict) else {}
-    all_events: list = payload.get("events") if isinstance(payload.get("events"), list) else []
+
+    # ── 从本地 events.jsonl 读取（Worker 写，API 读，通过 PVC 共享）─────
+    events_path = _Path(row.output_path or "") / task_id / "run" / "events.jsonl"
+    all_events: list[dict] = []
+    is_final = False
+    if events_path.is_file():
+        try:
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    import json as _json
+                    evt = _json.loads(line)
+                except Exception:
+                    continue
+                if evt.get("type") == "done":
+                    is_final = True
+                    continue
+                all_events.append(evt)
+        except Exception:
+            pass
+
     total = len(all_events)
     since_clamped = max(0, min(since, total))
     return {
         "task_id": task_id,
         "status": row.status,
         "total_event_count": total,
-        "final": bool(payload.get("final", False)),
+        "final": is_final or row.status in ("passed", "failed", "cancelled", "error"),
         "events": all_events[since_clamped:],
     }
 
