@@ -1090,6 +1090,8 @@ class PipelineEngine:
                 system_prompt=self._stage_sys_prompt("r1_worker"),
                 priority=SemPriority.R1_W,
             )
+            import sys
+            print(f"R1_POST_AWAIT [{basename}]: funcs={len(funcs)}", file=sys.stderr, flush=True)
             logger.info("R1_worker_done: file=%s funcs=%s gaps_attempted=True", basename, len(funcs))
             logger.info("R1_state_presave: file=%s registering %s functions", basename, len(funcs))
             state.register_functions(
@@ -1104,7 +1106,9 @@ class PipelineEngine:
             state.save(dirs.state_file)
             logger.info("R1_pass: file=%s funcs=%s", basename, len(funcs))
         except Exception as exc:
-            logger.error("R1-W failed for %s: %s", file_path, exc)
+            import sys, traceback
+            print(f"R1-W FAILED [{basename}]: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             fs.r1_w_state = NodeState.FAILED
             fs.r1_j_state = NodeState.FAILED
             state.save(dirs.state_file)
