@@ -730,7 +730,6 @@ class PipelineEngine:
             # _r1_sem 限制并发线程数（防止 CPU/NFS IO 饱和）
             _r1_timeout = int(os.environ.get("EA_R1_FILE_TIMEOUT_SECONDS", "600"))
             async with _r1_sem:
-                logger.info("R1_sem_acquired: file=%s hash=%s", _fname, file_hash)
                 try:
                     await asyncio.wait_for(
                         asyncio.to_thread(
@@ -752,7 +751,6 @@ class PipelineEngine:
             # 更新 R1 完成计数（动态 total_funcs）
             fs = state.files.get(file_hash)
             if fs is None or fs.r1_j_state != NodeState.PASSED:
-                logger.info("R1_file_failed: file=%s r1_w=%s r1_j=%s", _fname, getattr(fs, 'r1_w_state', '?') if fs else 'None', getattr(fs, 'r1_j_state', '?') if fs else 'None')
                 _on_r1_done(0)
                 return
             func_hashes = list(fs.functions.keys())
@@ -816,12 +814,10 @@ class PipelineEngine:
         FuncDB/ModuleDB SQLite writes all happen in this thread; the main
         uvicorn event loop is never blocked.
         """
-        logger.info("R1_thread_start: file=%s hash=%s", os.path.basename(file_path), file_hash)
         try:
             asyncio.run(self._run_r1(file_hash, file_path, dirs, state))
         except Exception as e:
             logger.error("R1_thread_crash: file=%s hash=%s err=%s", os.path.basename(file_path), file_hash, e, exc_info=True)
-        logger.info("R1_thread_done: file=%s hash=%s", os.path.basename(file_path), file_hash)
 
     async def _run_r2(
         self,
@@ -1060,22 +1056,18 @@ class PipelineEngine:
         """R1：一次调用即完成。在独立线程的 event loop 中运行。"""
         fs = state.files[file_hash]
         basename = os.path.basename(file_path)
-        logger.info("R1_enter: file=%s hash=%s", basename, file_hash)
         # 防超时竞态：外层 asyncio.wait_for 可能已将此文件标记为 FAILED，
         # 但本线程仍在后台运行。不再覆盖 FAILED 状态。
         if fs.r1_j_state == NodeState.FAILED:
-            logger.info("R1_skip_failed: file=%s hash=%s", basename, file_hash)
             return
         r1_max = int(getattr(self.cfg, "r1_max_rounds", -1))
         if r1_max == 0:
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED
             state.save(dirs.state_file)
-            logger.info("R1_skip_r1max0: file=%s hash=%s", basename, file_hash)
             return
         try:
             acfg = self.cfg.workers.agents[0]
-            logger.info("R1_call_worker: file=%s model=%s", basename, acfg.model)
             token_usage, funcs, func_hashes = await run_r1_worker(
                 file_path=file_path,
                 dirs=dirs,
@@ -1090,25 +1082,18 @@ class PipelineEngine:
                 system_prompt=self._stage_sys_prompt("r1_worker"),
                 priority=SemPriority.R1_W,
             )
-            import sys
-            print(f"R1_POST_AWAIT [{basename}]: funcs={len(funcs)}", file=sys.stderr, flush=True)
-            logger.info("R1_worker_done: file=%s funcs=%s gaps_attempted=True", basename, len(funcs))
-            logger.info("R1_state_presave: file=%s registering %s functions", basename, len(funcs))
+            logger.info("R1_worker_done: file=%s funcs=%s", basename, len(funcs))
             state.register_functions(
                 file_hash,
                 [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
                  for fe, fh in zip(funcs, func_hashes)],
             )
-            logger.info("R1_state_mid: file=%s registered, setting state", basename)
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
-            logger.info("R1_state_saving: file=%s", basename)
             state.save(dirs.state_file)
             logger.info("R1_pass: file=%s funcs=%s", basename, len(funcs))
         except Exception as exc:
-            import sys, traceback
-            print(f"R1-W FAILED [{basename}]: {exc}", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
+            logger.error("R1-W failed for %s: %s", file_path, exc)
             fs.r1_w_state = NodeState.FAILED
             fs.r1_j_state = NodeState.FAILED
             state.save(dirs.state_file)

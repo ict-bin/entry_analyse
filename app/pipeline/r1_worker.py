@@ -423,7 +423,6 @@ async def run_r1_worker(
                is_retry=False, retry_reason="", gap_count=len(gaps_list), llm_gap_count=len(llm_gaps))
 
     if llm_gaps:
-        logger.info("R1_llm_gaps_start: file=%s gaps=%s skipped=%s", basename, len(llm_gaps), skipped_n)
         try:
             source_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
         except Exception as e:
@@ -506,36 +505,29 @@ async def run_r1_worker(
                 total_usage = TokenUsage()
 
                 async def _invoke(prompt_text: str, is_retry: bool = False):
-                    logger.info("R1_gap_agent_call: file=%s gap=%s model=%s", basename, gid, acfg.model)
-                    try:
-                        result = await run_agent(
-                            prompt=prompt_text,
-                            model=acfg.model,
-                            tools=_gap_tools,  # read/edit/write excluded
-                            system_prompt=system_prompt,
-                            cwd=workspace,
-                            thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
-                            session_file=session_path,
-                            cancel_event=cancel_event,
-                            max_retries=cfg.agent_max_retries,
-                            retry_delay=cfg.agent_retry_delay,
-                            run_timeout_seconds=r1_timeout,
-                            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
-                            timeout_max_retries=cfg.agent_timeout_max_retries,
-                            pi_max_retries=cfg.pi_max_retries,
-                            pi_retry_delay=cfg.pi_retry_delay,
-                            max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
-                            task_id=task_id,
-                            stage_key="r1_w",
-                            role_kind="worker",
-                            priority=priority,
-                            task_pi_dir=getattr(cfg, "task_pi_dir", ""),
-                        )
-                        logger.info("R1_gap_agent_done: file=%s gap=%s ok=%s", basename, gid, not result.fatal and not result.error)
-                        return result
-                    except Exception as e:
-                        logger.error("R1_gap_agent_crash: file=%s gap=%s err=%s", basename, gid, e, exc_info=True)
-                        raise
+                    return await run_agent(
+                        prompt=prompt_text,
+                        model=acfg.model,
+                        tools=_gap_tools,
+                        system_prompt=system_prompt,
+                        cwd=workspace,
+                        thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
+                        session_file=session_path,
+                        cancel_event=cancel_event,
+                        max_retries=cfg.agent_max_retries,
+                        retry_delay=cfg.agent_retry_delay,
+                        run_timeout_seconds=r1_timeout,
+                        timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+                        timeout_max_retries=cfg.agent_timeout_max_retries,
+                        pi_max_retries=cfg.pi_max_retries,
+                        pi_retry_delay=cfg.pi_retry_delay,
+                        max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
+                        task_id=task_id,
+                        stage_key="r1_w",
+                        role_kind="worker",
+                        priority=priority,
+                        task_pi_dir=getattr(cfg, "task_pi_dir", ""),
+                    )
 
                 prompt = build_r1_gap_prompt(
                     file_path=file_path, file_hash=file_hash, gap=gap,
