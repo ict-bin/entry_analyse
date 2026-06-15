@@ -614,42 +614,18 @@ class WorkerService:
 
         The scheduler sets owner_pod=POD_NAME + status=running + lease_expires_at.
         This loop picks up such tasks and starts executing them.
-        Falls back to legacy self-claim if the scheduler is not running.
         """
-        from app.service import task_service as task_mod
-        svc = task_mod.get_task_service()
-
         while self._running and not self._infra_stop.wait(timeout=WORKER_POLL_SECONDS):
             if self._local_task_ids:
                 continue  # busy with a task
 
             try:
-                # Primary: poll for tasks assigned to this pod by the scheduler
                 task_id = self._poll_assigned_task()
                 if task_id:
                     logger.info(
                         "worker picked up scheduler-assigned task: %s", task_id,
                     )
                     self.start_task(task_id)
-                    continue
-
-                # Fallback: legacy self-claim (for backward compat if scheduler is down)
-                project_ids = self._discover_active_projects()
-                if not project_ids:
-                    continue
-
-                loop = self._main_event_loop
-                for pid in project_ids:
-                    if self._local_task_ids:
-                        break
-                    if loop is not None and loop.is_running():
-                        loop.call_soon_threadsafe(
-                            lambda p=pid: asyncio.ensure_future(
-                                self._claim_and_start_legacy(svc, p)
-                            )
-                        )
-                    else:
-                        svc.schedule_dispatch(pid)
             except Exception as exc:
                 logger.warning("dispatch loop error: %s", exc)
 
