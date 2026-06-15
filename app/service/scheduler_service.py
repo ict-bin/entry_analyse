@@ -887,13 +887,21 @@ class SchedulerService:
 
     async def _dispatch_loop(self) -> None:
         """Assign pending tasks to available workers."""
+        _tick = 0
         while self._running:
+            _tick += 1
             try:
                 assigned = await self._dispatch_pending_tasks()
-                if assigned:
+                # Heartbeat log every 12 cycles (~60s) to confirm loop is alive
+                if _tick % 12 == 0:
+                    logger.info(
+                        "scheduler heartbeat: dispatch_loop alive (tick=%s assigned=%s)",
+                        _tick, assigned,
+                    )
+                elif assigned:
                     logger.info("scheduler dispatched %s tasks", assigned)
             except Exception as exc:
-                logger.warning("scheduler dispatch error: %s", exc)
+                logger.warning("scheduler dispatch error: %s", exc, exc_info=True)
             await asyncio.sleep(self.DISPATCH_POLL_SECONDS)
 
     async def _dispatch_pending_tasks(self) -> int:
@@ -1030,22 +1038,50 @@ class SchedulerService:
     # Main loops
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _command_loop(self) -> None:
-        """Process command queue."""
-        await self._process_commands_loop()
+    async def _command_loop_wrapper(self) -> None:
+        """Wrapper with global exception handler to prevent silent task death."""
+        try:
+            await self._process_commands_loop()
+        except Exception as exc:
+            logger.critical("scheduler command_loop FATAL: %s", exc, exc_info=True)
 
-    async def _reconcile_loop(self) -> None:
+    async def _reconcile_loop_wrapper(self) -> None:
+        try:
+            await self._reconcile_loop()
+        except Exception as exc:
+            logger.critical("scheduler reconcile_loop FATAL: %s", exc, exc_info=True)
+
+    async def _pod_health_loop_wrapper(self) -> None:
+        try:
+            await self._pod_health_loop()
+        except Exception as exc:
+            logger.critical("scheduler health_loop FATAL: %s", exc, exc_info=True)
+
+    async def _dispatch_loop_wrapper(self) -> None:
+        try:
+            await self._dispatch_loop()
+        except Exception as exc:
+            logger.critical("scheduler dispatch_loop FATAL: %s", exc, exc_info=True)
         """Reconcile cluster state periodically."""
+        _tick = 0
         while self._running:
+            _tick += 1
             try:
                 changed = await self._reconcile_cluster_state()
-                if changed:
+                # Heartbeat log every 12 cycles (~60s) to confirm loop is alive
+                if _tick % 12 == 0:
+                    logger.info(
+                        "scheduler heartbeat: reconcile_loop alive (tick=%s changed=%s "
+                        "task_map=%s pod_map=%s)",
+                        _tick, changed, len(self._task_owner), len(self._pod_tasks),
+                    )
+                elif changed:
                     logger.info(
                         "scheduler reconciled %s stale entry-analysis tasks",
                         changed,
                     )
             except Exception as exc:
-                logger.warning("scheduler reconcile failed: %s", exc)
+                logger.warning("scheduler reconcile failed: %s", exc, exc_info=True)
             await asyncio.sleep(SCHEDULER_POLL_SECONDS)
 
     def start(self) -> None:
@@ -1065,10 +1101,10 @@ class SchedulerService:
                 pass
 
         self._tasks = [
-            asyncio.create_task(self._command_loop(), name="ea_cmd_loop"),
-            asyncio.create_task(self._reconcile_loop(), name="ea_reconcile_loop"),
-            asyncio.create_task(self._pod_health_loop(), name="ea_pod_health_loop"),
-            asyncio.create_task(self._dispatch_loop(), name="ea_dispatch_loop"),
+            asyncio.create_task(self._command_loop_wrapper(), name="ea_cmd_loop"),
+            asyncio.create_task(self._reconcile_loop_wrapper(), name="ea_reconcile_loop"),
+            asyncio.create_task(self._pod_health_loop_wrapper(), name="ea_pod_health_loop"),
+            asyncio.create_task(self._dispatch_loop_wrapper(), name="ea_dispatch_loop"),
         ]
         logger.info(
             "Entry-analysis scheduler started (poll=%ss, cmd=%ss, health=%ss, dispatch=%ss)",
