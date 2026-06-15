@@ -870,6 +870,7 @@ def _requeue_invalid_owner_running_tasks(
     scheduler_instance: str = "scheduler",
     alive_owner_pods: set[str] | None = None,
     worker_registry_pods: set[str] | None = None,
+    started_before: datetime | None = None,
 ) -> tuple[int, int]:
     current = now or now_local()
     owner_pods = alive_owner_pods if alive_owner_pods is not None else _alive_entry_analysis_owner_pods(db, current)
@@ -886,6 +887,15 @@ def _requeue_invalid_owner_running_tasks(
     )
     if project_id:
         query = query.filter(AppEaTask.project_id == project_id)
+    # 宽限期过滤：只对账运行超过 grace period 的任务，防止新分发的任务误伤
+    if started_before is not None:
+        from sqlalchemy import or_
+        query = query.filter(
+            or_(
+                AppEaTask.started_at.is_(None),
+                AppEaTask.started_at <= started_before,
+            )
+        )
     if limit is not None and limit > 0:
         query = query.limit(limit)
     candidates = query.all()
@@ -3297,18 +3307,22 @@ class TaskService:
 
     @staticmethod
     async def _notify_cancel(pod_ip: str, task_id: str) -> None:
-        """HTTP POST 到 worker 内置 cancel server，封装网络错误不抛出。"""
+        """HTTP POST 到 worker 内置 cancel server（双路径），封装网络错误不抛出。
+
+        路径 1: /cancel/{task_id} — 触发 instant_cancel + 强制杀进程（新版本）
+        路径 2: /kill/{task_id}   — 仅强制杀进程（新旧版本均兼容）
+        """
         import asyncio as _asyncio
         import urllib.request
-        try:
-            url = f"http://{pod_ip}:3001/cancel/{task_id}"
-            req = urllib.request.Request(url, method="POST", data=b"")
-            await _asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: urllib.request.urlopen(req, timeout=2)
-            )
-        except Exception:
-            pass  # 发送失败无关紧要，轮询机制不受影响
+        for path in (f"/cancel/{task_id}", f"/kill/{task_id}"):
+            try:
+                url = f"http://{pod_ip}:3001{path}"
+                await _asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda u=url: urllib.request.urlopen(u, timeout=2)
+                )
+            except Exception:
+                pass  # 发送失败无关紧要，轮询机制不受影响
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
         """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务不允许删除。"""

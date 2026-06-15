@@ -145,6 +145,26 @@ class AppEaProjectConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
 
 
+class AppEaTaskCommand(Base):
+    """Scheduler command queue — cancel / restart / kill_processes.
+
+    API pods write commands here; the scheduler pod polls and executes them.
+    This decouples the API from worker-pod liveness and guarantees that
+    cancel/kill can be executed even when the worker's asyncio loop is stuck.
+    """
+    __tablename__ = "secflow_app_ea_task_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    command: Mapped[str] = mapped_column(String(32), nullable=False, index=True)  # cancel / restart / kill_processes
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)  # pending / processing / done / failed
+    requested_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class AppEaWorkerSlot(Base):
     """Worker pod self-reported slot registry."""
     __tablename__ = "secflow_app_ea_worker_slots"

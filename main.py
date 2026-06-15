@@ -9,6 +9,7 @@ entry_analyse 服务器启动入口
 import os
 import sys
 import asyncio
+import threading
 
 import uvicorn
 from dotenv import load_dotenv
@@ -59,7 +60,11 @@ def _start_healthz_thread() -> None:
 async def _handle_cancel_request(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
-    """mini HTTP server handler：解析 POST /cancel/{task_id} 并触发内存取消。"""
+    """mini HTTP server handler：解析 POST /cancel/{task_id} 或 /kill/{task_id}。
+
+    /cancel/{task_id} : 触发 instant_cancel 唤醒轮询线程 + 强制杀 pi 进程
+    /kill/{task_id}   : 仅强制杀所有 pi+python 进程（不依赖 asyncio 事件循环）
+    """
     try:
         raw = await asyncio.wait_for(reader.read(512), timeout=1)
         text = raw.decode("utf-8", errors="replace")
@@ -67,10 +72,38 @@ async def _handle_cancel_request(
         task_id = ""
         first_line = text.split("\n", 1)[0].strip()
         parts = first_line.split(" ")
-        if len(parts) >= 2 and "/cancel/" in parts[1]:
-            task_id = parts[1].rsplit("/", 1)[-1]
-        triggered = trigger_instant_cancel(task_id) if task_id else False
-        body = b"{\"triggered\": true}" if triggered else b"{\"triggered\": false}"
+        is_kill = False
+        if len(parts) >= 2:
+            if "/kill/" in parts[1]:
+                task_id = parts[1].rsplit("/", 1)[-1]
+                is_kill = True
+            elif "/cancel/" in parts[1]:
+                task_id = parts[1].rsplit("/", 1)[-1]
+
+        if task_id:
+            if is_kill:
+                # 强制杀进程路径：不依赖 asyncio 事件循环，直接杀
+                def _kill():
+                    try:
+                        ws = get_worker_service()
+                        ws.force_kill_task_processes(task_id)
+                    except Exception:
+                        pass
+                threading.Thread(target=_kill, daemon=True, name=f"kill_{task_id}").start()
+                body = b"{\"killed\": true}"
+            else:
+                # 标准取消路径：wake 轮询线程 + 也尝试强制杀
+                triggered = trigger_instant_cancel(task_id)
+                def _kill():
+                    try:
+                        ws = get_worker_service()
+                        ws.force_kill_task_processes(task_id)
+                    except Exception:
+                        pass
+                threading.Thread(target=_kill, daemon=True, name=f"cancel_kill_{task_id}").start()
+                body = b"{\"triggered\": %s}" % (b"true" if triggered else b"false")
+        else:
+            body = b"{\"error\": \"missing task_id\"}"
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: application/json\r\n"

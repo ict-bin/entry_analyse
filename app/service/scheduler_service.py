@@ -22,6 +22,9 @@ EXPIRED_RUNNING_RECONCILE_BATCH_SIZE = max(
     1,
     int(os.environ.get("EA_EXPIRED_RUNNING_RECONCILE_BATCH_SIZE", "50")),
 )
+# 新分发的任务宽限期：任务被领取后90s内不触发 invalid_owner 对账，
+# 给 Worker Pod 足够时间写首次心跳到 AppEaWorkerSlot 表。
+INVALID_OWNER_GRACE_PERIOD_SECONDS = int(os.environ.get("EA_INVALID_OWNER_GRACE_PERIOD_SECONDS", "90"))
 
 
 class _ExpiredRunningReconcileStats:
@@ -77,14 +80,32 @@ class SchedulerService:
             _worker_registry_pods,
         )
 
+        from datetime import timedelta
+
         alive_owner_pods = _alive_entry_analysis_owner_pods(db, now)
-        # NOTE: _requeue_invalid_owner_running_tasks removed from regular reconcile.
-        # It was causing a race condition where newly dispatched tasks got
-        # requeued before the worker's first heartbeat appeared in AppEaWorkerSlot.
-        # Lease-based expiry (_requeue_expired_running_tasks) is sufficient: if the
-        # worker is alive, it renews the lease; if dead, the lease expires within
-        # LEASE_DURATION_SECONDS and the task is recovered then.
+        registry_pods = _worker_registry_pods(db, now)
+
+        # 重新启用 invalid_owner 检测，但加宽限期：任务被领取后90s内不触发，
+        # 给 Worker Pod 足够时间写首次心跳到 AppEaWorkerSlot 表。
         invalid_reconciled, invalid_owner_alive = 0, 0
+        grace_cutoff = now - timedelta(seconds=INVALID_OWNER_GRACE_PERIOD_SECONDS)
+        # 只对账 started_at <= grace_cutoff 的任务（运行超过90s的老任务）
+        invalid_reconciled, invalid_owner_alive = _requeue_invalid_owner_running_tasks(
+            db,
+            now,
+            limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
+            scheduler_instance="scheduler",
+            alive_owner_pods=alive_owner_pods,
+            worker_registry_pods=registry_pods,
+            started_before=grace_cutoff,
+        )
+        # 只统计宽限期内的任务（不做对账），但仍记录到 metrics
+        if invalid_reconciled or invalid_owner_alive:
+            logger.warning(
+                "scheduler reconciled %s invalid-owner tasks (owner_alive=%s)",
+                invalid_reconciled, invalid_owner_alive,
+            )
+
         reconciled, owner_alive = _requeue_expired_running_tasks(
             db,
             now,

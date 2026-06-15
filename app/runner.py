@@ -1144,8 +1144,12 @@ async def _run_with_api_retry(
                         buffer.decode("utf-8", errors="replace"),
                         exec_result, on_stream, _mark_activity)
 
+                _log_warn(f"pi stdout done: pid={proc.pid} lines_processed={exec_result.exit_code} task={task_id}")
+
                 assert proc.stderr is not None
+                _log_warn(f"pi reading stderr: pid={proc.pid} task={task_id}")
                 _stderr_data = await proc.stderr.read()
+                _log_warn(f"pi stderr done: pid={proc.pid} len={len(_stderr_data)} task={task_id}")
                 stderr_text = _stderr_data.decode(
                     "utf-8", errors="replace").strip()
                 if stderr_text:
@@ -1155,6 +1159,7 @@ async def _run_with_api_retry(
 
                 await proc.wait()
                 exec_result.exit_code = proc.returncode or 0
+                _log_warn(f"pi process exited: pid={proc.pid} rc={exec_result.exit_code} task={task_id} stage={stage_key}")
 
             except asyncio.CancelledError:
                 with contextlib.suppress(Exception):

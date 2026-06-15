@@ -378,6 +378,42 @@ class WorkerService:
     def has_local_task(self, task_id: str) -> bool:
         return task_id in self._local_task_ids
 
+    def force_kill_task_processes(self, task_id: str) -> int:
+        """Force-kill ALL pi+python processes belonging to a task.
+
+        Called from the cancel HTTP server handler (port 3001) and can
+        run in any thread.  Does NOT depend on the asyncio event loop —
+        works even when the main loop is stuck in a long-running tree-sitter
+        parse or DB transaction.
+
+        Returns number of processes killed.
+        """
+        # Derive task roots from DB (the task may be running or recently
+        # cancelled — we still want to clean up its processes).
+        task_roots: list[str] = []
+        try:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = db.query(AppEaTask).filter_by(task_id=task_id).first()
+                if row is not None:
+                    from app.service.task_service import _task_runtime_roots
+                    task_roots = _task_runtime_roots(row)
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        except Exception as exc:
+            logger.warning(
+                "force_kill: DB lookup failed for %s: %s",
+                task_id, exc,
+            )
+
+        return _kill_all_task_processes(
+            task_id=task_id, task_roots=task_roots,
+        )
+
     def start_task(self, task_id: str) -> threading.Thread:
         """Start a task in its own thread with a dedicated asyncio event loop.
 

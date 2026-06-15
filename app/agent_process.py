@@ -176,6 +176,8 @@ def cleanup_task_pi_processes(
 ) -> int:
     roots = [root for root in (task_roots or []) if str(root or "").strip()]
     killed = 0
+    _main_pid = os.getpid()
+    _main_ppid = os.getppid()
     proc_root = pathlib.Path("/proc")
     for proc_dir in proc_root.iterdir():
         if not proc_dir.name.isdigit():
@@ -188,7 +190,10 @@ def cleanup_task_pi_processes(
             cwd = os.readlink(proc_dir / "cwd")
         except Exception:
             continue
-        if comm != "pi" and exe != "node":
+        # Match: pi (node) or python processes (extended from original pi-only match)
+        is_pi = (comm == "pi" or exe == "node")
+        is_py = (comm.startswith("python") or exe.startswith("python"))
+        if not is_pi and not is_py:
             continue
         ppid = None
         pid = int(proc_dir.name)
@@ -203,6 +208,14 @@ def cleanup_task_pi_processes(
             continue
         if not _command_contains_task_id(command, task_id) and not _cwd_matches_task_roots(cwd, roots):
             continue
+        # ── 安全检查：绝不对主进程或主进程的父进程发送 SIGKILL ──
+        is_self_or_ancestor = (pid == _main_pid or pid == _main_ppid)
+        if is_self_or_ancestor:
+            logger(
+                f"BLOCKED cleanup of self/ancestor [{label}] task_id={task_id} pid={pid} "
+                f"comm={comm} cwd={cwd}"
+            )
+            continue
         try:
             pgid = int(
                 subprocess.check_output(
@@ -213,14 +226,13 @@ def cleanup_task_pi_processes(
         except Exception:
             pgid = None
         logger(
-            f"cleaning task pi process [{label}] task_id={task_id} pid={pid} "
+            f"cleaning task process [{label}] task_id={task_id} pid={pid} "
             f"pgid={pgid if pgid is not None else 'unknown'} cwd={cwd}"
         )
         try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
+            # 使用 os.kill(pid, SIGKILL) 而非 os.killpg()，
+            # killpg 可能意外杀死同进程组的其他进程（包括主进程）。
+            os.kill(pid, signal.SIGKILL)
             killed += 1
         except ProcessLookupError:
             continue
