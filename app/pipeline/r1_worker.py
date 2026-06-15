@@ -396,6 +396,7 @@ async def run_r1_worker(
     rel = os.path.relpath(os.path.abspath(file_path), source_dir) if source_dir else basename
     db.write_functions(file_hash, file_path, static_funcs, func_hashes_static, rel_path=rel)
     _safe_emit(on_event, "r1_static_done", task_id, file=basename, file_hash=file_hash, count=len(static_funcs))
+    logger.info("R1_static_done: file=%s funcs=%s", basename, len(static_funcs))
 
     # Complete gaps, no splitting. Script filter for maybe_function gaps.
     gaps_file = dirs.r1_gaps_file(file_hash)
@@ -417,9 +418,11 @@ async def run_r1_worker(
                is_retry=False, retry_reason="", gap_count=len(gaps_list), llm_gap_count=len(llm_gaps))
 
     if llm_gaps:
+        logger.info("R1_llm_gaps_start: file=%s gaps=%s skipped=%s", basename, len(llm_gaps), skipped_n)
         try:
             source_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
+        except Exception as e:
+            logger.error("R1-W gap_source_read failed %s: %s", basename, e)
             source_lines = []
 
         r1_gap_parallelism = max(1, int(os.environ.get("EA_R1_GAP_PARALLELISM", "8")))
@@ -498,29 +501,36 @@ async def run_r1_worker(
                 total_usage = TokenUsage()
 
                 async def _invoke(prompt_text: str, is_retry: bool = False):
-                    return await run_agent(
-                        prompt=prompt_text,
-                        model=acfg.model,
-                        tools=_gap_tools,  # read/edit/write excluded
-                        system_prompt=system_prompt,
-                        cwd=workspace,
-                        thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
-                        session_file=session_path,
-                        cancel_event=cancel_event,
-                        max_retries=cfg.agent_max_retries,
-                        retry_delay=cfg.agent_retry_delay,
-                        run_timeout_seconds=r1_timeout,
-                        timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
-                        timeout_max_retries=cfg.agent_timeout_max_retries,
-                        pi_max_retries=cfg.pi_max_retries,
-                        pi_retry_delay=cfg.pi_retry_delay,
-                        max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
-                        task_id=task_id,
-                        stage_key="r1_w",
-                        role_kind="worker",
-                        priority=priority,
-                        task_pi_dir=getattr(cfg, "task_pi_dir", ""),
-                    )
+                    logger.info("R1_gap_agent_call: file=%s gap=%s model=%s", basename, gid, acfg.model)
+                    try:
+                        result = await run_agent(
+                            prompt=prompt_text,
+                            model=acfg.model,
+                            tools=_gap_tools,  # read/edit/write excluded
+                            system_prompt=system_prompt,
+                            cwd=workspace,
+                            thinking_level=acfg.thinking_level or cfg.workers.default_thinking_level,
+                            session_file=session_path,
+                            cancel_event=cancel_event,
+                            max_retries=cfg.agent_max_retries,
+                            retry_delay=cfg.agent_retry_delay,
+                            run_timeout_seconds=r1_timeout,
+                            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+                            timeout_max_retries=cfg.agent_timeout_max_retries,
+                            pi_max_retries=cfg.pi_max_retries,
+                            pi_retry_delay=cfg.pi_retry_delay,
+                            max_consecutive_empty_responses=int(getattr(cfg, 'max_consecutive_empty_responses', 3)),
+                            task_id=task_id,
+                            stage_key="r1_w",
+                            role_kind="worker",
+                            priority=priority,
+                            task_pi_dir=getattr(cfg, "task_pi_dir", ""),
+                        )
+                        logger.info("R1_gap_agent_done: file=%s gap=%s ok=%s", basename, gid, not result.fatal and not result.error)
+                        return result
+                    except Exception as e:
+                        logger.error("R1_gap_agent_crash: file=%s gap=%s err=%s", basename, gid, e, exc_info=True)
+                        raise
 
                 prompt = build_r1_gap_prompt(
                     file_path=file_path, file_hash=file_hash, gap=gap,
@@ -598,6 +608,7 @@ async def run_r1_worker(
     _safe_emit(on_event, "r1_w_done", task_id, file=basename, file_hash=file_hash,
                tokens_in=total_usage.input, tokens_out=total_usage.output, error="",
                gap_count=len(gaps_list), llm_gap_count=len(llm_gaps), corrections=len(all_corrections))
+    logger.info("R1_w_done: file=%s funcs=%s corrections=%s", basename, len(func_hashes_static), len(all_corrections))
 
     funcs_out, hashes_out = _current_funcs()
     _sync_module_db(funcs_out, hashes_out)
@@ -657,8 +668,8 @@ async def run_r2_w_worker(
             _rec_r2w = db.get_function(func_hash)
             if _rec_r2w:
                 _r2w_body = str(_rec_r2w.get("body") or "")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("R2-W func_body_read failed %s: %s", func_name, e)
         prompt = build_r2_w_prompt(
             func_hash=func_hash,
             func_name=func_name,
@@ -741,5 +752,5 @@ def _safe_emit(on_event: Callable | None, etype: str, task_id: str, **data) -> N
     try:
         from ..models import SwarmEvent
         on_event(SwarmEvent(type=etype, task_id=task_id, data=data))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("_safe_emit failed: type=%s task=%s err=%s", etype, task_id, e)
