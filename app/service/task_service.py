@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppEaTask, AppEaTaskEvent, AppEaStageResultIndex, AppEaWorkerSlot
+from app.db.models import AppEaTask, AppEaTaskCommand, AppEaTaskEvent, AppEaStageResultIndex, AppEaWorkerSlot
 from app.logging_utils import log_event
 from app.service.session_index import build_session_catalog
 from app.service.runtime_role import RUNTIME_ROLE_WORKER, get_runtime_role, role_enabled
@@ -3183,6 +3183,19 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_retried", row.updated_at, row.status),
         )
         db.commit()
+        # ── 写入命令队列：确保调度器兜底处理 ──
+        try:
+            cmd = AppEaTaskCommand(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                command="restart",
+                status="pending",
+                requested_by="api_restart",
+            )
+            db.add(cmd)
+            db.commit()
+        except Exception as _cmd_exc:
+            logger.warning("failed to enqueue restart command for %s: %s", row.task_id, _cmd_exc)
 
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
@@ -3214,6 +3227,19 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_resumed", row.updated_at, row.status),
         )
         db.commit()
+        # ── 写入命令队列：确保调度器兜底处理 ──
+        try:
+            cmd = AppEaTaskCommand(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                command="restart",
+                status="pending",
+                requested_by="api_resume",
+            )
+            db.add(cmd)
+            db.commit()
+        except Exception as _cmd_exc:
+            logger.warning("failed to enqueue resume command for %s: %s", row.task_id, _cmd_exc)
 
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
@@ -3287,6 +3313,19 @@ class TaskService:
                 dedupe_key=_event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
             )
         db.commit(); db.refresh(row)
+        # ── 写入命令队列：确保调度器兜底处理（即使本 Pod 的 HTTP 通知失败）──
+        try:
+            cmd = AppEaTaskCommand(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                command="cancel",
+                status="pending",
+                requested_by="api_cancel",
+            )
+            db.add(cmd)
+            db.commit()
+        except Exception as _cmd_exc:
+            logger.warning("failed to enqueue cancel command for %s: %s", row.task_id, _cmd_exc)
         if row.status == "running":
             try:
                 cleanup_task_pi_processes(

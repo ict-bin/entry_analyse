@@ -228,9 +228,25 @@ def health():
     bootstrap = get_runtime_bootstrap().status()
     scheduler_running = False
     worker_running = False
+    scheduler_map_stats: dict = {}
     try:
         from .service.scheduler_service import get_scheduler_service
-        scheduler_running = get_scheduler_service().is_running()
+        s = get_scheduler_service()
+        scheduler_running = s.is_running()
+        scheduler_map_stats = {
+            "task_owner_map_size": len(s._task_owner),
+            "pod_task_map_size": len(s._pod_tasks),
+            "pod_count": len(s._pod_tasks),
+            "reconcile_stats": s.runtime_reconcile_stats_snapshot(),
+            "pod_health": {
+                pn: {
+                    "status": h.get("status", "unknown"),
+                    "tcp_failures": h.get("consecutive_tcp_failures", 0),
+                    "tasks": len(s._get_pod_tasks(pn)),
+                }
+                for pn, h in s._pod_health.items()
+            },
+        }
     except Exception:
         scheduler_running = False
     try:
@@ -246,6 +262,7 @@ def health():
         "bootstrap_attempts": bootstrap["attempts"],
         "bootstrap_error": bootstrap["last_error"],
         "scheduler_running": scheduler_running,
+        "scheduler_map": scheduler_map_stats,
         "worker_running": worker_running,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
