@@ -609,6 +609,7 @@ async def run_r1_worker(
 
     funcs_out, hashes_out = _current_funcs()
     _sync_module_db(funcs_out, hashes_out)
+    import sys; print(f"R1_RETURN [{basename}]: funcs={len(funcs_out)}", file=sys.stderr, flush=True)
     return total_usage, funcs_out, hashes_out
 # ─── run_r2_w_worker ─────────────────────────────────────────────────────────
 

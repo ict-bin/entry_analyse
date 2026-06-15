@@ -1082,6 +1082,7 @@ class PipelineEngine:
                 system_prompt=self._stage_sys_prompt("r1_worker"),
                 priority=SemPriority.R1_W,
             )
+            import sys; print(f"R1_POST [{basename}]: funcs={len(funcs)}", file=sys.stderr, flush=True)
             logger.info("R1_worker_done: file=%s funcs=%s", basename, len(funcs))
             state.register_functions(
                 file_hash,
