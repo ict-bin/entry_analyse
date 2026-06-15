@@ -1692,8 +1692,12 @@ def get_task_logs(
     _read_path = pvc_path if pvc_path.is_file() else (local_path if local_path.is_file() else None)
     if _read_path:
         try:
-            import logging as _l; _l.getLogger("ea.api").error("READING %s", _read_path)
+            import logging as _l, os as _os
+            _l.getLogger("ea.api").error("READING %s size=%s", _read_path, _os.path.getsize(str(_read_path)))
             with open(str(_read_path), "r", encoding="utf-8") as _f:
+                _first = _f.readline()
+                _l.getLogger("ea.api").error("FIRST LINE len=%s val=%s", len(_first), _first[:100])
+                _f.seek(0)
                 for line in _f:
                     line = line.strip()
                     if not line:
