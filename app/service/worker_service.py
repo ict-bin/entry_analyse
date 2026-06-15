@@ -1244,18 +1244,16 @@ def _start_lease_renewer_subprocess(
         def _monitor() -> None:
             try:
                 stdout_data, _ = proc.communicate(timeout=None)
-                if proc.returncode != 0:
-                    out_tail = ""
-                    if stdout_data:
-                        lines = stdout_data.decode("utf-8", errors="replace").splitlines()
-                        out_tail = " | ".join(lines[-5:])
-                    logger.warning(
-                        "lease_renewer exited abnormally task=%s rc=%s output=%s",
-                        task_id, proc.returncode, out_tail[:500],
-                    )
-                    stop_event.set()
-            except Exception:
-                pass
+                out_tail = ""
+                if stdout_data:
+                    lines = stdout_data.decode("utf-8", errors="replace").splitlines()
+                    out_tail = " | ".join(lines[-10:])
+                logger.warning(
+                    "lease_renewer EXITED: task=%s pid=%s rc=%s output=%s",
+                    task_id, proc.pid, proc.returncode, out_tail[:500],
+                )
+            except Exception as e:
+                logger.error("lease_renewer monitor error: task=%s err=%s", task_id, e)
             finally:
                 stop_event.set()
 

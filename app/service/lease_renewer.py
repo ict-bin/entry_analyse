@@ -130,8 +130,15 @@ def main() -> None:
     max_failures = 5
     attempt = 0
 
+    # ── First renewal IMMEDIATELY, then sleep-loop ──────────────────
+    # CRITICAL: do NOT sleep before the first renewal.  If this
+    # process dies within the first sleep interval, the task has
+    # zero lease protection and will be requeued within seconds.
+    #
+    # The parent-gone check is done AFTER the first renewal so that
+    # a brand-new task always has at least one lease window before
+    # the scheduler can expire it.
     while True:
-        time.sleep(args.interval)
         attempt += 1
 
         # Exit if parent is dead
@@ -152,6 +159,8 @@ def main() -> None:
                 _log(f"EXIT: {consecutive_failures} consecutive failures, giving up "
                      f"task={args.task_id}")
                 sys.exit(1)
+
+        time.sleep(args.interval)
 
 
 if __name__ == "__main__":
