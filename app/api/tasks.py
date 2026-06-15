@@ -1692,7 +1692,7 @@ def get_task_logs(
     _read_path = pvc_path if pvc_path.is_file() else (local_path if local_path.is_file() else None)
     if _read_path:
         try:
-            # 使用 open() 而非 read_text()，强制刷新 NFS 缓存
+            import logging as _l; _l.getLogger("ea.api").error("READING %s", _read_path)
             with open(str(_read_path), "r", encoding="utf-8") as _f:
                 for line in _f:
                     line = line.strip()
@@ -1706,6 +1706,7 @@ def get_task_logs(
                         is_final = True
                         continue
                     all_events.append(evt)
+            _l.getLogger("ea.api").error("READ DONE %s events=%s", _read_path, len(all_events))
         except Exception as e:
             import logging
             logging.getLogger("ea.api").error("Failed to read events.jsonl %s: %s", _read_path, e)
