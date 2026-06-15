@@ -119,6 +119,13 @@ if __name__ == "__main__":
             port = int(sys.argv[idx + 1])
 
     role = get_runtime_role()
+    # Start standalone kill server for worker pods (independent process)
+    _kill_proc = None
+    if role_enabled("worker"):
+        if not _external_probe_process_enabled():
+            _start_healthz_thread()
+        _kill_proc = _start_kill_server_process()
+
     if role_enabled("api") or role_enabled("worker"):
         print(f"""
 ╔═══════════════════════════════════════════════════════╗
