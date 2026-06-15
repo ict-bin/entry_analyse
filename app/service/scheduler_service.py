@@ -1038,6 +1038,28 @@ class SchedulerService:
     # Main loops
     # ═══════════════════════════════════════════════════════════════════════
 
+    async def _reconcile_loop(self) -> None:
+        """Reconcile cluster state periodically (inner loop)."""
+        _tick = 0
+        while self._running:
+            _tick += 1
+            try:
+                changed = await self._reconcile_cluster_state()
+                if _tick % 12 == 0:
+                    logger.info(
+                        "scheduler heartbeat: reconcile_loop alive (tick=%s changed=%s "
+                        "task_map=%s pod_map=%s)",
+                        _tick, changed, len(self._task_owner), len(self._pod_tasks),
+                    )
+                elif changed:
+                    logger.info(
+                        "scheduler reconciled %s stale entry-analysis tasks",
+                        changed,
+                    )
+            except Exception as exc:
+                logger.warning("scheduler reconcile failed: %s", exc, exc_info=True)
+            await asyncio.sleep(SCHEDULER_POLL_SECONDS)
+
     async def _command_loop_wrapper(self) -> None:
         """Wrapper with global exception handler to prevent silent task death."""
         try:
@@ -1062,27 +1084,6 @@ class SchedulerService:
             await self._dispatch_loop()
         except Exception as exc:
             logger.critical("scheduler dispatch_loop FATAL: %s", exc, exc_info=True)
-        """Reconcile cluster state periodically."""
-        _tick = 0
-        while self._running:
-            _tick += 1
-            try:
-                changed = await self._reconcile_cluster_state()
-                # Heartbeat log every 12 cycles (~60s) to confirm loop is alive
-                if _tick % 12 == 0:
-                    logger.info(
-                        "scheduler heartbeat: reconcile_loop alive (tick=%s changed=%s "
-                        "task_map=%s pod_map=%s)",
-                        _tick, changed, len(self._task_owner), len(self._pod_tasks),
-                    )
-                elif changed:
-                    logger.info(
-                        "scheduler reconciled %s stale entry-analysis tasks",
-                        changed,
-                    )
-            except Exception as exc:
-                logger.warning("scheduler reconcile failed: %s", exc, exc_info=True)
-            await asyncio.sleep(SCHEDULER_POLL_SECONDS)
 
     def start(self) -> None:
         if self._running:

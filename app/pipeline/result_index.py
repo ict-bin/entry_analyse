@@ -122,41 +122,10 @@ def upsert_stage_result_index(
     tokens_output: int = 0,
     duration_ms: int | None = None,
 ) -> None:
-    db_gen = get_db()
-    db = next(db_gen)
-    try:
-        row = (
-            db.query(AppEaStageResultIndex)
-            .filter(AppEaStageResultIndex.task_id == task_id)
-            .filter(AppEaStageResultIndex.stage_key == stage_key)
-            .filter(AppEaStageResultIndex.role_kind == role_kind)
-            .filter(AppEaStageResultIndex.attempt == attempt)
-            .filter(AppEaStageResultIndex.file_hash == (file_hash or None))
-            .filter(AppEaStageResultIndex.func_hash == (func_hash or None))
-            .first()
-        )
-        if row is None:
-            row = AppEaStageResultIndex(
-                task_id=task_id,
-                stage_key=stage_key,
-                role_kind=role_kind,
-                scope_kind=scope_kind,
-                file_hash=file_hash or None,
-                func_hash=func_hash or None,
-                attempt=attempt,
-            )
-            db.add(row)
-        row.status = status
-        row.passed = passed
-        row.summary = summary[:1000] if summary else None
-        row.result_file_path = result_file_path or None
-        row.raw_file_path = raw_file_path or None
-        row.tokens_input = tokens_input or None
-        row.tokens_output = tokens_output or None
-        row.duration_ms = duration_ms
-        db.commit()
-    finally:
-        try:
-            next(db_gen)
-        except StopIteration:
-            pass
+    # HACK: 暂时跳过 MySQL 写入以验证是否为阻塞点
+    import logging
+    _logger = logging.getLogger("ea.pipeline.result_index")
+    _logger.warning("upsert_stage_result_index SKIPPED: task=%s stage=%s file=%s", task_id, stage_key, file_hash)
+    return
+
+
