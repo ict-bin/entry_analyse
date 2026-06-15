@@ -220,10 +220,12 @@ class SchedulerService:
                         db.commit()
                         failed += 1
                         continue
-                    cmd.status = "done"
-                    cmd.processed_at = now_local()
-                    db.commit()
-                    processed += 1
+                    # Only mark done if handler didn't reset status (e.g. to pending for retry)
+                    if cmd.status == "processing":
+                        cmd.status = "done"
+                        cmd.processed_at = now_local()
+                        db.commit()
+                        processed += 1
                 except Exception as exc:
                     cmd.status = "failed"
                     cmd.error = str(exc)[:1000]
@@ -323,7 +325,7 @@ class SchedulerService:
     # ── Restart ───────────────────────────────────────────────────────────
 
     async def _execute_restart(self, db: Session, cmd: AppEaTaskCommand) -> None:
-        """Execute a restart: cleaner version — just reset to pending.
+        """Execute a restart: if running→cancel first; otherwise reset to pending.
 
         The worker will handle disk cleanup when it picks up the task.
         """
@@ -335,9 +337,13 @@ class SchedulerService:
         if row is None:
             return
 
-        # If currently running, cancel first
-        if row.status in ("pending", "running"):
-            # Write a cancel sub-command and return
+        # If already pending (set by API restart_task), nothing to do
+        if row.status == "pending":
+            return
+
+        # If currently running, cancel first, then retry on next cycle
+        if row.status == "running":
+            # Write a cancel sub-command and keep this command as pending
             sub = AppEaTaskCommand(
                 task_id=task_id,
                 project_id=row.project_id,
@@ -346,10 +352,11 @@ class SchedulerService:
                 requested_by=f"scheduler_restart:{cmd.requested_by}",
             )
             db.add(sub)
+            cmd.status = "pending"  # retry after cancel completes
             db.commit()
-            return  # cancel will be processed on next cycle; restart will be retried
+            return  # cancel will be processed on next cycle; restart will retry
 
-        # Reset to pending
+        # Reset to pending (from cancelled/failed/error/passed)
         from app.service.task_service import (
             TASK_EVENT_SOURCE_EA,
             _event_dedupe_key,
