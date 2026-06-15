@@ -1704,8 +1704,9 @@ def get_task_logs(
                     is_final = True
                     continue
                 all_events.append(evt)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger("ea.api").error("Failed to read events.jsonl %s: %s", _read_path, e)
     else:
         # 回退 MySQL stages_json
         try:

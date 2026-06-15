@@ -1153,6 +1153,9 @@ class WorkerService:
             _fr.owner_pod_ip = None
             _fr.lease_expires_at = None
             _fr.cancel_requested = False
+            # 任务结束时同步事件到 MySQL 时间线表（前端通过 /timeline API 读取）
+            task_mod._sync_stage_events_to_timeline(_fd, _fr, event_buffer)
+            _fr.cancel_requested = False
             reason, changed = task_mod._sync_task_abnormal_reason(_fr)
             task_mod._record_abnormal_reason(_fr, reason, changed=changed)
             task_mod._safe_create_task_event(
