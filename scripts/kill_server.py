@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Standalone kill server — runs as a completely independent process.
+Standalone kill server — independent process, receives cancel/kill from scheduler.
 
-When a scheduler sends a cancel/kill request, this server kills ALL
-pi+python processes in the pod (except itself and known system processes).
-Since each Worker pod runs only ONE task at a time, this effectively
-cancels the current task.
+Kills all pi+python processes in the pod except known system processes.
+Uses `ps` for fast process discovery (no /proc iteration).
 
 Usage:
   python3 scripts/kill_server.py --port 3001
@@ -15,101 +13,71 @@ import argparse
 import http.server
 import json
 import os
-import pathlib
 import signal
+import subprocess
 import time
 import threading
 
-# PIDs to NEVER kill
-_SYSTEM_COMMS = {"kill_server.py", "heartbeat_proc.py", "probe_process", "start-with-probe.sh", "entrypoint.sh", "bash"}
-
-
-def _is_system_process(pid: int) -> bool:
-    """Check if this process belongs to the pod infrastructure (main, probe, etc)."""
-    try:
-        comm = (pathlib.Path("/proc") / str(pid) / "comm").read_text(
-            encoding="utf-8", errors="replace",
-        ).strip()
-    except Exception:
-        return False
-
-    # Never kill: kill_server itself, heartbeat, probe, entrypoint
-    if comm in {"kill_server.py", "heartbeat_proc.py", "python3"}:
-        # For python3, check cmdline
-        try:
-            cmd = (
-                (pathlib.Path("/proc") / str(pid) / "cmdline")
-                .read_bytes().replace(b"\x00", b" ")
-                .decode("utf-8", errors="replace")
-            )
-            if any(kw in cmd for kw in ("kill_server.py", "heartbeat_proc.py", "probe_process", "start-with-probe.sh", "entrypoint.sh")):
-                return True
-            if "main.py" in cmd:
-                return True
-        except Exception:
-            pass
-        return False
-
-    return False
+# System processes to NEVER kill
+_SYSTEM_KEYWORDS = (
+    "kill_server.py",
+    "heartbeat_proc.py",
+    "probe_process",
+    "start-with-probe.sh",
+    "entrypoint.sh",
+    "main.py",
+)
 
 
 def kill_all_task_processes() -> int:
-    """Kill all pi+python processes in the pod except system processes."""
+    """Kill all pi+python processes except system processes. Uses `ps`."""
     main_pid = os.getpid()
     main_ppid = os.getppid()
     killed = 0
-    proc_root = pathlib.Path("/proc")
 
-    for proc_dir in proc_root.iterdir():
-        if not proc_dir.name.isdigit():
+    try:
+        output = subprocess.check_output(
+            ["ps", "-eo", "pid,ppid,comm,args", "--no-headers"],
+            text=True, timeout=3,
+        )
+    except Exception:
+        return 0
+
+    targets = []
+    for line in output.strip().splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3:
             continue
-        pid = int(proc_dir.name)
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        comm = parts[2] if len(parts) > 2 else ""
+        args = parts[3] if len(parts) > 3 else comm
 
         # Never kill self or parent
-        if pid == main_pid or pid == main_ppid:
+        if pid == main_pid or pid == main_ppid or ppid == main_pid:
             continue
 
-        try:
-            comm = (proc_dir / "comm").read_text(
-                encoding="utf-8", errors="replace",
-            ).strip()
-            exe = os.path.basename(os.readlink(proc_dir / "exe"))
-        except Exception:
-            continue
-
-        is_pi = (comm == "pi" or exe == "node")
-        is_py = (comm.startswith("python") or exe.startswith("python"))
+        # Match: pi (node) or python processes
+        is_pi = comm in ("pi", "node") or "node" in comm
+        is_py = comm.startswith("python")
         if not is_pi and not is_py:
             continue
 
         # Skip system processes
-        if _is_system_process(pid):
+        if any(kw in args for kw in _SYSTEM_KEYWORDS):
             continue
 
-        # Safety: check ppid to avoid ancestor
-        try:
-            ppid_str = (
-                (proc_dir / "stat").read_text(
-                    encoding="utf-8", errors="replace",
-                ).split()
-            )
-            ppid = int(ppid_str[3]) if len(ppid_str) > 3 else -1
-        except Exception:
-            ppid = -1
-        if pid == main_pid or pid == main_ppid or ppid == main_pid:
-            continue
+        targets.append(pid)
 
+    for pid in targets:
         try:
             os.kill(pid, signal.SIGKILL)
             killed += 1
         except (ProcessLookupError, PermissionError):
-            continue
-
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            if not pathlib.Path(f"/proc/{pid}").exists():
-                break
-            time.sleep(0.02)
+            pass
 
     return killed
 
@@ -131,11 +99,9 @@ class KillRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         path = self.path.split("?")[0].rstrip("/")
-
         if path == "/healthz":
             self._respond({"status": "ok"})
             return
-
         try:
             killed = kill_all_task_processes()
             self._respond({"killed": killed})
@@ -147,7 +113,7 @@ class KillRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Standalone kill server")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=3001)
     parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args()
@@ -167,8 +133,7 @@ def main():
                 os._exit(0)
 
     if args.parent_pid > 0:
-        t = threading.Thread(target=_watch_parent, daemon=True)
-        t.start()
+        threading.Thread(target=_watch_parent, daemon=True).start()
 
     print(f"[kill_server] listening on :{args.port}", flush=True)
     try:

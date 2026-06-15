@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bubblewrap \
+        procps \
         sqlite3 \
         universal-ctags \
     && rm -rf /var/lib/apt/lists/*
