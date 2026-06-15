@@ -48,6 +48,34 @@ class ModuleInfo(NamedTuple):
     files: list[str]        # 文件路径列表（绝对或相对）
 
 
+# 允许分析的源文件扩展名（C/C++）——防御上游 system-analyse 可能
+# 把 .pl/.py/.ini 等非源码文件误写入 files.list。
+_SOURCE_EXTS: frozenset[str] = frozenset({
+    ".c", ".h",
+    ".cc", ".cpp", ".cxx", ".c++",
+    ".hh", ".hpp", ".hxx", ".h++",
+})
+
+
+def _filter_source_files(files: list[str]) -> list[str]:
+    """过滤 files.list 中非 C/C++ 源文件的条目（安全防护）。"""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for fp in files:
+        suffix = os.path.splitext(os.path.basename(fp))[1].lower()
+        if suffix in _SOURCE_EXTS:
+            kept.append(fp)
+        else:
+            dropped.append(fp)
+    if dropped:
+        import logging
+        logging.getLogger("ea.module_loader").warning(
+            "filtered %d non-C/C++ files from files.list: %s",
+            len(dropped), ", ".join(os.path.basename(f) for f in dropped[:10]),
+        )
+    return kept
+
+
 def load_module(module_name: str, target_dir: str) -> ModuleInfo:
     """
     从 target_dir 中加载指定模块的文件列表。

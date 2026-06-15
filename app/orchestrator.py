@@ -217,6 +217,12 @@ class Orchestrator:
             # ── 0. 加载模块文件列表 ──────────────────────────────────────────
             self._emit("module_load", task_id, module=cfg.module_name)
             module_info = load_module(cfg.module_name, target_dir)
+            # 防御上游 system-analyse 可能把非 C/C++ 文件（.pl/.py 等）
+            # 写入 files.list，导致 tree-sitter C parser 解析非 C 代码
+            # 产生大量 ERROR 节点 → gap 正则灾难性回溯 → R1 卡死
+            from .module_loader import _filter_source_files
+            filtered = _filter_source_files(module_info.files)
+            module_info = module_info._replace(files=filtered)
             self._emit("module_found", task_id,
                        module=cfg.module_name, files=module_info.files)
 

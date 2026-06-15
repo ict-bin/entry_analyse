@@ -103,6 +103,11 @@ def _looks_like_function_gap(lines_data: list[str], start: int, end: int) -> tup
     comments/strings and rejects declarations, initializers and control blocks.
     """
     raw = "\n".join(lines_data[start - 1:end])
+    # 安全上限：巨型 gap（>5000 行）通常是 parse 错误的产物
+    # （如 tree-sitter C parser 解析 .pl/.py 等非 C 文件），
+    # 正则回溯会在此类文本上灾难性耗时，直接跳过。
+    if end - start + 1 > 5000 or len(raw) > 250_000:
+        return False, "gap_too_large", 0.0
     code = _strip_comments_and_strings(raw)
     nonempty = [l.strip() for l in code.splitlines() if l.strip()]
     if not nonempty:
