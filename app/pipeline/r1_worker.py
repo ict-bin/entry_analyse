@@ -33,7 +33,7 @@ from ..models import AgentInstanceConfig, TaskConfig, TokenUsage
 from ..runner import run_agent, AgentResult
 from ..agent_slots import SemPriority
 from .dirs import PipelineDirs
-from .result_index import write_stage_result_files, upsert_stage_result_index
+from .result_index import write_stage_result_files
 from .extractor import (
     FunctionExtract,
     compute_file_hash,
@@ -587,20 +587,6 @@ async def run_r1_worker(
         payload=result_payload,
         raw_text="\n\n--- GAP OUTPUT ---\n\n".join(raw_outputs),
     )
-    upsert_stage_result_index(
-        task_id=task_id,
-        stage_key="r1_w",
-        role_kind="worker",
-        scope_kind="file",
-        attempt=1,
-        file_hash=file_hash,
-        status="ok",
-        summary=f"gaps={len(gaps_list)}, llm_gaps={len(llm_gaps)}, corrections={len(all_corrections)}",
-        result_file_path=str(result_file),
-        raw_file_path=str(raw_file),
-        tokens_input=total_usage.input,
-        tokens_output=total_usage.output,
-    )
 
     _safe_emit(on_event, "r1_w_done", task_id, file=basename, file_hash=file_hash,
                tokens_in=total_usage.input, tokens_out=total_usage.output, error="",
@@ -722,12 +708,6 @@ async def run_r2_w_worker(
     result_file = dirs.stage_result_file("r2_w", "worker", func_hash, attempt_no)
     raw_file = dirs.stage_raw_file("r2_w", "worker", func_hash, attempt_no)
     write_stage_result_files(result_file=result_file, raw_file=raw_file, payload=result_payload, raw_text=ar.output or "")
-    upsert_stage_result_index(
-        task_id=task_id, stage_key="r2_w", role_kind="worker", scope_kind="func",
-        attempt=attempt_no, file_hash=file_hash, func_hash=func_hash, status=result_payload["status"],
-        summary="source_incomplete" if source_incomplete else f"corrections={len(result_payload['result'])}",
-        result_file_path=str(result_file), raw_file_path=str(raw_file),
-    )
     if source_incomplete:
         logger.info("R2-W: SOURCE_INCOMPLETE for %s (%s), skipping apply_corrections", func_hash, func_name)
     elif corrections is None:

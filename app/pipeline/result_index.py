@@ -122,9 +122,6 @@ def upsert_stage_result_index(
     tokens_output: int = 0,
     duration_ms: int | None = None,
 ) -> None:
-    import logging, time as _time
-    _logger = logging.getLogger("ea.pipeline.result_index")
-    _t0 = _time.monotonic()
     db_gen = get_db()
     db = next(db_gen)
     try:
@@ -158,15 +155,6 @@ def upsert_stage_result_index(
         row.tokens_output = tokens_output or None
         row.duration_ms = duration_ms
         db.commit()
-        _elapsed = _time.monotonic() - _t0
-        if _elapsed > 1.0:
-            _logger.warning("upsert_stage_result_index SLOW: %.2fs task=%s stage=%s file=%s", _elapsed, task_id, stage_key, file_hash)
-    except Exception as e:
-        _logger.error("upsert_stage_result_index FAILED: %s task=%s stage=%s", e, task_id, stage_key)
-        try:
-            db.rollback()
-        except Exception:
-            pass
     finally:
         try:
             next(db_gen)

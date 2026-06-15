@@ -166,6 +166,7 @@ def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
         max_overflow=max_overflow,
         pool_pre_ping=True,
         pool_recycle=3600,
+        connect_args={"connect_timeout": 5, "read_timeout": 10, "write_timeout": 10},
     )
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
     Base.metadata.create_all(bind=_engine)
