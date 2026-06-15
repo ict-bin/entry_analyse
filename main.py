@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from app.service.runtime_bootstrap import get_runtime_bootstrap
 from app.service.runtime_role import get_runtime_role, role_enabled
 from app.service.scheduler_service import get_scheduler_service
-from app.service.worker_service import get_worker_service, trigger_instant_cancel
+from app.service.worker_service import get_worker_service
 
 load_dotenv()
 
@@ -57,64 +57,25 @@ def _start_healthz_thread() -> None:
     t.start()
 
 
-async def _handle_cancel_request(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-) -> None:
-    """mini HTTP server handler：解析 POST /cancel/{task_id} 或 /kill/{task_id}。
+def _start_kill_server_process() -> subprocess.Popen | None:
+    """Launch standalone kill server as a completely independent process.
 
-    /cancel/{task_id} : 触发 instant_cancel 唤醒轮询线程 + 强制杀 pi 进程
-    /kill/{task_id}   : 仅强制杀所有 pi+python 进程（不依赖 asyncio 事件循环）
+    This process survives even if the main asyncio event loop is stuck.
+    The scheduler communicates with it via HTTP on port 3001.
     """
-    try:
-        raw = await asyncio.wait_for(reader.read(512), timeout=1)
-        text = raw.decode("utf-8", errors="replace")
-        # 抽取 task_id：第一行格式为 "POST /cancel/{task_id} HTTP/1.1"
-        task_id = ""
-        first_line = text.split("\n", 1)[0].strip()
-        parts = first_line.split(" ")
-        is_kill = False
-        if len(parts) >= 2:
-            if "/kill/" in parts[1]:
-                task_id = parts[1].rsplit("/", 1)[-1]
-                is_kill = True
-            elif "/cancel/" in parts[1]:
-                task_id = parts[1].rsplit("/", 1)[-1]
-
-        if task_id:
-            if is_kill:
-                # 强制杀进程路径：不依赖 asyncio 事件循环，直接杀
-                def _kill():
-                    try:
-                        ws = get_worker_service()
-                        ws.force_kill_task_processes(task_id)
-                    except Exception:
-                        pass
-                threading.Thread(target=_kill, daemon=True, name=f"kill_{task_id}").start()
-                body = b"{\"killed\": true}"
-            else:
-                # 标准取消路径：wake 轮询线程 + 也尝试强制杀
-                triggered = trigger_instant_cancel(task_id)
-                def _kill():
-                    try:
-                        ws = get_worker_service()
-                        ws.force_kill_task_processes(task_id)
-                    except Exception:
-                        pass
-                threading.Thread(target=_kill, daemon=True, name=f"cancel_kill_{task_id}").start()
-                body = b"{\"triggered\": %s}" % (b"true" if triggered else b"false")
-        else:
-            body = b"{\"error\": \"missing task_id\"}"
-        writer.write(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-            b"Connection: close\r\n\r\n" + body
-        )
-        await writer.drain()
-    except Exception:
-        pass
-    finally:
-        writer.close()
+    import subprocess as _sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "scripts", "kill_server.py")
+    if not os.path.isfile(script):
+        print("[main] WARNING: kill_server.py not found, skip", flush=True)
+        return None
+    proc = _sp.Popen(
+        [sys.executable, script, "--port", str(_CANCEL_SERVER_PORT),
+         "--parent-pid", str(os.getpid())],
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+    )
+    print(f"[main] kill_server started pid={proc.pid} port={_CANCEL_SERVER_PORT}", flush=True)
+    return proc
 
 
 async def _run_background_runtime() -> None:
@@ -122,14 +83,12 @@ async def _run_background_runtime() -> None:
     scheduler_service = get_scheduler_service() if role_enabled("scheduler") else None
     worker_service = get_worker_service() if role_enabled("worker") else None
 
-    # 内置 cancel HTTP server（只在 worker role 下启动）
-    cancel_server = None
+    # Standalone kill server (independent process, survives main loop stalls)
+    kill_server_proc = None
     if role_enabled("worker"):
         if not _external_probe_process_enabled():
             _start_healthz_thread()
-        cancel_server = await asyncio.start_server(
-            _handle_cancel_request, "0.0.0.0", _CANCEL_SERVER_PORT
-        )
+        kill_server_proc = _start_kill_server_process()
 
     try:
         await bootstrap.start()
@@ -137,9 +96,15 @@ async def _run_background_runtime() -> None:
             await asyncio.sleep(3600)
     finally:
         await bootstrap.stop()
-        if cancel_server is not None:
-            cancel_server.close()
-            await cancel_server.wait_closed()
+        if kill_server_proc is not None:
+            try:
+                kill_server_proc.terminate()
+                kill_server_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    kill_server_proc.kill()
+                except Exception:
+                    pass
         if scheduler_service is not None:
             scheduler_service.stop()
         if worker_service is not None:
