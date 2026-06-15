@@ -1689,7 +1689,10 @@ def get_task_logs(
     local_path = _Path(row.output_path or "") / task_id / "run" / "events.jsonl"
     all_events: list[dict] = []
     is_final = False
+    import logging as _logging
+    _log = _logging.getLogger("ea.api.logs")
     _read_path = pvc_path if pvc_path.is_file() else (local_path if local_path.is_file() else None)
+    _log.warning("get_task_logs: task=%s pvc=%s local=%s read=%s", task_id, pvc_path.is_file(), local_path.is_file(), _read_path)
     if _read_path:
         try:
             for line in _read_path.read_text(encoding="utf-8").splitlines():
