@@ -1088,13 +1088,16 @@ class PipelineEngine:
                 priority=SemPriority.R1_W,
             )
             logger.info("R1_worker_done: file=%s funcs=%s gaps_attempted=True", basename, len(funcs))
+            logger.info("R1_state_presave: file=%s registering %s functions", basename, len(funcs))
             state.register_functions(
                 file_hash,
                 [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
                  for fe, fh in zip(funcs, func_hashes)],
             )
+            logger.info("R1_state_mid: file=%s registered, setting state", basename)
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
+            logger.info("R1_state_saving: file=%s", basename)
             state.save(dirs.state_file)
             logger.info("R1_pass: file=%s funcs=%s", basename, len(funcs))
         except Exception as exc:

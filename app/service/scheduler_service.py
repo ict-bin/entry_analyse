@@ -879,6 +879,154 @@ class SchedulerService:
         return result
 
     # ═══════════════════════════════════════════════════════════════════════
+    # Task dispatch
+    # ═══════════════════════════════════════════════════════════════════════
+
+    DISPATCH_POLL_SECONDS = int(os.environ.get("EA_DISPATCH_POLL_SECONDS", "5"))
+    DISPATCH_BATCH_SIZE = max(1, int(os.environ.get("EA_DISPATCH_BATCH_SIZE", "10")))
+
+    async def _dispatch_loop(self) -> None:
+        """Assign pending tasks to available workers."""
+        while self._running:
+            try:
+                assigned = await self._dispatch_pending_tasks()
+                if assigned:
+                    logger.info("scheduler dispatched %s tasks", assigned)
+            except Exception as exc:
+                logger.warning("scheduler dispatch error: %s", exc)
+            await asyncio.sleep(self.DISPATCH_POLL_SECONDS)
+
+    async def _dispatch_pending_tasks(self) -> int:
+        """Find pending tasks and assign to best available workers."""
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        assigned = 0
+        try:
+            now = now_local()
+
+            # 1. Get pending tasks
+            pending = (
+                db.query(AppEaTask)
+                .filter(
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.status == "pending",
+                    AppEaTask.owner_pod.is_(None),
+                    AppEaTask.cancel_requested.is_(False),
+                )
+                .order_by(AppEaTask.created_at.asc())
+                .limit(self.DISPATCH_BATCH_SIZE)
+                .all()
+            )
+            if not pending:
+                return 0
+
+            # 2. Get healthy workers with capacity
+            from app.db.models import AppEaWorkerSlot
+            from app.service.worker_slot_service import STALE_AFTER_SECONDS
+            cutoff = now - timedelta(seconds=STALE_AFTER_SECONDS)
+            workers = (
+                db.query(AppEaWorkerSlot)
+                .filter(
+                    AppEaWorkerSlot.runtime_role == "worker",
+                    AppEaWorkerSlot.last_heartbeat_at >= cutoff,
+                )
+                .all()
+            )
+            if not workers:
+                logger.warning("scheduler dispatch: no healthy workers")
+                return 0
+
+            # 3. Count running tasks per worker
+            running_counts: dict[str, int] = {}
+            for w in workers:
+                pod = str(w.pod_name or "").strip()
+                if pod:
+                    running_counts[pod] = len(self._get_pod_tasks(pod))
+
+            # 4. Assign tasks to least-loaded workers
+            from app.service.task_service import (
+                TASK_EVENT_SOURCE_SYSTEM,
+                _event_dedupe_key,
+                _lease_deadline,
+                _reset_cancel_state,
+                _safe_create_task_event,
+            )
+            from sqlalchemy import update as _up
+
+            for task in pending:
+                # Pick worker with fewest running tasks (max 1 per worker for entry-analyse)
+                best_worker = None
+                best_count = 999
+                for w in workers:
+                    pod = str(w.pod_name or "").strip()
+                    if not pod:
+                        continue
+                    count = running_counts.get(pod, 0)
+                    max_tasks = max(1, int(getattr(w, "max_concurrent_tasks", 1) or 1))
+                    if count < max_tasks and count < best_count:
+                        best_worker = pod
+                        best_count = count
+
+                if best_worker is None:
+                    logger.debug("scheduler dispatch: no capacity for task %s", task.task_id)
+                    break
+
+                # Atomic assign: only update if still pending + unowned
+                lease = now + timedelta(seconds=300)  # 5 min lease
+                result = db.execute(
+                    _up(AppEaTask)
+                    .where(
+                        AppEaTask.id == task.id,
+                        AppEaTask.status == "pending",
+                        AppEaTask.owner_pod.is_(None),
+                        AppEaTask.cancel_requested.is_(False),
+                    )
+                    .values(
+                        status="running",
+                        owner_pod=best_worker,
+                        lease_expires_at=lease,
+                        started_at=now,
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    continue  # claimed by someone else
+
+                # Update mapping
+                self._assign_task(task.task_id, best_worker)
+                running_counts[best_worker] = running_counts.get(best_worker, 0) + 1
+
+                _safe_create_task_event(
+                    db,
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    event_type="task_dispatched",
+                    message=f"任务已由调度器分发给 {best_worker}",
+                    source=TASK_EVENT_SOURCE_SYSTEM,
+                    status="running",
+                    payload={
+                        "owner_pod": best_worker,
+                        "dispatch_mode": "scheduler",
+                        "lease_expires_at": lease.isoformat(),
+                    },
+                    dedupe_key=_event_dedupe_key(
+                        task.task_id, "task_dispatched", best_worker, "scheduler",
+                    ),
+                )
+                assigned += 1
+                logger.info(
+                    "scheduler dispatched task %s to %s (load=%s)",
+                    task.task_id, best_worker, best_count + 1,
+                )
+
+            db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+        return assigned
+
+    # ═══════════════════════════════════════════════════════════════════════
     # Main loops
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -920,10 +1068,12 @@ class SchedulerService:
             asyncio.create_task(self._command_loop(), name="ea_cmd_loop"),
             asyncio.create_task(self._reconcile_loop(), name="ea_reconcile_loop"),
             asyncio.create_task(self._pod_health_loop(), name="ea_pod_health_loop"),
+            asyncio.create_task(self._dispatch_loop(), name="ea_dispatch_loop"),
         ]
         logger.info(
-            "Entry-analysis scheduler started (poll=%ss, cmd_poll=%ss, health_poll=%ss)",
-            SCHEDULER_POLL_SECONDS, COMMAND_POLL_SECONDS, POD_HEALTH_CHECK_SECONDS,
+            "Entry-analysis scheduler started (poll=%ss, cmd=%ss, health=%ss, dispatch=%ss)",
+            SCHEDULER_POLL_SECONDS, COMMAND_POLL_SECONDS,
+            POD_HEALTH_CHECK_SECONDS, self.DISPATCH_POLL_SECONDS,
         )
 
     def stop(self) -> None:

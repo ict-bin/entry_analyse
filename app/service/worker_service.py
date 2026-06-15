@@ -610,7 +610,12 @@ class WorkerService:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _dispatch_loop(self) -> None:
-        """Poll DB for pending tasks; claim one when idle."""
+        """Poll for tasks assigned to this pod by the scheduler.
+
+        The scheduler sets owner_pod=POD_NAME + status=running + lease_expires_at.
+        This loop picks up such tasks and starts executing them.
+        Falls back to legacy self-claim if the scheduler is not running.
+        """
         from app.service import task_service as task_mod
         svc = task_mod.get_task_service()
 
@@ -619,6 +624,16 @@ class WorkerService:
                 continue  # busy with a task
 
             try:
+                # Primary: poll for tasks assigned to this pod by the scheduler
+                task_id = self._poll_assigned_task()
+                if task_id:
+                    logger.info(
+                        "worker picked up scheduler-assigned task: %s", task_id,
+                    )
+                    self.start_task(task_id)
+                    continue
+
+                # Fallback: legacy self-claim (for backward compat if scheduler is down)
                 project_ids = self._discover_active_projects()
                 if not project_ids:
                     continue
@@ -628,13 +643,53 @@ class WorkerService:
                     if self._local_task_ids:
                         break
                     if loop is not None and loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
-                            self._schedule_dispatch_async(svc, pid), loop,
+                        loop.call_soon_threadsafe(
+                            lambda p=pid: asyncio.ensure_future(
+                                self._claim_and_start_legacy(svc, p)
+                            )
                         )
                     else:
                         svc.schedule_dispatch(pid)
             except Exception as exc:
                 logger.warning("dispatch loop error: %s", exc)
+
+    def _poll_assigned_task(self) -> str | None:
+        """Find a task assigned to this pod by the scheduler.
+
+        Returns task_id if found, None otherwise.
+        """
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            from app.db.models import AppEaTask as _T
+            from app.time_utils import now_local as _nl
+            now = _nl()
+            row = (
+                db.query(_T.task_id)
+                .filter(
+                    _T.is_deleted.is_(False),
+                    _T.status == "running",
+                    _T.owner_pod == POD_NAME,
+                    _T.cancel_requested.is_(False),
+                    _T.lease_expires_at.is_not(None),
+                    _T.lease_expires_at > now,
+                )
+                .order_by(_T.started_at.asc())
+                .first()
+            )
+            return str(row[0]) if row else None
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    async def _claim_and_start_legacy(self, svc, project_id: str) -> None:
+        """Legacy self-claim dispatch (fallback)."""
+        try:
+            svc.schedule_dispatch(project_id)
+        except Exception as exc:
+            logger.warning("legacy dispatch failed for %s: %s", project_id, exc)
 
     async def _schedule_dispatch_async(self, svc, project_id: str) -> None:
         """Async wrapper so schedule_dispatch works from a thread."""
