@@ -1684,7 +1684,7 @@ def get_task_logs(
     if not row:
         raise HTTPException(404, f"任务不存在: {task_id}")
 
-    # ── 从本地 events.jsonl 读取（Worker 写，API 读，通过 PVC 共享）─────
+    # ── 从本地 events.jsonl 读取（优先），失败则回退到 MySQL ──────────────
     events_path = _Path(row.output_path or "") / task_id / "run" / "events.jsonl"
     all_events: list[dict] = []
     is_final = False
@@ -1703,6 +1703,14 @@ def get_task_logs(
                     is_final = True
                     continue
                 all_events.append(evt)
+        except Exception:
+            pass
+    else:
+        # 文件不在 PVC 上（如测试任务用 /tmp 路径），回退读 MySQL stages_json
+        try:
+            payload = row.stages_json if isinstance(row.stages_json, dict) else {}
+            all_events = payload.get("events") if isinstance(payload.get("events"), list) else []
+            is_final = bool(payload.get("final", False))
         except Exception:
             pass
 
