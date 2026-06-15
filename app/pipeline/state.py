@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -273,6 +274,13 @@ class PipelineState:
 
     updated_at: float = field(default_factory=time.time)
 
+    # ── 线程安全 ────────────────────────────────────────────────────────────
+    # R1 通过 asyncio.to_thread() 在多个线程中并发运行 _run_r1，
+    # 每个线程都会调用 register_functions() 和 save()。
+    # to_dict() 遍历 self.files 及其子 dict 时会触发
+    # "dict changed size during iteration" RuntimeError。
+    _lock: "threading.Lock" = field(default_factory=threading.Lock, init=False, repr=False)
+
     # ── 便捷查询 ──────────────────────────────────────────────────────────────
 
     @property
@@ -296,23 +304,26 @@ class PipelineState:
         }
 
     def save(self, path: Path) -> None:
-        """原子写：用 mkstemp 产生唯一临时文件，再 rename 到目标路径。"""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_str = tempfile.mkstemp(
-            dir=str(path.parent),
-            prefix='.ps_',
-            suffix='.tmp',
-        )
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-                fh.write(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
-            os.replace(tmp_str, str(path))
-        except Exception:
+        """原子写：用 mkstemp 产生唯一临时文件，再 rename 到目标路径。
+
+        线程安全：持有 _lock 防止与 register_functions() 并发修改。"""
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_str = tempfile.mkstemp(
+                dir=str(path.parent),
+                prefix='.ps_',
+                suffix='.tmp',
+            )
             try:
-                os.unlink(tmp_str)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    fh.write(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+                os.replace(tmp_str, str(path))
+            except Exception:
+                try:
+                    os.unlink(tmp_str)
+                except OSError:
+                    pass
+                raise
 
     @classmethod
     def from_dict(cls, data: dict) -> "PipelineState":
@@ -381,7 +392,15 @@ class PipelineState:
         file_hash: str,
         funcs: list[tuple[str, str, str, int, int]],
     ) -> None:
-        """注册函数列表到文件状态（R1 完成后调用）。"""
+        """注册函数列表到文件状态（R1 完成后调用）。线程安全。"""
+        with self._lock:
+            self._register_functions_unlocked(file_hash, funcs)
+
+    def _register_functions_unlocked(
+        self,
+        file_hash: str,
+        funcs: list[tuple[str, str, str, int, int]],
+    ) -> None:
         fs = self.files.get(file_hash)
         if fs is None:
             return
