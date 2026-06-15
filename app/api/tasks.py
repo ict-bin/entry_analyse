@@ -1695,7 +1695,9 @@ def get_task_logs(
     _log.warning("get_task_logs: task=%s pvc=%s local=%s read=%s", task_id, pvc_path.is_file(), local_path.is_file(), _read_path)
     if _read_path:
         try:
-            for line in _read_path.read_text(encoding="utf-8").splitlines():
+            _raw = _read_path.read_text(encoding="utf-8")
+            _log.warning("get_task_logs: file size=%s lines=%s", len(_raw), _raw.count(chr(10)))
+            for line in _raw.splitlines():
                 line = line.strip()
                 if not line:
                     continue
