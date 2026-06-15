@@ -48,32 +48,52 @@ class ModuleInfo(NamedTuple):
     files: list[str]        # 文件路径列表（绝对或相对）
 
 
-# 允许分析的源文件扩展名（C/C++）——防御上游 system-analyse 可能
-# 把 .pl/.py/.ini 等非源码文件误写入 files.list。
-_SOURCE_EXTS: frozenset[str] = frozenset({
-    ".c", ".h",
-    ".cc", ".cpp", ".cxx", ".c++",
-    ".hh", ".hpp", ".hxx", ".h++",
-})
+# ─── 语言解析器注册表（可扩展）────────────────────────────────────────────────
+# 每个条目: {extensions} → parser_id
+# 新增语言只需添加一行注册，无需修改过滤逻辑。
+_PARSER_REGISTRY: list[tuple[frozenset[str], str]] = [
+    (frozenset({".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp", ".hxx", ".h++"}), "tree-sitter-c/cpp"),
+    # 未来扩展示例：
+    # (frozenset({".py", ".pyx"}), "python-ast"),
+    # (frozenset({".go"}), "go-parser"),
+    # (frozenset({".rs"}), "rust-analyzer"),
+]
+
+# 缓存：ext → parser_id（由 _PARSER_REGISTRY 惰性构建）
+_KNOWN_EXTS: frozenset[str] | None = None
 
 
-def _filter_source_files(files: list[str]) -> list[str]:
-    """过滤 files.list 中非 C/C++ 源文件的条目（安全防护）。"""
+def _get_known_extensions() -> frozenset[str]:
+    global _KNOWN_EXTS
+    if _KNOWN_EXTS is None:
+        _KNOWN_EXTS = frozenset(
+            ext for exts, _pid in _PARSER_REGISTRY for ext in exts
+        )
+    return _KNOWN_EXTS
+
+
+def _filter_source_files(files: list[str]) -> tuple[list[str], list[str]]:
+    """过滤 files.list 中当前不支持的文件类型。
+
+    返回 (kept, dropped)。已注册在 _PARSER_REGISTRY 中的扩展名保留，
+    其余丢弃并记录 WARNING 日志。
+    """
+    known = _get_known_extensions()
     kept: list[str] = []
     dropped: list[str] = []
     for fp in files:
         suffix = os.path.splitext(os.path.basename(fp))[1].lower()
-        if suffix in _SOURCE_EXTS:
+        if suffix in known:
             kept.append(fp)
         else:
             dropped.append(fp)
     if dropped:
         import logging
         logging.getLogger("ea.module_loader").warning(
-            "filtered %d non-C/C++ files from files.list: %s",
+            "filtered %d unsupported files (no parser): %s",
             len(dropped), ", ".join(os.path.basename(f) for f in dropped[:10]),
         )
-    return kept
+    return kept, dropped
 
 
 def load_module(module_name: str, target_dir: str) -> ModuleInfo:

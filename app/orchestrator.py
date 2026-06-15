@@ -221,8 +221,8 @@ class Orchestrator:
             # 写入 files.list，导致 tree-sitter C parser 解析非 C 代码
             # 产生大量 ERROR 节点 → gap 正则灾难性回溯 → R1 卡死
             from .module_loader import _filter_source_files
-            filtered = _filter_source_files(module_info.files)
-            module_info = module_info._replace(files=filtered)
+            kept, dropped = _filter_source_files(module_info.files)
+            module_info = module_info._replace(files=kept)
             self._emit("module_found", task_id,
                        module=cfg.module_name, files=module_info.files)
 
