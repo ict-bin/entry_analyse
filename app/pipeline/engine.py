@@ -435,6 +435,7 @@ class PipelineEngine:
         self.cfg = cfg
         self.task_id = task_id
         self._cancel = cancel_event or asyncio.Event()
+        self._cancel_thr = threading.Event()  # 线程可检查的取消信号
         self._source_dir: str = ""
         self._out_dir: Path | None = None
         self._r4_j_confirmed: bool = False
@@ -1082,7 +1083,7 @@ class PipelineEngine:
                 system_prompt=self._stage_sys_prompt("r1_worker"),
                 priority=SemPriority.R1_W,
             )
-            import sys; print(f"R1_POST [{basename}]: funcs={len(funcs)}", file=sys.stderr, flush=True)
+            logger.warning("R1_POST_AWAIT: file=%s funcs=%s", basename, len(funcs))
             logger.info("R1_worker_done: file=%s funcs=%s", basename, len(funcs))
             state.register_functions(
                 file_hash,
