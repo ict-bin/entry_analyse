@@ -877,9 +877,6 @@ class WorkerService:
                         pass
             with _progress_lock:
                 last_progress_time = time.time()
-            # ── DB 周期性刷新：前端 getTaskLogs 接口读 stages_json ────
-            if len(event_buffer) % 5 == 0:
-                task_mod._flush_stages(task_id, event_buffer)
 
         # ── Step 0: Claim the task in DB ──────────────────────────────────
         db_gen = get_db()
