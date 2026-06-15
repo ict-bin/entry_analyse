@@ -2,7 +2,7 @@ import asyncio
 
 from app.models import TaskConfig
 from app.pipeline import api_filter as api_filter_mod
-from app.pipeline.lean_engine import LeanPipelineEngine
+from app.pipeline.engine import PipelineEngine
 from app.pipeline.state import FunctionState
 
 
@@ -86,7 +86,7 @@ def test_function_state_preserves_api_filter_skip_fields() -> None:
 
 
 def test_lean_engine_exposes_api_filter_summary() -> None:
-    engine = LeanPipelineEngine(cfg=TaskConfig(task="t", module_name="m"), task_id="task-1")
+    engine = PipelineEngine(cfg=TaskConfig(task="t", module_name="m"), task_id="task-1")
     states = [
         FunctionState(func_hash="f1", name="a", start_line=1, api_filter_state="passed"),
         FunctionState(func_hash="f2", name="b", start_line=2, api_filter_state="skipped", api_filter_skip_reason="timeout"),

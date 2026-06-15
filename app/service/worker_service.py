@@ -952,15 +952,16 @@ class WorkerService:
                 # ── Pipeline progress watchdog ───────────────────────────
                 with _progress_lock:
                     stall_seconds = time.time() - last_progress_time
-                # Allow 15 min grace for first R1 file (tree-sitter + LLM),
-                # 5 min thereafter.
-                stall_limit = 900 if last_progress_time == self._task_lease_started_at.get(task_id, 0) else 300
+                # Entry analysis can spend a long time inside agents without
+                # producing incremental progress events; keep the watchdog as a
+                # last-resort hang protection instead of an aggressive killer.
+                stall_limit = 36000
                 if stall_seconds > stall_limit:
                     logger.error(
                         "pipeline stalled: no progress for %ds (limit=%ds, last_progress=%.1f), aborting task=%s",
                         stall_seconds, stall_limit, last_progress_time, task_id,
                     )
-                    orch.abort()
+                    orch.abort(reason="stalled")
                     stop_lease.set()
                     return
                 # ── Lease renewal ────────────────────────────────────────
@@ -998,7 +999,7 @@ class WorkerService:
                             "lease renewal: consecutive failures=%s, aborting task=%s",
                             failures, task_id,
                         )
-                        orch.abort()
+                        orch.abort(reason="lease_failure")
                         stop_lease.set()
                         return
 
@@ -1041,7 +1042,7 @@ class WorkerService:
                         )
                         if _cr is None:
                             stop_lease.set()
-                            orch.abort()
+                            orch.abort(reason="task_missing")
                             return
                         if _cr.cancel_requested:
                             logger.warning(
@@ -1049,7 +1050,7 @@ class WorkerService:
                             )
                             nonlocal cancel_requested
                             cancel_requested = True
-                            orch.abort()
+                            orch.abort(reason="cancelled")
                             stop_lease.set()
                             return
                     finally:

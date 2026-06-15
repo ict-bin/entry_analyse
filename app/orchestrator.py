@@ -157,6 +157,7 @@ class Orchestrator:
         self.cfg = config
         self.on_event = on_event or (lambda e: None)
         self._cancel_event: asyncio.Event | None = None
+        self._abort_reason: str | None = None
         self.module_files: list[str] = []
 
     def _emit(self, etype: str, task_id: str, **data) -> None:
@@ -177,6 +178,7 @@ class Orchestrator:
         target_dir = os.path.abspath(cfg.cwd)
         source_dir = os.path.abspath(cfg.source_path) if cfg.source_path else target_dir
         self._cancel_event = asyncio.Event()
+        self._abort_reason = None
 
         # ── 同步 LLM Provider → pi models.json ──────────────────────────────
         try:
@@ -196,6 +198,7 @@ class Orchestrator:
         input_dir = base_dir / "input"
         run_dir   = base_dir / "run"
         out_dir   = base_dir / "output"
+        resolved_files: list[str] = []
 
         _write_input_metadata(
             input_dir, task_id=task_id, cfg=cfg,
@@ -207,6 +210,7 @@ class Orchestrator:
             task_id=task_id, status=TaskStatus.RUNNING,
             task=cfg.task, module_name=cfg.module_name,
             config_snapshot=cfg.model_dump())
+        engine = None
 
         flag_path = out_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")
@@ -280,9 +284,12 @@ class Orchestrator:
                 task_id, len(entries) if entries else 0, _time.monotonic() - _eng_start,
             )
 
-            if self._cancel_event.is_set():
+            if self._cancel_event.is_set() and self._abort_reason == "cancelled":
                 result.status = TaskStatus.CANCELLED
                 result.error = "任务已被取消"
+            elif self._cancel_event.is_set():
+                result.status = TaskStatus.FAILED
+                result.error = "任务因运行保护机制中止"
             elif entries:
                 result.status = TaskStatus.PASSED
             elif engine._r4_j_confirmed:
@@ -309,12 +316,13 @@ class Orchestrator:
 
         # ── 3. 产物写出 ──────────────────────────────────────────────────────
         # cancel 后跳过产物写出，避免浪费时间写无效文件
-        if self._cancel_event and self._cancel_event.is_set():
+        if self._cancel_event and self._cancel_event.is_set() and self._abort_reason == "cancelled":
             self._emit("task_end", task_id,
                        status=result.status.value,
                        run_dir=str(run_dir),
                        output_dir=str(out_dir))
             self._cancel_event = None
+            self._abort_reason = None
             return result
 
         # result.json（中间过程归档）
@@ -382,28 +390,29 @@ class Orchestrator:
 
 
         # final_report.md — 先由 Python 从 funcDB 提取完整草稿，再由 W+J 丰富化
-        try:
-            _stats = {
-                "module_name":       cfg.module_name,
-                "file_count":        len(resolved_files) if resolved_files else 0,
-                "total_duration_ms": result.total_duration_ms,
-                # Fix-5: 从 engine 实例读取已聚合的 session token 用量
-                "total_tokens":      getattr(engine, "_total_token_usage", None)
-                                     or (result.total_tokens.model_dump()
-                                         if hasattr(result, "total_tokens") and result.total_tokens
-                                         else {}),
-            }
-            await engine.generate_final_report(
-                run_dir=run_dir,
-                fl_entries=_fl_all,  # final_report 包含外部入口和处理入口
-                out_dir=out_dir,
-                module_name=cfg.module_name,
-                stats=_stats,
-            )
-        except Exception as _rep_exc:
-            import logging as _log
-            _log.getLogger("ea.orchestrator").warning(
-                "final_report.md generation failed: %s", _rep_exc)
+        if engine is not None:
+            try:
+                _stats = {
+                    "module_name":       cfg.module_name,
+                    "file_count":        len(resolved_files) if resolved_files else 0,
+                    "total_duration_ms": result.total_duration_ms,
+                    # Fix-5: 从 engine 实例读取已聚合的 session token 用量
+                    "total_tokens":      getattr(engine, "_total_token_usage", None)
+                                         or (result.total_tokens.model_dump()
+                                             if hasattr(result, "total_tokens") and result.total_tokens
+                                             else {}),
+                }
+                await engine.generate_final_report(
+                    run_dir=run_dir,
+                    fl_entries=_fl_all,  # final_report 包含外部入口和处理入口
+                    out_dir=out_dir,
+                    module_name=cfg.module_name,
+                    stats=_stats,
+                )
+            except Exception as _rep_exc:
+                import logging as _log
+                _log.getLogger("ea.orchestrator").warning(
+                    "final_report.md generation failed: %s", _rep_exc)
 
         # incomplete_functions.json（R2 判定源文件不完整的函数，跳过了后续分析）
         _inc_src = run_dir / "workspace" / "r1-functions" / "incomplete_functions.json"
@@ -447,8 +456,10 @@ class Orchestrator:
                    flag_file=str(flag_path))
 
         self._cancel_event = None
+        self._abort_reason = None
         return result
 
-    def abort(self) -> None:
+    def abort(self, reason: str = "cancelled") -> None:
+        self._abort_reason = reason
         if self._cancel_event:
             self._cancel_event.set()

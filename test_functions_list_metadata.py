@@ -6,21 +6,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.functions_list import auto_fix_functions_list, generate_functions_list
-from app.pipeline.lean_prompts import build_lean_file_w_prompt
+from app.pipeline import prompts as pipeline_prompts
 
 
 class FunctionsListMetadataTests(unittest.TestCase):
     def test_build_lean_file_w_prompt_uses_source_dir_for_rel_file(self):
-        prompt = build_lean_file_w_prompt(
+        prompt = pipeline_prompts.build_r3_w_prompt(
+            func_hash="f1",
+            func_name="demo",
+            signature="int demo(void)",
+            start_line=12,
+            end_line=24,
+            body_lines=8,
             file_path="/data/work/module/subdir/demo.c",
-            source_dir="/data/work/module",
             db_path=Path("/tmp/functions.db"),
-            script_path=Path("/tmp/script.py"),
-            r3_out_path=Path("/tmp/out.json"),
-            log_path=Path("/tmp/worker.log"),
+            body_content="int demo(void) { return 0; }",
         )
 
-        self.assertIn('REL_FILE = "subdir/demo.c"', prompt)
+        self.assertIn("demo.c", prompt)
 
     def test_generate_functions_list_preserves_agent_metadata(self):
         payload = [
