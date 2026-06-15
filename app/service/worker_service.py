@@ -32,6 +32,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -232,6 +233,142 @@ def _kill_all_task_processes(
         task_id, killed,
     )
     return killed
+
+
+def _task_agent_key(task_config_json: dict | None) -> dict | None:
+    if not isinstance(task_config_json, dict):
+        return None
+    payload = task_config_json.get("agent_task_key")
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_json_file(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None) -> tuple[str | None, str]:
+    secret = str((agent_task_key or {}).get("secret") or "").strip()
+    if not secret or not task_root:
+        return None, "global"
+    task_pi_dir = Path(task_root) / ".pi" / "agent"
+    task_pi_dir.mkdir(parents=True, exist_ok=True)
+    global_pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+    models_src = Path(os.environ.get("PI_MODELS_JSON") or (global_pi_dir / "models.json"))
+    settings_src = global_pi_dir / "settings.json"
+    if models_src.is_file():
+        _shutil.copy2(models_src, task_pi_dir / "models.json")
+    else:
+        (task_pi_dir / "models.json").write_text(json.dumps({"providers": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
+    if settings_src.is_file():
+        _shutil.copy2(settings_src, task_pi_dir / "settings.json")
+    elif not (task_pi_dir / "settings.json").exists():
+        (task_pi_dir / "settings.json").write_text("{}", encoding="utf-8")
+    (task_pi_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
+                "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
+                "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
+                "agent_task_key_secret": secret,
+                "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return str(task_pi_dir), "task_scoped"
+
+
+def _normalize_agent_auth_snapshot(agent_task_key: dict | None) -> dict[str, Any] | None:
+    if not isinstance(agent_task_key, dict):
+        return None
+    payload = {
+        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
+        "agent_task_key_name": str(agent_task_key.get("name") or "").strip() or None,
+        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+        "agent_task_key_secret": str(agent_task_key.get("secret") or "").strip() or None,
+        "agent_task_key_source": str(agent_task_key.get("source") or "").strip() or None,
+    }
+    return payload if any(payload.values()) else None
+
+
+def _build_role_runtime_summary(
+    role_name: str,
+    role_config: Any,
+    *,
+    models_json: dict[str, Any] | None,
+    settings_json: dict[str, Any] | None,
+) -> dict[str, Any]:
+    agents = []
+    for index, agent in enumerate(getattr(role_config, "agents", []) or []):
+        if hasattr(agent, "model_dump"):
+            payload = agent.model_dump(mode="json")
+        elif isinstance(agent, dict):
+            payload = dict(agent)
+        else:
+            payload = {"model": str(getattr(agent, "model", "") or "").strip() or None}
+        payload.setdefault("index", index)
+        agents.append(payload)
+    return {
+        "role_name": role_name,
+        "default_model": str(getattr(role_config, "default_model", "") or "").strip() or None,
+        "default_tools": list(getattr(role_config, "default_tools", []) or []),
+        "default_thinking_level": str(getattr(role_config, "default_thinking_level", "") or "").strip() or None,
+        "system_prompt_dir": str(getattr(role_config, "system_prompt_dir", "") or "").strip() or None,
+        "agent_count": len(agents),
+        "agents": agents,
+        "models_json": models_json,
+        "settings_json": settings_json,
+    }
+
+
+def _build_runtime_config_snapshots(
+    *,
+    cfg: Any,
+    agent_task_key: dict | None,
+    task_pi_dir: str | None,
+    agent_runtime_mode: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    frozen_at = now_local().isoformat()
+    runtime_dir = Path(task_pi_dir) if task_pi_dir else Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+    models_path = Path(os.environ.get("PI_MODELS_JSON")) if not task_pi_dir and os.environ.get("PI_MODELS_JSON") else (runtime_dir / "models.json")
+    settings_path = runtime_dir / "settings.json"
+    models_json = _read_json_file(models_path)
+    settings_json = _read_json_file(settings_path)
+    agent_auth_json = _normalize_agent_auth_snapshot(agent_task_key)
+    role_config_snapshot = {
+        "workers": cfg.workers.model_dump(mode="json"),
+        "judges": cfg.judges.model_dump(mode="json"),
+    }
+    provider_runtime_summary = {
+        "workers": _build_role_runtime_summary("workers", cfg.workers, models_json=models_json, settings_json=settings_json),
+        "judges": _build_role_runtime_summary("judges", cfg.judges, models_json=models_json, settings_json=settings_json),
+    }
+    llm_binding_snapshot = {
+        "version": 1,
+        "frozen_at": frozen_at,
+        "agent_runtime_mode": agent_runtime_mode,
+        "agent_task_key": {
+            "id": str((agent_task_key or {}).get("id") or "").strip() or None,
+            "name": str((agent_task_key or {}).get("name") or "").strip() or None,
+            "prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
+            "secret": str((agent_task_key or {}).get("secret") or "").strip() or None,
+            "source": str((agent_task_key or {}).get("source") or "").strip() or None,
+        } if isinstance(agent_task_key, dict) else None,
+        "runtime_files": {
+            "models_json": models_json,
+            "settings_json": settings_json,
+        },
+        "roles": role_config_snapshot,
+    }
+    return agent_auth_json, role_config_snapshot, provider_runtime_summary, llm_binding_snapshot
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -704,6 +841,51 @@ class WorkerService:
             source_path=task_snapshot.source_path or "",
             resume_task_id=tcfg.get("resume_task_id", ""),
         )
+        task_root = str(Path(task_snapshot.output_path or "") / task_id) if task_snapshot.output_path else ""
+        agent_task_key = _task_agent_key(tcfg)
+        task_pi_dir, agent_runtime_mode = _materialize_task_pi_runtime(
+            task_root=task_root,
+            agent_task_key=agent_task_key,
+        )
+        if task_pi_dir:
+            cfg.task_pi_dir = task_pi_dir
+        (
+            agent_auth_json,
+            role_config_snapshot,
+            provider_runtime_summary,
+            llm_binding_snapshot,
+        ) = _build_runtime_config_snapshots(
+            cfg=cfg,
+            agent_task_key=agent_task_key,
+            task_pi_dir=task_pi_dir,
+            agent_runtime_mode=agent_runtime_mode,
+        )
+        _db_cfg_gen = get_db()
+        _db_cfg = next(_db_cfg_gen)
+        try:
+            _row_cfg = (
+                _db_cfg.query(AppEaTask)
+                .filter(
+                    AppEaTask.task_id == task_id,
+                    AppEaTask.owner_pod == POD_NAME,
+                )
+                .first()
+            )
+            if _row_cfg is not None and _row_cfg.status == "running":
+                _task_config_json = task_mod._parse_task_config(_row_cfg.task_config_json)
+                _row_cfg.task_config_json = {
+                    **_task_config_json,
+                    "agent_auth_json": agent_auth_json,
+                    "role_config_snapshot": role_config_snapshot,
+                    "provider_runtime_summary": provider_runtime_summary,
+                    "llm_binding_snapshot": llm_binding_snapshot,
+                }
+                _db_cfg.commit()
+        finally:
+            try:
+                next(_db_cfg_gen)
+            except StopIteration:
+                pass
         orch = Orchestrator(config=cfg, on_event=_on_event)
         self._task_abort_callbacks[task_id] = orch.abort
         self._task_lease_started_at[task_id] = time.time()

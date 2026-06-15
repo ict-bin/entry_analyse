@@ -1835,6 +1835,14 @@ def _agent_runtime_payload(row: AppEaTask) -> dict[str, object]:
         "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
         "agent_runtime_mode": "task_scoped" if secret else "global",
     }
+def _task_config_snapshot_payload(row: AppEaTask) -> dict[str, object]:
+    task_config = _parse_task_config(row.task_config_json)
+    return {
+        "agent_auth_json": task_config.get("agent_auth_json") if isinstance(task_config.get("agent_auth_json"), dict) else None,
+        "role_config_snapshot": task_config.get("role_config_snapshot") if isinstance(task_config.get("role_config_snapshot"), dict) else None,
+        "provider_runtime_summary": task_config.get("provider_runtime_summary") if isinstance(task_config.get("provider_runtime_summary"), dict) else None,
+        "llm_binding_snapshot": task_config.get("llm_binding_snapshot") if isinstance(task_config.get("llm_binding_snapshot"), dict) else None,
+    }
 
 
 def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task_id: Optional[str], parent_stage_name: Optional[str]) -> bool:
@@ -3609,6 +3617,7 @@ class TaskService:
             "abnormal_reason_history": _abnormal_reason_history(row),
             "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
             **_agent_runtime_payload(row),
+            **_task_config_snapshot_payload(row),
         })
         if include_function_catalog:
             payload["function_catalog"] = _build_function_catalog(row)
