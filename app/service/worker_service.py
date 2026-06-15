@@ -722,14 +722,17 @@ class WorkerService:
             ts = task_mod._time.time()
             entry = {"ts": ts, "type": event.type, "data": dict(getattr(event, "data", {}))}
             event_buffer.append(entry)
-            # 写本地 JSONL（每行一个 event，即时 flush）
-            if _events_path is not None:
-                try:
-                    with open(str(_events_path), "a", encoding="utf-8") as _ef:
-                        _ef.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                        _ef.flush()
-                except Exception:
-                    pass
+            # 写本地 JSONL（output_path 和 PVC 双写，API 读 PVC）
+            _line = json.dumps(entry, ensure_ascii=False) + "\n"
+            for _p in (_events_path, _events_path_pvc):
+                if _p is not None:
+                    try:
+                        _p.parent.mkdir(parents=True, exist_ok=True)
+                        with open(str(_p), "a", encoding="utf-8") as _ef:
+                            _ef.write(_line)
+                            _ef.flush()
+                    except Exception:
+                        pass
             with _progress_lock:
                 last_progress_time = time.time()
 
@@ -819,9 +822,13 @@ class WorkerService:
                         raise
                 d.mkdir(parents=True, exist_ok=True)
 
-        # 初始化本地事件文件（写在 run/ 下，API Pod 通过 PVC 读取）
+        # 初始化事件文件：写在 PVC 路径（API Pod 可读），同时写 output_path（本地）
+        _events_path: _pl.Path | None = None
+        _events_path_pvc: _pl.Path | None = None
         if task_snapshot.output_path:
             _events_path = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id / "run" / "events.jsonl"
+        if project_id:
+            _events_path_pvc = _pl.Path("/data/files") / project_id / "app" / "secflow-app-entry-analyse" / task_id / "run" / "events.jsonl"
 
         # DB: clear runtime fields, stage_result_index
         _db2_gen = get_db()
@@ -1103,18 +1110,19 @@ class WorkerService:
             )
 
         # ── Step 9: Finalize events file ──────────────────────────────────
-        # 写入最终事件（含 final 标记）到本地 JSONL，不再推送 MySQL。
-        if _events_path is not None:
-            try:
-                final_entry = {"ts": time.time(), "type": "done", "data": {"status": result.status.value if result else "error"}}
-                with open(str(_events_path), "a", encoding="utf-8") as _ef:
-                    # 写入缓冲区中未落盘的事件
-                    for _evt in event_buffer:
-                        _ef.write(json.dumps(_evt, ensure_ascii=False) + "\n")
-                    _ef.write(json.dumps(final_entry, ensure_ascii=False) + "\n")
-                    _ef.flush()
-            except Exception as _exc:
-                logger.warning("Failed to write final events.jsonl: %s", _exc)
+        # 写入最终事件到 output_path 和 PVC 双路径。
+        final_entry = {"ts": time.time(), "type": "done", "data": {"status": result.status.value if result else "error"}}
+        for _p in (_events_path, _events_path_pvc):
+            if _p is not None:
+                try:
+                    _p.parent.mkdir(parents=True, exist_ok=True)
+                    with open(str(_p), "a", encoding="utf-8") as _ef:
+                        for _evt in event_buffer:
+                            _ef.write(json.dumps(_evt, ensure_ascii=False) + "\n")
+                        _ef.write(json.dumps(final_entry, ensure_ascii=False) + "\n")
+                        _ef.flush()
+                except Exception as _exc:
+                    logger.warning("Failed to write final events.jsonl (%s): %s", _p, _exc)
 
         # ── Step 10: Finalize DB status ───────────────────────────────────
 

@@ -1684,19 +1684,20 @@ def get_task_logs(
     if not row:
         raise HTTPException(404, f"任务不存在: {task_id}")
 
-    # ── 从本地 events.jsonl 读取（优先），失败则回退到 MySQL ──────────────
-    events_path = _Path(row.output_path or "") / task_id / "run" / "events.jsonl"
+    # ── 从 PVC events.jsonl 读取（优先），回退 output_path，最后 MySQL ──
+    pvc_path = _Path("/data/files") / (row.project_id or "") / "app" / "secflow-app-entry-analyse" / task_id / "run" / "events.jsonl"
+    local_path = _Path(row.output_path or "") / task_id / "run" / "events.jsonl"
     all_events: list[dict] = []
     is_final = False
-    if events_path.is_file():
+    _read_path = pvc_path if pvc_path.is_file() else (local_path if local_path.is_file() else None)
+    if _read_path:
         try:
-            for line in events_path.read_text(encoding="utf-8").splitlines():
+            for line in _read_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    import json as _json
-                    evt = _json.loads(line)
+                    evt = json.loads(line)
                 except Exception:
                     continue
                 if evt.get("type") == "done":
@@ -1706,7 +1707,7 @@ def get_task_logs(
         except Exception:
             pass
     else:
-        # 文件不在 PVC 上（如测试任务用 /tmp 路径），回退读 MySQL stages_json
+        # 回退 MySQL stages_json
         try:
             payload = row.stages_json if isinstance(row.stages_json, dict) else {}
             all_events = payload.get("events") if isinstance(payload.get("events"), list) else []
