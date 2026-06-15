@@ -405,9 +405,7 @@ async def run_r1_worker(
 
     # Complete gaps, no splitting. Script filter for maybe_function gaps.
     gaps_file = dirs.r1_gaps_file(file_hash)
-    logger.warning("GAP_START: file=%s", basename)
     gaps_list = _compute_gaps(static_funcs, file_path)
-    logger.warning("GAP_DONE: file=%s gaps=%s", basename, len(gaps_list))
     llm_gaps = [g for g in gaps_list if bool(g.get("maybe_function"))]
     skipped_n = len(gaps_list) - len(llm_gaps)
     import json as _json
@@ -611,7 +609,6 @@ async def run_r1_worker(
 
     funcs_out, hashes_out = _current_funcs()
     _sync_module_db(funcs_out, hashes_out)
-    logger.warning("R1_RETURN: file=%s funcs=%s", basename, len(funcs_out))
     return total_usage, funcs_out, hashes_out
 # ─── run_r2_w_worker ─────────────────────────────────────────────────────────
 
