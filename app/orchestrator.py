@@ -250,6 +250,12 @@ class Orchestrator:
                        files=resolved_files, agents=agents_desc)
 
             # ── 2. 运行流水线 ──
+            import time as _time
+            _eng_start = _time.monotonic()
+            logger.info(
+                "orchestrator: pipeline_start task=%s module=%s files=%s",
+                task_id, cfg.module_name, len(resolved_files),
+            )
             from .pipeline.engine import PipelineEngine
             engine = PipelineEngine(
                     cfg=cfg,
@@ -262,6 +268,10 @@ class Orchestrator:
                 run_dir=run_dir,
                 source_dir=source_dir,
                 out_dir=out_dir,
+            )
+            logger.info(
+                "orchestrator: pipeline_done task=%s entries=%s duration=%.2fs",
+                task_id, len(entries) if entries else 0, _time.monotonic() - _eng_start,
             )
 
             if self._cancel_event.is_set():

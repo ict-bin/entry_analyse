@@ -124,6 +124,17 @@ def _kill_all_task_processes(
     killed = 0
     proc_root = _pl.Path("/proc")
 
+    # Get the main PID to avoid killing self
+    _main_pid = os.getpid()
+    _main_pgid = os.getpgid(0)
+    _main_ppid = os.getppid()
+    _main_cwd = str(os.getcwd())
+
+    logger.info(
+        "kill_task_processes START: task_id=%s roots=%s main_pid=%s main_pgid=%s main_ppid=%s main_cwd=%s",
+        task_id, [str(r) for r in roots], _main_pid, _main_pgid, _main_ppid, _main_cwd,
+    )
+
     targets: list[tuple[int, int | None]] = []  # (pid, pgid)
 
     for proc_dir in proc_root.iterdir():
@@ -145,14 +156,43 @@ def _kill_all_task_processes(
             continue
 
         cwd_path = _pl.Path(cwd)
-        match = (
-            f" {task_id} " in f" {cmd} "
-            or any(
-                cwd_path == root or str(cwd_path).startswith(str(root) + "/")
-                for root in roots
-            )
-        )
+        cmdline_has_task = f" {task_id} " in f" {cmd} "
+        cwd_match_roots = [
+            str(r) for r in roots
+            if cwd_path == r or str(cwd_path).startswith(str(r) + "/")
+        ]
+        match = cmdline_has_task or bool(cwd_match_roots)
+
+        # 记录所有 python/node 进程，方便排查
+        match_reason = ""
+        if cmdline_has_task:
+            match_reason = f"cmdline_contains_task_id"
+        elif cwd_match_roots:
+            match_reason = f"cwd_under_root:{cwd_match_roots[0]}"
+
         if not match:
+            # 记录跳过原因（DEBUG 级别避免刷屏）
+            logger.debug(
+                "kill_task_processes SKIP: pid=%s comm=%s exe=%s cwd=%s ppid=%s cmd_head=%s",
+                pid, comm, exe, cwd,
+                (proc_dir / "stat").read_text(encoding="utf-8", errors="replace").split()[3] if (proc_dir / "stat").exists() else "?",
+                cmd[:200],
+            )
+            continue
+
+        # ── 安全检查：绝不对主进程或主进程的父/子进程发送 SIGKILL ──
+        try:
+            _ppid_str = (proc_dir / "stat").read_text(encoding="utf-8", errors="replace").split()
+            _ppid = int(_ppid_str[3]) if len(_ppid_str) > 3 else -1
+        except Exception:
+            _ppid = -1
+
+        is_self_or_ancestor = (pid == _main_pid or pid == _main_ppid or _ppid == _main_pid)
+        if is_self_or_ancestor:
+            logger.critical(
+                "kill_task_processes BLOCKED (self/ancestor): pid=%s comm=%s exe=%s cwd=%s ppid=%s match=%s",
+                pid, comm, exe, cwd, _ppid, match_reason,
+            )
             continue
 
         try:
@@ -166,8 +206,8 @@ def _kill_all_task_processes(
             pgid = None
 
         logger.warning(
-            "kill_task_processes: pid=%s pgid=%s comm=%s cwd=%s task=%s",
-            pid, pgid, comm, cwd, task_id,
+            "kill_task_processes KILL: pid=%s pgid=%s comm=%s exe=%s cwd=%s ppid=%s match=%s task=%s",
+            pid, pgid, comm, exe, cwd, _ppid, match_reason, task_id,
         )
         try:
             # CRITICAL: use os.kill(pid) NOT os.killpg().  killpg sends
@@ -185,8 +225,12 @@ def _kill_all_task_processes(
                 break
             time.sleep(0.05)
         else:
-            logger.warning("process pid=%s did not exit after SIGKILL", pid)
+            logger.warning("kill_task_processes: process pid=%s did not exit after SIGKILL", pid)
 
+    logger.info(
+        "kill_task_processes DONE: task_id=%s total_killed=%s",
+        task_id, killed,
+    )
     return killed
 
 
@@ -523,15 +567,24 @@ class WorkerService:
                 pass
 
         # ── Step 1: Environment reset (clean before starting) ─────────────
+        _t1_start = time.monotonic()
+        logger.info(
+            "_execute_task STEP1 cleanup_start: task=%s roots=%s",
+            task_id, [str(r) for r in task_roots],
+        )
         if task_roots:
             killed = _kill_all_task_processes(
                 task_id=task_id, task_roots=task_roots,
             )
-            if killed:
-                logger.warning(
-                    "task start: cleaned %s leftover processes for %s",
-                    killed, task_id,
-                )
+            logger.info(
+                "_execute_task STEP1 cleanup_done: task=%s killed=%s duration=%.2fs",
+                task_id, killed, time.monotonic() - _t1_start,
+            )
+        else:
+            logger.info(
+                "_execute_task STEP1 cleanup_skipped: task=%s (no task_roots)",
+                task_id,
+            )
 
         # ── Step 2: Reset disk (clean run/ and output/ dirs) ──────────────
         if task_snapshot.output_path:
@@ -638,8 +691,8 @@ class WorkerService:
                 stall_limit = 900 if last_progress_time == self._task_lease_started_at.get(task_id, 0) else 300
                 if stall_seconds > stall_limit:
                     logger.error(
-                        "pipeline stalled: no progress for %ds (limit=%ds), aborting task=%s",
-                        stall_seconds, stall_limit, task_id,
+                        "pipeline stalled: no progress for %ds (limit=%ds, last_progress=%.1f), aborting task=%s",
+                        stall_seconds, stall_limit, last_progress_time, task_id,
                     )
                     orch.abort()
                     stop_lease.set()
@@ -749,8 +802,17 @@ class WorkerService:
         cancel_thread.start()
 
         # ── Step 6: Run the pipeline ──────────────────────────────────────
+        _t6_start = time.monotonic()
+        logger.info(
+            "_execute_task STEP6 pipeline_start: task=%s last_progress_time=%.1f",
+            task_id, last_progress_time,
+        )
         try:
             result = await orch.execute(task_id)
+            logger.info(
+                "_execute_task STEP6 pipeline_done: task=%s result_status=%s duration=%.2fs",
+                task_id, getattr(result, 'status', None), time.monotonic() - _t6_start,
+            )
         except Exception as exc:
             logger.error("pipeline error for %s: %s", task_id, exc)
             result = None
@@ -770,8 +832,16 @@ class WorkerService:
                     pass
 
         # ── Step 8: Environment cleanup ───────────────────────────────────
+        logger.info(
+            "_execute_task STEP8 cleanup_start: task=%s cancel_requested=%s",
+            task_id, cancel_requested,
+        )
         if task_roots:
             _kill_all_task_processes(task_id=task_id, task_roots=task_roots)
+            logger.info(
+                "_execute_task STEP8 cleanup_done: task=%s",
+                task_id,
+            )
 
         # ── Step 9: Finalize DB ───────────────────────────────────────────
         task_mod._flush_stages(task_id, event_buffer)

@@ -488,6 +488,10 @@ class PipelineEngine:
         await asyncio.to_thread(state.save, dirs.state_file)
 
         self._emit("pipeline_start", file_count=len(module_files))
+        logger.info(
+            "engine.run initialized: task=%s files=%s state_file=%s",
+            self.task_id, len(module_files), dirs.state_file,
+        )
 
         # ─── 单一全并行流水线：文件 R1 完成后立即启动其函数的 R2/R3/R4/R5 ────────
         #
@@ -536,6 +540,11 @@ class PipelineEngine:
             nonlocal r1_done_count, total_funcs, all_r1_done_flag
             total_funcs   += func_count
             r1_done_count += 1
+            if r1_done_count % 10 == 0 or r1_done_count == total_files:
+                logger.info(
+                    "engine.run R1 progress: %s/%s files done, total_funcs=%s",
+                    r1_done_count, total_files, total_funcs,
+                )
             if r1_done_count == total_files:
                 all_r1_done_flag = True
                 _maybe_set_all_r2_done()
@@ -763,6 +772,10 @@ class PipelineEngine:
         # Fix-5: 从 sessions JSONL 聚合 token 用量
         self._total_token_usage = _aggregate_session_tokens(dirs.sessions)
 
+        logger.info(
+            "engine.run done: task=%s entries=%s",
+            self.task_id, len(final_entries),
+        )
         return final_entries
 
     # ── Phase 1 文件单元：R1（静态提取 + per-gap 并行补全）+ R2（行号准确性）──────
