@@ -445,8 +445,11 @@ class PipelineEngine:
         _raw = on_event or (lambda e: None)
         _lock = self._on_event_lock
         def _ts_emit(evt: Any) -> None:
-            with _lock:
-                _raw(evt)
+            # CRITICAL: do NOT hold the lock during the callback.
+            # _raw(evt) may trigger DB writes (_flush_stages),
+            # which blocks → deadlocks all other R1 threads.
+            # Python list append is GIL-protected, no lock needed.
+            _raw(evt)
         self._on_event = _ts_emit
 
     # ── 公共入口 ───────────────────────────────────────────────────────────────
