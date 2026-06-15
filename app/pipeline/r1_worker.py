@@ -34,6 +34,7 @@ from ..runner import run_agent, AgentResult
 from ..agent_slots import SemPriority
 from .dirs import PipelineDirs
 from .result_index import write_stage_result_files
+from .prompts import build_r2_w_prompt
 from .extractor import (
     FunctionExtract,
     compute_file_hash,
@@ -554,7 +555,7 @@ async def run_r1_worker(
                         stage_key="r1_w",
                         role_kind="worker",
                         priority=priority,
-                        task_pi_dir=getattr(cfg, "task_pi_dir", ""),
+                        task_pi_dir=cfg.role_pi_dir("workers"),
                     )
 
                 prompt = build_r1_gap_prompt(
@@ -713,7 +714,7 @@ async def run_r2_w_worker(
         stage_key="r2_w",
         role_kind="worker",
         priority=priority,
-        task_pi_dir=getattr(cfg, "task_pi_dir", ""),
+        task_pi_dir=cfg.role_pi_dir("workers"),
     )
 
     corrections = _parse_r1_corrections(ar.output)

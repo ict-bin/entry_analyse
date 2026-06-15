@@ -1829,11 +1829,13 @@ def _agent_runtime_payload(row: AppEaTask) -> dict[str, object]:
     task_config = _parse_task_config(row.task_config_json)
     agent_task_key = task_config.get("agent_task_key") if isinstance(task_config.get("agent_task_key"), dict) else {}
     secret = str(agent_task_key.get("secret") or "").strip()
+    llm_binding_snapshot = task_config.get("llm_binding_snapshot") if isinstance(task_config.get("llm_binding_snapshot"), dict) else {}
+    runtime_mode = str(llm_binding_snapshot.get("agent_runtime_mode") or "").strip() or "task_scoped"
     return {
         "has_agent_task_key": bool(secret),
         "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
         "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
-        "agent_runtime_mode": "task_scoped" if secret else "global",
+        "agent_runtime_mode": runtime_mode,
     }
 def _task_config_snapshot_payload(row: AppEaTask) -> dict[str, object]:
     task_config = _parse_task_config(row.task_config_json)

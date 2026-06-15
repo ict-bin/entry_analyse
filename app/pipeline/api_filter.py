@@ -79,16 +79,26 @@ def get_api_filter_sem() -> asyncio.Semaphore:
 
 # ─── Provider 配置加载 ─────────────────────────────────────────────────────────
 
-def _load_provider_config(model: str) -> tuple[str, str, str]:
+def _resolve_models_json_path(models_json_path: str | None = None, task_pi_dir: str | None = None) -> Path:
+    if models_json_path:
+        return Path(models_json_path)
+    normalized_task_pi_dir = str(task_pi_dir or "").strip()
+    if normalized_task_pi_dir:
+        return Path(normalized_task_pi_dir) / "models.json"
+    return _MODELS_JSON_PATH
+
+
+def _load_provider_config(model: str, *, models_json_path: str | None = None, task_pi_dir: str | None = None) -> tuple[str, str, str]:
     """
     从 models.json 读取 (base_url, api_key, model_id)。
 
     按 model 名称优先匹配，无精确匹配时用第一个可用 provider。
     """
     try:
-        data = json.loads(_MODELS_JSON_PATH.read_text(encoding="utf-8"))
+        resolved_path = _resolve_models_json_path(models_json_path=models_json_path, task_pi_dir=task_pi_dir)
+        data = json.loads(resolved_path.read_text(encoding="utf-8"))
     except Exception as e:
-        raise RuntimeError(f"无法读取 models.json ({_MODELS_JSON_PATH}): {e}")
+        raise RuntimeError(f"无法读取 models.json ({resolved_path}): {e}")
 
     providers: dict[str, Any] = data.get("providers", {})
     if not providers:
@@ -377,6 +387,8 @@ async def api_filter_function(
     cancel_event:    asyncio.Event | None = None,
     timeout_seconds: int = _REQUEST_TIMEOUT,  # 默认对齐 agent_run_timeout_seconds
     session_file:    str | None = None,       # API_Filter JSONL 审计日志；None=不保存
+    task_pi_dir:     str | None = None,
+    models_json_path:str | None = None,
 ) -> dict[str, Any]:
     """
     对单个函数调用 LLM API，快速判断是否为外部入口。
@@ -436,7 +448,7 @@ async def api_filter_function(
     # 从 models.json 加载 provider 配置（同步 I/O 推到线程）
     try:
         base_url, api_key, model_id = await asyncio.to_thread(
-            _load_provider_config, model
+            _load_provider_config, model, models_json_path=models_json_path, task_pi_dir=task_pi_dir
         )
         _provider_name = model.split("/", 1)[0] if "/" in (model or "") else "api_filter"
     except Exception as exc:

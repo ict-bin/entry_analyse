@@ -2790,7 +2790,7 @@ class PipelineEngine:
                     pi_max_retries=self.cfg.pi_max_retries,
                     pi_retry_delay=self.cfg.pi_retry_delay,
                     max_consecutive_empty_responses=int(getattr(self.cfg, 'max_consecutive_empty_responses', 3)),
-                    task_pi_dir=getattr(self.cfg, "task_pi_dir", ""),
+                    task_pi_dir=self.cfg.role_pi_dir("judges" if role_kind == "judge" else "workers"),
                     task_id=self.task_id,
                     stage_key=stage_key,
                     role_kind=role_kind,
@@ -2816,6 +2816,56 @@ class PipelineEngine:
                 reason=str(getattr(ar, "api_retry_reason", "") or ""),
                 role_kind=role_kind,
                 model=acfg.model,
+            )
+        if getattr(ar, "compaction_requested", False):
+            self._emit(
+                "task_context_compaction_requested",
+                stage=stage_key,
+                role=role_kind,
+                runtime_dir=str(getattr(ar, "runtime_dir", "") or ""),
+                model=acfg.model,
+                context_window=int(getattr(ar, "context_window", 0) or 0),
+            )
+        if getattr(ar, "compaction_completed", False):
+            self._emit(
+                "task_context_compaction_completed",
+                stage=stage_key,
+                role=role_kind,
+                runtime_dir=str(getattr(ar, "runtime_dir", "") or ""),
+                model=acfg.model,
+                context_window=int(getattr(ar, "context_window", 0) or 0),
+            )
+        if getattr(ar, "context_budget_exceeded_preflight", False):
+            self._emit(
+                "task_context_budget_exceeded_preflight",
+                stage=stage_key,
+                role=role_kind,
+                runtime_dir=str(getattr(ar, "runtime_dir", "") or ""),
+                model=acfg.model,
+                context_window=int(getattr(ar, "context_window", 0) or 0),
+                proxy_reserved_tokens=int(getattr(ar, "proxy_reserved_tokens", 0) or 0),
+                error=str(getattr(ar, "error", "") or ""),
+            )
+        if getattr(ar, "context_overflow_retrying", False):
+            self._emit(
+                "task_context_overflow_retrying",
+                stage=stage_key,
+                role=role_kind,
+                runtime_dir=str(getattr(ar, "runtime_dir", "") or ""),
+                model=acfg.model,
+                context_window=int(getattr(ar, "context_window", 0) or 0),
+                proxy_reserved_tokens=int(getattr(ar, "proxy_reserved_tokens", 0) or 0),
+            )
+        if getattr(ar, "context_overflow_failed_after_compaction", False):
+            self._emit(
+                "task_context_overflow_failed_after_compaction",
+                stage=stage_key,
+                role=role_kind,
+                runtime_dir=str(getattr(ar, "runtime_dir", "") or ""),
+                model=acfg.model,
+                context_window=int(getattr(ar, "context_window", 0) or 0),
+                proxy_reserved_tokens=int(getattr(ar, "proxy_reserved_tokens", 0) or 0),
+                error=str(getattr(ar, "error", "") or ""),
             )
         if getattr(ar, "fatal", False):
             raise PiFatalError(f"Pipeline fatal error [{context}]: {ar.error}")
@@ -2897,6 +2947,7 @@ class PipelineEngine:
                     cancel_event=self._cancel,
                     timeout_seconds=int(getattr(self.cfg, "api_filter_timeout_seconds", 120) or 120),
                     session_file=str(dirs.af_session(func_hash)),
+                    task_pi_dir=self.cfg.role_pi_dir("workers"),
                 )
             _af_wall_dur = self._dur(_af_start)  # 含槽位等待 + API semaphore 等待
             if result.get("skipped"):

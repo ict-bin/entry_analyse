@@ -133,6 +133,7 @@ class TaskConfig(BaseModel):
     cwd: str = Field(default="/data/target", description="模块目录（含 files.list 或子模块目录）")
     source_path: Optional[str] = Field(default=None, description="源码根目录（用于解析files.list中的文件路径；为None时使用cwd）")
     task_pi_dir: str = Field(default="", description="任务级 PI runtime 目录")
+    task_pi_dirs: dict[str, str] = Field(default_factory=dict, description="按角色划分的任务级 PI runtime 目录")
 
     max_rounds: int = Field(default=-1, description="最大分析轮次；-1 为无限制")
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
@@ -196,6 +197,14 @@ class TaskConfig(BaseModel):
     @property
     def judge_count(self) -> int:
         return len(self.judges.agents)
+
+    def role_pi_dir(self, role: str) -> str:
+        role_key = str(role or "").strip().lower()
+        role_dirs = self.task_pi_dirs if isinstance(self.task_pi_dirs, dict) else {}
+        candidate = str(role_dirs.get(role_key) or "").strip()
+        if candidate:
+            return candidate
+        return str(self.task_pi_dir or "").strip()
 
 class TokenUsage(BaseModel):
     input: int = 0

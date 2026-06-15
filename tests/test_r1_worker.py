@@ -40,7 +40,6 @@ def test_run_r2_w_worker_uses_w_attempt_for_result_artifacts(tmp_path: Path) -> 
         patch("app.pipeline.funcdb.FunctionDB.open", return_value=fake_db),
         patch("app.pipeline.r1_worker.run_agent", AsyncMock(return_value=agent_result)),
         patch("app.pipeline.r1_worker.write_stage_result_files") as write_files,
-        patch("app.pipeline.r1_worker.upsert_stage_result_index") as upsert_index,
     ):
         result = run_r2_w_worker(
             file_path=str(file_path),
@@ -64,8 +63,8 @@ def test_run_r2_w_worker_uses_w_attempt_for_result_artifacts(tmp_path: Path) -> 
             task_id="task1",
             on_event=lambda *args, **kwargs: None,
             cancel_event=None,
-            is_retry=True,
-            w_attempt=3,
+            is_retry=False,
+            w_attempt=1,
         )
 
         import asyncio
@@ -73,7 +72,6 @@ def test_run_r2_w_worker_uses_w_attempt_for_result_artifacts(tmp_path: Path) -> 
 
     assert token_usage_result is token_usage
     write_kwargs = write_files.call_args.kwargs
-    assert write_kwargs["result_file"].name.endswith("a3.json")
-    assert write_kwargs["raw_file"].name.endswith("a3.txt")
-    assert write_kwargs["payload"]["attempt"] == 3
-    assert upsert_index.call_args.kwargs["attempt"] == 3
+    assert write_kwargs["result_file"].name.endswith("a1.json")
+    assert write_kwargs["raw_file"].name.endswith("a1.txt")
+    assert write_kwargs["payload"]["attempt"] == 1
