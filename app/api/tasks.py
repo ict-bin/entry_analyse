@@ -1689,26 +1689,23 @@ def get_task_logs(
     local_path = _Path(row.output_path or "") / task_id / "run" / "events.jsonl"
     all_events: list[dict] = []
     is_final = False
-    import logging as _logging
-    _log = _logging.getLogger("ea.api.logs")
     _read_path = pvc_path if pvc_path.is_file() else (local_path if local_path.is_file() else None)
-    _log.warning("get_task_logs: task=%s pvc=%s local=%s read=%s", task_id, pvc_path.is_file(), local_path.is_file(), _read_path)
     if _read_path:
         try:
-            _raw = _read_path.read_text(encoding="utf-8")
-            _log.warning("get_task_logs: file size=%s lines=%s", len(_raw), _raw.count(chr(10)))
-            for line in _raw.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except Exception:
-                    continue
-                if evt.get("type") == "done":
-                    is_final = True
-                    continue
-                all_events.append(evt)
+            # 使用 open() 而非 read_text()，强制刷新 NFS 缓存
+            with open(str(_read_path), "r", encoding="utf-8") as _f:
+                for line in _f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except Exception:
+                        continue
+                    if evt.get("type") == "done":
+                        is_final = True
+                        continue
+                    all_events.append(evt)
         except Exception as e:
             import logging
             logging.getLogger("ea.api").error("Failed to read events.jsonl %s: %s", _read_path, e)
