@@ -235,6 +235,147 @@ def _kill_all_task_processes(
     return killed
 
 
+def _close_task_fds(
+    *, task_roots: list[str], task_id: str = "",
+) -> int:
+    """Close all FDs in the current process pointing under any task_root.
+
+    NFS silly-rename files (``.nfsXXX``) are created when a file is
+    unlinked while still open.  If the *worker process itself* holds
+    those FDs (via SQLite WAL, session JSONL streams, etc.),
+    ``shutil.rmtree`` will fail with EBUSY and the task enters an
+    infinite retry loop.
+
+    This function scans ``/proc/self/fd`` and closes every descriptor
+    whose target falls inside the task directories.
+    """
+    roots_resolved: list[str] = []
+    for r in (task_roots or []):
+        if r and str(r).strip():
+            resolved = os.path.realpath(str(r))
+            roots_resolved.append(resolved)
+            if resolved != str(r).strip():
+                roots_resolved.append(str(r).strip())
+    if not roots_resolved:
+        return 0
+
+    closed = 0
+    fd_dir = _pl.Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        return 0
+
+    for entry in sorted(fd_dir.iterdir(), key=lambda e: int(e.name)):
+        try:
+            target = os.readlink(str(entry))
+        except OSError:
+            continue
+        target_clean = target
+        if target.endswith(" (deleted)"):
+            target_clean = target[:-len(" (deleted)")]
+        matched = False
+        target_resolved = ""
+        try:
+            target_resolved = os.path.realpath(target_clean)
+        except OSError:
+            target_resolved = target_clean
+        for root in roots_resolved:
+            if (target_clean == root
+                    or target_clean.startswith(root + "/")
+                    or target_clean.startswith(root + os.sep)
+                    or target_resolved.startswith(root + "/")
+                    or target_resolved.startswith(root + os.sep)):
+                matched = True
+                break
+        if not matched:
+            continue
+        fd = int(entry.name)
+        if fd <= 2:
+            continue
+        try:
+            os.close(fd)
+            closed += 1
+        except OSError:
+            pass
+
+    if closed > 0:
+        logger.info(
+            "_close_task_fds: closed=%d fds task=%s",
+            closed, task_id,
+        )
+    return closed
+
+
+def _rmtree_nfs_safe(
+    path: str,
+    *,
+    task_id: str = "",
+    subdir: str = "",
+    max_attempts: int = 5,
+) -> None:
+    """Remove *path* tree, tolerating NFS silly-rename files."""
+    for attempt in range(max_attempts):
+        try:
+            _shutil.rmtree(path)
+            return
+        except OSError as e:
+            if e.errno == _errno.ENOENT:
+                return
+            if e.errno in (_errno.ENOTEMPTY, _errno.EBUSY):
+                if attempt < max_attempts - 1:
+                    delay = 0.5 * (2 ** min(attempt, 3))
+                    logger.warning(
+                        "rmtree %s/%s attempt=%d err=%s, retry in %.1fs",
+                        subdir, task_id, attempt + 1, e, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning(
+                    "rmtree %s/%s failed after %d attempts (%s), "
+                    "falling back to per-entry removal",
+                    subdir, task_id, max_attempts, e,
+                )
+                _rmtree_per_entry(path, task_id=task_id, subdir=subdir)
+                return
+            raise
+
+
+def _rmtree_per_entry(
+    path: str,
+    *,
+    task_id: str = "",
+    subdir: str = "",
+) -> None:
+    """Walk a directory tree and remove every entry individually,
+    skipping ``.nfsXXX`` files that still return EBUSY."""
+    nfs_skipped = 0
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files:
+            fp = os.path.join(root, name)
+            try:
+                os.unlink(fp)
+            except OSError as e:
+                if e.errno in (_errno.EBUSY, _errno.ENOENT):
+                    if name.startswith(".nfs"):
+                        nfs_skipped += 1
+                        continue
+                raise
+        for name in dirs:
+            dp = os.path.join(root, name)
+            try:
+                os.rmdir(dp)
+            except OSError as e:
+                if e.errno in (_errno.ENOTEMPTY, _errno.EBUSY):
+                    continue
+                if e.errno == _errno.ENOENT:
+                    continue
+                raise
+    if nfs_skipped > 0:
+        logger.warning(
+            "rmtree %s/%s: skipped %d NFS silly-rename files",
+            subdir, task_id, nfs_skipped,
+        )
+
+
 def _task_agent_key(task_config_json: dict | None) -> dict | None:
     if not isinstance(task_config_json, dict):
         return None
@@ -547,6 +688,7 @@ class WorkerService:
                 task_id, exc,
             )
 
+        _close_task_fds(task_roots=task_roots, task_id=task_id)
         return _kill_all_task_processes(
             task_id=task_id, task_roots=task_roots,
         )
@@ -790,9 +932,12 @@ class WorkerService:
             killed = _kill_all_task_processes(
                 task_id=task_id, task_roots=task_roots,
             )
+            closed = _close_task_fds(
+                task_roots=task_roots, task_id=task_id,
+            )
             logger.info(
-                "_execute_task STEP1 cleanup_done: task=%s killed=%s duration=%.2fs",
-                task_id, killed, time.monotonic() - _t1_start,
+                "_execute_task STEP1 cleanup_done: task=%s killed=%s closed_fds=%s duration=%.2fs",
+                task_id, killed, closed, time.monotonic() - _t1_start,
             )
         else:
             logger.info(
@@ -805,21 +950,7 @@ class WorkerService:
             task_dir = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id
             for subdir in ("run", "output"):
                 d = task_dir / subdir
-                for attempt in range(4):
-                    try:
-                        _shutil.rmtree(str(d))
-                        break
-                    except OSError as e:
-                        if e.errno == _errno.ENOENT:
-                            break
-                        if e.errno == _errno.ENOTEMPTY and attempt < 3:
-                            logger.warning(
-                                "rmtree ENOTEMPTY for %s/%s, retry %d",
-                                subdir, task_id, attempt + 1,
-                            )
-                            time.sleep(0.5)
-                            continue
-                        raise
+                _rmtree_nfs_safe(str(d), task_id=task_id, subdir=subdir)
                 d.mkdir(parents=True, exist_ok=True)
 
         # 初始化事件文件：写在 PVC 路径（API Pod 可读），同时写 output_path（本地）
@@ -1104,6 +1235,7 @@ class WorkerService:
             task_id, cancel_requested,
         )
         if task_roots:
+            _close_task_fds(task_roots=task_roots, task_id=task_id)
             _kill_all_task_processes(task_id=task_id, task_roots=task_roots)
             logger.info(
                 "_execute_task STEP8 cleanup_done: task=%s",
