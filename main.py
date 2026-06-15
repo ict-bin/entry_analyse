@@ -9,6 +9,7 @@ entry_analyse 服务器启动入口
 import os
 import sys
 import asyncio
+import subprocess
 import threading
 
 import uvicorn
@@ -63,16 +64,15 @@ def _start_kill_server_process() -> subprocess.Popen | None:
     This process survives even if the main asyncio event loop is stuck.
     The scheduler communicates with it via HTTP on port 3001.
     """
-    import subprocess as _sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "scripts", "kill_server.py")
     if not os.path.isfile(script):
         print("[main] WARNING: kill_server.py not found, skip", flush=True)
         return None
-    proc = _sp.Popen(
+    proc = subprocess.Popen(
         [sys.executable, script, "--port", str(_CANCEL_SERVER_PORT),
          "--parent-pid", str(os.getpid())],
-        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     print(f"[main] kill_server started pid={proc.pid} port={_CANCEL_SERVER_PORT}", flush=True)
     return proc
