@@ -97,86 +97,84 @@ def _strip_comments_and_strings(text: str) -> str:
 
 def _looks_like_function_gap(lines_data: list[str], start: int, end: int) -> tuple[bool, str, float]:
     """
-    Conservative, linear-time script filter for complete gaps.
+    Conservative script filter for complete gaps.
 
-    重要：这里运行在 R1 文件线程中，绝不能对整段 gap 使用复杂多行正则。
-    openGauss/catalog 等大 C++ 文件会产生数万字符的 gap；原先的
-    candidate_re / loose_re 在包含大量括号、模板、宏和控制块的文本上会
-    触发灾难性回溯，导致 Python 单线程 100% CPU，任务卡在 R1 且没有
-    任何 pi 子进程。该实现只做逐行和小窗口匹配，复杂度近似 O(n)。
-
-    Returns (maybe_function, reason, score). The filter favors recall but masks
-    comments/strings and rejects declarations, initializers and control blocks.
+    DIAGNOSTIC VERSION: keep the original regex-based logic, but add
+    fine-grained probe logs before/after each expensive step. If a worker hangs
+    in R1 gap prefilter, the last R1_GAP_PROBE line identifies the exact regex.
     """
+    import time as _time
+    _t0 = _time.monotonic()
     raw = "\n".join(lines_data[start - 1:end])
-    # 安全上限：巨型 gap（>5000 行）通常是 parse 错误的产物；直接跳过，
-    # 避免任何预筛逻辑在超大文本上消耗 CPU。
+    logger.warning(
+        "R1_GAP_PROBE looks_start range=%s-%s lines=%s chars=%s",
+        start, end, end - start + 1, len(raw),
+    )
+    # 安全上限：巨型 gap（>5000 行）通常是 parse 错误的产物
+    # （如 tree-sitter C parser 解析 .pl/.py 等非 C 文件），
+    # 正则回溯会在此类文本上灾难性耗时，直接跳过。
     if end - start + 1 > 5000 or len(raw) > 250_000:
+        logger.warning(
+            "R1_GAP_PROBE looks_skip_too_large range=%s-%s elapsed=%.3fs",
+            start, end, _time.monotonic() - _t0,
+        )
         return False, "gap_too_large", 0.0
-
+    logger.warning("R1_GAP_PROBE before_strip range=%s-%s", start, end)
     code = _strip_comments_and_strings(raw)
+    logger.warning(
+        "R1_GAP_PROBE after_strip range=%s-%s elapsed=%.3fs",
+        start, end, _time.monotonic() - _t0,
+    )
     nonempty = [l.strip() for l in code.splitlines() if l.strip()]
     if not nonempty:
+        logger.warning("R1_GAP_PROBE looks_empty range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
         return False, "empty_or_comment", 0.0
+    joined = "\n".join(nonempty)
 
-    if "{" not in code or "}" not in code:
-        if any(re.search(r"\)\s*;\s*$", l) for l in nonempty[:80]):
+    # Reject common non-function blocks when the first code line is a control/top-level keyword
+    reject_head = re.compile(r"^(if|for|while|switch|do|else|case|default|typedef|struct|enum|union|namespace|class)\b")
+    if nonempty and reject_head.match(nonempty[0]):
+        logger.warning("R1_GAP_PROBE looks_reject_head range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+        return False, "control_or_type_block", 0.1
+
+    logger.warning("R1_GAP_PROBE before_compile_regex range=%s-%s", start, end)
+    candidate_re = re.compile(
+        r"(?m)^\s*(?:[A-Za-z_~][\w:<>,~*&\s\[\]]+\s+)+"
+        r"(?:[A-Za-z_~][\w:~]*::)*[A-Za-z_~][\w:~]*\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:->\s*[^{}]+\s*)?\{"
+    )
+    macro_candidate_re = re.compile(
+        r"(?m)^\s*[A-Z_][A-Z0-9_]*\s*\([^\n;{}]*\)\s*(?:[A-Za-z_~][\w:~]*\s*)?\([^;{}]*\)\s*\{"
+    )
+    loose_re = re.compile(r"(?m)^\s*(?:static\s+)?(?:inline\s+)?[A-Za-z_~][\w:<>,~*&\s]+\([^;{}]*\)\s*\{")
+
+    if "{" not in joined or "}" not in joined:
+        logger.warning("R1_GAP_PROBE before_decl_regex range=%s-%s", start, end)
+        if re.search(r"\)\s*;", joined):
+            logger.warning("R1_GAP_PROBE looks_declaration_only range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
             return False, "declaration_only", 0.05
+        logger.warning("R1_GAP_PROBE looks_no_balanced_body range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
         return False, "no_balanced_body", 0.0
 
-    reject_head = re.compile(
-        r"^(if|for|while|switch|do|else|case|default|typedef|struct|enum|union|namespace|class)\b"
-    )
-    ident = r"[A-Za-z_~][\w:~]*"
-    # 只用于单行/小窗口字符串，禁止对整段 gap search。
-    single_line_func_re = re.compile(
-        rf"^\s*(?!(?:if|for|while|switch|catch)\b)"
-        rf"(?:[A-Za-z_~][\w:<>,~*&\[\]]*\s+)+"
-        rf"(?:{ident}::)*{ident}\s*\([^;{{}}]*\)\s*"
-        rf"(?:const\s*)?(?:noexcept\s*)?(?:->\s*[^{{}}]+\s*)?\{{"
-    )
-    macro_func_re = re.compile(
-        rf"^\s*[A-Z_][A-Z0-9_]*\s*\([^\n;{{}}]*\)\s*"
-        rf"(?:{ident}\s*)?\([^;{{}}]*\)\s*\{{"
-    )
-
-    scan_limit = min(len(nonempty), 1200)
-    for idx in range(scan_limit):
-        line = nonempty[idx]
-        if reject_head.match(line):
-            continue
-        if single_line_func_re.match(line):
-            return True, "function_signature", 0.95
-        if macro_func_re.match(line):
-            return True, "macro_function_signature", 0.75
-
-        # 多行签名：只合并从当前行开始到出现 { 的短窗口，且限制字符数，
-        # 覆盖常见 return-type\nname(args)\n{ 形式，避免整段正则回溯。
-        if "(" in line and ";" not in line:
-            window_parts: list[str] = []
-            total_len = 0
-            for j in range(idx, min(idx + 8, len(nonempty))):
-                part = nonempty[j]
-                window_parts.append(part)
-                total_len += len(part)
-                if total_len > 2000:
-                    break
-                if "{" in part:
-                    compact = " ".join(window_parts)
-                    if reject_head.match(compact):
-                        break
-                    if single_line_func_re.match(compact) or macro_func_re.match(compact):
-                        return True, "multiline_function_signature", 0.85
-                    break
-
-    # 兜底：小文本里存在 name(args){ 的形态，作为低置信度候选；仍然只在
-    # 截断后的短文本上执行简单正则。
-    short = "\n".join(nonempty[:scan_limit])[:20000]
-    if short.count("{") >= 2 and short.count("}") >= 2:
-        simple_call_body = re.compile(r"(?m)^\s*(?!(?:if|for|while|switch|catch)\b)\w[\w:~]*\s*\([^;{}]*\)\s*\{")
-        if simple_call_body.search(short):
-            return True, "nested_possible_signature", 0.55
-
+    logger.warning("R1_GAP_PROBE before_candidate_re range=%s-%s nonempty=%s code_chars=%s", start, end, len(nonempty), len(code))
+    if candidate_re.search(code):
+        logger.warning("R1_GAP_PROBE after_candidate_re_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+        return True, "function_signature", 0.95
+    logger.warning("R1_GAP_PROBE after_candidate_re_no_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+    logger.warning("R1_GAP_PROBE before_macro_candidate_re range=%s-%s", start, end)
+    if macro_candidate_re.search(code):
+        logger.warning("R1_GAP_PROBE after_macro_candidate_re_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+        return True, "macro_function_signature", 0.75
+    logger.warning("R1_GAP_PROBE after_macro_candidate_re_no_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+    logger.warning("R1_GAP_PROBE before_loose_re range=%s-%s", start, end)
+    if loose_re.search(code):
+        logger.warning("R1_GAP_PROBE after_loose_re_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+        return True, "loose_signature", 0.65
+    logger.warning("R1_GAP_PROBE after_loose_re_no_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+    logger.warning("R1_GAP_PROBE before_nested_regex range=%s-%s", start, end)
+    if joined.count("{") >= 2 and joined.count("}") >= 2 and re.search(r"\w+\s*\([^;{}]*\)\s*\{", joined):
+        logger.warning("R1_GAP_PROBE after_nested_regex_match range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
+        return True, "nested_possible_signature", 0.55
+    logger.warning("R1_GAP_PROBE looks_done_no_signature range=%s-%s elapsed=%.3fs", start, end, _time.monotonic() - _t0)
     return False, "no_function_signature", 0.15
 
 
@@ -197,6 +195,10 @@ def _compute_gaps(
     except OSError:
         return []
     total = len(lines)
+    logger.warning(
+        "R1_GAP_PROBE compute_start file=%s total_lines=%s funcs=%s",
+        os.path.basename(file_path), total, len(funcs),
+    )
     if total == 0:
         return []
 
@@ -229,7 +231,15 @@ def _compute_gaps(
             )
             if has_code:
                 gap_id += 1
+                logger.warning(
+                    "R1_GAP_PROBE compute_gap_before file=%s gap_id=gap-%s range=%s-%s lines=%s",
+                    os.path.basename(file_path), gap_id, gap_start, gap_end, gap_end - gap_start + 1,
+                )
                 maybe_func, reason, score = _looks_like_function_gap(lines, gap_start, gap_end)
+                logger.warning(
+                    "R1_GAP_PROBE compute_gap_after file=%s gap_id=gap-%s range=%s-%s reason=%s score=%.2f maybe=%s",
+                    os.path.basename(file_path), gap_id, gap_start, gap_end, reason, score, maybe_func,
+                )
                 gaps.append({
                     "id": f"gap-{gap_id}",
                     "start": gap_start,
@@ -242,6 +252,10 @@ def _compute_gaps(
                 })
         prev_end = seg_end
 
+    logger.warning(
+        "R1_GAP_PROBE compute_done file=%s gaps=%s",
+        os.path.basename(file_path), len(gaps),
+    )
     return gaps
 
 
