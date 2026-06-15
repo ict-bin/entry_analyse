@@ -84,6 +84,43 @@ class WorkerSlotService:
             query = query.filter(AppEaTask.project_id == project_id)
         return int(query.count())
 
+    def _list_live_worker_pods_with_ips(self) -> dict[str, str]:
+        """Like _list_live_worker_pods but returns {pod_name: pod_ip} mapping."""
+        if not K8S_SERVICE_HOST:
+            return {}
+        try:
+            with open(K8S_TOKEN_PATH, "r", encoding="utf-8") as fh:
+                token = fh.read().strip()
+            if not token:
+                return {}
+        except Exception:
+            return {}
+        url = (
+            f"https://{K8S_SERVICE_HOST}:{K8S_SERVICE_PORT}"
+            f"/api/v1/namespaces/{K8S_NAMESPACE}/pods?labelSelector={urllib.parse.quote(WORKER_LABEL_SELECTOR)}"
+        )
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        context = ssl.create_default_context(cafile=K8S_CA_PATH if os.path.exists(K8S_CA_PATH) else None)
+        try:
+            with urllib.request.urlopen(request, context=context, timeout=5) as response:
+                import json
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return {}
+        result: dict[str, str] = {}
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            status = item.get("status") if isinstance(item.get("status"), dict) else {}
+            phase = str(status.get("phase") or "").strip().lower()
+            deletion_timestamp = metadata.get("deletionTimestamp")
+            pod_name = str(metadata.get("name") or "").strip()
+            pod_ip = str(status.get("podIP") or "").strip()
+            if pod_name and pod_ip and not deletion_timestamp and phase in {"pending", "running"}:
+                result[pod_name] = pod_ip
+        return result
+
     def _list_live_worker_pods(self) -> set[str]:
         if not K8S_SERVICE_HOST:
             return set()

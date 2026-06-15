@@ -827,24 +827,43 @@ class SchedulerService:
                 pass
 
     async def _resolve_all_pod_ips(self, pod_names: list[str]) -> dict[str, str]:
-        """Batch-resolve pod names to IPs from the worker slot registry."""
+        """Batch-resolve pod names to IPs.
+
+        Tries multiple sources in order:
+          1. K8s API (via existing _list_live_worker_pods + pod metadata)
+          2. AppEaWorkerSlot.pod_ip (heartbeat may write real IP in future)
+        """
+        result: dict[str, str] = {}
+
+        # Source 1: K8s API — most reliable, already used by _list_live_worker_pods
+        from app.service.worker_slot_service import get_worker_slot_service
+        try:
+            k8s_pods = get_worker_slot_service()._list_live_worker_pods_with_ips()
+            for pod_name, pod_ip in k8s_pods.items():
+                if pod_name in pod_names and pod_ip:
+                    result[pod_name] = pod_ip
+        except Exception:
+            pass
+
+        # Source 2: DB heartbeat registry (fallback for pods not in K8s list)
         db_gen = get_db()
         db: Session = next(db_gen)
-        result: dict[str, str] = {}
         try:
             from app.db.models import AppEaWorkerSlot
-            rows = (
-                db.query(AppEaWorkerSlot.pod_name, AppEaWorkerSlot.pod_ip)
-                .filter(
-                    AppEaWorkerSlot.pod_name.in_(pod_names),
-                    AppEaWorkerSlot.pod_ip.is_not(None),
-                    AppEaWorkerSlot.pod_ip != "",
+            unresolved = [pn for pn in pod_names if pn not in result]
+            if unresolved:
+                rows = (
+                    db.query(AppEaWorkerSlot.pod_name, AppEaWorkerSlot.pod_ip)
+                    .filter(
+                        AppEaWorkerSlot.pod_name.in_(unresolved),
+                        AppEaWorkerSlot.pod_ip.is_not(None),
+                        AppEaWorkerSlot.pod_ip != "",
+                    )
+                    .all()
                 )
-                .all()
-            )
-            for pod_name, pod_ip in rows:
-                if pod_name and pod_ip:
-                    result[pod_name] = str(pod_ip).strip()
+                for pod_name, pod_ip in rows:
+                    if pod_name and pod_ip:
+                        result.setdefault(pod_name, str(pod_ip).strip())
         finally:
             try:
                 next(db_gen)
