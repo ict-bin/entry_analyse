@@ -56,3 +56,4 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认 REST API，覆盖: python3 cli.py "分析xxx模块的外部入口"
 CMD ["./scripts/start-with-probe.sh", "python3", "main.py"]
+# procps
