@@ -630,7 +630,6 @@ async def run_r1_worker(
     logger.info("R1_w_done: file=%s funcs=%s corrections=%s", basename, len(func_hashes_static), len(all_corrections))
 
     funcs_out, hashes_out = _current_funcs()
-    _sync_module_db(funcs_out, hashes_out)
     return total_usage, funcs_out, hashes_out
 # ─── run_r2_w_worker ─────────────────────────────────────────────────────────
 
