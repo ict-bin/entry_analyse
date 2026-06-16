@@ -1489,6 +1489,26 @@ def _derive_task_entry_count(row: AppEaTask) -> int | None:
                 return len(loaded)
         except Exception:
             return None
+
+    # For running tasks without functions.list, count keep entries from pipeline_state
+    run_root = _task_run_root(row)
+    if run_root:
+        state_path = run_root / "pipeline_state.json"
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                files = state.get("files") if isinstance(state, dict) else {}
+                keep = 0
+                for fs in (files or {}).values():
+                    if not isinstance(fs, dict):
+                        continue
+                    for f in (fs.get("functions") or {}).values():
+                        r4d = str(f.get("r4_decision") or "").lower() if isinstance(f, dict) else ""
+                        if r4d == "keep":
+                            keep += 1
+                return keep or None
+            except Exception:
+                pass
     return None
 
 
@@ -2643,6 +2663,66 @@ class TaskService:
         if row.status in ("pending", "running") and not available:
             available = False
 
+        # ── 运行中任务：从 pipeline_state 获得实时函数/阶段统计 ──────────────
+        live_stats: dict[str, Any] | None = None
+        if row.status in ("running", "pending") and run_root:
+            state_path = run_root / "pipeline_state.json"
+            if state_path.is_file():
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    files = state.get("files") if isinstance(state, dict) else {}
+                    total_funcs = 0
+                    r2_done = 0
+                    r3_done = 0
+                    r4_kept = 0
+                    ext_entries = 0
+                    hdl_entries = 0
+                    cc_state = str(state.get("cc_state") or "pending")
+                    r6_state = str(state.get("r6_state") or "pending")
+                    for fs in (files or {}).values():
+                        if not isinstance(fs, dict):
+                            continue
+                        for f in (fs.get("functions") or {}).values():
+                            if not isinstance(f, dict):
+                                continue
+                            total_funcs += 1
+                            if str(f.get("r2_j_state") or "") == "passed":
+                                r2_done += 1
+                            r3w = str(f.get("r3_w_state") or "")
+                            r3j = str(f.get("r3_j_state") or "")
+                            if r3w == "passed" and r3j == "passed":
+                                r3_done += 1
+                            r4d = str(f.get("r4_decision") or "").lower()
+                            if r4d == "keep":
+                                r4_kept += 1
+                                cat = str(f.get("entry_category") or "")
+                                if cat == "处理入口":
+                                    hdl_entries += 1
+                                else:
+                                    ext_entries += 1
+                    ms_since_start = None
+                    if row.started_at and row.started_at.tzinfo is None:
+                        ms_since_start = int((now_local() - row.started_at).total_seconds() * 1000)
+                    live_stats = {
+                        "total_functions": total_funcs,
+                        "r2_done": r2_done,
+                        "r3_done": r3_done,
+                        "r4_kept": r4_kept,
+                        "ext_entries": ext_entries,
+                        "hdl_entries": hdl_entries,
+                        "cc_state": cc_state,
+                        "r6_state": r6_state,
+                        "duration_ms_since_start": ms_since_start,
+                    }
+                except Exception:
+                    pass
+
+        total_duration_ms_value = None
+        if isinstance(run_result_json, dict):
+            total_duration_ms_value = run_result_json.get("total_duration_ms")
+        if total_duration_ms_value is None and live_stats and live_stats.get("duration_ms_since_start"):
+            total_duration_ms_value = live_stats["duration_ms_since_start"]
+
         return {
             "task_id": row.task_id,
             "available": available,
@@ -2661,12 +2741,13 @@ class TaskService:
             "run_report_markdown": run_report_markdown,
             "final_report_markdown": run_report_markdown if (_final_report and _final_report.is_file()) else None,
             "result_json": run_result_json,
+            "live_stats": live_stats,
             "summary": {
                 "module_name": row.module_name,
-                "function_count": len(functions_list_items) if functions_list_items else len(functions_list),
+                "function_count": (live_stats or {}).get("total_functions") or len(functions_list_items) if functions_list_items else len(functions_list),
                 "round_count": len(rounds),
                 "passed_round_count": passed_rounds,
-                "total_duration_ms": (run_result_json or {}).get("total_duration_ms") if isinstance(run_result_json, dict) else None,
+                "total_duration_ms": total_duration_ms_value,
                 "total_tokens": sum(
                     int(total_tokens.get(key) or 0)
                     for key in ("input", "output", "cache_read", "cache_write")
@@ -2771,6 +2852,35 @@ class TaskService:
                     latest_round = round_number
 
         event_summary = _build_task_event_summary(db, row.task_id)
+        # ── 运行中任务：从 pipeline_state 获取实时函数/阶段统计 ──────────────
+        live_pipeline_stats: dict[str, Any] | None = None
+        if row.status in ("running", "pending") and run_root:
+            state_path = run_root / "pipeline_state.json"
+            if state_path.is_file():
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    files = state.get("files") if isinstance(state, dict) else {}
+                    total_funcs = 0; r2_done = 0; r3_done = 0; r4_kept = 0
+                    for fs in (files or {}).values():
+                        if not isinstance(fs, dict): continue
+                        for f in (fs.get("functions") or {}).values():
+                            if not isinstance(f, dict): continue
+                            total_funcs += 1
+                            if str(f.get("r2_j_state") or "") == "passed": r2_done += 1
+                            r3w = str(f.get("r3_w_state") or ""); r3j = str(f.get("r3_j_state") or "")
+                            if r3w == "passed" and r3j == "passed": r3_done += 1
+                            if str(f.get("r4_decision") or "").lower() == "keep": r4_kept += 1
+                    ms_since_start = None
+                    if row.started_at:
+                        ms_since_start = int((now_local() - row.started_at).total_seconds() * 1000)
+                    live_pipeline_stats = {
+                        "total_functions": total_funcs, "r2_done": r2_done,
+                        "r3_done": r3_done, "r4_kept": r4_kept,
+                        "cc_state": str(state.get("cc_state") or "pending"),
+                        "r6_state": str(state.get("r6_state") or "pending"),
+                        "duration_ms_since_start": ms_since_start,
+                    }
+                except Exception: pass
         return {
             "task_id": row.task_id,
             "project_id": row.project_id,
@@ -2794,6 +2904,7 @@ class TaskService:
             "active_roles": active_roles,
             "latest_active_event_at": latest_event_at,
             "entry_count": _derive_task_entry_count(row),
+            "live_pipeline_stats": live_pipeline_stats,
             "event_summary": event_summary,
             "warnings": warnings,
         }
