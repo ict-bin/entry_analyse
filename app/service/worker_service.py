@@ -1127,10 +1127,12 @@ class WorkerService:
         # 如果 _materialize_task_pi_runtime 在 sync 前执行，per-role dir 的
         # models.json 会被写成 {"providers":{}}，导致后续 pi 找不到模型。
         try:
+            from app.service.svc_config import get_service_yaml as _svc_yaml
+            _yaml = _svc_yaml()
             await sync_providers_to_pi(
-                base_url=svc.configcenter.base_url if hasattr(svc, 'configcenter') else "http://secflow-platform-configcenter/api/configcenter",
-                token=svc.auth_service.service_machine_token if hasattr(svc, 'auth_service') else "",
-                timeout=30,
+                base_url=_yaml.configcenter.base_url,
+                token=_yaml.auth_service.service_machine_token,
+                timeout=_yaml.configcenter.timeout,
             )
         except Exception as _sync_err:
             logger.warning("_execute_task pre-materialize sync failed: %s", _sync_err)
