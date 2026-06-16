@@ -37,6 +37,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.agent_process import cleanup_task_pi_processes
+from app.service.llm_provider_sync import sync_providers_to_pi
 from app.agent_slots import (
     AgentProcessSlotManager,
     SemPriority,
@@ -1120,6 +1121,20 @@ class WorkerService:
             resume_task_id=tcfg.get("resume_task_id", ""),
         )
         task_root = str(Path(task_snapshot.output_path or "") / task_id) if task_snapshot.output_path else ""
+
+        # ── 先同步 models.json 到全局目录，再 materialize 到 per-role 目录 ──
+        # 新 Pod 启动时 /root/.pi/agent/models.json 尚不存在，
+        # 如果 _materialize_task_pi_runtime 在 sync 前执行，per-role dir 的
+        # models.json 会被写成 {"providers":{}}，导致后续 pi 找不到模型。
+        try:
+            await sync_providers_to_pi(
+                base_url=svc.configcenter.base_url if hasattr(svc, 'configcenter') else "http://secflow-platform-configcenter/api/configcenter",
+                token=svc.auth_service.service_machine_token if hasattr(svc, 'auth_service') else "",
+                timeout=30,
+            )
+        except Exception as _sync_err:
+            logger.warning("_execute_task pre-materialize sync failed: %s", _sync_err)
+
         agent_task_key = _task_agent_key(tcfg)
         task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(
             task_root=task_root,
