@@ -52,7 +52,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "system_prompt_dir": "/app/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "vllm/zai-org/GLM-5", "tools": None, "system_prompt": None, "thinking_level": None},
+            {"model": "gaiasec/auto", "tools": None, "system_prompt": None, "thinking_level": None},
         ],
         "stage_models": {},
     },
@@ -62,7 +62,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "system_prompt_dir": "/app/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "vllm/zai-org/GLM-5", "tools": None, "system_prompt": None, "thinking_level": None},
+            {"model": "gaiasec/auto", "tools": None, "system_prompt": None, "thinking_level": None},
         ],
         "stage_models": {},
     },

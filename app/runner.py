@@ -510,6 +510,26 @@ def _resolve_model_for_pi(model: str, *, task_pi_dir: str | None = None) -> str:
     if resolved and resolved != requested:
         logger.info("resolved pi model %r -> %r via %s", requested, resolved, models_path)
         return resolved
+
+    # ── 最终兜底：模型在 models.json 中完全不存在，切换到第一个可用的模型 ──
+    fallback: str | None = None
+    for provider_name, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        models = provider_cfg.get("models")
+        if not isinstance(models, list) or not models:
+            continue
+        first = models[0]
+        if isinstance(first, dict) and first.get("id"):
+            fallback = f"{provider_name}/{first['id']}"
+            break
+    if fallback and fallback != requested:
+        logger.warning(
+            "model %r not found in %s, falling back to %r",
+            requested, models_path, fallback,
+        )
+        return fallback
+
     return requested
 
 
