@@ -35,15 +35,17 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r1_max_rounds": -1,
     "r2_max_rounds": -1,
     "r3_max_rounds": -1,
-    "r3_j_max_rounds": -1,   # R3-J（外部输入验证）最大重试轮次；-1=无限，0=跳过
-    "r4_func_max_rounds": -1,   # Fix-3: 默认 -1 启用 per-func R4 Agent；0=跳过
-    "r4_func_j_max_rounds": -1,  # R4-J 默认 -1；0=跳过
+    "r3_j_max_rounds": -1,
+    "r4_func_max_rounds": -1,
+    "r4_func_j_max_rounds": -1,
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,
-    # 并发控制
-    "agent_process_limit": 8,
-    # 精简模式（与完整模式配置并列，互不影响）    "master_merge_mode": "hierarchical",
+    "lean_mode": False,
+    "lean_file_max_rounds": -1,
+    "lean_module_max_rounds": -1,
+    "api_filter_entry_judge": True,
+    "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
     "workers": {
@@ -52,7 +54,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "system_prompt_dir": "/app/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto", "tools": None, "system_prompt": None, "thinking_level": None},
+            {"model": "local_minimax/MiniMax/MiniMax-M2.5", "tools": None, "system_prompt": None, "thinking_level": None},
         ],
         "stage_models": {},
     },
@@ -62,7 +64,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "system_prompt_dir": "/app/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto", "tools": None, "system_prompt": None, "thinking_level": None},
+            {"model": "local_minimax/MiniMax/MiniMax-M2.5", "tools": None, "system_prompt": None, "thinking_level": None},
         ],
         "stage_models": {},
     },
