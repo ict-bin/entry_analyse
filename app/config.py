@@ -93,11 +93,6 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         # ── 快速模式（项目级配置，此处仅从 ServiceConfig 取默认值）──
         fast_mode=bool(getattr(svc, 'fast_mode', False)),
         fast_mode_batch_size=int(getattr(svc, 'fast_mode_batch_size', 20)),
-        # 已废弃的旧字段（保留以兼容）
-        api_filter_entry_judge=bool(getattr(svc, 'api_filter_entry_judge', False)),
-        api_filter_timeout_seconds=int(getattr(svc, 'api_filter_timeout_seconds', 120)),
-        lean_file_max_rounds=int(getattr(svc, 'lean_file_max_rounds', -1)),
-        lean_module_max_rounds=int(getattr(svc, 'lean_module_max_rounds', -1)),
     )
 
     _backfill_role(cfg.workers)

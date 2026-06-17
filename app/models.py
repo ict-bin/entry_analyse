@@ -110,15 +110,6 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    # ── 已废弃字段（保留以兼容旧配置文件）──
-    api_filter_entry_judge: bool = Field(
-        default=False,
-        description="已废弃。请使用项目级配置 fast_mode 替代。此字段不再生效。",
-    )
-    api_filter_timeout_seconds: int = Field(default=120, description="已废弃。")
-    api_filter_max_timeouts: int = Field(default=2, description="已废弃。")
-    api_filter_parse_max_retries: int = Field(default=1, description="已废弃。")
-
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
 
@@ -170,15 +161,6 @@ class TaskConfig(BaseModel):
     r4_final_max_rounds: int = Field(default=-1, description="R4 汇总 Judge 最大轮次（-1=无限）")
     report_func_max_rounds: int = Field(default=-1, description="Report per-func W+J 最大轮次（-1=无限）")
     report_final_max_rounds: int = Field(default=-1, description="Report final W+J 最大轮次（-1=无限）")
-
-    # ── 已废弃字段（保留以兼容旧配置）──
-    api_filter_entry_judge: bool = Field(
-        default=False,
-        description="已废弃。请使用 fast_mode 替代。此字段不再生效。",
-    )
-    api_filter_timeout_seconds: int = Field(default=120, description="已废弃。")
-    api_filter_max_timeouts: int = Field(default=2, description="已废弃。")
-    api_filter_parse_max_retries: int = Field(default=1, description="已废弃。")
 
     # ── 快速模式 ──
     fast_mode: bool = Field(
