@@ -1951,6 +1951,8 @@ _TASK_CONFIG_OVERRIDE_FIELDS = {
     "master_shard_size",
     "master_shard_parallelism",
     "pipeline_prompts_dir",
+    "fast_mode",
+    "fast_mode_batch_size",
 }
 
 
