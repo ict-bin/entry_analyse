@@ -1911,8 +1911,8 @@ def _load_svc_config():
     raise RuntimeError(f"Service config not found: {SERVICE_CONFIG_PATH}")
 
 
-def _load_svc_config_from_db(db: "Session", project_id: str):
-    """从数据库读取分析配置，构造 ServiceConfig；失败时回退到文件读取。"""
+def _load_svc_config(db: "Session", project_id: str):
+    """加载全局服务配置（优先配置中心，回退 MySQL/文件）。"""
     try:
         from app.service.config_service import get_config_service
         from app.models import ServiceConfig as _ServiceConfig
