@@ -561,100 +561,14 @@ class PipelineEngine:
             cc_done_event.set()
 
         # ── 快速模式：线程安全的流式批处理 ──────────────────────────────
-        _fm_lock = threading.Lock()
-        _fm_pending: list = []          # [(func_info, threading.Event), ...]
-        _fm_results: dict[str, str] = {}  # func_hash -> "keep" | "filter"
-        _fm_batch_size = max(10, min(
-            int(getattr(self.cfg, 'fast_mode_batch_size', 20)), 50))
-        _fm_total_collected = 0
-        _fm_total_processed = 0
-        _fm_batch_seq = 0
-
-        def _fm_process_batch(batch: list) -> None:
-            """在线程中处理一批函数的快速分类。"""
-            nonlocal _fm_batch_seq, _fm_total_processed
-            funcs = [info for info, _evt in batch]
-            batch_idx = _fm_batch_seq
-            _fm_batch_seq += 1
-
-            self._emit("fast_mode_batch_start", batch=batch_idx, count=len(funcs))
-
-            try:
-                import asyncio as _aio
-                _loop = _aio.new_event_loop()
-                _aio.set_event_loop(_loop)
-                try:
-                    from .fast_mode_worker import run_fast_mode_classification
-                    session = dirs.sessions / f"fast-mode-batch-{batch_idx:03d}.jsonl"
-                    stage_cwd = dirs.stage_cwd(f"fast_mode_b{batch_idx:03d}")
-                    stage_cwd.mkdir(parents=True, exist_ok=True)
-                    entry_hashes = _loop.run_until_complete(
-                        run_fast_mode_classification(
-                            batch=funcs, batch_idx=batch_idx,
-                            stage_cwd=stage_cwd, session_file=str(session),
-                            cfg=self.cfg, task_id=self.task_id,
-                            on_event=None, cancel_event=None,
-                        )
-                    )
-                finally:
-                    _loop.close()
-            except Exception as _exc:
-                logger.warning("fast_mode batch %d failed: %s, keeping all", batch_idx, _exc)
-                entry_hashes = [f["func_hash"] for f in funcs]
-
-            entry_set = set(entry_hashes)
-            keep_count = 0
-            filter_count = 0
-
-            for func_info in funcs:
-                fh = func_info["func_hash"]
-                decision = "keep" if fh in entry_set else "filter"
-                if decision == "keep":
-                    keep_count += 1
-                else:
-                    filter_count += 1
-
-                # Write Funcdb
-                file_hash = func_info.get("file_hash", "")
-                if file_hash:
-                    try:
-                        from .funcdb import FunctionDB
-                        has_input = 1 if decision == "keep" else 0
-                        FunctionDB.open(dirs.r1, file_hash).set_fast_mode_result(
-                            fh, decision, has_input)
-                    except Exception as _db_exc:
-                        logger.warning("fast_mode Funcdb write %s: %s", fh, _db_exc)
-
-                # Update FunctionState
-                if file_hash:
-                    _fs = state.files.get(file_hash)
-                    if _fs and fh in _fs.functions:
-                        _fn = _fs.functions[fh]
-                        _fn.fast_mode_state = NodeState.PASSED
-                        _fn.fast_mode_result = decision
-                        _fn.fast_mode_batch = batch_idx
-                        _fn.r4_decision = decision
-                        _fn.has_external_input = (decision == "keep")
-
-            # Persist state
-            try:
-                state.save(dirs.state_file)
-            except Exception:
-                pass
-
-            self._emit("fast_mode_batch_done", batch=batch_idx,
-                       keep=keep_count, filter=filter_count, total=len(funcs))
-            logger.info("fast_mode batch %d: keep=%d filter=%d (total=%d)",
-                        batch_idx, keep_count, filter_count, len(funcs))
-
-            # Signal all functions in this batch
-            with _fm_lock:
-                _fm_total_processed += len(funcs)
-                for func_info in funcs:
-                    _fm_results[func_info["func_hash"]] = \
-                        "keep" if func_info["func_hash"] in entry_set else "filter"
-            for _info, _event in batch:
-                _event.set()
+        fm: FastModeBatchProcessor | None = None
+        if self.cfg.fast_mode:
+            from .fast_mode_engine import FastModeBatchProcessor
+            fm = FastModeBatchProcessor(
+                state=state, dirs=dirs, cfg=self.cfg,
+                task_id=self.task_id, on_emit=self._emit,
+                cancel_event=self._cancel,
+            )
 
         async def _func_pipeline(
             func_hash: str, file_hash: str, file_path: str
@@ -693,7 +607,7 @@ class PipelineEngine:
                 return
 
             # ── 快速模式：流式批处理（线程安全）──────────────────────────
-            if self.cfg.fast_mode:
+            if fm is not None:
                 # 收集 callee 信息
                 from .fast_mode_collector import extract_callees
                 from .funcdb import FunctionDB as _FDB_fm
@@ -705,28 +619,13 @@ class PipelineEngine:
                 except Exception:
                     body = ""
                 callees = extract_callees(body, own_name=func_state.name)
-                func_info = {
+                decision = await fm.enqueue({
                     "func_hash": func_hash,
                     "name": func_state.name,
                     "file": os.path.basename(file_path),
                     "file_hash": file_hash,
                     "callees": callees,
-                }
-                event = threading.Event()
-                with _fm_lock:
-                    _fm_pending.append((func_info, event))
-                    _fm_total_collected += 1
-                    if len(_fm_pending) >= _fm_batch_size:
-                        batch = list(_fm_pending[:_fm_batch_size])
-                        _fm_pending = _fm_pending[_fm_batch_size:]
-                        threading.Thread(
-                            target=_fm_process_batch, args=(batch,),
-                            daemon=True, name=f"fm-batch-{_fm_batch_seq}"
-                        ).start()
-                # 等待分类结果
-                await asyncio.to_thread(event.wait)
-                with _fm_lock:
-                    decision = _fm_results.get(func_hash, "keep")
+                })
                 if decision == "filter":
                     return
 
@@ -905,32 +804,8 @@ class PipelineEngine:
             return []
 
         # ── 快速模式尾批：处理剩余不足一满批的函数 ───────────────────────
-        if self.cfg.fast_mode:
-            with _fm_lock:
-                remaining = list(_fm_pending)
-                _fm_pending.clear()
-            if remaining:
-                logger.info("fast_mode tail batch: %d remaining functions", len(remaining))
-                threading.Thread(
-                    target=_fm_process_batch, args=(remaining,),
-                    daemon=True, name=f"fm-tail-batch"
-                ).start()
-                # Wait for tail batch to complete
-                for _info, _event in remaining:
-                    await asyncio.to_thread(_event.wait)
-                logger.info("fast_mode tail batch done")
-
-            _keep_total = sum(
-                1 for _fs in state.files.values()
-                for _fns in _fs.functions.values()
-                if _fns.fast_mode_result == "keep"
-            )
-            self._emit("fast_mode_done",
-                       total_funcs=_fm_total_collected,
-                       kept=_keep_total,
-                       filtered=_fm_total_collected - _keep_total)
-            logger.info("fast_mode done: %d/%d functions kept",
-                        _keep_total, _fm_total_collected)
+        if fm is not None:
+            await fm.flush()
 
         # ─── Phase 6: R6 最终报告 ─────────────────────────────────────────
         final_entries = await self._run_r6_finalize(dirs, state)
