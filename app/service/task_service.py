@@ -1489,26 +1489,7 @@ def _derive_task_entry_count(row: AppEaTask) -> int | None:
                 return len(loaded)
         except Exception:
             return None
-
-    # For running tasks without functions.list, count keep entries from pipeline_state
-    run_root = _task_run_root(row)
-    if run_root:
-        state_path = run_root / "pipeline_state.json"
-        if state_path.is_file():
-            try:
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                files = state.get("files") if isinstance(state, dict) else {}
-                keep = 0
-                for fs in (files or {}).values():
-                    if not isinstance(fs, dict):
-                        continue
-                    for f in (fs.get("functions") or {}).values():
-                        r4d = str(f.get("r4_decision") or "").lower() if isinstance(f, dict) else ""
-                        if r4d == "keep":
-                            keep += 1
-                return keep or None
-            except Exception:
-                pass
+    # 不读取 pipeline_state.json（23MB）：getTask 高频调用会严重拖慢 API
     return None
 
 
