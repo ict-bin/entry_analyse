@@ -110,6 +110,10 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
+    # ── 快速模式 ──
+    fast_mode: bool = Field(default=False)
+    fast_mode_batch_size: int = Field(default=20, ge=10, le=50)
+
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
 
