@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import os
 
-RUNTIME_ROLE_ALL = "all"
 RUNTIME_ROLE_API = "api"
 RUNTIME_ROLE_SCHEDULER = "scheduler"
 RUNTIME_ROLE_WORKER = "worker"
+VALID_RUNTIME_ROLES = {
+    RUNTIME_ROLE_API,
+    RUNTIME_ROLE_SCHEDULER,
+    RUNTIME_ROLE_WORKER,
+}
 
 
 def get_runtime_role() -> str:
-    return str(os.environ.get("EA_RUNTIME_ROLE", RUNTIME_ROLE_ALL)).strip().lower() or RUNTIME_ROLE_ALL
+    raw = str(os.environ.get("EA_RUNTIME_ROLE", RUNTIME_ROLE_API)).strip().lower() or RUNTIME_ROLE_API
+    if raw not in VALID_RUNTIME_ROLES:
+        return RUNTIME_ROLE_API
+    return raw
 
 
 def role_enabled(role: str) -> bool:
-    current = get_runtime_role()
-    if current == RUNTIME_ROLE_ALL:
-        return True
-    return current == role
+    return get_runtime_role() == str(role or "").strip().lower()

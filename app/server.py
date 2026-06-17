@@ -205,7 +205,7 @@ def _ensure_legacy_worker_runtime() -> None:
         return
     raise HTTPException(
         status_code=409,
-        detail=f"当前运行角色 {get_runtime_role()} 不支持内存执行接口，请使用 worker/all 角色",
+        detail=f"当前运行角色 {get_runtime_role()} 不支持内存执行接口，请使用 worker 角色",
     )
 
 
