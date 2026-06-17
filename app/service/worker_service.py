@@ -467,41 +467,13 @@ def _build_role_models_json(
     return global_models_json if isinstance(global_models_json, dict) else {"providers": {}}
 
 
-def _materialize_task_pi_runtime(*, agent_task_key: dict | None, cfg: Any) -> tuple[dict[str, str], str]:
+def _materialize_task_pi_runtime(*, agent_task_key: dict | None = None) -> tuple[dict[str, str], str]:
     """
-    生成 Pod 全局 PI 配置（/root/.pi/agent/）。
-
-    一个 Pod 同时只运行一个任务，无需任务级隔离。
-    models.json 由 sync_providers_to_pi() 写入。
-    settings.json 合并全局配置后写入。
-    auth.json 写入任务级 agent key。
+    返回 Pod 全局 PI 配置目录。
+    一个 Pod 一个任务，无需任务级隔离。
+    models.json / settings.json / auth.json 均为 Pod 启动时全局生成。
     """
-    global_pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
-    global_pi_dir.mkdir(parents=True, exist_ok=True)
-
-    # settings.json：合并全局配置
-    settings_src = global_pi_dir / "settings.json"
-    global_settings = _read_json_file(settings_src)
-    merged_settings = _merge_pi_settings(global_settings)
-    (global_pi_dir / "settings.json").write_text(
-        json.dumps(merged_settings, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    # auth.json：任务级 agent key
-    auth_payload = {
-        "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
-        "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
-        "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
-        "agent_task_key_secret": str((agent_task_key or {}).get("secret") or "").strip() or None,
-        "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
-    }
-    (global_pi_dir / "auth.json").write_text(
-        json.dumps(auth_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    global_dir = str(global_pi_dir)
+    global_dir = str(Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")))
     return {"workers": global_dir, "judges": global_dir}, "global"
 
 
@@ -1145,7 +1117,6 @@ class WorkerService:
         agent_task_key = _task_agent_key(tcfg)
         task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(
             agent_task_key=agent_task_key,
-            cfg=cfg,
         )
         cfg.task_pi_dirs = dict(task_pi_dirs)
         cfg.task_pi_dir = str(task_pi_dirs.get("workers", os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")))
