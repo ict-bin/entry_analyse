@@ -1207,7 +1207,8 @@ async def _run_with_api_retry(
             )
             proc = handle.proc
             _current_handle = handle
-            slot_lease.bind_pid(getattr(proc, "pid", None))
+            if slot_lease is not None:
+                slot_lease.bind_pid(getattr(proc, "pid", None))
             with contextlib.suppress(Exception):
                 _get_worker_service().register_live_agent_process(
                     pid=getattr(proc, "pid", None),
