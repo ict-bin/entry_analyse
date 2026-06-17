@@ -707,6 +707,7 @@ async def _run_with_context_overflow_recovery(
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
     env: dict[str, str] | None = None,
     task_pi_dir: str | None = None,
+    use_slot: bool = True,
 ) -> AgentResult:
     base_context_window = _model_context_window(model)
     preflight_limit = _preflight_context_token_limit(base_context_window)
@@ -755,6 +756,7 @@ async def _run_with_context_overflow_recovery(
             role_kind=role_kind,
             on_slot_event=on_slot_event,
             session_file=session_file,
+            use_slot=use_slot,
         )
         preflight_result.compaction_completed = True
         refreshed_preflight_limit = _preflight_context_token_limit(base_context_window)
@@ -791,6 +793,7 @@ async def _run_with_context_overflow_recovery(
         role_kind=role_kind,
         on_slot_event=on_slot_event,
         session_file=session_file,
+        use_slot=use_slot,
     )
     result.agent_role = str(role_kind or "").strip() or None
     result.runtime_dir = runtime_dir
@@ -841,6 +844,7 @@ async def _run_with_context_overflow_recovery(
             role_kind=role_kind,
             on_slot_event=on_slot_event,
             session_file=session_file,
+            use_slot=use_slot,
         )
         result.compaction_completed = True
 
@@ -878,6 +882,7 @@ async def _run_with_context_overflow_recovery(
         max_consecutive_empty_responses=max_consecutive_empty_responses,
         priority=priority,
         session_file=session_file,
+        use_slot=use_slot,
     )
     retry_result.agent_role = str(role_kind or "").strip() or None
     retry_result.runtime_dir = runtime_dir
@@ -919,15 +924,13 @@ async def run_agent(
     priority: int = SemPriority.DEFAULT,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
     task_pi_dir: str | None = None,
+    use_slot: bool = True,  # False: 线程中的 event loop 跳过槽位
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
-
-    外层：pi 进程级重试（拉起失败、崩溃、被 kill）
-    内层：API 级重试（连接超时、限流、服务器错误）
-    致命：Model not found / Unauthorized → 不重试，result.fatal=True
-
-    Skills 通过复制到 {cwd}/.pi/skills/ 被 pi 自动发现，不再通过参数注入。
+    
+    当 use_slot=False 时跳过 agent_process_slot（用于线程中的 event loop，
+    其 asyncio 原语绑定在主 event loop 上，无法跨 event loop 使用）。
     """
     try:
         pi_cmd = _find_pi_command()
@@ -993,6 +996,7 @@ async def run_agent(
             on_slot_event=on_slot_event,
             env=env,
             task_pi_dir=task_pi_dir,
+            use_slot=use_slot,
         )
     finally:
         if tmp_file and os.path.exists(tmp_file):
@@ -1027,7 +1031,8 @@ async def _run_with_pi_retry(
     stage_key: str | None = None,
     role_kind: str | None = None,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
-    session_file: str | None = None,  # 透传 session_file 给 _run_with_api_retry（修复 NameError）
+    session_file: str | None = None,
+    use_slot: bool = True,
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     pi_attempt = 0
@@ -1056,6 +1061,7 @@ async def _run_with_pi_retry(
                 role_kind=role_kind,
                 on_slot_event=on_slot_event,
                 session_file=session_file,
+                use_slot=use_slot,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -1137,6 +1143,7 @@ async def _run_with_api_retry(
     role_kind: str | None = None,
     on_slot_event: Callable[[str, dict[str, Any]], None] | None = None,
     session_file: str | None = None,  # 新增：供 agent_process_slot/_truncate_session 使用
+    use_slot: bool = True,
 ) -> AgentResult:
     """内层循环：启动 pi 子进程，处理 API 级错误重试。
 
@@ -1152,16 +1159,24 @@ async def _run_with_api_retry(
     rate_limit_streak = 0
     current_stdin = stdin_data
 
-    # 排队无超时：永久等候，直到获得 slot
-    async with agent_process_slot(
-        priority=priority,
-        task_id=task_id,
-        stage_key=stage_key,
-        role_kind=role_kind,
-        cancel_event=cancel_event,
-        on_event=on_slot_event,
-        session_path=session_file,
-    ) as slot_lease:
+    # 排队无超时：永久等候，直到获得 slot（use_slot=False 时跳过）
+    if use_slot:
+        _slot_ctx = agent_process_slot(
+            priority=priority,
+            task_id=task_id,
+            stage_key=stage_key,
+            role_kind=role_kind,
+            cancel_event=cancel_event,
+            on_event=on_slot_event,
+            session_path=session_file,
+        )
+    else:
+        from contextlib import asynccontextmanager as _asynccm
+        @_asynccm
+        async def _noop_slot():
+            yield None
+        _slot_ctx = _noop_slot()
+    async with _slot_ctx as slot_lease:
       # slot 已获取，所有重试（超时/API错误）均在此作用域内进行
       # _current_handle: 当前 pi 进程句柄，用于超时时精确 kill 对应进程
       _current_handle: "AgentProcessHandle | None" = None

@@ -202,6 +202,7 @@ async def run_fast_mode_classification(
             role_kind="worker",
             priority=SemPriority.R3_W,
             task_pi_dir=task_pi_dir,
+            use_slot=False,  # 线程中的 event loop 无法使用主线槽位
         )
 
         if result.error:
