@@ -966,15 +966,21 @@ class WorkerService:
             event_buffer.append(entry)
             # 写本地 JSONL（output_path 和 PVC 双写，API 读 PVC）
             _line = json.dumps(entry, ensure_ascii=False) + "\n"
+            _seen: set[str] = set()
             for _p in (_events_path, _events_path_pvc):
-                if _p is not None:
-                    try:
-                        _p.parent.mkdir(parents=True, exist_ok=True)
-                        with open(str(_p), "a", encoding="utf-8") as _ef:
-                            _ef.write(_line)
-                            _ef.flush()
-                    except Exception:
-                        pass
+                if _p is None:
+                    continue
+                _resolved = str(_p.resolve()) if hasattr(_p, 'resolve') else str(_p)
+                if _resolved in _seen:
+                    continue
+                _seen.add(_resolved)
+                try:
+                    _p.parent.mkdir(parents=True, exist_ok=True)
+                    with open(str(_p), "a", encoding="utf-8") as _ef:
+                        _ef.write(_line)
+                        _ef.flush()
+                except Exception:
+                    pass
             with _progress_lock:
                 last_progress_time = time.time()
 
@@ -1362,18 +1368,22 @@ class WorkerService:
             )
 
         # ── Step 9: Finalize events file ──────────────────────────────────
-        # 写入最终事件到 output_path 和 PVC 双路径。
+        # 事件已由 _on_event 逐条写入，此处只追加 done 标记。
         final_entry = {"ts": time.time(), "type": "done", "data": {"status": result.status.value if result else "error"}}
+        _seen_final: set[str] = set()
         for _p in (_events_path, _events_path_pvc):
-            if _p is not None:
-                try:
-                    _p.parent.mkdir(parents=True, exist_ok=True)
-                    with open(str(_p), "a", encoding="utf-8") as _ef:
-                        for _evt in event_buffer:
-                            _ef.write(json.dumps(_evt, ensure_ascii=False) + "\n")
-                        _ef.write(json.dumps(final_entry, ensure_ascii=False) + "\n")
-                        _ef.flush()
-                except Exception as _exc:
+            if _p is None:
+                continue
+            _resolved = str(_p.resolve()) if hasattr(_p, 'resolve') else str(_p)
+            if _resolved in _seen_final:
+                continue
+            _seen_final.add(_resolved)
+            try:
+                _p.parent.mkdir(parents=True, exist_ok=True)
+                with open(str(_p), "a", encoding="utf-8") as _ef:
+                    _ef.write(json.dumps(final_entry, ensure_ascii=False) + "\n")
+                    _ef.flush()
+            except Exception as _exc:
                     logger.warning("Failed to write final events.jsonl (%s): %s", _p, _exc)
 
         # ── Step 10: Finalize DB status ───────────────────────────────────
