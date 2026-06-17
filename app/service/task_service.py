@@ -3625,6 +3625,11 @@ class TaskService:
         error_text = str(row.error or "").strip().lower()
         owner_role_guess = _owner_role_guess(row.owner_pod)
         owner_valid = _is_valid_worker_owner_pod(row.owner_pod) if row.owner_pod else False
+        lease_expired = bool(
+            str(row.status or "") == "running"
+            and row.lease_expires_at is not None
+            and row.lease_expires_at < now_local()
+        )
         awaiting_takeover = bool(
             str(row.status or "") == "running"
             and (
@@ -3637,6 +3642,17 @@ class TaskService:
             and row.lease_expires_at is not None
             and row.lease_expires_at < now_local()
         )
+        lease_state = "active"
+        if str(row.status or "") != "running":
+            lease_state = "none"
+        elif row.owner_pod and not owner_valid:
+            lease_state = "invalid_owner"
+        elif reconcile_pending:
+            lease_state = "reconcile_pending"
+        elif awaiting_takeover:
+            lease_state = "awaiting_takeover"
+        elif lease_expired:
+            lease_state = "expired"
         reconcile_reason = "awaiting_takeover" if reconcile_pending else ("invalid_owner" if row.owner_pod and not owner_valid else None)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
@@ -3654,6 +3670,7 @@ class TaskService:
             "owner_valid": owner_valid,
             "owner_live": owner_valid,
             "lease_expires_at": fmt(row.lease_expires_at),
+            "lease_state": lease_state,
             "awaiting_takeover": awaiting_takeover,
             "reconcile_pending": reconcile_pending,
             "reconcile_reason": reconcile_reason,
