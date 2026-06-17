@@ -176,7 +176,6 @@ class FastModeBatchProcessor:
                         task_id=self._task_id,
                         on_event=None,
                         cancel_event=None,
-                        task_pi_dir=getattr(self._cfg, 'task_pi_dir', None) or None,
                     )
                 )
             finally:

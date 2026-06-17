@@ -142,7 +142,6 @@ async def run_fast_mode_classification(
     task_id: str,
     on_event: Callable | None = None,
     cancel_event: asyncio.Event | None = None,
-    task_pi_dir: str | None = None,
 ) -> list[str]:
     """
     用 pi Agent 子进程对一批函数做入口快速分类。
@@ -201,7 +200,6 @@ async def run_fast_mode_classification(
             stage_key="fast_mode",
             role_kind="worker",
             priority=SemPriority.R3_W,
-            task_pi_dir=task_pi_dir,
             use_slot=False,  # 线程中的 event loop 无法使用主线槽位
         )
 
