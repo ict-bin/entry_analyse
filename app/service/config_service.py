@@ -42,10 +42,12 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,
-    "lean_mode": False,
-    "lean_file_max_rounds": -1,
-    "lean_module_max_rounds": -1,
-    "api_filter_entry_judge": True,
+    "lean_mode": False,  # 已废弃
+    "lean_file_max_rounds": -1,  # 已废弃
+    "lean_module_max_rounds": -1,  # 已废弃
+    "api_filter_entry_judge": False,  # 已废弃
+    "fast_mode": False,
+    "fast_mode_batch_size": 20,
     "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
@@ -141,7 +143,7 @@ class ConfigService:
             normalized.get("max_rounds_exceeded_action")
         )
         # 强制所有 max_rounds 相关字段为 -1（前端不再展示，统一无限重试）
-        # min_rounds 不是“最大轮次”字段，不能被归一到 -1，否则会破坏
+        # min_rounds 不是"最大轮次"字段，不能被归一到 -1，否则会破坏
         # ServiceConfig 的合法性并导致 worker 持续回退到文件配置。
         _MAX_ROUNDS_KEYS = [
             "max_rounds",
@@ -149,7 +151,6 @@ class ConfigService:
             "r2_max_rounds", "r3_max_rounds", "r3_j_max_rounds",
             "r4_func_max_rounds", "r4_func_j_max_rounds", "r4_final_max_rounds",
             "report_func_max_rounds", "report_final_max_rounds",
-            "lean_file_max_rounds", "lean_module_max_rounds",
         ]
         for _k in _MAX_ROUNDS_KEYS:
             normalized[_k] = -1
@@ -179,8 +180,21 @@ class ConfigService:
             "pipeline_parallelism",
             "model_capacity_enabled",
             "model_max_concurrency",
+            "api_filter_entry_judge",
+            "api_filter_timeout_seconds",
+            "api_filter_max_timeouts",
+            "api_filter_parse_max_retries",
+            "lean_mode",
+            "lean_file_max_rounds",
+            "lean_module_max_rounds",
         ):
             normalized.pop(stale_key, None)
+        # 快速模式字段归一化
+        normalized["fast_mode"] = bool(normalized.get("fast_mode", False))
+        try:
+            normalized["fast_mode_batch_size"] = max(10, min(int(normalized.get("fast_mode_batch_size", 20)), 50))
+        except (TypeError, ValueError):
+            normalized["fast_mode_batch_size"] = 20
         return normalized
 
     def get_config(self, db: Session, project_id: str | None = None) -> dict:
@@ -216,7 +230,6 @@ class ConfigService:
             "r2_max_rounds", "r3_max_rounds", "r3_j_max_rounds",
             "r4_func_max_rounds", "r4_func_j_max_rounds", "r4_final_max_rounds",
             "report_func_max_rounds", "report_final_max_rounds",
-            "lean_file_max_rounds", "lean_module_max_rounds",
         ]
         rows = db.query(AppEaProjectConfig).filter_by(project_id=_GLOBAL_CONFIG_PROJECT_ID).all()
         updated = 0

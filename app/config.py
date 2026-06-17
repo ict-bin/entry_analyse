@@ -90,12 +90,9 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         r4_final_max_rounds=int(getattr(svc, 'r4_final_max_rounds', -1)),
         report_func_max_rounds=int(getattr(svc, 'report_func_max_rounds', -1)),
         report_final_max_rounds=int(getattr(svc, 'report_final_max_rounds', -1)),
-        # 精简模式字段透传（与完整模式字段并列，互不影响）),
-        api_filter_entry_judge=bool(getattr(svc, 'api_filter_entry_judge', True)),
-        api_filter_timeout_seconds=int(getattr(svc, 'api_filter_timeout_seconds',
-            getattr(svc, 'agent_run_timeout_seconds', 3600))),
-        lean_file_max_rounds=int(getattr(svc, 'lean_file_max_rounds', -1)),
-        lean_module_max_rounds=int(getattr(svc, 'lean_module_max_rounds', -1)),
+        # ── 快速模式（项目级配置，此处仅从 ServiceConfig 取默认值）──
+        fast_mode=bool(getattr(svc, 'fast_mode', False)),
+        fast_mode_batch_size=int(getattr(svc, 'fast_mode_batch_size', 20)),
     )
 
     _backfill_role(cfg.workers)

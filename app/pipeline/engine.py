@@ -514,8 +514,9 @@ class PipelineEngine:
         r2_done_count   = 0
         all_r1_done_flag = False
 
-        all_r2_done_event: asyncio.Event = asyncio.Event()
-        cc_done_event:      asyncio.Event = asyncio.Event()
+        all_r2_done_event:   asyncio.Event = asyncio.Event()
+        fast_mode_done_event: asyncio.Event = asyncio.Event()
+        cc_done_event:        asyncio.Event = asyncio.Event()
         # R2 并发信号量：只限制同时进入 R2 的函数数，R2完成后立即释放
         # 防止 336 个函数同时提交 asyncio.to_thread 任务风暴导致 health probe 超时
         # R3/CC/R4 不受此限制（不会造成死锁）
@@ -531,6 +532,11 @@ class PipelineEngine:
         # 无文件时直接解锁
         if total_files == 0:
             all_r2_done_event.set()
+            fast_mode_done_event.set()
+
+        # 快速模式未启用时，直接解锁 fast_mode_done_event（_func_pipeline 中 wait 不会阻塞）
+        if not self.cfg.fast_mode:
+            fast_mode_done_event.set()
 
         # 注意：本服务不支持断点续跑，每次运行必须从零开始。
         # callchain.db 如果残留（异常情况）不得作为续跑信号，直接忽略。
@@ -559,6 +565,160 @@ class PipelineEngine:
                     await self._run_callchain_analysis(
                         dirs, state, module_files, file_hash_paths)
             cc_done_event.set()
+
+        async def _fast_mode_phase() -> None:
+            """快速模式：等所有 R2 完成 → 收集 callee → 分批 pi 分类 → 写 Funcdb。"""
+            if not self.cfg.fast_mode:
+                fast_mode_done_event.set()
+                return
+            await all_r2_done_event.wait()
+            if self._cancel.is_set():
+                fast_mode_done_event.set()
+                return
+
+            from .fast_mode_collector import collect_module_functions
+            from .fast_mode_worker import run_fast_mode_classification
+            from .funcdb import FunctionDB
+
+            # 构建 file_hash → file_path 反向映射（写 Funcdb 时需要）
+            _hash_to_path: dict[str, str] = {fh: fp for fh, fp in file_hash_paths}
+
+            self._emit("fast_mode_start", total_funcs=total_funcs)
+            logger.info("fast_mode: collecting callees for %d functions in %d files",
+                        total_funcs, total_files)
+
+            # Step 1: 收集所有函数的 callee 列表
+            all_funcs = await asyncio.to_thread(
+                collect_module_functions, dirs, file_hash_paths)
+
+            if not all_funcs:
+                logger.info("fast_mode: no functions to classify, skipping")
+                fast_mode_done_event.set()
+                return
+
+            # 按文件分组（同文件函数放同批，便于 pi 读源码）
+            all_funcs.sort(key=lambda f: (f.get("file", ""), f.get("name", "")))
+
+            batch_size = max(10, min(
+                int(getattr(self.cfg, 'fast_mode_batch_size', 20)), 50))
+            batches = [
+                all_funcs[i:i + batch_size]
+                for i in range(0, len(all_funcs), batch_size)
+            ]
+
+            logger.info("fast_mode: %d functions → %d batches (batch_size=%d)",
+                        len(all_funcs), len(batches), batch_size)
+            self._emit("fast_mode_batches", total=len(batches), batch_size=batch_size,
+                       total_funcs=len(all_funcs))
+
+            async def _process_batch(idx: int, batch: list[dict]) -> None:
+                if self._cancel.is_set():
+                    return
+                session = dirs.sessions / f"fast-mode-batch-{idx:03d}.jsonl"
+                stage_cwd = dirs.stage_cwd(f"fast_mode_b{idx:03d}")
+                stage_cwd.mkdir(parents=True, exist_ok=True)
+                # 软链接源文件到 stage_cwd（pi 可能需要读取源码做验证）
+                import os as _os
+                _src_link = stage_cwd / "source"
+                if not _src_link.exists():
+                    try:
+                        _os.symlink(str(dirs.source.resolve()), str(_src_link),
+                                    target_is_directory=True)
+                    except OSError:
+                        pass
+
+                self._emit("fast_mode_batch_start", batch=idx, count=len(batch))
+                entry_hashes = await run_fast_mode_classification(
+                    batch=batch,
+                    batch_idx=idx,
+                    stage_cwd=stage_cwd,
+                    session_file=str(session),
+                    cfg=self.cfg,
+                    task_id=self.task_id,
+                    on_event=None,
+                    cancel_event=self._cancel,
+                )
+
+                # Step 3: 写入 Funcdb + 更新 state
+                entry_set = set(entry_hashes)
+                keep_count = 0
+                filter_count = 0
+
+                for func in batch:
+                    fh = func["func_hash"]
+                    func_file = func.get("file", "")
+
+                    # 查找 file_hash
+                    _matched_hash = ""
+                    for _fh, _fp in file_hash_paths:
+                        if _fp.endswith("/" + func_file) or _fp == func_file or _fp.endswith("\\" + func_file):
+                            _matched_hash = _fh
+                            break
+                    # 兜底：通过 func_hash 在 state 中查找
+                    if not _matched_hash:
+                        for _fh, _fs in state.files.items():
+                            if fh in _fs.functions:
+                                _matched_hash = _fh
+                                break
+
+                    is_entry = fh in entry_set
+                    decision = "keep" if is_entry else "filter"
+                    has_input = 1 if is_entry else 0
+
+                    if is_entry:
+                        keep_count += 1
+                    else:
+                        filter_count += 1
+
+                    # 写 Funcdb
+                    if _matched_hash:
+                        try:
+                            await asyncio.to_thread(
+                                lambda mh=_matched_hash, fh=fh, d=decision, hi=has_input:
+                                    FunctionDB.open(dirs.r1, mh).set_fast_mode_result(fh, d, hi)
+                            )
+                        except Exception as _db_exc:
+                            logger.warning("fast_mode: Funcdb write failed for %s: %s", fh, _db_exc)
+
+                    # 更新 FunctionState
+                    if _matched_hash:
+                        _fs = state.files.get(_matched_hash)
+                        if _fs and fh in _fs.functions:
+                            _fn_state = _fs.functions[fh]
+                            _fn_state.fast_mode_state = NodeState.PASSED
+                            _fn_state.fast_mode_result = decision
+                            _fn_state.fast_mode_batch = idx
+                            _fn_state.r4_decision = decision
+                            _fn_state.has_external_input = bool(has_input)
+
+                # 写 state 持久化
+                await asyncio.to_thread(state.save, dirs.state_file)
+
+                self._emit("fast_mode_batch_done", batch=idx,
+                           keep=keep_count, filter=filter_count,
+                           total=len(batch))
+                logger.info("fast_mode batch %d/%d: keep=%d filter=%d (total=%d)",
+                            idx + 1, len(batches), keep_count, filter_count, len(batch))
+
+            # 所有批次并行执行（并发受 agent 槽位限制）
+            await asyncio.gather(*[
+                _process_batch(i, b) for i, b in enumerate(batches)
+            ])
+
+            if not self._cancel.is_set():
+                _keep_total = sum(
+                    1 for _fs in state.files.values()
+                    for _fns in _fs.functions.values()
+                    if _fns.fast_mode_result == "keep"
+                )
+                self._emit("fast_mode_done",
+                           total_funcs=len(all_funcs),
+                           kept=_keep_total,
+                           filtered=len(all_funcs) - _keep_total)
+                logger.info("fast_mode done: %d/%d functions kept",
+                            _keep_total, len(all_funcs))
+
+            fast_mode_done_event.set()
 
         async def _func_pipeline(
             func_hash: str, file_hash: str, file_path: str
@@ -594,6 +754,18 @@ class PipelineEngine:
             # R2 未通过：函数边界不可信，跳过后续所有阶段
             func_state = fs.functions.get(func_hash)
             if func_state is None or func_state.r2_j_state != NodeState.PASSED:
+                return
+
+            # ── 快速模式：等待快速模式分类完成 ──────────────────────────────
+            await fast_mode_done_event.wait()
+            if self._cancel.is_set():
+                return
+            # 重新读取 state（快速模式可能已更新 r4_decision）
+            func_state = fs.functions.get(func_hash)
+            if func_state is None:
+                return
+            if func_state.r4_decision == "filter":
+                # 快速模式已判定为非入口，跳过 R3/R4/R5
                 return
 
             # ── R3 分析: 入口判断 + 污点分析 W+J（与 CC 并行）────────────────
@@ -765,6 +937,7 @@ class PipelineEngine:
 
         await asyncio.gather(
             _cc_phase(),
+            _fast_mode_phase(),
             *[_complete_file_pipeline(fh, fp) for fh, fp in file_hash_paths],
         )
         if self._cancel.is_set():

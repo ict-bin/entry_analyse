@@ -56,14 +56,19 @@ class FunctionState:
     r2_j_feedback_path: str = ""
     r2_source_incomplete: bool = False  # agent 判定源文件函数体不完整，永久跳过后续阶段
 
-    # ── API_Filter：精简模式下的函数级预筛────────────────────────────────────
-    api_filter_state: str = "pending"  # pending|running|passed|failed|skipped
+    # ── API_Filter：已废弃（保留以兼容旧状态文件）──────────────────────────
+    api_filter_state: str = "pending"
     api_filter_attempts: int = 0
-    api_filter_decision: str = ""      # keep|filter|skip
+    api_filter_decision: str = ""
     api_filter_skip_reason: str = ""
     api_filter_last_error: str = ""
     api_filter_timed_out: bool = False
     api_filter_duration_ms: int = 0
+
+    # ── 快速模式：批量 LLM 预筛 ────────────────────────────────────────────
+    fast_mode_state: NodeState = NodeState.PENDING
+    fast_mode_result: str = ""         # "keep" | "filter"
+    fast_mode_batch: int = 0           # 批号（调试用）
 
     # ── R3：外部输入分析（原 R2）─────────────────────────────────────────────
     r3_w_state:    NodeState = NodeState.PENDING

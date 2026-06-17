@@ -110,19 +110,6 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    api_filter_entry_judge: bool = Field(
-        default=True,
-        description=(
-            "启用 API_Filter 主导入口判断："
-            "Direct LLM API 在 R3 前快速判断函数是否是外部入口；"
-            "R3 仅做污点分析（不再重复判断是否入口）。"
-            "关闭则由 R3 Agent 完整判断入口 + 分析污点，适合需要最高准确度的场景。"
-        ),
-    )
-    api_filter_timeout_seconds: int = Field(default=120, description="API_Filter 单次 LLM 请求超时时间（秒）")
-    api_filter_max_timeouts: int = Field(default=2, description="API_Filter 超时达到该次数后跳过该函数")
-    api_filter_parse_max_retries: int = Field(default=1, description="API_Filter 不可解析响应最大重试次数")
-
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
 
@@ -175,18 +162,21 @@ class TaskConfig(BaseModel):
     report_func_max_rounds: int = Field(default=-1, description="Report per-func W+J 最大轮次（-1=无限）")
     report_final_max_rounds: int = Field(default=-1, description="Report final W+J 最大轮次（-1=无限）")
 
-    api_filter_entry_judge: bool = Field(
-        default=True,
+    # ── 快速模式 ──
+    fast_mode: bool = Field(
+        default=False,
         description=(
-            "启用 API_Filter 主导入口判断："
-            "Direct LLM API 在 R3 前快速判断函数是否是外部入口；"
-            "R3 仅做污点分析（不再重复判断是否入口）。"
-            "关闭则由 R3 Agent 完整判断入口 + 分析污点，适合需要最高准确度的场景。"
+            "快速模式开关（不保证全面性）。"
+            "开启后，在 R2 完成后由脚本收集函数名+callee 列表，"
+            "分批交给 LLM 快速筛选潜在入口，仅被选中的函数进入 R3。"
         ),
     )
-    api_filter_timeout_seconds: int = Field(default=120)
-    api_filter_max_timeouts: int = Field(default=2)
-    api_filter_parse_max_retries: int = Field(default=1)
+    fast_mode_batch_size: int = Field(
+        default=20,
+        ge=10,
+        le=50,
+        description="快速模式下每批次发送给 LLM 的函数数量（10-50）。",
+    )
 
     resume_task_id: str = Field(default="", description="保留字段（未使用，续跑功能已废弃，重启请使用 restart API）")
 

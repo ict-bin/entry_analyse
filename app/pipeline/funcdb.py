@@ -270,6 +270,24 @@ class FunctionDB:
                 (decision, time.time(), func_hash),
             )
 
+    def set_fast_mode_result(
+        self, func_hash: str, decision: str, has_external_input: int = 0
+    ) -> None:
+        """快速模式结果写入：同时设置 r3_decision + has_external_input。
+
+        Args:
+            func_hash:          函数 hash
+            decision:           "keep" | "filter"
+            has_external_input: 1=是入口 / 0=不是入口（预标记，R3 可能覆盖）
+        """
+        with self._get_conn() as conn:
+            conn.execute(
+                """UPDATE functions
+                   SET r3_decision=?, has_external_input=?, updated_at=?
+                   WHERE func_hash=?""",
+                (decision, has_external_input, time.time(), func_hash),
+            )
+
     def update_r4_decision(self, func_hash: str, decision: str) -> None:
         """R4-W/J 完成后：写 r4_decision（keep/filter）到 FuncDB。"""
         with self._get_conn() as conn:
