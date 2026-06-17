@@ -42,10 +42,10 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "r4_final_max_rounds": -1,
     "report_func_max_rounds": -1,
     "report_final_max_rounds": -1,
-    "lean_mode": False,  # 已废弃
-    "lean_file_max_rounds": -1,  # 已废弃
-    "lean_module_max_rounds": -1,  # 已废弃
-    "api_filter_entry_judge": False,  # 已废弃
+    "lean_mode": False,
+    "lean_file_max_rounds": -1,
+    "lean_module_max_rounds": -1,
+    "api_filter_entry_judge": False,
     "fast_mode": False,
     "fast_mode_batch_size": 20,
     "master_merge_mode": "hierarchical",
@@ -108,46 +108,9 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 class ConfigService:
-    """全局配置服务 — 从配置中心拉取，MySQL 缓存作为回退。"""
+    """全局配置服务 — MySQL 存储，所有项目共享 __global__ 配置。"""
 
-    def _fetch_from_config_center(self) -> dict | None:
-        """从配置中心拉取 EA 服务配置。失败返回 None。"""
-        try:
-            import httpx
-            from app.service.svc_config import get_service_yaml
-            svc = get_service_yaml()
-            url = f"{svc.configcenter.base_url.rstrip('/')}/service/ea/config"
-            token = svc.auth_service.service_machine_token
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-            resp = httpx.get(url, headers=headers, timeout=svc.configcenter.timeout)
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("配置中心返回 HTTP %s，回退 DB 配置", resp.status_code)
-        except Exception as e:
-            logger.warning("配置中心不可达 (%s)，回退 DB 配置", e)
-        return None
-
-    def get_config(self, db: Session, project_id: str | None = None) -> dict:
-        # 1. 优先从配置中心拉取
-        center_data = self._fetch_from_config_center()
-        if center_data:
-            data = _deep_merge(dict(_DEFAULT_CONFIG), center_data)
-            data["updated_at"] = None
-            return self._normalize_runtime_fields(data)
-
-        # 2. 回退 MySQL（兼容旧版 + 配置中心不可达）
-        row = self._ensure_global_config_row(db)
-        if row and row.config_json:
-            data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
-        else:
-            data = dict(_DEFAULT_CONFIG)
-        data = self._normalize_runtime_fields(data)
-        data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
-        return data
-
-    def save_config(self, db: Session, config_data: dict, project_id: str | None = None) -> dict:
-        """配置由配置中心管理，API 端不再接受写入。保留此方法用于兼容。"""
-        raise NotImplementedError("配置由配置中心统一管理，请在配置中心修改")
+    def _latest_legacy_project_row(self, db: Session) -> AppEaProjectConfig | None:
         return (
             db.query(AppEaProjectConfig)
             .filter(AppEaProjectConfig.project_id != _GLOBAL_CONFIG_PROJECT_ID)
@@ -181,9 +144,6 @@ class ConfigService:
         normalized["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
             normalized.get("max_rounds_exceeded_action")
         )
-        # 强制所有 max_rounds 相关字段为 -1（前端不再展示，统一无限重试）
-        # min_rounds 不是"最大轮次"字段，不能被归一到 -1，否则会破坏
-        # ServiceConfig 的合法性并导致 worker 持续回退到文件配置。
         _MAX_ROUNDS_KEYS = [
             "max_rounds",
             "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",
@@ -228,7 +188,6 @@ class ConfigService:
             "lean_module_max_rounds",
         ):
             normalized.pop(stale_key, None)
-        # 快速模式字段归一化
         normalized["fast_mode"] = bool(normalized.get("fast_mode", False))
         try:
             normalized["fast_mode_batch_size"] = max(10, min(int(normalized.get("fast_mode_batch_size", 20)), 50))
@@ -262,7 +221,6 @@ class ConfigService:
         return result
 
     def migrate_max_rounds_to_unlimited(self, db: Session) -> int:
-        """将全局配置中的 max_rounds 相关字段强制设为 -1。服务启动时调用一次。"""
         _MAX_ROUNDS_KEYS = [
             "max_rounds",
             "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",

@@ -1,4 +1,4 @@
-"""Analysis config API routes — 全局配置，由配置中心管理。"""
+"""Analysis config API routes — 全局配置，所有项目共享。"""
 
 from __future__ import annotations
 
@@ -19,14 +19,18 @@ from .deps import get_current_user
 logger = logging.getLogger("ea.api.config")
 
 
-# ── 服务配置（全局，配置中心管理）───────────────────────────────────────────────
+# ── 服务配置（全局，所有项目共享）───────────────────────────────────────────────
+
+class ConfigSaveRequest(BaseModel):
+    config: Dict[str, Any]
+
 
 @router.get("/config")
 async def get_config(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    """获取全局服务配置。配置由配置中心统一管理，MySQL 作为回退。"""
+    """获取全局服务配置。"""
     try:
         return get_config_service().get_config(db)
     except SQLAlchemyError as exc:
@@ -36,11 +40,16 @@ async def get_config(
 
 @router.put("/config")
 async def save_config(
+    body: ConfigSaveRequest,
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    """配置已由配置中心统一管理，API 不再接受写入。"""
-    raise HTTPException(status_code=400, detail="配置已由配置中心统一管理，请在配置中心修改")
+    """保存全局服务配置。"""
+    try:
+        return get_config_service().save_config(db, body.config)
+    except SQLAlchemyError as exc:
+        logger.error("save_config failed: %s", exc)
+        raise HTTPException(status_code=503, detail="保存失败，数据库暂时不可用") from exc
 
 
 # ── 模型配置（全局）─────────────────────────────────────────────────────────────
