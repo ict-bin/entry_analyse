@@ -1,4 +1,4 @@
-"""Per-project entry-analysis config service."""
+"""Global entry-analysis config service."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from app.models import (
 )
 
 logger = logging.getLogger("ea.config_service")
+_GLOBAL_CONFIG_PROJECT_ID = "__global__"
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds": -1,
@@ -105,6 +106,34 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 class ConfigService:
+    def _latest_legacy_project_row(self, db: Session) -> AppEaProjectConfig | None:
+        return (
+            db.query(AppEaProjectConfig)
+            .filter(AppEaProjectConfig.project_id != _GLOBAL_CONFIG_PROJECT_ID)
+            .order_by(AppEaProjectConfig.updated_at.desc())
+            .first()
+        )
+
+    def _ensure_global_config_row(self, db: Session) -> AppEaProjectConfig | None:
+        row = db.query(AppEaProjectConfig).filter_by(project_id=_GLOBAL_CONFIG_PROJECT_ID).first()
+        if row is not None:
+            return row
+        legacy_row = self._latest_legacy_project_row(db)
+        if legacy_row is None:
+            return None
+        migrated = AppEaProjectConfig(
+            project_id=_GLOBAL_CONFIG_PROJECT_ID,
+            config_json=dict(legacy_row.config_json or {}),
+        )
+        db.add(migrated)
+        db.commit()
+        db.refresh(migrated)
+        logger.info(
+            "migrated entry-analysis project config to global config from project %s",
+            legacy_row.project_id,
+        )
+        return migrated
+
     @staticmethod
     def _normalize_runtime_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(data)
@@ -154,35 +183,33 @@ class ConfigService:
             normalized.pop(stale_key, None)
         return normalized
 
-    def get_config(self, db: Session, project_id: str) -> dict:
-        row = db.query(AppEaProjectConfig).filter_by(project_id=project_id).first()
+    def get_config(self, db: Session, project_id: str | None = None) -> dict:
+        row = self._ensure_global_config_row(db)
         if row and row.config_json:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
         data = self._normalize_runtime_fields(data)
-        data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
 
-    def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
+    def save_config(self, db: Session, config_data: dict, project_id: str | None = None) -> dict:
         blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
         blob = self._normalize_runtime_fields(blob)
-        row = db.query(AppEaProjectConfig).filter_by(project_id=project_id).first()
+        row = self._ensure_global_config_row(db)
         if row:
             row.config_json = blob
         else:
-            row = AppEaProjectConfig(project_id=project_id, config_json=blob)
+            row = AppEaProjectConfig(project_id=_GLOBAL_CONFIG_PROJECT_ID, config_json=blob)
             db.add(row)
         db.commit()
         db.refresh(row)
         result = self._normalize_runtime_fields(_deep_merge(_DEFAULT_CONFIG, blob))
-        result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
 
     def migrate_max_rounds_to_unlimited(self, db: Session) -> int:
-        """将所有项目配置中的 max_rounds 相关字段强制设为 -1。服务启动时调用一次。"""
+        """将全局配置中的 max_rounds 相关字段强制设为 -1。服务启动时调用一次。"""
         _MAX_ROUNDS_KEYS = [
             "max_rounds",
             "r1_max_rounds", "r1a_max_rounds", "r1b_max_rounds",
@@ -191,7 +218,7 @@ class ConfigService:
             "report_func_max_rounds", "report_final_max_rounds",
             "lean_file_max_rounds", "lean_module_max_rounds",
         ]
-        rows = db.query(AppEaProjectConfig).all()
+        rows = db.query(AppEaProjectConfig).filter_by(project_id=_GLOBAL_CONFIG_PROJECT_ID).all()
         updated = 0
         for row in rows:
             blob = dict(row.config_json or {})
