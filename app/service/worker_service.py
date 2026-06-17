@@ -1002,7 +1002,7 @@ class WorkerService:
             row.started_at = now_local()
             db.commit()
 
-            svc = task_mod._load_svc_config_from_db(db, row.project_id)
+            svc = task_mod._load_svc_config(db)
             tcfg = task_mod._parse_task_config(row.task_config_json)
             svc = task_mod._apply_task_config_overrides(svc, tcfg)
             if row.output_path:

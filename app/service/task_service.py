@@ -1911,17 +1911,17 @@ def _load_svc_config():
     raise RuntimeError(f"Service config not found: {SERVICE_CONFIG_PATH}")
 
 
-def _load_svc_config(db: "Session", project_id: str):
-    """加载全局服务配置（优先配置中心，回退 MySQL/文件）。"""
+def _load_svc_config(db: "Session"):
+    """加载全局服务配置（MySQL __global__，失败回退文件）。"""
     try:
         from app.service.config_service import get_config_service
         from app.models import ServiceConfig as _ServiceConfig
-        cfg_dict = get_config_service().get_config(db, project_id)
+        cfg_dict = get_config_service().get_config(db)
         for _k in ("updated_at", "project_id"):
             cfg_dict.pop(_k, None)
         return _ServiceConfig(**cfg_dict)
     except Exception as _exc:
-        logger.warning("_load_svc_config_from_db failed (%s), falling back to file: %s", project_id, _exc)
+        logger.warning("_load_svc_config failed, falling back to file: %s", _exc)
         return _load_svc_config()
 
 
@@ -3202,16 +3202,16 @@ class TaskService:
         if normalized_input_contract:
             merged_task_config["input_contract"] = normalized_input_contract
         # 创建时快照项目配置中心，仅供查看使用、不参与运行时 override
-        # （运行时 _load_svc_config_from_db 依然读取最新项目配置）
+        # 快照全局配置到任务记录中
         try:
             from app.service.config_service import get_config_service
-            snapshot_cfg = dict(get_config_service().get_config(db, project_id) or {})
+            snapshot_cfg = dict(get_config_service().get_config(db) or {})
             for _k in ("updated_at", "project_id"):
                 snapshot_cfg.pop(_k, None)
             if snapshot_cfg:
                 merged_task_config["project_config_snapshot"] = snapshot_cfg
         except Exception as _exc:
-            logger.warning("snapshot project config failed for %s: %s", project_id, _exc)
+            logger.warning("snapshot config failed: %s", _exc)
         row = AppEaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=normalized_input_path,
