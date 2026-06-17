@@ -467,18 +467,28 @@ def _build_role_models_json(
     return global_models_json if isinstance(global_models_json, dict) else {"providers": {}}
 
 
-def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None, cfg: Any) -> tuple[dict[str, str], str]:
-    role_dirs: dict[str, str] = {}
-    if not task_root:
-        return role_dirs, "task_scoped"
-    agents_root = Path(task_root) / ".pi" / "agents"
-    agents_root.mkdir(parents=True, exist_ok=True)
+def _materialize_task_pi_runtime(*, agent_task_key: dict | None, cfg: Any) -> tuple[dict[str, str], str]:
+    """
+    生成 Pod 全局 PI 配置（/root/.pi/agent/）。
+
+    一个 Pod 同时只运行一个任务，无需任务级隔离。
+    models.json 由 sync_providers_to_pi() 写入。
+    settings.json 合并全局配置后写入。
+    auth.json 写入任务级 agent key。
+    """
     global_pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
-    models_src = Path(os.environ.get("PI_MODELS_JSON") or (global_pi_dir / "models.json"))
+    global_pi_dir.mkdir(parents=True, exist_ok=True)
+
+    # settings.json：合并全局配置
     settings_src = global_pi_dir / "settings.json"
-    global_models_json = _read_json_file(models_src)
-    global_settings_json = _read_json_file(settings_src)
-    merged_settings = _merge_pi_settings(global_settings_json)
+    global_settings = _read_json_file(settings_src)
+    merged_settings = _merge_pi_settings(global_settings)
+    (global_pi_dir / "settings.json").write_text(
+        json.dumps(merged_settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # auth.json：任务级 agent key
     auth_payload = {
         "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
         "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
@@ -486,24 +496,13 @@ def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None,
         "agent_task_key_secret": str((agent_task_key or {}).get("secret") or "").strip() or None,
         "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
     }
-    for role_name, role_config in (("workers", cfg.workers), ("judges", cfg.judges)):
-        role_dir = agents_root / role_name
-        role_dir.mkdir(parents=True, exist_ok=True)
-        models_json = _build_role_models_json(role_name, role_config, global_models_json=global_models_json)
-        (role_dir / "models.json").write_text(
-            json.dumps(models_json, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (role_dir / "settings.json").write_text(
-            json.dumps(merged_settings, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (role_dir / "auth.json").write_text(
-            json.dumps(auth_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        role_dirs[role_name] = str(role_dir)
-    return role_dirs, "task_scoped"
+    (global_pi_dir / "auth.json").write_text(
+        json.dumps(auth_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    global_dir = str(global_pi_dir)
+    return {"workers": global_dir, "judges": global_dir}, "global"
 
 
 def _normalize_agent_auth_snapshot(agent_task_key: dict | None) -> dict[str, Any] | None:
@@ -1145,12 +1144,11 @@ class WorkerService:
 
         agent_task_key = _task_agent_key(tcfg)
         task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(
-            task_root=task_root,
             agent_task_key=agent_task_key,
             cfg=cfg,
         )
         cfg.task_pi_dirs = dict(task_pi_dirs)
-        cfg.task_pi_dir = cfg.role_pi_dir("workers")
+        cfg.task_pi_dir = str(task_pi_dirs.get("workers", os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")))
         (
             agent_auth_json,
             role_config_snapshot,
