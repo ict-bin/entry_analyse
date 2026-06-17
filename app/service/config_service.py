@@ -44,7 +44,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "lean_mode": False,
     "lean_file_max_rounds": -1,
     "lean_module_max_rounds": -1,
-    "api_filter_entry_judge": True,
+    "api_filter_entry_judge": False,  # 已废弃，保留兼容
+    "fast_mode": False,
+    "fast_mode_batch_size": 20,
     "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
@@ -150,8 +152,18 @@ class ConfigService:
             "pipeline_parallelism",
             "model_capacity_enabled",
             "model_max_concurrency",
+            "api_filter_entry_judge",
+            "api_filter_timeout_seconds",
+            "api_filter_max_timeouts",
+            "api_filter_parse_max_retries",
         ):
             normalized.pop(stale_key, None)
+        # 快速模式字段归一化
+        normalized["fast_mode"] = bool(normalized.get("fast_mode", False))
+        try:
+            normalized["fast_mode_batch_size"] = max(10, min(int(normalized.get("fast_mode_batch_size", 20)), 50))
+        except (TypeError, ValueError):
+            normalized["fast_mode_batch_size"] = 20
         return normalized
 
     def get_config(self, db: Session, project_id: str) -> dict:
