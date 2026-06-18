@@ -2854,6 +2854,18 @@ class PipelineEngine:
                 role_kind=role_kind,
                 model=acfg.model,
             )
+        if getattr(ar, "fatal_retry_event_due", False):
+            self._emit(
+                "task_fatal_retrying",
+                stage=stage_key,
+                retry_delay_seconds=int(getattr(ar, "retry_delay_seconds", 30) or 30),
+                consecutive_fatal_retry_count=int(getattr(ar, "consecutive_fatal_retry_count", 0) or 0),
+                reason=str(getattr(ar, "fatal_retry_reason", "") or ""),
+                role=role_kind,
+                runtime_dir=str(getattr(ar, "runtime_dir", "") or ""),
+                model=acfg.model,
+                context_window=int(getattr(ar, "context_window", 0) or 0),
+            )
         if getattr(ar, "compaction_requested", False):
             self._emit(
                 "task_context_compaction_requested",
@@ -2883,7 +2895,7 @@ class PipelineEngine:
                 proxy_reserved_tokens=int(getattr(ar, "proxy_reserved_tokens", 0) or 0),
                 error=str(getattr(ar, "error", "") or ""),
             )
-        if getattr(ar, "context_overflow_retrying", False):
+        if getattr(ar, "context_overflow_retrying", False) and getattr(ar, "context_overflow_retry_event_due", False):
             self._emit(
                 "task_context_overflow_retrying",
                 stage=stage_key,
@@ -2892,6 +2904,7 @@ class PipelineEngine:
                 model=acfg.model,
                 context_window=int(getattr(ar, "context_window", 0) or 0),
                 proxy_reserved_tokens=int(getattr(ar, "proxy_reserved_tokens", 0) or 0),
+                context_overflow_retry_count=int(getattr(ar, "context_overflow_retry_count", 0) or 0),
             )
         if getattr(ar, "context_overflow_failed_after_compaction", False):
             self._emit(
