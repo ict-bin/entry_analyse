@@ -63,6 +63,12 @@ class FastModeBatchProcessor:
         self._batch_seq = 0
         self._total_collected = 0
         self._total_processed = 0
+        # 并发控制：线程池
+        import concurrent.futures
+        _max_workers = max(1, int(os.environ.get('EA_FAST_MODE_CONCURRENCY', '8')))
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_max_workers, thread_name_prefix="fm-batch")
+        self._futures: list[concurrent.futures.Future] = []
 
     # ── 公开接口 ─────────────────────────────────────────────────────────────
 
@@ -85,12 +91,9 @@ class FastModeBatchProcessor:
             if len(self._pending) >= self._batch_size:
                 batch = list(self._pending[:self._batch_size])
                 self._pending = self._pending[self._batch_size:]
-                threading.Thread(
-                    target=self._process_batch,
-                    args=(batch,),
-                    daemon=True,
-                    name=f"fm-batch-{self._batch_seq}",
-                ).start()
+                self._futures.append(
+                    self._executor.submit(self._process_batch, batch)
+                )
 
         # 等待分类完成（在独立线程中 set）
         await asyncio.to_thread(event.wait)
@@ -111,13 +114,9 @@ class FastModeBatchProcessor:
             return
 
         logger.info("fast_mode tail batch: %d remaining functions", len(remaining))
-        thread = threading.Thread(
-            target=self._process_batch,
-            args=(remaining,),
-            daemon=True,
-            name="fm-tail-batch",
+        self._futures.append(
+            self._executor.submit(self._process_batch, remaining)
         )
-        thread.start()
 
         for _, event in remaining:
             await asyncio.to_thread(event.wait)
