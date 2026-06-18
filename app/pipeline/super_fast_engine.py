@@ -721,7 +721,7 @@ class SuperFastPipelineEngine:
 
                     # ── Fix-A: R4 快速路径预判 ────────────────────────────
                     # 若无 R3-kept 调用者，或本函数为主动型(tag=A)，直接 keep 跳过 W+J
-                    _r4_quick_keep, _r4_quick_reason = await asyncio.to_thread(
+                    _r4_quick_keep, _r4_quick_reason = await run_in_script_thread(
                         _r4_quick_path, func_hash, file_hash, dirs, state)
                     if _r4_quick_keep:
                         func_state.r4_decision = "keep"
@@ -1332,7 +1332,7 @@ class SuperFastPipelineEngine:
                 if not func_state.end_line or func_state.end_line <= 0:
                     try:
                         from .funcdb import FunctionDB as _FDB_R2
-                        _next = await asyncio.to_thread(
+                        _next = await run_in_script_thread(
                             lambda: _FDB_R2.open(dirs.r1, file_hash).get_next_boundary_line(
                                 file_hash, func_state.start_line
                             )
@@ -1622,7 +1622,7 @@ class SuperFastPipelineEngine:
                         _prefetched_body_retry = ""
                         try:
                             from .funcdb import FunctionDB as _FDB3r
-                            _rec3r = await asyncio.to_thread(
+                            _rec3r = await run_in_script_thread(
                                 lambda: _FDB3r.open(dirs.r1, file_hash).get_function(func_hash)
                             )
                             if _rec3r:
@@ -1654,7 +1654,7 @@ class SuperFastPipelineEngine:
                     _prefetched_body = ""
                     try:
                         from .funcdb import FunctionDB as _FDB3
-                        _rec3 = await asyncio.to_thread(
+                        _rec3 = await run_in_script_thread(
                             lambda: _FDB3.open(dirs.r1, file_hash).get_function(func_hash)
                         )
                         if _rec3:
@@ -1911,7 +1911,7 @@ class SuperFastPipelineEngine:
             _funcdb_record: dict = {}
             try:
                 from .funcdb import FunctionDB as _FDB_j
-                _rec_j = await asyncio.to_thread(
+                _rec_j = await run_in_script_thread(
                     lambda: _FDB_j.open(dirs.r1, file_hash).get_function(func_hash)
                 )
                 if _rec_j:
@@ -1927,7 +1927,7 @@ class SuperFastPipelineEngine:
             _r3j_body = ""
             try:
                 from .funcdb import FunctionDB as _FDB_jb
-                _rec_jb = await asyncio.to_thread(
+                _rec_jb = await run_in_script_thread(
                     lambda: _FDB_jb.open(dirs.r1, file_hash).get_function(func_hash)
                 )
                 if _rec_jb:
@@ -2308,7 +2308,7 @@ class SuperFastPipelineEngine:
                     if _ch in _fs_c.functions:
                         try:
                             from .funcdb import FunctionDB as _FDB_r4w
-                            _cr = await asyncio.to_thread(
+                            _cr = await run_in_script_thread(
                                 lambda _h=_fh_c, _c=_ch: _FDB_r4w.open(dirs.r1, _h).get_function(_c)
                             )
                             if _cr:
@@ -2456,7 +2456,7 @@ class SuperFastPipelineEngine:
         try:
             from .funcdb import FunctionDB as _FDBJ2
             if file_hash_j:
-                _r4j_rec = await asyncio.to_thread(
+                _r4j_rec = await run_in_script_thread(
                     lambda: _FDBJ2.open(dirs.r1, file_hash_j).get_function(func_hash)
                 )
                 if _r4j_rec:
@@ -2474,7 +2474,7 @@ class SuperFastPipelineEngine:
                     if _ch in _fs_c.functions:
                         try:
                             from .funcdb import FunctionDB as _FDBJ3
-                            _cr = await asyncio.to_thread(
+                            _cr = await run_in_script_thread(
                                 lambda _h=_fh_c, _c=_ch: _FDBJ3.open(dirs.r1, _h).get_function(_c)
                             )
                             if _cr:
@@ -3029,7 +3029,7 @@ class SuperFastPipelineEngine:
 
         body = ""
         try:
-            _rec_af = await asyncio.to_thread(
+            _rec_af = await run_in_script_thread(
                 lambda: _FDBAF.open(dirs.r1, file_hash).get_function(func_hash)
             )
             if _rec_af:
@@ -3128,7 +3128,7 @@ class SuperFastPipelineEngine:
         被一个个串行送入阻塞，此期间 R3 agent 无法被调度，且如果 MySQL 开销较大
         可能导致租约续期线程的连接池等待超时。
         """
-        await asyncio.to_thread(lambda: upsert_stage_result_index(**kwargs))
+        await run_in_script_thread(lambda: upsert_stage_result_index(**kwargs))
 
     @staticmethod
     def _tok(ar) -> tuple[int, int]:
