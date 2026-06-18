@@ -579,13 +579,21 @@ class SuperFastPipelineEngine:
                     pass
 
         def _sync_evt() -> None:
-            """Sync events.jsonl to NFS for frontend live display."""
+            """Sync events.jsonl and sessions to NFS for frontend live display."""
             try:
                 local_evt = run_dir / "events.jsonl"
                 nfs_evt = _nfs_run / "events.jsonl"
                 if local_evt.exists():
                     _nfs_run.mkdir(parents=True, exist_ok=True)
                     _shutil.copy2(str(local_evt), str(nfs_evt))
+                # Sync sessions directory
+                local_sessions = run_dir / "sessions"
+                nfs_sessions = _nfs_run / "sessions"
+                if local_sessions.is_dir():
+                    nfs_sessions.mkdir(parents=True, exist_ok=True)
+                    for f in local_sessions.iterdir():
+                        if f.is_file() and not (nfs_sessions / f.name).exists():
+                            _shutil.copy2(str(f), str(nfs_sessions / f.name))
             except Exception:
                 pass
 
