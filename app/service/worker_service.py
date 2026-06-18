@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 
 import asyncio
+import contextlib
 import errno as _errno
 import json
 import logging
@@ -88,6 +89,10 @@ LEASE_DURATION_SECONDS        = int(os.environ.get("EA_TASK_LEASE_SECONDS", "300
 HEALTH_PORT                   = max(1, int(os.environ.get("EA_WORKER_HEALTH_PORT", "18080")))
 WORKER_HTTP_PORT              = max(1, int(os.environ.get("PORT", "3000")))
 GUARD_LEASE_FAILURE_THRESHOLD = max(1, int(os.environ.get("EA_WORKER_LEASE_FAILURE_UNHEALTHY_THRESHOLD", "3")))
+FORCE_KILL_ALL_PI_ON_TASK_START = os.environ.get("EA_FORCE_KILL_ALL_PI_ON_TASK_START", "1").strip().lower() not in {"0", "false", "no", "off"}
+FORCE_KILL_ALL_PI_ON_TASK_TERMINAL = os.environ.get("EA_FORCE_KILL_ALL_PI_ON_TASK_TERMINAL", "1").strip().lower() not in {"0", "false", "no", "off"}
+IDLE_PI_REAPER_ENABLED = os.environ.get("EA_IDLE_PI_REAPER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+IDLE_PI_REAPER_INTERVAL_SECONDS = max(5, int(os.environ.get("EA_IDLE_PI_REAPER_INTERVAL_SECONDS", "30")))
 
 # Re-export for backward compat (used by agent_observability.py)
 ORPHAN_PROCESS_GRACE_SECONDS = max(30, int(os.environ.get("EA_ORPHAN_PROCESS_GRACE_SECONDS", "900")))
@@ -621,6 +626,7 @@ class WorkerService:
         # Threads
         self._dispatch_thread: threading.Thread | None = None
         self._health_server_thread: threading.Thread | None = None
+        self._idle_pi_reaper_thread: threading.Thread | None = None
         self._health_server_httpd: ThreadingHTTPServer | None = None
         self._health_server_lock = threading.Lock()
         self._health_server_stop = threading.Event()
@@ -637,6 +643,11 @@ class WorkerService:
 
         # Health
         self._health = WorkerHealthSnapshot()
+        self._last_idle_pi_reaper_at: float | None = None
+        self._last_idle_pi_reaper_killed_count: int = 0
+        self._idle_pi_reaper_runs_total: int = 0
+        self._idle_pi_reaper_killed_pids_total: int = 0
+        self._idle_pi_reaper_failures_total: int = 0
 
         # Heartbeat subprocess
         self._heartbeat_proc: subprocess.Popen | None = None
@@ -684,6 +695,13 @@ class WorkerService:
             daemon=True,
         )
         self._dispatch_thread.start()
+        if IDLE_PI_REAPER_ENABLED:
+            self._idle_pi_reaper_thread = threading.Thread(
+                target=self._idle_pi_reaper_loop,
+                name="ea_idle_pi_reaper",
+                daemon=True,
+            )
+            self._idle_pi_reaper_thread.start()
 
         self._health.bootstrapped = True
         self._health.startup_phase = "ready"
@@ -709,6 +727,8 @@ class WorkerService:
         # Wait for dispatch thread
         if self._dispatch_thread and self._dispatch_thread.is_alive():
             self._dispatch_thread.join(timeout=3.0)
+        if self._idle_pi_reaper_thread and self._idle_pi_reaper_thread.is_alive():
+            self._idle_pi_reaper_thread.join(timeout=3.0)
 
         # Stop heartbeat subprocess
         self._stop_heartbeat_subprocess()
@@ -723,6 +743,46 @@ class WorkerService:
 
     def local_running_count(self) -> int:
         return 1 if self._local_task_ids else 0
+
+    def claimed_running_task_count(self) -> int:
+        return self.local_running_count()
+
+    def snapshot_live_agent_processes(self) -> list[dict[str, Any]]:
+        with self._agent_registry_lock:
+            return [dict(item) for item in self._live_agent_processes.values()]
+
+    def snapshot_suspected_orphans(self) -> dict[int, dict[str, Any]]:
+        with self._agent_registry_lock:
+            return {int(pid): dict(item) for pid, item in self._suspected_orphans.items()}
+
+    def reconcile_suspected_orphans(self, observed_pids: set[int]) -> None:
+        current = time.time()
+        normalized = {int(pid) for pid in observed_pids if pid is not None}
+        with self._agent_registry_lock:
+            for pid in normalized:
+                if pid in self._live_agent_processes:
+                    self._suspected_orphans.pop(pid, None)
+                    continue
+                orphan = self._suspected_orphans.get(pid)
+                if orphan is None:
+                    self._suspected_orphans[pid] = {
+                        "first_detected_at": current,
+                        "last_detected_at": current,
+                    }
+                else:
+                    orphan["last_detected_at"] = current
+            missing = [pid for pid in self._suspected_orphans if pid not in normalized]
+            for pid in missing:
+                self._suspected_orphans.pop(pid, None)
+
+    def last_idle_pi_reaper_state(self) -> dict[str, Any]:
+        return {
+            "last_idle_pi_reaper_at": self._last_idle_pi_reaper_at,
+            "last_idle_pi_reaper_killed_count": self._last_idle_pi_reaper_killed_count,
+            "idle_pi_reaper_runs_total": self._idle_pi_reaper_runs_total,
+            "idle_pi_reaper_killed_pids_total": self._idle_pi_reaper_killed_pids_total,
+            "idle_pi_reaper_failures_total": self._idle_pi_reaper_failures_total,
+        }
 
     def has_local_task(self, task_id: str) -> bool:
         return task_id in self._local_task_ids
@@ -763,6 +823,144 @@ class WorkerService:
         return _kill_all_task_processes(
             task_id=task_id, task_roots=task_roots,
         )
+
+    def force_kill_all_pi_processes(self, *, reason: str = "", task_id: str | None = None) -> dict[str, Any]:
+        start = time.monotonic()
+        main_pid = os.getpid()
+        main_ppid = os.getppid()
+        matched_processes: list[dict[str, Any]] = []
+        failed_pids: list[dict[str, Any]] = []
+        killed_pids: set[int] = set()
+        killed_pgids: set[int] = set()
+        pgid_targets: set[int] = set()
+        pid_targets: set[int] = set()
+        for proc_dir in _pl.Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            pid = int(proc_dir.name)
+            try:
+                comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+                exe = os.path.basename(os.readlink(proc_dir / "exe"))
+                cmd = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+                cwd = os.readlink(proc_dir / "cwd")
+                stat_parts = (proc_dir / "stat").read_text(encoding="utf-8", errors="replace").split()
+                ppid = int(stat_parts[3]) if len(stat_parts) > 3 else -1
+                pgid = int(stat_parts[4]) if len(stat_parts) > 4 else None
+            except Exception:
+                continue
+            is_pi = comm == "pi" or exe == "node"
+            if not is_pi:
+                continue
+            if pid == main_pid or pid == main_ppid or ppid == main_pid:
+                continue
+            if any(keyword in cmd for keyword in ("kill_server.py", "heartbeat_proc.py", "probe_process", "lease_renewer.py", "main.py")):
+                continue
+            matched_processes.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "pgid": pgid,
+                    "comm": comm,
+                    "exe": exe,
+                    "cwd": cwd,
+                    "cmd": cmd[:500],
+                }
+            )
+            if pgid is not None and pgid > 1:
+                pgid_targets.add(int(pgid))
+            else:
+                pid_targets.add(pid)
+        for pgid in sorted(pgid_targets):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                killed_pgids.add(pgid)
+            except ProcessLookupError:
+                continue
+            except Exception as exc:
+                failed_pids.append({"pgid": pgid, "reason": str(exc)})
+        for pid in sorted(pid_targets):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed_pids.add(pid)
+            except ProcessLookupError:
+                continue
+            except Exception as exc:
+                failed_pids.append({"pid": pid, "reason": str(exc)})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            remaining = [
+                item for item in matched_processes
+                if _pl.Path(f"/proc/{int(item['pid'])}").exists()
+            ]
+            if not remaining:
+                break
+            time.sleep(0.05)
+        result = {
+            "reason": reason or "unspecified",
+            "task_id": task_id,
+            "matched_processes": matched_processes,
+            "killed_pid_count": len(killed_pids),
+            "killed_pgid_count": len(killed_pgids),
+            "failed_pids": failed_pids,
+            "duration_ms": round((time.monotonic() - start) * 1000, 2),
+        }
+        logger.warning(
+            "force_kill_all_pi_processes done: reason=%s task_id=%s matched=%s killed_pid_count=%s killed_pgid_count=%s failed=%s duration_ms=%s",
+            result["reason"],
+            task_id,
+            len(matched_processes),
+            result["killed_pid_count"],
+            result["killed_pgid_count"],
+            len(failed_pids),
+            result["duration_ms"],
+        )
+        return result
+
+    def _has_owned_running_task_in_db(self) -> bool:
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            row = (
+                db.query(AppEaTask.task_id)
+                .filter(
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.status == "running",
+                    AppEaTask.owner_pod == POD_NAME,
+                )
+                .first()
+            )
+            return row is not None
+        finally:
+            with contextlib.suppress(StopIteration):
+                next(db_gen)
+
+    def _worker_idle_for_pi_reaping(self) -> bool:
+        return (
+            not self._local_task_ids
+            and self.claimed_running_task_count() == 0
+            and not self._has_owned_running_task_in_db()
+        )
+
+    def _idle_pi_reaper_loop(self) -> None:
+        while self._running and not self._infra_stop.wait(timeout=IDLE_PI_REAPER_INTERVAL_SECONDS):
+            self._idle_pi_reaper_runs_total += 1
+            if not self._worker_idle_for_pi_reaping():
+                continue
+            logger.info("idle_pi_reaper_scan_started: pod=%s", POD_NAME)
+            try:
+                result = self.force_kill_all_pi_processes(reason="idle_worker_reaper")
+                self._last_idle_pi_reaper_at = time.time()
+                self._last_idle_pi_reaper_killed_count = int(result.get("killed_pid_count") or 0)
+                self._idle_pi_reaper_killed_pids_total += self._last_idle_pi_reaper_killed_count
+                logger.info(
+                    "idle_pi_reaper_cleanup_finished: pod=%s killed_pid_count=%s failed=%s",
+                    POD_NAME,
+                    self._last_idle_pi_reaper_killed_count,
+                    len(result.get("failed_pids") or []),
+                )
+            except Exception as exc:
+                self._idle_pi_reaper_failures_total += 1
+                logger.warning("idle_pi_reaper_cleanup_failed: pod=%s error=%s", POD_NAME, exc)
 
     def start_task(self, task_id: str) -> threading.Thread:
         """Start a task in its own thread with a dedicated asyncio event loop.
@@ -924,6 +1122,7 @@ class WorkerService:
         event_buffer: list[dict] = []
         task_roots: list[str] = []
         cancel_requested = False
+        preflight_cleanup_result: dict[str, Any] | None = None
         last_progress_time = time.time()
         _progress_lock = threading.Lock()
         # 本地事件文件：写在 run/ 目录下，与 pipeline_state.json 同级。
@@ -1006,6 +1205,11 @@ class WorkerService:
             task_id, [str(r) for r in task_roots],
         )
         if task_roots:
+            if FORCE_KILL_ALL_PI_ON_TASK_START:
+                preflight_cleanup_result = self.force_kill_all_pi_processes(
+                    reason="task_preflight",
+                    task_id=task_id,
+                )
             killed = _kill_all_task_processes(
                 task_id=task_id, task_roots=task_roots,
             )
@@ -1077,7 +1281,10 @@ class WorkerService:
                     message="任务已开始执行",
                     source=task_mod.TASK_EVENT_SOURCE_WORKER,
                     status=_r3.status,
-                    payload={"owner_pod": POD_NAME},
+                    payload={
+                        "owner_pod": POD_NAME,
+                        "preflight_pi_cleanup": preflight_cleanup_result,
+                    },
                     dedupe_key=task_mod._event_dedupe_key(
                         _r3.task_id, "task_started", POD_NAME,
                     ),
@@ -1328,13 +1535,19 @@ class WorkerService:
             "_execute_task STEP8 cleanup_start: task=%s cancel_requested=%s",
             task_id, cancel_requested,
         )
+        terminal_cleanup_result: dict[str, Any] | None = None
+        if FORCE_KILL_ALL_PI_ON_TASK_TERMINAL:
+            terminal_cleanup_result = self.force_kill_all_pi_processes(
+                reason="task_terminal",
+                task_id=task_id,
+            )
         if task_roots:
             _close_task_fds(task_roots=task_roots, task_id=task_id)
             _kill_all_task_processes(task_id=task_id, task_roots=task_roots)
-            logger.info(
-                "_execute_task STEP8 cleanup_done: task=%s",
-                task_id,
-            )
+        logger.info(
+            "_execute_task STEP8 cleanup_done: task=%s",
+            task_id,
+        )
 
         # ── Step 9: Finalize events file ──────────────────────────────────
         # 事件已由 _on_event 逐条写入，此处只追加 done 标记。
@@ -1412,6 +1625,28 @@ class WorkerService:
                     _fr.task_id, _fr.status, _fr.finished_at, "terminal",
                 ),
             )
+            if terminal_cleanup_result is not None:
+                task_mod._safe_create_task_event(
+                    _fd,
+                    task_id=_fr.task_id,
+                    project_id=_fr.project_id,
+                    event_type="task_terminal_pi_cleanup_finished",
+                    message="任务终态前已执行全量 PI 清理",
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    level="warning" if terminal_cleanup_result.get("failed_pids") else "info",
+                    status=_fr.status,
+                    payload={
+                        "cleanup_scope": "pod_all_pi",
+                        "terminal_status": _fr.status,
+                        **terminal_cleanup_result,
+                    },
+                    dedupe_key=task_mod._event_dedupe_key(
+                        _fr.task_id,
+                        "task_terminal_pi_cleanup_finished",
+                        _fr.finished_at,
+                        _fr.status,
+                    ),
+                )
             _fd.commit()
         finally:
             try:

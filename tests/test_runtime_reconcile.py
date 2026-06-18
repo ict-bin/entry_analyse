@@ -59,12 +59,14 @@ def _fake_worker_service(
     claimed_running_tasks: int = 0,
     live_rows: list[dict] | None = None,
     suspected_orphans: dict[int, dict[str, object]] | None = None,
+    idle_reaper_state: dict[str, object] | None = None,
 ):
     return SimpleNamespace(
         claimed_running_task_count=lambda: claimed_running_tasks,
         snapshot_live_agent_processes=lambda: list(live_rows or []),
         snapshot_suspected_orphans=lambda: dict(suspected_orphans or {}),
         reconcile_suspected_orphans=lambda _observed: None,
+        last_idle_pi_reaper_state=lambda: dict(idle_reaper_state or {}),
     )
 
 
@@ -906,6 +908,89 @@ def test_agent_snapshot_marks_expired_suspected_orphan_as_killable(monkeypatch) 
     assert row["kill_allowed"] is True
     assert row["kill_block_reason"] is None
     assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1
+
+
+def test_agent_snapshot_reports_residual_pi_and_idle_reaper_state(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 3234,
+        "ppid": 1,
+        "pgid": 3234,
+        "command": "pi",
+        "cwd": "/tmp/out/eat_done/run/workspace/stage_cwd/r3_w",
+        "exe": "/usr/bin/node",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "env_map": {},
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_slot_service",
+        lambda: SimpleNamespace(
+            get_cluster_snapshot=lambda _db, project_id="": {
+                "workers": [{
+                    "pod_name": "entry-analyse-pod",
+                    "agent_process_in_use": 0,
+                    "agent_process_limit": 4,
+                    "agent_process_available": 4,
+                    "agent_waiting_requests": 0,
+                    "agent_waiting_tasks": 0,
+                    "agent_queue_oldest_wait_seconds": 0.0,
+                    "agent_rss_total_bytes": 0,
+                    "agent_rss_max_bytes": 0,
+                }]
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_worker_service",
+        lambda: _fake_worker_service(
+            claimed_running_tasks=0,
+            idle_reaper_state={
+                "last_idle_pi_reaper_at": 123.0,
+                "last_idle_pi_reaper_killed_count": 2,
+            },
+        ),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(
+                task_id="eat_done",
+                project_id="p1",
+                task_name="done task",
+                input_path="/tmp/in",
+                output_path="/tmp/out",
+                source_path="/tmp/src",
+                status="cancelled",
+                owner_pod=None,
+                lease_expires_at=None,
+                stages_json={},
+                updated_at=None,
+            )]
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    assert snapshot["summary"]["total_pi_process_count"] == 1
+    assert snapshot["summary"]["residual_pi_process_count"] == 1
+    assert snapshot["summary"]["unknown_pi_process_count"] == 0
+    assert snapshot["summary"]["residual_pi_detected"] is True
+    assert snapshot["summary"]["last_idle_pi_reaper_at"] == 123.0
+    assert snapshot["summary"]["last_idle_pi_reaper_killed_count"] == 2
+    assert snapshot["pods"][0]["residual_pi_detected"] is True
+    assert snapshot["pods"][0]["total_pi_process_count"] == 1
 
 
 def test_agent_snapshot_detects_codex_session_argument(monkeypatch) -> None:

@@ -693,10 +693,17 @@ class AgentObservabilityService:
         residual_task_rows = [item for item in ownership_rows if item.ownership_status == "residual"]
         scanned_at = time.time()
         pod_slot = cluster_by_pod.get(POD_NAME) or {}
+        idle_reaper_state = {}
+        fn = getattr(worker_service, "last_idle_pi_reaper_state", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                idle_reaper_state = dict(fn() or {})
         claimed_running_tasks = 0
         claimed_running_tasks = _worker_service_claimed_running_task_count(worker_service)
         runtime_observed_task_count = len(running_task_rows)
         ghost_running_tasks = max(0, claimed_running_tasks - runtime_observed_task_count)
+        total_pi_process_count = len(process_rows)
+        residual_pi_detected = total_pi_process_count > int(pod_slot.get("agent_process_in_use") or 0)
         return {
             "summary": {
                 "pod_name": POD_NAME,
@@ -710,6 +717,10 @@ class AgentObservabilityService:
                 "killable_residual_processes": len([item for item in residual_processes if item.kill_allowed]),
                 "killable_suspected_orphan_processes": len([item for item in suspected_orphan_processes if item.kill_allowed]),
                 "killable_unknown_processes": len([item for item in unknown_processes if item.kill_allowed]),
+                "total_pi_process_count": total_pi_process_count,
+                "residual_pi_process_count": len(residual_processes),
+                "unknown_pi_process_count": len(unknown_processes),
+                "residual_pi_detected": residual_pi_detected,
                 "agent_process_limit": int(pod_slot.get("agent_process_limit") or 0),
                 "agent_process_in_use": int(pod_slot.get("agent_process_in_use") or 0),
                 "agent_process_available": int(pod_slot.get("agent_process_available") or 0),
@@ -718,6 +729,8 @@ class AgentObservabilityService:
                 "agent_queue_oldest_wait_seconds": float(pod_slot.get("agent_queue_oldest_wait_seconds") or 0.0),
                 "agent_rss_total_bytes": int(pod_slot.get("agent_rss_total_bytes") or 0),
                 "agent_rss_max_bytes": int(pod_slot.get("agent_rss_max_bytes") or 0),
+                "last_idle_pi_reaper_at": idle_reaper_state.get("last_idle_pi_reaper_at"),
+                "last_idle_pi_reaper_killed_count": int(idle_reaper_state.get("last_idle_pi_reaper_killed_count") or 0),
                 "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
@@ -749,6 +762,12 @@ class AgentObservabilityService:
                 },
                 "claimed_running_tasks": claimed_running_tasks,
                 "ghost_running_tasks": ghost_running_tasks,
+                "total_pi_process_count": total_pi_process_count,
+                "residual_pi_process_count": len(residual_processes),
+                "unknown_pi_process_count": len(unknown_processes),
+                "residual_pi_detected": residual_pi_detected,
+                "last_idle_pi_reaper_at": idle_reaper_state.get("last_idle_pi_reaper_at"),
+                "last_idle_pi_reaper_killed_count": int(idle_reaper_state.get("last_idle_pi_reaper_killed_count") or 0),
                 "last_scanned_at": scanned_at,
                 "scan_errors": 0,
                 "processes": [item.__dict__ for item in process_rows],

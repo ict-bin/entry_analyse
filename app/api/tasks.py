@@ -370,6 +370,12 @@ class EntryAnalyseWorkerSlotResponse(BaseModel):
     agent_process_available: int = 0
     agent_waiting_requests: int = 0
     agent_waiting_tasks: int = 0
+    total_pi_process_count: int = 0
+    residual_pi_process_count: int = 0
+    unknown_pi_process_count: int = 0
+    residual_pi_detected: bool = False
+    last_idle_pi_reaper_at: Optional[float] = None
+    last_idle_pi_reaper_killed_count: int = 0
     agent_queue_oldest_wait_seconds: float = 0.0
     agent_rss_total_bytes: int = 0
     agent_rss_max_bytes: int = 0
@@ -497,6 +503,12 @@ class AgentPodSnapshotResponse(BaseModel):
     residual_process_count: int = 0
     suspected_orphan_process_count: int = 0
     unknown_process_count: int = 0
+    total_pi_process_count: int = 0
+    residual_pi_process_count: int = 0
+    unknown_pi_process_count: int = 0
+    residual_pi_detected: bool = False
+    last_idle_pi_reaper_at: Optional[float] = None
+    last_idle_pi_reaper_killed_count: int = 0
     task_count: int = 0
     running_task_count: int = 0
     residual_task_count: int = 0
@@ -527,6 +539,10 @@ class AgentObservabilitySummaryResponse(BaseModel):
     killable_residual_processes: int = 0
     killable_suspected_orphan_processes: int = 0
     killable_unknown_processes: int = 0
+    total_pi_process_count: int = 0
+    residual_pi_process_count: int = 0
+    unknown_pi_process_count: int = 0
+    residual_pi_detected: bool = False
     agent_process_limit: int = 0
     agent_process_in_use: int = 0
     agent_process_available: int = 0
@@ -535,6 +551,8 @@ class AgentObservabilitySummaryResponse(BaseModel):
     agent_queue_oldest_wait_seconds: float = 0.0
     agent_rss_total_bytes: int = 0
     agent_rss_max_bytes: int = 0
+    last_idle_pi_reaper_at: Optional[float] = None
+    last_idle_pi_reaper_killed_count: int = 0
     scanned_at: Optional[float] = None
     scan_errors: int = 0
     aggregate_mode: Optional[str] = None

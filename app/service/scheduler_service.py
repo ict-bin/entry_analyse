@@ -241,6 +241,15 @@ class SchedulerService:
         pod_name = self._get_owner(task_id)
         if row.status == "running" and pod_name:
             self._notify_worker_kill(pod_name, task_id)
+        try:
+            from app.service.worker_service import get_worker_service
+
+            get_worker_service().force_kill_all_pi_processes(
+                reason="scheduler_cancel",
+                task_id=task_id,
+            )
+        except Exception as exc:
+            logger.warning("scheduler cancel pi cleanup failed: task=%s error=%s", task_id, exc)
 
         from app.service.task_service import (
             TASK_EVENT_SOURCE_SYSTEM, _event_dedupe_key, _safe_create_task_event,
@@ -292,6 +301,15 @@ class SchedulerService:
             cmd.status = "pending"
             db.commit()
             return
+        try:
+            from app.service.worker_service import get_worker_service
+
+            get_worker_service().force_kill_all_pi_processes(
+                reason="scheduler_restart_prepare",
+                task_id=task_id,
+            )
+        except Exception as exc:
+            logger.warning("scheduler restart pi cleanup failed: task=%s error=%s", task_id, exc)
 
         from app.service.task_service import (
             TASK_EVENT_SOURCE_EA, _event_dedupe_key, _reset_cancel_state, _safe_create_task_event,

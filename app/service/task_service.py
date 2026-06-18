@@ -31,6 +31,19 @@ from app.agent_process import cleanup_task_pi_processes
 
 logger = logging.getLogger("ea.task_service")
 
+
+def _force_kill_all_worker_pi(*, task_id: str, reason: str) -> dict[str, Any] | None:
+    try:
+        from app.service.worker_service import get_worker_service
+
+        return get_worker_service().force_kill_all_pi_processes(
+            reason=reason,
+            task_id=task_id,
+        )
+    except Exception as exc:
+        logger.warning("force_kill_all_worker_pi failed: task_id=%s reason=%s error=%s", task_id, reason, exc)
+        return None
+
 _PARENT_REUSABLE_TASK_STATUSES = {"pending", "running", "passed", "success"}
 TASK_EVENT_SOURCE_EA = "entry_analyse"
 TASK_EVENT_SOURCE_WORKER = "worker"
@@ -788,6 +801,7 @@ def _requeue_expired_running_tasks(
     owner_alive_requeued = 0
     for row in candidates:
         previous_owner = str(row.owner_pod or "").strip() or None
+        _force_kill_all_worker_pi(task_id=row.task_id, reason="expired_lease_reconcile")
         owner_is_alive = bool(previous_owner and previous_owner in owner_pods)
         previous_owner_ip = row.owner_pod_ip
         previous_lease_expires_at = row.lease_expires_at
@@ -906,6 +920,7 @@ def _requeue_invalid_owner_running_tasks(
         previous_owner = str(row.owner_pod or "").strip() or None
         if _is_valid_worker_owner(previous_owner, registry_pods):
             continue
+        _force_kill_all_worker_pi(task_id=row.task_id, reason="invalid_owner_reconcile")
         owner_is_alive = bool(previous_owner and previous_owner in owner_pods)
         previous_owner_ip = row.owner_pod_ip
         previous_lease_expires_at = row.lease_expires_at
@@ -3301,6 +3316,7 @@ class TaskService:
             db.commit()
         except Exception as _cmd_exc:
             logger.warning("failed to enqueue restart command for %s: %s", row.task_id, _cmd_exc)
+        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_restart_prepare")
 
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
@@ -3345,6 +3361,7 @@ class TaskService:
             db.commit()
         except Exception as _cmd_exc:
             logger.warning("failed to enqueue resume command for %s: %s", row.task_id, _cmd_exc)
+        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_resume_prepare")
 
         self.schedule_dispatch(row.project_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
@@ -3431,6 +3448,7 @@ class TaskService:
             db.commit()
         except Exception as _cmd_exc:
             logger.warning("failed to enqueue cancel command for %s: %s", row.task_id, _cmd_exc)
+        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_cancel")
         if row.status == "running":
             try:
                 cleanup_task_pi_processes(
@@ -3502,6 +3520,7 @@ class TaskService:
             )
         except Exception as exc:
             logger.warning("task-scoped pi cleanup failed during delete for %s: %s", row.task_id, exc)
+        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_delete")
         if delete_files and row.output_path:
             task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):
