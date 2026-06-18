@@ -8,7 +8,7 @@ entry_analyse — SuperFast 极速流水线引擎
   R2S   — 脚本验证行号 + body 一致性（无 Judge）
   FM    — 快速模式批分类：收集 callee → pi Agent 批分类
   R3W   — 入口分析 Worker（无 Judge，输出格式脚本校验）
-  R4S   — 调用链快速路径去重（纯脚本，无 Judge）
+  R4W   — 调用链分析 Worker + 脚本校验（无 Judge）
   R5    — 跳过（不生成 per-func 报告）
   R6    — 聚合输出 functions.list / entry-details.json / flag
 
@@ -139,9 +139,10 @@ class SuperFastPipelineEngine:
                     all_r2_done_event.set()
                 return
 
-            # ── R2S: 脚本验证行号 ──────────────────────────────────────
+            # ── R2: 脚本快速路径 + LLM Worker 修正（无 Judge）─────────
             if func_state.r2_j_state != NodeState.PASSED:
-                await self._run_r2_script(file_hash, func_hash, file_path, dirs, state)
+                await self._run_r2_worker(
+                    file_hash, func_hash, file_path, dirs, state)
             r2_done_count += 1
             if r2_done_count >= total_funcs and all_r1_done_flag:
                 all_r2_done_event.set()
@@ -174,15 +175,17 @@ class SuperFastPipelineEngine:
             if decision == "filter":
                 return
 
-            # ── R3W: 入口分析（无 Judge）───────────────────────────────
+            # ── R3W: 入口分析 Worker + 脚本校验输出格式（无 Judge）────
             await self._run_r3w(func_hash, file_hash, file_path, dirs, state)
             if self._cancel.is_set():
                 return
 
-            # ── R4S: 调用链快速去重 ────────────────────────────────────
+            # ── R4W: 调用链分析 Worker + 脚本校验（无 Judge）──────────
             func_state = fs.functions.get(func_hash)
-            if func_state and func_state.r3_w_state == NodeState.PASSED:
-                await self._run_r4_script(func_hash, file_hash, dirs, state)
+            if (func_state and func_state.r3_w_state == NodeState.PASSED
+                    and func_state.r4_decision == "keep"
+                    and func_state.r4_state != NodeState.PASSED):
+                await self._run_r4_worker(func_hash, file_hash, file_path, dirs, state)
 
         async def _process_file(file_hash: str, file_path: str) -> None:
             if self._cancel.is_set():
@@ -213,15 +216,6 @@ class SuperFastPipelineEngine:
 
         # ── FM 尾批 ────────────────────────────────────────────────────
         await fm.flush()
-
-        # ── R4S 尾批：剩余函数调用链去重 ───────────────────────────────
-        for file_hash, _ in file_hash_paths:
-            fs = state.files.get(file_hash)
-            if fs is None:
-                continue
-            for fh, fns in fs.functions.items():
-                if fns.r4_decision == "keep" and fns.r4_state != NodeState.PASSED:
-                    await self._run_r4_script(fh, file_hash, dirs, state)
 
         # ── R6: 聚合输出 ───────────────────────────────────────────────
         final_entries = await self._run_r6(dirs, state)
@@ -262,13 +256,13 @@ class SuperFastPipelineEngine:
             fs.r1_j_state = NodeState.FAILED
             state.save(dirs.state_file)
 
-    # ── R2S: 脚本验证行号 ──────────────────────────────────────────────────
+    # ── R2: 脚本快速路径 + LLM Worker 修正 + 脚本校验（无 Judge）───────────
 
-    async def _run_r2_script(
+    async def _run_r2_worker(
         self, file_hash: str, func_hash: str, file_path: str,
         dirs: PipelineDirs, state: PipelineState,
     ) -> None:
-        """R2S：纯脚本验证行号，无 Judge Agent。"""
+        """R2: 脚本先行，不匹配时 LLM Worker 修正行号，脚本校验格式。"""
         from .r2_script import r2_script_validate, R2Verdict
         from .funcdb import FunctionDB as _FDB
 
@@ -277,6 +271,7 @@ class SuperFastPipelineEngine:
         if func_state is None or func_state.r2_j_state == NodeState.PASSED:
             return
 
+        # Step 1: 脚本快速路径
         try:
             def _io():
                 lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -297,20 +292,78 @@ class SuperFastPipelineEngine:
                 self._emit("r2_j_done", func_hash=func_hash,
                            function=func_state.name, passed=True,
                            feedback="script: body matched", attempt=1)
-                self._emit("r2_script_pass", func_hash=func_hash,
-                           function=func_state.name, detail=sr.detail)
-            else:
-                # 脚本不匹配 → 跳过（不阻塞流水线）
-                logger.debug("R2S mismatch for %s: %s", func_hash, sr.detail)
-                func_state.r2_j_state = NodeState.PASSED  # force pass
-                func_state.r2_source_incomplete = True
-                state.save(dirs.state_file)
+                return
         except Exception as exc:
-            logger.warning("R2S error for %s: %s, force-pass", func_hash, exc)
+            logger.warning("R2 script check error: %s", exc)
+
+        # Step 2: LLM Worker 修正
+        from ..runner import run_agent
+        from ..agent_slots import SemPriority
+
+        system_prompt = self._load_prompt("r2_worker")
+        prompt = f"""ctags 提取的函数 {func_state.name} 行号不正确。
+源文件: {os.path.basename(file_path)}
+当前行号: {func_state.start_line}-{func_state.end_line}
+请在源文件中正确定位该函数的起始行和结束行。
+
+输出格式:
+<result>
+{{"start_line": 正确起始行, "end_line": 正确结束行}}
+</result>"""
+
+        try:
+            result = await run_agent(
+                prompt=prompt,
+                model=self.cfg.workers.agents[0].model,
+                tools=["read", "bash", "grep"],
+                system_prompt=system_prompt,
+                cwd=str(dirs.stage_cwd("r2_w")),
+                session_file=str(dirs.r2_w_session(func_hash)),
+                thinking_level="off",
+                cancel_event=self._cancel,
+                max_retries=self.cfg.agent_max_retries,
+                retry_delay=self.cfg.agent_retry_delay,
+                run_timeout_seconds=self.cfg.agent_run_timeout_seconds,
+                timeout_retry_enabled=self.cfg.agent_timeout_retry_enabled,
+                timeout_max_retries=self.cfg.agent_timeout_max_retries,
+                pi_max_retries=self.cfg.pi_max_retries,
+                pi_retry_delay=self.cfg.pi_retry_delay,
+                max_consecutive_empty_responses=self.cfg.max_consecutive_empty_responses,
+                task_id=self.task_id, stage_key="r2_w", role_kind="worker",
+                priority=SemPriority.R2_W,
+            )
+
+            # Step 3: 脚本校验输出格式
+            import re, json as _json
+            m = re.search(r"<result>(.*?)</result>", result.output or "", re.DOTALL)
+            if m:
+                data = _json.loads(m.group(1).strip())
+                new_start = int(data.get("start_line", func_state.start_line))
+                new_end = int(data.get("end_line", func_state.end_line))
+                if new_start > 0 and new_end >= new_start:
+                    func_state.start_line = new_start
+                    func_state.end_line = new_end
+                    func_state.r2_j_state = NodeState.PASSED
+                    func_state.r2_w_attempts = 1
+                    _FDB.open(dirs.r1, file_hash).update_function(
+                        func_hash, start_line=new_start, end_line=new_end)
+                    state.save(dirs.state_file)
+                    self._emit("r2_j_done", func_hash=func_hash,
+                               function=func_state.name, passed=True,
+                               feedback="worker corrected", attempt=1)
+                    return
+
+            # 脚本校验失败 → force pass（不阻塞）
+            logger.warning("R2 worker unparseable for %s, force pass", func_hash)
             func_state.r2_j_state = NodeState.PASSED
             state.save(dirs.state_file)
 
-    # ── R3W: 入口分析 Worker（无 Judge）─────────────────────────────────────
+        except Exception as exc:
+            logger.warning("R2 worker failed for %s: %s, force pass", func_hash, exc)
+            func_state.r2_j_state = NodeState.PASSED
+            state.save(dirs.state_file)
+
+    # ── R3W: 入口分析 Worker + 脚本校验输出格式 ─────────────────────────────
 
     async def _run_r3w(
         self, func_hash: str, file_hash: str, file_path: str,
@@ -400,28 +453,94 @@ class SuperFastPipelineEngine:
             func_state.r4_decision = "filter"
             state.save(dirs.state_file)
 
-    # ── R4S: 调用链快速去重 ─────────────────────────────────────────────────
+    # ── R4W: 调用链分析 Worker + 脚本校验（无 Judge）──────────────────────
 
-    async def _run_r4_script(
-        self, func_hash: str, file_hash: str,
+    async def _run_r4_worker(
+        self, func_hash: str, file_hash: str, file_path: str,
         dirs: PipelineDirs, state: PipelineState,
     ) -> None:
-        """R4S：纯脚本调用链去重，无 Judge。"""
-        fs = state.files.get(file_hash)
-        if fs is None:
-            return
+        """R4W：LLM Worker 分析调用链上下文 + 脚本校验输出格式。"""
+        from .funcdb import FunctionDB as _FDB
+        from ..runner import run_agent
+        from ..agent_slots import SemPriority
+
+        fs = state.files[file_hash]
         func_state = fs.functions.get(func_hash)
         if func_state is None or func_state.r4_state == NodeState.PASSED:
             return
 
-        # 简单策略：有参数且非工具函数 → keep
-        if func_state.has_external_input:
+        try:
+            rec = _FDB.open(dirs.r1, file_hash).get_function(func_hash)
+            if not rec:
+                func_state.r4_state = NodeState.PASSED
+                state.save(dirs.state_file)
+                return
+        except Exception:
+            return
+
+        name = rec.get("name", "")
+        analysis = rec.get("analysis") or {}
+        if isinstance(analysis, str):
+            import json as _j
+            try: analysis = _j.loads(analysis)
+            except: analysis = {}
+
+        system_prompt = self._load_prompt("r4_func_worker")
+        prompt = f"""函数 {name} 已被标记为潜在入口。请结合调用链上下文判断是否为独立外部入口。
+
+当前判定：is_entry=True, tag={analysis.get('tag','P')}, taints={analysis.get('taints',[])}, entry_role={analysis.get('entry_role','boundary')}
+
+请确认或修正：
+1. 该函数是否确实是模块外部入口（而非内部子步骤）？
+2. 如有调用者也是入口，该函数是否应被去重？
+
+输出 JSON：
+{{"keep": true/false, "reason": "..."}}
+
+只输出 JSON。"""
+
+        try:
+            result = await run_agent(
+                prompt=prompt,
+                model=self.cfg.workers.agents[0].model,
+                tools=["read", "bash"],
+                system_prompt=system_prompt,
+                cwd=str(dirs.stage_cwd("r4_func_w")),
+                session_file=str(dirs.r4_func_w_session(func_hash)),
+                thinking_level="off",
+                cancel_event=self._cancel,
+                max_retries=self.cfg.agent_max_retries,
+                retry_delay=self.cfg.agent_retry_delay,
+                run_timeout_seconds=self.cfg.agent_run_timeout_seconds,
+                timeout_retry_enabled=self.cfg.agent_timeout_retry_enabled,
+                timeout_max_retries=self.cfg.agent_timeout_max_retries,
+                pi_max_retries=self.cfg.pi_max_retries,
+                pi_retry_delay=self.cfg.pi_retry_delay,
+                max_consecutive_empty_responses=self.cfg.max_consecutive_empty_responses,
+                task_id=self.task_id, stage_key="r4_w", role_kind="worker",
+                priority=SemPriority.R4_W,
+            )
+
+            # 脚本校验输出
+            import re, json as _json
+            m = re.search(r'\{[^{}]*\}', result.output or "", re.DOTALL)
+            if m:
+                data = _json.loads(m.group(0))
+                keep = data.get("keep", True)
+                func_state.r4_decision = "keep" if keep else "filter"
+            else:
+                func_state.r4_decision = "keep"  # 保守
+            func_state.r4_state = NodeState.PASSED
+            func_state.r4_attempts = 1
+            state.save(dirs.state_file)
+            _FDB.open(dirs.r1, file_hash).update_r4_decision(
+                func_hash, func_state.r4_decision)
+
+        except Exception as exc:
+            logger.warning("R4W failed for %s: %s, keep", func_hash, exc)
             func_state.r4_decision = "keep"
-        else:
-            func_state.r4_decision = "filter"
-        func_state.r4_state = NodeState.PASSED
-        func_state.r4_attempts = 1
-        state.save(dirs.state_file)
+            func_state.r4_state = NodeState.PASSED
+            state.save(dirs.state_file)
 
     # ── R6: 聚合输出 ────────────────────────────────────────────────────────
 
