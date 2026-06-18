@@ -53,6 +53,9 @@ class SuperFastPipelineEngine:
         self._cancel = cancel_event or asyncio.Event()
         self._source_dir = ""
         self._out_dir: Path | None = None
+        self._r4_j_confirmed: bool = False  # 兼容 orchestrator 状态检查
+        self._api_filter_summary: dict = {}  # 兼容 orchestrator
+        self._total_token_usage: dict = {}   # 兼容 orchestrator
 
         _raw = on_event or (lambda e: None)
         self._on_event = _raw
