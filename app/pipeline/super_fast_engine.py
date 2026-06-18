@@ -206,15 +206,19 @@ class SuperFastPipelineEngine:
             except Exception:
                 body = ""
             callees = extract_callees(body, own_name=func_state.name)
-            decision = await fm.enqueue({
-                "func_hash": func_hash,
-                "name": func_state.name,
-                "file": os.path.basename(file_path),
-                "file_hash": file_hash,
-                "callees": callees,
-            })
-            if decision == "filter":
-                return
+            try:
+                decision = await fm.enqueue({
+                    "func_hash": func_hash,
+                    "name": func_state.name,
+                    "file": os.path.basename(file_path),
+                    "file_hash": file_hash,
+                    "callees": callees,
+                })
+                if decision == "filter":
+                    return
+            except Exception as _fm_exc:
+                logger.warning("fast_mode enqueue failed for %s: %s, keep", func_hash, _fm_exc)
+                # 保守保留，继续进入 R3
 
             # ── R3W: 入口分析 Worker + 脚本校验输出格式（无 Judge）────
             await self._run_r3w(func_hash, file_hash, file_path, dirs, state)
