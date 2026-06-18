@@ -489,7 +489,7 @@ class PipelineEngine:
         state = PipelineState.load_or_create(dirs.state_file, self.task_id)
         file_hash_paths = [(compute_file_hash(fp), fp) for fp in module_files]
         state.register_files(file_hash_paths)
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
 
         self._emit("pipeline_start", file_count=len(module_files))
         logger.info(
@@ -656,7 +656,7 @@ class PipelineEngine:
                 _r3_entry_path = dirs.r3.parent / "r3_func" / f"{func_hash}.json"
                 try:
                     if _r3_entry_path.exists():
-                        _r4_entry = await asyncio.to_thread(lambda: json.loads(_r3_entry_path.read_text(encoding="utf-8")))
+                        _r4_entry = await run_in_script_thread(lambda: json.loads(_r3_entry_path.read_text(encoding="utf-8")))
                     else:
                         _r4_entry = {
                             "func_hash":  func_hash,
@@ -674,10 +674,10 @@ class PipelineEngine:
                         func_state.r4_decision = "keep"
                         func_state.r4_state    = NodeState.PASSED
                         func_state.r4_reason   = _r4_quick_reason
-                        await asyncio.to_thread(state.save, dirs.state_file)
+                        await run_in_script_thread(state.save, dirs.state_file)
                         try:
                             from .funcdb import FunctionDB as _FDB4
-                            await asyncio.to_thread(lambda: _FDB4.open(dirs.r1, file_hash).update_r4_decision(func_hash, "keep"))
+                            await run_in_script_thread(lambda: _FDB4.open(dirs.r1, file_hash).update_r4_decision(func_hash, "keep"))
                         except Exception:
                             pass
                         _fn4 = _r4_entry.get("function", func_hash[:8])
@@ -700,23 +700,23 @@ class PipelineEngine:
                             j_passed = await self._run_r4_j(_r4_entry, dirs, state)
                             if j_passed:
                                 func_state.r4_state = NodeState.PASSED
-                                await asyncio.to_thread(state.save, dirs.state_file)
+                                await run_in_script_thread(state.save, dirs.state_file)
                                 break
                             # J 失败：重置 W 状态带反馈重跑
                             if not _should_continue(func_state.r4_j_attempts, r4_j_max, self._cancel):
                                 # 超出 J 上限： force-pass（不允许漏报）
                                 func_state.r4_state = NodeState.PASSED
-                                await asyncio.to_thread(state.save, dirs.state_file)
+                                await run_in_script_thread(state.save, dirs.state_file)
                                 break
                             func_state.r4_j_state = NodeState.PENDING
                         # 超出 W 上限： force-pass
                         if func_state.r4_state != NodeState.PASSED:
                             func_state.r4_state = NodeState.PASSED
-                            await asyncio.to_thread(state.save, dirs.state_file)
+                            await run_in_script_thread(state.save, dirs.state_file)
                 except Exception as _r4_exc:
                     logger.warning("R4-func error for %s: %s, force-keep", func_hash, _r4_exc)
                     func_state.r4_state = NodeState.PASSED
-                    await asyncio.to_thread(state.save, dirs.state_file)
+                    await run_in_script_thread(state.save, dirs.state_file)
 
             # ── R5: 单函数报告─────────────────────────────────────────────────
             # F3 Fix: 多文件模块须等 R4 confirmed keep 后才跑 R5，
@@ -735,7 +735,7 @@ class PipelineEngine:
                 _r3_func_dir = dirs.r3.parent / "r3_func"
                 _entry_path  = _r3_func_dir / f"{func_hash}.json"
                 try:
-                    _entry = await asyncio.to_thread(lambda: json.loads(_entry_path.read_text(encoding="utf-8")))
+                    _entry = await run_in_script_thread(lambda: json.loads(_entry_path.read_text(encoding="utf-8")))
                 except Exception:
                     _entry = {
                         "func_hash": func_hash,
@@ -781,7 +781,7 @@ class PipelineEngine:
                     if fs2 is not None:
                         fs2.r1_w_state = NodeState.FAILED
                         fs2.r1_j_state = NodeState.FAILED
-                        await asyncio.to_thread(state.save, dirs.state_file)
+                        await run_in_script_thread(state.save, dirs.state_file)
             # 更新 R1 完成计数（动态 total_funcs）
             fs = state.files.get(file_hash)
             if fs is None or fs.r1_j_state != NodeState.PASSED:
@@ -900,7 +900,7 @@ class PipelineEngine:
             if _sr.verdict == R2Verdict.PASS:
                 func_state.r2_j_state    = NodeState.PASSED
                 func_state.r2_j_attempts = 1
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
                 # 兼容前端：emit 标准 r2_j_done 保证进度统计正常
                 self._emit("r2_j_done", func_hash=func_hash,
                            function=func_state.name, passed=True,
@@ -946,7 +946,7 @@ class PipelineEngine:
             # 否则下一轮 R2-J 仍用旧 start_line/name，形成无限循环
             try:
                 from .funcdb import FunctionDB as _FuncDB
-                updated = await asyncio.to_thread(lambda: _FuncDB.open(dirs.r1, file_hash).get_function(func_hash))
+                updated = await run_in_script_thread(lambda: _FuncDB.open(dirs.r1, file_hash).get_function(func_hash))
                 if updated:
                     if updated.get("start_line"):
                         func_state.start_line = int(updated["start_line"])
@@ -956,7 +956,7 @@ class PipelineEngine:
                         func_state.name = str(updated["name"])
                     if updated.get("signature"):
                         func_state.signature = str(updated["signature"])
-                    await asyncio.to_thread(state.save, dirs.state_file)
+                    await run_in_script_thread(state.save, dirs.state_file)
                     logger.debug("R2 synced func_state from funcdb: %s start_line=%s name=%s",
                                  func_hash, func_state.start_line, func_state.name)
             except Exception as _sync_exc:
@@ -965,7 +965,7 @@ class PipelineEngine:
         # 超出上限时 force-pass，不阻塞下游（“不允许漏报”原则）
         if func_state.r2_j_state != NodeState.PASSED:
             func_state.r2_j_state = NodeState.PASSED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
 
     async def _run_r3_analysis(
         self,
@@ -1006,7 +1006,7 @@ class PipelineEngine:
             # zero conflicts (0 out of 23 in production: W=false always yields J=pass).
             if not func_state.has_external_input:
                 func_state.r3_j_state = NodeState.PASSED
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
                 logger.debug("R3-J fast-skip for %s (has_external_input=false)", func_hash)
                 self._emit("r3_j_done", func_hash=func_hash, function=func_state.name,
                            passed=True, fast_path=True, reason="no_external_input")
@@ -1032,7 +1032,7 @@ class PipelineEngine:
         # has_external_input=False 时 W 已设 r4_decision=filter；兜底保障
         if not func_state.has_external_input and not func_state.r4_decision:
             func_state.r4_decision = "filter"
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
 
         # CC 已完成时：用 callchain_role 补算最终置信度（含调用链加减分）
         if state.cc_state == NodeState.PASSED and func_state.has_external_input:
@@ -1042,7 +1042,7 @@ class PipelineEngine:
                 from .confidence import compute_confidence as _cc3
                 _cc_db = CallchainDB.open(dirs.callchain)
                 _chain_role = _cc_db.get_callchain_role(func_hash)
-                _fn3 = await asyncio.to_thread(lambda: _FDB_CC.open(dirs.r1, file_hash).get_function(func_hash))
+                _fn3 = await run_in_script_thread(lambda: _FDB_CC.open(dirs.r1, file_hash).get_function(func_hash))
                 if _fn3 and _chain_role:
                     _an3 = _fn3.get("analysis") or {}
                     if isinstance(_an3, str):
@@ -1151,7 +1151,7 @@ class PipelineEngine:
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_w_state = NodeState.RUNNING
         func_state.r2_w_attempts += 1
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
         self._emit("r2_w_start", func_hash=func_hash, function=func_state.name,
                    file=Path(file_path).name, attempt=func_state.r2_w_attempts)
 
@@ -1177,18 +1177,18 @@ class PipelineEngine:
                 )
             if source_incomplete:
                 func_state.r2_source_incomplete = True
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
                 self._emit("r2_w_source_incomplete", func_hash=func_hash,
                            function=func_state.name, file=Path(file_path).name)
             func_state.r2_w_state = NodeState.PASSED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
                        file=Path(file_path).name, passed=True,
                        source_incomplete=source_incomplete)
         except Exception as exc:
             logger.error("R2-W failed for %s: %s", func_hash, exc)
             func_state.r2_w_state = NodeState.FAILED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("r2_w_done", func_hash=func_hash, function=func_state.name,
                        file=Path(file_path).name, passed=False, error=str(exc)[:100])
 
@@ -1208,7 +1208,7 @@ class PipelineEngine:
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r2_j_state = NodeState.RUNNING
         func_state.r2_j_attempts += 1
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
 
         attempt = func_state.r2_j_attempts
         session_file = str(dirs.r2_j_session(func_hash, attempt))
@@ -1240,8 +1240,8 @@ class PipelineEngine:
             except Exception:
                 _w_chk = {}
 
-            _script_verdict, _script_reason = await asyncio.to_thread(
-                _r2_j_script_check,
+            _script_verdict, _script_reason = await run_in_script_thread(
+                    _r2_j_script_check,
                 func_state.name, func_hash,
                 func_state.start_line, func_state.end_line,
                 file_path, _w_chk,
@@ -1305,7 +1305,7 @@ class PipelineEngine:
                             func_state.name, func_hash, real_feedback[:100])
                 try:
                     from .funcdb import FunctionDB
-                    await asyncio.to_thread(FunctionDB.open(dirs.r1, file_hash).delete_function, func_hash)
+                    await run_in_script_thread(FunctionDB.open(dirs.r1, file_hash).delete_function, func_hash)
                 except Exception as del_exc:
                     logger.warning("R2-J DELETE: failed to remove %s from funcdb: %s", func_hash, del_exc)
                 passed = True  # force-pass
@@ -1321,7 +1321,7 @@ class PipelineEngine:
                 func_state.r2_source_incomplete = True
                 func_state.r2_j_state    = NodeState.FAILED
                 func_state.r2_j_feedback = "[DISCARD] " + real_feedback
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
                 self._emit("r2_source_incomplete",
                            func_hash=func_hash, function=func_state.name,
                            file=Path(file_path).name,
@@ -1338,7 +1338,7 @@ class PipelineEngine:
                 func_state.r2_source_incomplete = True
                 func_state.r2_j_state    = NodeState.FAILED
                 func_state.r2_j_feedback = "[SKIP] " + real_feedback
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
                 # 写 incomplete_functions.json（追加）
                 try:
                     _inc_path = dirs.incomplete_functions_path()
@@ -1419,7 +1419,7 @@ class PipelineEngine:
                 fb_file.parent.mkdir(parents=True, exist_ok=True)
                 fb_file.write_text(feedback, encoding="utf-8")
                 func_state.r2_j_feedback_path = str(fb_file)   # 修复: 原来误存到 r3_j_feedback_path
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("r2_j_done",
                        func_hash=func_hash, function=func_state.name,
                        passed=passed, feedback=feedback[:200], attempt=attempt)
@@ -1427,7 +1427,7 @@ class PipelineEngine:
         except Exception as exc:
             logger.error("R2-J failed for %s: %s", func_hash, exc)
             func_state.r2_j_state = NodeState.FAILED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             return False
 
     def _infer_entry_role_from_cc(
@@ -1497,7 +1497,7 @@ class PipelineEngine:
 
             func_state.r3_w_state = NodeState.RUNNING
             func_state.r3_w_attempts += 1
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
 
             # R3 开始时回写 callchain.db r3_state='running'（供 R4 quick-path 感知）
             if func_state.r3_w_attempts == 1 and state.cc_state == NodeState.PASSED:
@@ -1668,7 +1668,7 @@ class PipelineEngine:
                         if role in VALID_ENTRY_ROLES:
                             func_state.entry_role = role
                         from .funcdb import FunctionDB
-                        await asyncio.to_thread(lambda: FunctionDB.open(dirs.r1, file_hash).set_analysis(func_hash, analysis))
+                        await run_in_script_thread(lambda: FunctionDB.open(dirs.r1, file_hash).set_analysis(func_hash, analysis))
                 else:
                     func_state.has_external_input = _parse_has_external_input(ar.output)
                     # 兜底：无分析结果时若无外部输入则 filter
@@ -1697,7 +1697,7 @@ class PipelineEngine:
                                      _cc_r3_state, func_hash, _cc_fin_exc)
 
                 func_state.r3_w_state = NodeState.PASSED
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
                 self._emit("r3_w_done",
                            func_hash=func_hash, function=func_state.name,
                            has_external_input=func_state.has_external_input,
@@ -1710,7 +1710,7 @@ class PipelineEngine:
             except Exception as exc:
                 logger.error("R3-W failed for %s: %s", func_hash, exc)
                 func_state.r3_w_state = NodeState.FAILED
-                await asyncio.to_thread(state.save, dirs.state_file)
+                await run_in_script_thread(state.save, dirs.state_file)
 
     # ── R3-J ────────────────────────────────────────────────────
 
@@ -1732,7 +1732,7 @@ class PipelineEngine:
         func_state = state.files[file_hash].functions[func_hash]
         func_state.r3_j_state = NodeState.RUNNING
         func_state.r3_j_attempts += 1
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
 
         session_file = str(dirs.r3_j_session(func_hash, func_state.r3_j_attempts))
         db_path = dirs.r1_functions_db(file_hash)
@@ -1978,7 +1978,7 @@ class PipelineEngine:
                 fb_path.write_text(feedback, encoding="utf-8")
                 func_state.r3_j_feedback_path = str(fb_path)
 
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("r3_j_done",
                        func_hash=func_hash, function=func_state.name,
                        passed=passed, summary=summary,
@@ -1989,7 +1989,7 @@ class PipelineEngine:
         except Exception as exc:
             logger.error("R3-J failed for %s: %s", func_hash, exc)
             func_state.r3_j_state = NodeState.FAILED  # J 异常→FAILED，交 max_rounds 重试
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             return False, f"judge exception: {str(exc)[:300]}"
 
     # ── R3 ────────────────────────────────────────────────────────────────────
@@ -2010,7 +2010,7 @@ class PipelineEngine:
 
         state.cc_state = NodeState.RUNNING
         state.cc_attempts += 1
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
         self._emit("callchain_start", attempt=state.cc_attempts)
 
         try:
@@ -2044,7 +2044,7 @@ class PipelineEngine:
 
             cc_stats = cc_db.stats()
             state.cc_state = NodeState.PASSED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("callchain_done",
                        nodes=cc_stats["nodes"],
                        edges=cc_stats["edges"],
@@ -2053,7 +2053,7 @@ class PipelineEngine:
         except Exception as exc:
             logger.warning("CC analysis failed (non-fatal): %s", exc)
             state.cc_state = NodeState.FAILED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("callchain_failed", error=str(exc)[:200])
 
     async def _run_entry_classification(
@@ -2144,7 +2144,7 @@ class PipelineEngine:
             # 本服务不支持断点续跑，不兜底从 state 收集——若 FuncDB 为空则视为正常结论。
             logger.info("R6: no keep entries in FuncDB, treating as fully-filtered result")
             state.r6_state = NodeState.PASSED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._r4_j_confirmed = True
             return []
 
@@ -2160,7 +2160,7 @@ class PipelineEngine:
 
         if state.r6_state != NodeState.PASSED:
             state.r6_state = NodeState.PASSED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
 
         self._r4_j_confirmed = True
         return final_entries
@@ -2313,7 +2313,7 @@ class PipelineEngine:
         reason   = ""
         if result_file.exists():
             try:
-                d = await asyncio.to_thread(lambda: json.loads(result_file.read_text(encoding="utf-8")))
+                d = await run_in_script_thread(lambda: json.loads(result_file.read_text(encoding="utf-8")))
                 decision = str(d.get("decision", "keep")).lower().strip()
                 reason   = str(d.get("reason", ""))[:200]
             except Exception:
@@ -2323,7 +2323,7 @@ class PipelineEngine:
             func_state.r4_decision = decision
             func_state.r4_reason   = reason
             # r4_state = PASSED 由 R4-J 通过后设置，此处不设
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             # 将 r4_decision 写入 FuncDB（权威来源）——直接用已知的 file_hash_for_func
             if file_hash_for_func:
                 try:
@@ -2356,7 +2356,7 @@ class PipelineEngine:
 
         func_state.r4_j_state = NodeState.RUNNING
         func_state.r4_j_attempts += 1
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
 
         session_file = str(dirs.r4_func_j_session(func_hash, func_state.r4_j_attempts))
         r4_result_file = dirs.r4_func_result_file(func_hash)
@@ -2468,14 +2468,14 @@ class PipelineEngine:
             )
             func_state.r4_j_state    = NodeState.PASSED if passed else NodeState.FAILED
             func_state.r4_j_feedback = feedback
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             self._emit("r4_j_done", func_hash=func_hash, function=func_name,
                        passed=passed, attempt=func_state.r4_j_attempts)
             return passed
         except Exception as exc:
             logger.error("R4-J failed for %s: %s", func_hash, exc)
             func_state.r4_j_state = NodeState.FAILED
-            await asyncio.to_thread(state.save, dirs.state_file)
+            await run_in_script_thread(state.save, dirs.state_file)
             return False
 
     def _collect_r4_kept(
@@ -2532,7 +2532,7 @@ class PipelineEngine:
         state.r6_feedback = (
             f"script: {len(final_entries)} entries, {len(issues)} field warnings"
         )
-        await asyncio.to_thread(state.save, dirs.state_file)
+        await run_in_script_thread(state.save, dirs.state_file)
         self._emit("r6_script_done",
                    entry_count=len(final_entries), warnings=len(issues))
 
@@ -2663,7 +2663,7 @@ class PipelineEngine:
                 result_file=worker_result_file,
                 raw_file=worker_raw_file,
                 payload={"stage": "r5_w", "attempt": attempts, "scope": "func", "func_hash": func_hash, "status": "ok", "report_file": str(report_out)},
-                raw_text=(await asyncio.to_thread(lambda: report_out.read_text(encoding="utf-8")) if report_out.exists() else ""),
+                raw_text=(await run_in_script_thread(lambda: report_out.read_text(encoding="utf-8")) if report_out.exists() else ""),
             )
             await self._aupsert(task_id=self.task_id, stage_key="r5_w", role_kind="worker", scope_kind="func", attempt=attempts,
                                       func_hash=func_hash, status="ok", summary=func_name[:200], result_file_path=str(worker_result_file), raw_file_path=str(worker_raw_file))
