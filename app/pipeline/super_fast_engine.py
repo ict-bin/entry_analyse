@@ -253,6 +253,9 @@ class SuperFastPipelineEngine:
                 is_retry=False, feedback="", system_prompt=system_prompt,
                 priority=1,  # R1_J priority
             )
+            fs.r1_w_state = NodeState.PASSED
+            fs.r1_j_state = NodeState.PASSED
+            state.save(dirs.state_file)
         except Exception as exc:
             logger.warning("R1 failed for %s: %s", file_path, exc)
             fs.r1_w_state = NodeState.FAILED
