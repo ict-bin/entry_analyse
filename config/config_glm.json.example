@@ -12,8 +12,8 @@
         "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "glm/zai-org/GLM-5" },
-            { "model": "glm/zai-org/GLM-5" }
+            { "model": "glm/zai-org/GLM-5", "thinkingLevelMap": { "disabled": "disabled" } },
+            { "model": "glm/zai-org/GLM-5", "thinkingLevelMap": { "disabled": "disabled" } }
         ]
     },
 
@@ -22,7 +22,7 @@
         "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "glm/zai-org/GLM-5" }
+            { "model": "glm/zai-org/GLM-5", "thinkingLevelMap": { "disabled": "disabled" } }
         ]
     },
 

@@ -16,6 +16,7 @@ logger = logging.getLogger("ea.llm_sync")
 # pi 的 models.json 写入目录（与 Dockerfile 中 PI_CODING_AGENT_DIR 一致）
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
+_DEFAULT_THINKING_LEVEL_MAP = {"disabled": "disabled"}
 
 
 def _provider_api(provider_type: str) -> str:
@@ -64,6 +65,11 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         entry.setdefault("id", model_id)
         entry.setdefault("name", entry.get("id") or model_id)
         entry.setdefault("reasoning", False)
+        thinking_level_map = entry.get("thinkingLevelMap")
+        if not isinstance(thinking_level_map, dict):
+            thinking_level_map = {}
+        thinking_level_map.setdefault("disabled", "disabled")
+        entry["thinkingLevelMap"] = thinking_level_map
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
         if max_tokens > 0:
