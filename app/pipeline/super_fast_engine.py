@@ -473,7 +473,8 @@ class SuperFastPipelineEngine:
         _local_out.mkdir(parents=True, exist_ok=True)
 
         # ── 关闭所有 Judge + R5 报告 ────────────────────────────────────
-        self.cfg.r2_max_rounds = 1       # R2: 脚本 + 1次 W 修正，无 J 循环
+        self.cfg.r2_max_rounds = 1       # R2: 脚本 + 1次 W 修正
+        self.cfg.r3_max_rounds = 1       # R3: 1次 W，无重复分析
         self.cfg.r3_j_max_rounds = 0    # R3: 无 Judge
         self.cfg.r4_func_j_max_rounds = 0  # R4-func: 无 Judge
         self.cfg.r4_final_max_rounds = 0   # R4-final: 无 Judge
