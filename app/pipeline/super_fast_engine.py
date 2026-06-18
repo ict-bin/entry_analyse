@@ -149,6 +149,7 @@ class SuperFastPipelineEngine:
 
         if total_files == 0:
             all_r2_done_event.set()
+            self._r4_j_confirmed = True
             _move_to_nfs(run_dir, _local_out, _nfs_run, _nfs_out, _local_root)
             return []
 
@@ -303,13 +304,25 @@ class SuperFastPipelineEngine:
         try:
             acfg = self.cfg.workers.agents[0]
             system_prompt = self._load_prompt("r1_worker")
-            await run_r1_worker(
+            _, funcs, func_hashes = await run_r1_worker(
                 file_path=file_path, dirs=dirs, acfg=acfg, cfg=self.cfg,
                 task_id=self.task_id, on_event=self._on_event,
                 cancel_event=self._cancel, source_dir=self._source_dir,
                 is_retry=False, feedback="", system_prompt=system_prompt,
                 priority=1,  # R1_J priority
             )
+            # Register functions in state (run_r1_worker writes Funcdb, not state)
+            from .funcdb import FunctionDB
+            fh = compute_file_hash(file_path)
+            for func_info in FunctionDB.open(dirs.r1, fh).get_all_meta():
+                fhash = func_info["func_hash"]
+                fs.functions[fhash] = FunctionState(
+                    func_hash=fhash,
+                    name=func_info.get("name", ""),
+                    start_line=func_info.get("start_line", 0),
+                    end_line=func_info.get("end_line", 0),
+                    signature=func_info.get("signature", ""),
+                )
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED
             state.save(dirs.state_file)
