@@ -193,18 +193,24 @@ class Orchestrator:
             _log.getLogger("ea.orchestrator").warning(
                 "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err)
 
-        # ── 目录初始化 ───────────────────────────────────────────────────────
+        # ── 目录初始化：本地磁盘加速 ─────────────────────────────────────
         base_dir  = Path(os.path.abspath(cfg.output_dir)) / task_id
         input_dir = base_dir / "input"
-        run_dir   = base_dir / "run"
         out_dir   = base_dir / "output"
+
+        # 使用本地 /tmp 作为运行时目录，避免 NFS I/O 瓶颈
+        import tempfile, shutil as _shutil
+        _local_root = Path(tempfile.mkdtemp(prefix=f"ea-{task_id}-"))
+        run_dir = _local_root / "run"
+        _local_out = _local_root / "output"
         resolved_files: list[str] = []
 
         _write_input_metadata(
             input_dir, task_id=task_id, cfg=cfg,
             source_dir=source_dir, target_dir=target_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        _local_out.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)  # NFS output dir for final copy
 
         result = TaskResult(
             task_id=task_id, status=TaskStatus.RUNNING,
@@ -212,7 +218,7 @@ class Orchestrator:
             config_snapshot=cfg.model_dump())
         engine = None
 
-        flag_path = out_dir / "flag"
+        flag_path = _local_out / "flag"
         flag_path.write_text("0", encoding="utf-8")
 
         entries: list[dict] = []
@@ -326,6 +332,29 @@ class Orchestrator:
         result.total_duration_ms = (time.time() - start) * 1000
 
         # ── 3. 产物写出 ──────────────────────────────────────────────────────
+        # 复制本地输出到 NFS
+        _nfs_run = base_dir / "run"
+        _nfs_run.mkdir(parents=True, exist_ok=True)
+        try:
+            for _f in _local_out.iterdir():
+                _dst = out_dir / _f.name
+                if _f.is_file():
+                    safe_copy2(str(_f), str(_dst))
+                elif _f.is_dir() and not _dst.exists():
+                    _shutil.copytree(str(_f), str(_dst))
+        except Exception as _ce:
+            logger.warning("NFS copy output failed: %s", _ce)
+        try:
+            for _f in run_dir.iterdir():
+                _dst = _nfs_run / _f.name
+                if _f.is_file() and not _dst.exists():
+                    safe_copy2(str(_f), str(_dst))
+        except Exception as _ce2:
+            pass
+        try:
+            _shutil.rmtree(str(_local_root), ignore_errors=True)
+        except Exception:
+            pass
         # cancel 后跳过产物写出，避免浪费时间写无效文件
         if self._cancel_event and self._cancel_event.is_set() and self._abort_reason == "cancelled":
             self._emit("task_end", task_id,
