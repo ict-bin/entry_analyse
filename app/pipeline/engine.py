@@ -84,6 +84,7 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
 from .r1_worker import run_r1_worker, run_r2_w_worker
 from .state import FileState, FunctionState, NodeState, PipelineState
 from ..agent_slots import SemPriority, agent_process_slot, get_agent_process_slot_manager
+from ..script_executor import run_in_script_thread
 from . import prompts as P
 
 logger = logging.getLogger("ea.pipeline.engine")
@@ -615,7 +616,7 @@ class PipelineEngine:
                     def _read_body():
                         rec = _FDB_fm.open(dirs.r1, file_hash).get_function(func_hash)
                         return (rec.get("body") or "") if rec else ""
-                    body = await asyncio.to_thread(_read_body)
+                    body = await run_in_script_thread(_read_body)
                 except Exception:
                     body = ""
                 callees = extract_callees(body, own_name=func_state.name)
@@ -888,7 +889,7 @@ class PipelineEngine:
                 _rec2  = _FDB2.open(_r1d, _fh2).get_function(_fuh2)
                 return _lines, _rec2
 
-            _source_lines, _rec = await asyncio.to_thread(_r2_fast_io)
+            _source_lines, _rec = await run_in_script_thread(_r2_fast_io)
             _stored_body = (_rec.get("body") or "") if _rec else ""
             _sr = r2_script_validate(
                 start_line   = func_state.start_line,

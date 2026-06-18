@@ -27,6 +27,11 @@ from ..runner import AgentResult, PiFatalError, run_agent
 from .dirs import PipelineDirs
 from .extractor import compute_file_hash, compute_func_hash
 from .result_index import write_stage_result_files, upsert_stage_result_index
+from .r1_worker import run_r1_worker, run_r2_w_worker
+from .state import FileState, FunctionState, NodeState, PipelineState
+from ..agent_slots import SemPriority, agent_process_slot, get_agent_process_slot_manager
+from ..script_executor import run_in_script_thread
+from . import prompts as P
 
 # Skills 目录：相对于本文件 (app/pipeline/engine.py) → app/pipeline/../../.pi/skills
 _EA_SKILLS_DIR = Path(__file__).parent.parent.parent / ".pi" / "skills"
@@ -72,10 +77,7 @@ def setup_stage_skills(dirs: "PipelineDirs") -> None:
                 logger.warning("skill copy failed %s -> %s: %s", src_dir, dest, _e)
 
 
-from .r1_worker import run_r1_worker, run_r2_w_worker
-from .state import FileState, FunctionState, NodeState, PipelineState
-from ..agent_slots import SemPriority, agent_process_slot, get_agent_process_slot_manager
-from . import prompts as P
+# 各阶段 cwd 对应的 skill 目录列表（skill 名 → 来源目录路径，幂等复制到 stage_cwd/.pi/skills/）
 
 logger = logging.getLogger("ea.pipeline.engine")
 
@@ -667,7 +669,7 @@ class SuperFastPipelineEngine:
                     def _read_body():
                         rec = _FDB_fm.open(dirs.r1, file_hash).get_function(func_hash)
                         return (rec.get("body") or "") if rec else ""
-                    body = await asyncio.to_thread(_read_body)
+                    body = await run_in_script_thread(_read_body)
                 except Exception:
                     body = ""
                 callees = extract_callees(body, own_name=func_state.name)
@@ -951,7 +953,7 @@ class SuperFastPipelineEngine:
                 _rec2  = _FDB2.open(_r1d, _fh2).get_function(_fuh2)
                 return _lines, _rec2
 
-            _source_lines, _rec = await asyncio.to_thread(_r2_fast_io)
+            _source_lines, _rec = await run_in_script_thread(_r2_fast_io)
             _stored_body = (_rec.get("body") or "") if _rec else ""
             _sr = r2_script_validate(
                 start_line   = func_state.start_line,
