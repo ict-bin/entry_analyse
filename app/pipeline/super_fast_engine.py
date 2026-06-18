@@ -32,6 +32,34 @@ from .extractor import compute_file_hash, compute_func_hash
 logger = logging.getLogger("ea.pipeline.super_fast")
 
 
+def _move_to_nfs(local_run: Path, local_out: Path, nfs_run: Path, nfs_out: Path, local_root: Path) -> None:
+    """Move local output/run to NFS, then cleanup local tmp."""
+    import shutil
+    try:
+        nfs_run.mkdir(parents=True, exist_ok=True)
+        nfs_out.mkdir(parents=True, exist_ok=True)
+        # Move output files
+        for f in local_out.iterdir():
+            dst = nfs_out / f.name
+            try:
+                shutil.move(str(f), str(dst))
+            except Exception:
+                pass
+        # Move run files
+        for f in local_run.iterdir():
+            dst = nfs_run / f.name
+            try:
+                if f.is_file():
+                    shutil.move(str(f), str(dst))
+            except Exception:
+                pass
+    finally:
+        try:
+            shutil.rmtree(str(local_root), ignore_errors=True)
+        except Exception:
+            pass
+
+
 class SuperFastPipelineEngine:
     """
     极速流水线引擎：无 Judge、无 R5 报告、批分类预筛。
@@ -76,11 +104,20 @@ class SuperFastPipelineEngine:
         source_dir: str,
         out_dir: Path | None = None,
     ) -> list[dict]:
+        # ── 本地磁盘加速：所有中间产物写入 /tmp，完成后 move 到 NFS ──
+        import tempfile, shutil
+        _nfs_run = run_dir
+        _nfs_out = out_dir
+        _local_root = Path(tempfile.mkdtemp(prefix=f"ea-sf-{self.task_id}-"))
+        run_dir = _local_root / "run"
+        _local_out = _local_root / "output"
+
         dirs = PipelineDirs(run=run_dir)
         dirs.setup()
+        _local_out.mkdir(parents=True, exist_ok=True)
 
         self._source_dir = str(Path(source_dir).resolve())
-        self._out_dir = out_dir
+        self._out_dir = _local_out
 
         from ..module_loader import ModuleInfo, prepare_workspace
         mi = ModuleInfo(module_name=self.cfg.module_name, files=module_files)
@@ -99,11 +136,12 @@ class SuperFastPipelineEngine:
 
         if total_files == 0:
             all_r2_done_event.set()
+            _move_to_nfs(run_dir, _local_out, _nfs_run, _nfs_out, _local_root)
             return []
 
         self._emit("pipeline_start", file_count=total_files)
 
-        # ── 快速模式批处理器 ─────────────────────────────────────────────
+        # ── 快速模式批处理器 ─────────────────────────────────────────
         from .fast_mode_engine import FastModeBatchProcessor
         fm = FastModeBatchProcessor(
             state=state, dirs=dirs, cfg=self.cfg,
@@ -215,13 +253,12 @@ class SuperFastPipelineEngine:
             _process_file(fh, fp) for fh, fp in file_hash_paths
         ])
         if self._cancel.is_set():
-            return []
+            final_entries = []
+        else:
+            await fm.flush()
+            final_entries = await self._run_r6(dirs, state)
 
-        # ── FM 尾批 ────────────────────────────────────────────────────
-        await fm.flush()
-
-        # ── R6: 聚合输出 ───────────────────────────────────────────────
-        final_entries = await self._run_r6(dirs, state)
+        _move_to_nfs(run_dir, _local_out, _nfs_run, _nfs_out, _local_root)
         return final_entries
 
     # ── R1: 文件级函数提取 ──────────────────────────────────────────────────
