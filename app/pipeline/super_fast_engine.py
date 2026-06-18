@@ -32,6 +32,19 @@ from .extractor import compute_file_hash, compute_func_hash
 logger = logging.getLogger("ea.pipeline.super_fast")
 
 
+def _sync_events_to_nfs(local_run: Path, nfs_run: Path) -> None:
+    """Copy events.jsonl from local to NFS for frontend live display."""
+    local_events = local_run / "events.jsonl"
+    nfs_events = nfs_run / "events.jsonl"
+    try:
+        if local_events.exists():
+            nfs_run.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(str(local_events), str(nfs_events))
+    except Exception:
+        pass
+
+
 def _move_to_nfs(local_run: Path, local_out: Path, nfs_run: Path, nfs_out: Path, local_root: Path) -> None:
     """Move local output/run to NFS, then cleanup local tmp."""
     import shutil
@@ -256,11 +269,14 @@ class SuperFastPipelineEngine:
         await asyncio.gather(*[
             _process_file(fh, fp) for fh, fp in file_hash_paths
         ])
+        _sync_events_to_nfs(run_dir, _nfs_run)
         if self._cancel.is_set():
             final_entries = []
         else:
             await fm.flush()
+            _sync_events_to_nfs(run_dir, _nfs_run)
             final_entries = await self._run_r6(dirs, state)
+            _sync_events_to_nfs(run_dir, _nfs_run)
 
         _move_to_nfs(run_dir, _local_out, _nfs_run, _nfs_out, _local_root)
         return final_entries
