@@ -1953,6 +1953,7 @@ _TASK_CONFIG_OVERRIDE_FIELDS = {
     "pipeline_prompts_dir",
     "fast_mode",
     "fast_mode_batch_size",
+    "super_fast_mode",
 }
 
 

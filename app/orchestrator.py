@@ -267,7 +267,18 @@ class Orchestrator:
                 task_id, cfg.module_name, len(resolved_files),
             )
             from .pipeline.engine import PipelineEngine
-            engine = PipelineEngine(
+            from .pipeline.super_fast_engine import SuperFastPipelineEngine
+
+            if getattr(cfg, 'super_fast_mode', False):
+                logger.info("orchestrator: using SuperFastPipelineEngine")
+                engine = SuperFastPipelineEngine(
+                    cfg=cfg,
+                    task_id=task_id,
+                    on_event=self.on_event,
+                    cancel_event=self._cancel_event,
+                )
+            else:
+                engine = PipelineEngine(
                     cfg=cfg,
                     task_id=task_id,
                     on_event=self.on_event,

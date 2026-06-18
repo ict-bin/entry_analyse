@@ -48,6 +48,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "api_filter_entry_judge": False,
     "fast_mode": False,
     "fast_mode_batch_size": 20,
+    "super_fast_mode": False,
     "master_merge_mode": "hierarchical",
     "master_shard_size": 10,
     "master_shard_parallelism": 4,
@@ -193,6 +194,7 @@ class ConfigService:
             normalized["fast_mode_batch_size"] = max(10, min(int(normalized.get("fast_mode_batch_size", 20)), 50))
         except (TypeError, ValueError):
             normalized["fast_mode_batch_size"] = 20
+        normalized["super_fast_mode"] = bool(normalized.get("super_fast_mode", False))
         return normalized
 
     def get_config(self, db: Session, project_id: str | None = None) -> dict:

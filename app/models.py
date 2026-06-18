@@ -114,6 +114,9 @@ class ServiceConfig(BaseModel):
     fast_mode: bool = Field(default=False)
     fast_mode_batch_size: int = Field(default=20, ge=10, le=50)
 
+    # ── 极速模式 ──
+    super_fast_mode: bool = Field(default=False)
+
 class TaskConfig(BaseModel):
     """运行时完整配置 = 服务配置 + 用户输入"""
 
@@ -180,6 +183,15 @@ class TaskConfig(BaseModel):
         ge=10,
         le=50,
         description="快速模式下每批次发送给 LLM 的函数数量（10-50）。",
+    )
+
+    # ── 极速模式 ──
+    super_fast_mode: bool = Field(
+        default=False,
+        description=(
+            "极速模式：关闭所有评审者(J)，只用脚本保证输出格式正确；"
+            "跳过函数功能解读报告，只输出入口决策+污点信息。"
+        ),
     )
 
     resume_task_id: str = Field(default="", description="保留字段（未使用，续跑功能已废弃，重启请使用 restart API）")

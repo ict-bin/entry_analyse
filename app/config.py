@@ -93,6 +93,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None, resume_t
         # ── 快速模式（项目级配置，此处仅从 ServiceConfig 取默认值）──
         fast_mode=bool(getattr(svc, 'fast_mode', False)),
         fast_mode_batch_size=int(getattr(svc, 'fast_mode_batch_size', 20)),
+        super_fast_mode=bool(getattr(svc, 'super_fast_mode', False)),
     )
 
     _backfill_role(cfg.workers)
