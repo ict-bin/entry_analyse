@@ -1181,33 +1181,26 @@ class SuperFastPipelineEngine:
             state.save(dirs.state_file)
             return
         try:
-            acfg = self.cfg.workers.agents[0]
-            token_usage, funcs, func_hashes = await run_r1_worker(
-                file_path=file_path,
-                dirs=dirs,
-                acfg=acfg,
-                cfg=self.cfg,
-                task_id=self.task_id,
-                on_event=self._on_event,
-                cancel_event=self._cancel,
-                source_dir=self._source_dir,
-                is_retry=False,
-                feedback="",
-                system_prompt=self._stage_sys_prompt("r1_worker"),
-                priority=SemPriority.R1_W,
+            from .extractor import extract_functions_static, compute_func_hash
+            static_funcs = await run_in_script_thread(extract_functions_static, file_path)
+            func_hashes = [compute_func_hash(file_path, fe.name, fe.start_line)
+                          for fe in static_funcs]
+            rel = os.path.relpath(os.path.abspath(file_path), self._source_dir) if self._source_dir else basename
+            from .funcdb import FunctionDB as _FDB
+            _FDB.open(dirs.r1, file_hash).write_functions(
+                file_hash, file_path, static_funcs, func_hashes, rel_path=rel
             )
-            logger.info("R1_worker_done: file=%s funcs=%s", basename, len(funcs))
-            state.register_functions(
-                file_hash,
-                [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
-                 for fe, fh in zip(funcs, func_hashes)],
-            )
+            for fe, fh in zip(static_funcs, func_hashes):
+                fs.functions[fh] = FunctionState(
+                    func_hash=fh, name=fe.name, start_line=fe.start_line,
+                    end_line=fe.end_line, signature=fe.signature,
+                )
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
             state.save(dirs.state_file)
-            logger.info("R1_pass: file=%s funcs=%s", basename, len(funcs))
+            logger.info("R1_pass(super_fast): file=%s funcs=%s", basename, len(static_funcs))
         except Exception as exc:
-            logger.error("R1-W failed for %s: %s", file_path, exc)
+            logger.error("R1 failed for %s: %s", file_path, exc)
             fs.r1_w_state = NodeState.FAILED
             fs.r1_j_state = NodeState.FAILED
             state.save(dirs.state_file)
