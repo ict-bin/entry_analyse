@@ -858,19 +858,23 @@ class SuperFastPipelineEngine:
             cancel_event=self._cancel,
         ) if self.cfg.fast_mode else None
 
+        # ── 后台定期同步 events 到 NFS ──────────────────────────────────
+        async def _periodic_sync() -> None:
+            while not self._cancel.is_set():
+                await asyncio.sleep(15)
+                _sync_evt()
+        _sync_task = asyncio.create_task(_periodic_sync())
+
         await asyncio.gather(
             _cc_phase(),
             *[_complete_file_pipeline(fh, fp) for fh, fp in file_hash_paths],
         )
         if fm is not None:
             await fm.flush()
+            _sync_evt()
         if self._cancel.is_set():
             _move_to_nfs()
             return []
-
-        # ── 快速模式尾批：处理剩余不足一满批的函数 ───────────────────────
-        if fm is not None:
-            await fm.flush()
 
         # ─── Phase 6: R6 最终报告 ─────────────────────────────────────────
         final_entries = await self._run_r6_finalize(dirs, state)
