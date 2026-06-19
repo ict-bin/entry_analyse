@@ -1708,7 +1708,7 @@ class PipelineEngine:
                 break
 
             except Exception as exc:
-                logger.error("R3-W failed for %s: %s", func_hash, exc)
+                logger.error("R3-W failed for %s: %s", func_hash, exc, exc_info=True)
                 func_state.r3_w_state = NodeState.FAILED
                 await run_in_script_thread(state.save, dirs.state_file)
 
