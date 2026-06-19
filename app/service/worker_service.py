@@ -1384,10 +1384,11 @@ class WorkerService:
                 # ── Pipeline progress watchdog ───────────────────────────
                 with _progress_lock:
                     stall_seconds = time.time() - last_progress_time
-                # Entry analysis can spend a long time inside agents without
+                # Entry analysis can spend time inside agents without
                 # producing incremental progress events; keep the watchdog as a
-                # last-resort hang protection instead of an aggressive killer.
-                stall_limit = 36000
+                # last-resort hang protection. 1h is enough since events are
+                # emitted frequently (R1/R3/R4/R5 stage transitions).
+                stall_limit = int(os.environ.get("EA_PIPELINE_STALL_LIMIT_SECONDS", "3600"))
                 if stall_seconds > stall_limit:
                     logger.error(
                         "pipeline stalled: no progress for %ds (limit=%ds, last_progress=%.1f), aborting task=%s",

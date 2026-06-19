@@ -642,7 +642,6 @@ def build_r4_j_func_prompt(
         + "- tag=A（主动型，自身读取外部数据）\n"
         + "- entry_role=dispatch_target\n"
         + no_r3_warn
-        + db_section
     )
 
 
