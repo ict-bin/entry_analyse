@@ -372,6 +372,43 @@ def _parse_has_external_input(output: str) -> bool:
     return True
 
 
+def _r3_taint_gate_check(analysis: dict, signature: str) -> tuple[bool, str]:
+    """super_fast 污点门禁（脚本级，不调 Agent Judge）。
+
+    super_fast 关闭了 R3-J，丢失了标准模式 R3-J 的“taints 非空”引擎硬校验，
+    导致 keep 入口可能漏写污点 → functions.list 过滤空 taints 条目 → 最终报告无污点。
+    此函数复现 R3-J 的核心脚本校验，以便 R3-W 带反馈重试。
+
+    返回 (ok, reason)：ok=False 表示 keep 入口缺少合法污点，应让 R3-W 重试。
+    """
+    try:
+        if not analysis.get("has_external_input", True):
+            return True, ""
+        decision = str(analysis.get("decision") or "").lower().strip()
+        if decision == "filter":
+            return True, ""
+        taints = analysis.get("taints") or []
+        sig = (signature or "").strip()
+        # 无参函数 func() / func(void)：A 型 taints=[] 合法，跳过
+        if sig and re.search(r"\(\s*(void\s*)?\)", sig):
+            return True, ""
+        if not taints:
+            return False, (
+                "keep 入口 has_external_input=true 但 taints 为空；有参函数必须列出至少"
+                "一个承载外部数据的污点（P型=参数名，A型=recv@buf 形式）。"
+            )
+        # 格式校验：根标识符须为合法 C 标识符（允许 -> / . 成员访问、@ 调用名前缀）
+        def _ident(t: str) -> str:
+            root = re.split(r"->|\.", str(t))[0]
+            return root.split("@")[-1]
+        invalid = [t for t in taints if not re.match(r"^[a-zA-Z_]\w*$", _ident(str(t)))]
+        if invalid:
+            return False, f"taints 格式非法（根标识符含非法字符）: {invalid[:3]}；请用合法 C 标识符。"
+        return True, ""
+    except Exception:
+        return True, ""  # 校验异常不阻塞流水线
+
+
 def _count_json_array(path: Path) -> int:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -1559,6 +1596,9 @@ class SuperFastPipelineEngine:
         # 修复：原来误用 dirs.r4_w_session()，生成 r4-w-*.jsonl，导致 R3-W session 被误当 R4 session
         session_file = str(dirs.r3_w_session(file_hash, func_hash))
         db_path = dirs.r1_functions_db(file_hash)
+        # super_fast 污点门禁的有限重试预算（避免无限重试，与 r3_max 独立）
+        _taint_gate_max = max(0, int(os.environ.get("EA_SUPERFAST_TAINT_RETRY", "2")))
+        _taint_gate_used = 0
 
         while _should_continue(func_state.r3_w_attempts, r3_max, self._cancel):
             if func_state.r3_w_state == NodeState.PASSED:
@@ -1738,6 +1778,29 @@ class SuperFastPipelineEngine:
                             func_state.entry_role = role
                         from .funcdb import FunctionDB
                         await run_in_script_thread(lambda: FunctionDB.open(dirs.r1, file_hash).set_analysis(func_hash, analysis))
+                        # ── super_fast 污点门禁（脚本级，不调 Agent Judge）──────────────
+                        # super_fast 既需“判断污点”：keep 入口若 taints 为空/非法，带反馈
+                        # 重试 R3-W（有限次），避免污点信息在最终报告中缺失。
+                        _tg_ok, _tg_reason = _r3_taint_gate_check(
+                            analysis, func_state.signature)
+                        if not _tg_ok and _taint_gate_used < _taint_gate_max:
+                            _taint_gate_used += 1
+                            func_state.r3_w_feedback = (
+                                "【污点必填】" + _tg_reason +
+                                " 请重新分析并在 <result> JSON 的 taints 字段给出非空且"
+                                "格式合法的污点列表。"
+                            )
+                            func_state.r3_w_state = NodeState.PENDING
+                            await run_in_script_thread(state.save, dirs.state_file)
+                            self._emit("r3_taint_gate_retry",
+                                       func_hash=func_hash, function=func_state.name,
+                                       attempt=_taint_gate_used, reason=_tg_reason[:120])
+                            continue
+                        if not _tg_ok:
+                            logger.warning(
+                                "super_fast taint gate exhausted for %s(%s): %s; accepting",
+                                func_state.name, func_hash, _tg_reason,
+                            )
                 else:
                     func_state.has_external_input = _parse_has_external_input(ar.output)
                     # 兜底：无分析结果时若无外部输入则 filter
