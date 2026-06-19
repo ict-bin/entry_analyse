@@ -1465,7 +1465,8 @@ class PipelineEngine:
             "register", "hook", "subscribe", "listen", "callback",
             "addhandler", "sethandler", "install",
         )
-        for caller_hash, caller_name in callers:
+        for c in callers:
+            caller_name = (c.get("name") if isinstance(c, dict) else "") or ""
             cn = caller_name.lower()
             if any(h in cn for h in _DISPATCHER_HINTS):
                 return "dispatch_target"
