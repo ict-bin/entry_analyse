@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from typing import Any, Callable
 
 from .state import FileState, NodeState, PipelineState
@@ -70,6 +71,52 @@ class FastModeBatchProcessor:
             max_workers=_max_workers, thread_name_prefix="fm-batch")
         self._futures: list[concurrent.futures.Future] = []
 
+        # ── 尾批死锁防护：空闲自动刷新 ────────────────────────────────────
+        # 死锁场景：当 (通过 R2 的函数数 % batch_size) != 0 时会留下不足一批的
+        # 尾批，尾批仅由 flush() 处理；而 flush() 在 engine.run() 的
+        # asyncio.gather(...) 之后才调用，但尾批函数的 enqueue() 正阻塞在
+        # event.wait → _func_pipeline 不返回 → gather 不完成 → flush 永不执行
+        # → 尾批 event 永不 set。形成 gather→enqueue→flush→gather 循环死锁。
+        # 防护：守护线程检测到 _pending 长时间无新 enqueue（已到尾批），即把
+        # 它作为一个批次提前处理，彻底打断对 flush() 的依赖。
+        self._last_activity = time.monotonic()
+        self._stop_flusher = threading.Event()
+        self._tail_idle_seconds = max(
+            10, int(os.environ.get('EA_FAST_MODE_TAIL_IDLE_SECONDS', '90')))
+        self._flusher_thread = threading.Thread(
+            target=self._idle_flush_loop,
+            name=f"fm-idle-flush-{task_id[:8]}",
+            daemon=True,
+        )
+        self._flusher_thread.start()
+
+    def _idle_flush_loop(self) -> None:
+        """守护线程：_pending 空闲超时（或任务取消）时把它作为尾批提前处理，
+        避免尾批必须等 gather 之后的 flush() 而形成死锁。"""
+        check_interval = 5.0
+        while not self._stop_flusher.wait(check_interval):
+            try:
+                cancelled = bool(self._cancel and self._cancel.is_set())
+                with self._lock:
+                    if not self._pending:
+                        continue
+                    idle = time.monotonic() - self._last_activity
+                    if not cancelled and idle < self._tail_idle_seconds:
+                        continue
+                    batch = list(self._pending)
+                    self._pending.clear()
+                    self._last_activity = time.monotonic()
+                logger.warning(
+                    "fast_mode idle-flush(deadlock-breaker): %d pending funcs "
+                    "idle=%.0fs (limit=%ds, cancelled=%s), processing as tail batch",
+                    len(batch), idle, self._tail_idle_seconds, cancelled,
+                )
+                self._futures.append(
+                    self._executor.submit(self._process_batch, batch)
+                )
+            except Exception as exc:
+                logger.warning("fast_mode idle-flush loop error: %s", exc)
+
     # ── 公开接口 ─────────────────────────────────────────────────────────────
 
     async def enqueue(self, func_info: dict) -> str:
@@ -88,6 +135,7 @@ class FastModeBatchProcessor:
         with self._lock:
             self._pending.append((func_info, event))
             self._total_collected += 1
+            self._last_activity = time.monotonic()
             if len(self._pending) >= self._batch_size:
                 batch = list(self._pending[:self._batch_size])
                 self._pending = self._pending[self._batch_size:]
@@ -106,6 +154,8 @@ class FastModeBatchProcessor:
         处理尾批（不足 batch_size 的剩余函数）。
         在所有 R2 完成后调用。
         """
+        # 停掉空闲刷新守护线程（尾批若已被它处理，这里 remaining 为空直接返回）
+        self._stop_flusher.set()
         with self._lock:
             remaining = list(self._pending)
             self._pending.clear()
