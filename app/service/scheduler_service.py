@@ -428,7 +428,11 @@ class SchedulerService:
             w = self._workers.get(pod) if pod else None
             if w:
                 w.tasks.discard(cmd.task_id)
+                w.free_slots = min(w.capacity, w.free_slots + 1)
         logger.info("scheduler cancelled task %s", cmd.task_id)
+        # 事件驱动：cancel 后 worker 释放 capacity， 立即派发下一个（不靠兜底 10s）
+        if pod:
+            self._dispatch_one_to(pod)
 
     def _cmd_restart(self, db: Session, cmd: AppEaTaskCommand) -> None:
         from app.service.task_service import (
