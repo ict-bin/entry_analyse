@@ -1,27 +1,31 @@
-"""Background scheduler for entry-analysis tasks.
+"""Entry-analysis 任务调度器（架构 v3 — TCP socket server）。
 
-Responsibilities:
-  1. Maintain in-memory task_id <-> pod_name mapping.
-  2. Process command queue (cancel / restart / kill_processes).
-  3. Reconcile stale cluster state (expired leases, invalid owners, zombie tasks).
-  4. Dispatch pending tasks to available workers.
-  5. Monitor pod health via TCP probe + heartbeat.
+职责：
+  1. 监听一个集群内 TCP 端口，接受 worker 控制进程的长连接。
+  2. 维护 worker 注册表：pod → {连接, capacity, free_slots, last_seen, 在跑任务集}。
+  3. 派发：从 DB 取 pending 任务，选有空闲槽的 worker 连接发 LAUNCH。
+  4. 取消/重启：读 DB 命令队列（API/前端写入），对持有该任务的 worker 连接发 TERMINATE/RESTART
+     —— 取代旧的 HTTP 3001。
+  5. 存活 = 连接/心跳超时：worker 的 last_seen 过期即判其死亡，把它名下任务全部回 pending。
+     —— 取代旧的 lease 过期回收 + TCP 18080 探针 + dispatch_lease。
 
-All loops use threading + time.sleep().  No asyncio.
+worker↔scheduler 协议（JSON-line over TCP）见 app/service/worker_control.py。
+
+全部 threading + time.sleep()，无 asyncio（除 FastAPI/uvicorn 路由外）。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
 import threading
 import time
-import urllib.request
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -33,16 +37,14 @@ logger = logging.getLogger("ea.scheduler")
 SCHEDULER_POLL_SECONDS = int(os.environ.get("EA_SCHEDULER_POLL_SECONDS", "5"))
 COMMAND_POLL_SECONDS = int(os.environ.get("EA_COMMAND_POLL_SECONDS", "2"))
 COMMAND_BATCH_SIZE = max(1, int(os.environ.get("EA_COMMAND_BATCH_SIZE", "20")))
-EXPIRED_RUNNING_RECONCILE_BATCH_SIZE = max(
-    1, int(os.environ.get("EA_EXPIRED_RUNNING_RECONCILE_BATCH_SIZE", "50")),
-)
-INVALID_OWNER_GRACE_PERIOD_SECONDS = int(os.environ.get("EA_INVALID_OWNER_GRACE_PERIOD_SECONDS", "90"))
-WORKER_HEARTBEAT_STALE_SECONDS = int(os.environ.get("EA_WORKER_HEARTBEAT_STALE_SECONDS", "120"))
-POD_HEALTH_CHECK_SECONDS = int(os.environ.get("EA_POD_HEALTH_CHECK_SECONDS", "15"))
-POD_TCP_PROBE_TIMEOUT_SECONDS = int(os.environ.get("EA_POD_TCP_PROBE_TIMEOUT_SECONDS", "3"))
-POD_TCP_FAILURE_THRESHOLD = int(os.environ.get("EA_POD_TCP_FAILURE_THRESHOLD", "3"))
-DISPATCH_POLL_SECONDS = int(os.environ.get("EA_DISPATCH_POLL_SECONDS", "5"))
+DISPATCH_POLL_SECONDS = int(os.environ.get("EA_DISPATCH_POLL_SECONDS", "3"))
 DISPATCH_BATCH_SIZE = max(1, int(os.environ.get("EA_DISPATCH_BATCH_SIZE", "10")))
+WORKER_HEARTBEAT_STALE_SECONDS = int(os.environ.get("EA_WORKER_HEARTBEAT_STALE_SECONDS", "45"))
+WORKER_RECLAIM_INTERVAL_SECONDS = int(os.environ.get("EA_WORKER_RECLAIM_INTERVAL_SECONDS", "10"))
+RECLAIM_BATCH_SIZE = max(1, int(os.environ.get("EA_RECLAIM_BATCH_SIZE", "50")))
+
+LISTEN_HOST = os.environ.get("EA_SCHEDULER_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("EA_SCHEDULER_SOCKET_PORT", "18090"))
 
 POD_NAME = (
     os.environ.get("EA_POD_NAME")
@@ -52,135 +54,245 @@ POD_NAME = (
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Stats
-# ═══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class _Worker:
+    pod: str
+    conn: socket.socket
+    addr: Any
+    capacity: int = 1
+    free_slots: int = 1
+    last_seen: float = field(default_factory=time.time)
+    tasks: set[str] = field(default_factory=set)
+    send_lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
 
-class _ExpiredRunningReconcileStats:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._reconciled_total = 0
-        self._owner_alive_total = 0
-        self._invalid_owner_reconciled_total = 0
-        self._invalid_owner_alive_total = 0
-        self._commands_processed_total = 0
-        self._commands_failed_total = 0
-
-    def observe(self, *, reconciled: int = 0, owner_alive: int = 0,
-                invalid_reconciled: int = 0, invalid_owner_alive: int = 0,
-                commands_processed: int = 0, commands_failed: int = 0) -> None:
-        with self._lock:
-            self._reconciled_total += max(0, int(reconciled))
-            self._owner_alive_total += max(0, int(owner_alive))
-            self._invalid_owner_reconciled_total += max(0, int(invalid_reconciled))
-            self._invalid_owner_alive_total += max(0, int(invalid_owner_alive))
-            self._commands_processed_total += max(0, int(commands_processed))
-            self._commands_failed_total += max(0, int(commands_failed))
-
-    def snapshot(self) -> dict[str, int]:
-        with self._lock:
-            return {
-                "reconciled_total": self._reconciled_total,
-                "owner_alive_total": self._owner_alive_total,
-                "invalid_owner_reconciled_total": self._invalid_owner_reconciled_total,
-                "invalid_owner_alive_total": self._invalid_owner_alive_total,
-                "commands_processed_total": self._commands_processed_total,
-                "commands_failed_total": self._commands_failed_total,
-            }
-
-
-_expired_running_reconcile_stats = _ExpiredRunningReconcileStats()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SchedulerService
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class SchedulerService:
-    def __init__(self):
+    """调度器主体：socket server + worker 注册表 + 派发 + 命令转发 + 断联回收。"""
+
+    def __init__(self) -> None:
         self._running = False
+        self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._listen_sock: Optional[socket.socket] = None
 
-        # task_id <-> pod_name mapping
-        self._task_owner: dict[str, str] = {}
-        self._pod_tasks: dict[str, set[str]] = {}
-        self._map_lock = threading.Lock()
+        self._reg_lock = threading.Lock()
+        self._workers: dict[str, _Worker] = {}          # pod -> _Worker
+        self._task_owner: dict[str, str] = {}           # task_id -> pod
 
-        # Pod health tracking
-        self._pod_health: dict[str, dict[str, Any]] = {}
-        self._pod_health_lock = threading.Lock()
+    # ── 公共 ────────────────────────────────────────────────────────────────
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._stop.clear()
+        # 监听线程
+        t = threading.Thread(target=self._listen_loop, name="sch_listen", daemon=True)
+        t.start(); self._threads.append(t)
+        # 派发线程（pending → 选 worker → LAUNCH）
+        t = threading.Thread(target=self._dispatch_loop, name="sch_dispatch", daemon=True)
+        t.start(); self._threads.append(t)
+        # 命令队列线程（cancel/restart → 转发 socket）
+        t = threading.Thread(target=self._command_loop, name="sch_command", daemon=True)
+        t.start(); self._threads.append(t)
+        # 断联回收线程（心跳超时 → 任务回 pending）
+        t = threading.Thread(target=self._reclaim_loop, name="sch_reclaim", daemon=True)
+        t.start(); self._threads.append(t)
+        logger.info("SchedulerService started: listen=%s:%s", LISTEN_HOST, LISTEN_PORT)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Mapping helpers
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _assign_task(self, task_id: str, pod_name: str) -> None:
-        with self._map_lock:
-            self._task_owner[task_id] = pod_name
-            self._pod_tasks.setdefault(pod_name, set()).add(task_id)
-
-    def _unassign_task(self, task_id: str) -> str | None:
-        with self._map_lock:
-            pod = self._task_owner.pop(task_id, None)
-            if pod:
-                tasks = self._pod_tasks.get(pod)
-                if tasks:
-                    tasks.discard(task_id)
-                    if not tasks:
-                        self._pod_tasks.pop(pod, None)
-            return pod
-
-    def _get_owner(self, task_id: str) -> str | None:
-        with self._map_lock:
-            return self._task_owner.get(task_id)
-
-    def _get_pod_tasks(self, pod_name: str) -> set[str]:
-        with self._map_lock:
-            return set(self._pod_tasks.get(pod_name, set()))
-
-    def _rebuild_maps_from_db(self, db: Session) -> None:
-        rows = (
-            db.query(AppEaTask.task_id, AppEaTask.owner_pod)
-            .filter(
-                AppEaTask.is_deleted.is_(False),
-                AppEaTask.status == "running",
-                AppEaTask.owner_pod.is_not(None),
-            )
-            .all()
-        )
-        with self._map_lock:
-            self._task_owner.clear()
-            self._pod_tasks.clear()
-            for task_id, pod_name in rows:
-                if task_id and pod_name:
-                    self._task_owner[task_id] = pod_name
-                    self._pod_tasks.setdefault(pod_name, set()).add(task_id)
-        logger.info(
-            "scheduler rebuilt task map: %s tasks across %s pods",
-            len(self._task_owner), len(self._pod_tasks),
-        )
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Command processing
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _command_loop(self) -> None:
-        while self._running:
+    def stop(self) -> None:
+        self._stop.set()
+        self._running = False
+        if self._listen_sock is not None:
             try:
-                processed, failed = self._process_pending_commands()
-                if processed or failed:
-                    _expired_running_reconcile_stats.observe(
-                        commands_processed=processed, commands_failed=failed,
-                    )
-            except Exception as exc:
-                logger.warning("scheduler command loop error: %s", exc)
-            time.sleep(COMMAND_POLL_SECONDS)
+                self._listen_sock.close()
+            except Exception:
+                pass
 
-    def _process_pending_commands(self) -> tuple[int, int]:
+    # ── 监听 + per-worker 接收 ──────────────────────────────────────────────
+    def _listen_loop(self) -> None:
+        last_err = 0.0
+        while not self._stop.is_set():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((LISTEN_HOST, LISTEN_PORT))
+                s.listen(128)
+                self._listen_sock = s
+                logger.info("scheduler listening on %s:%s", LISTEN_HOST, LISTEN_PORT)
+                while not self._stop.is_set():
+                    try:
+                        conn, addr = s.accept()
+                    except OSError:
+                        break
+                    threading.Thread(target=self._serve_worker, args=(conn, addr),
+                                     name="sch_serve", daemon=True).start()
+            except Exception as exc:
+                if time.time() - last_err > 10:
+                    logger.warning("listen error: %s", exc)
+                    last_err = time.time()
+                self._stop.wait(2)
+
+    def _serve_worker(self, conn: socket.socket, addr: Any) -> None:
+        conn.settimeout(WORKER_HEARTBEAT_STALE_SECONDS * 2)
+        pod: Optional[str] = None
+        buf = b""
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = conn.recv(65536)
+                except socket.timeout:
+                    # 超时无数据：若也超过心跳阈值，视为断联
+                    if pod and self._worker_stale(pod):
+                        break
+                    continue
+                except OSError:
+                    break
+                if not data:
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line.decode("utf-8"))
+                    except Exception:
+                        continue
+                    pod = self._handle_worker_msg(conn, addr, pod, msg)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if pod:
+                self._on_worker_disconnect(pod)
+
+    def _handle_worker_msg(self, conn: socket.socket, addr: Any,
+                           pod: Optional[str], msg: dict) -> Optional[str]:
+        mtype = msg.get("type")
+        if mtype == "HELLO":
+            pod = str(msg.get("pod") or "")
+            cap = int(msg.get("capacity") or 1)
+            free = int(msg.get("free_slots", cap))
+            with self._reg_lock:
+                w = self._workers.get(pod)
+                if w is not None and not w.closed:
+                    # 重连：复用条目，换连接
+                    try:
+                        w.conn.close()
+                    except Exception:
+                        pass
+                w = _Worker(pod=pod, conn=conn, addr=addr, capacity=cap, free_slots=free)
+                self._workers[pod] = w
+            logger.info("worker HELLO: pod=%s capacity=%s free=%s", pod, cap, free)
+            return pod
+        if pod is None:
+            return None
+        # 刷新 last_seen
+        with self._reg_lock:
+            w = self._workers.get(pod)
+            if w is not None:
+                w.last_seen = time.time()
+                if mtype == "HEARTBEAT":
+                    w.free_slots = int(msg.get("free_slots", w.free_slots))
+                elif mtype == "STATUS":
+                    tid = msg.get("task_id")
+                    state = msg.get("state")
+                    if tid and state == "running":
+                        self._task_owner[tid] = pod
+                        w.tasks.add(tid)
+                    elif tid and state == "rejected":
+                        # worker 拒收（无空闲）—— 解除归属，交回派发
+                        self._task_owner.pop(tid, None)
+                        w.tasks.discard(tid)
+                elif mtype == "DONE":
+                    tid = msg.get("task_id")
+                    if tid:
+                        self._task_owner.pop(tid, None)
+                        w.tasks.discard(tid)
+        return pod
+
+    def _worker_stale(self, pod: str) -> bool:
+        with self._reg_lock:
+            w = self._workers.get(pod)
+            return w is None or (time.time() - w.last_seen) > WORKER_HEARTBEAT_STALE_SECONDS
+
+    def _on_worker_disconnect(self, pod: str) -> None:
+        with self._reg_lock:
+            w = self._workers.pop(pod, None)
+            orphan_tasks: set[str] = set()
+            if w is not None:
+                w.closed = True
+                orphan_tasks = set(w.tasks)
+                for tid in orphan_tasks:
+                    self._task_owner.pop(tid, None)
+        if orphan_tasks:
+            logger.warning("worker disconnect: pod=%s, reclaiming %d task(s)", pod, len(orphan_tasks))
+            self._requeue_tasks(orphan_tasks, reason=f"worker_disconnect:{pod}")
+
+    # ── 派发：pending → 选 worker → LAUNCH ─────────────────────────────────
+    def _dispatch_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._dispatch_once()
+            except Exception as exc:
+                logger.warning("dispatch loop error: %s", exc)
+            self._stop.wait(DISPATCH_POLL_SECONDS)
+
+    def _dispatch_once(self) -> None:
+        if not self._has_free_worker():
+            return
         db_gen = get_db()
         db: Session = next(db_gen)
-        processed = 0
-        failed = 0
+        claimed: list[str] = []
+        try:
+            rows = (
+                db.query(AppEaTask)
+                .filter(AppEaTask.is_deleted.is_(False), AppEaTask.status == "pending")
+                .order_by(AppEaTask.created_at.asc())
+                .limit(DISPATCH_BATCH_SIZE)
+                .all()
+            )
+            for row in rows:
+                pod = self._pick_worker()
+                if pod is None:
+                    break  # 无空闲 worker
+                ok = self._send_to(pod, {"type": "LAUNCH", "task_id": row.task_id})
+                if not ok:
+                    continue
+                # 立即占位（避免下一轮重复派发同一任务）；worker HELLO/STATUS 会确认
+                with self._reg_lock:
+                    w = self._workers.get(pod)
+                    if w is not None:
+                        w.free_slots = max(0, w.free_slots - 1)
+                        w.tasks.add(row.task_id)
+                        self._task_owner[row.task_id] = pod
+                row.status = "running"
+                row.owner_pod = pod
+                row.started_at = now_local()
+                claimed.append(row.task_id)
+            if claimed:
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    # ── 命令队列：cancel/restart → socket 转发 ──────────────────────────────
+    def _command_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._process_commands()
+            except Exception as exc:
+                logger.warning("command loop error: %s", exc)
+            self._stop.wait(COMMAND_POLL_SECONDS)
+
+    def _process_commands(self) -> None:
+        db_gen = get_db()
+        db: Session = next(db_gen)
         try:
             rows = (
                 db.query(AppEaTaskCommand)
@@ -194,66 +306,43 @@ class SchedulerService:
                 db.commit()
                 try:
                     if cmd.command == "cancel":
-                        self._execute_cancel(db, cmd)
+                        self._cmd_cancel(db, cmd)
                     elif cmd.command == "restart":
-                        self._execute_restart(db, cmd)
+                        self._cmd_restart(db, cmd)
                     elif cmd.command == "kill_processes":
-                        self._execute_kill(db, cmd)
+                        # 语义由 TERMINATE 覆盖：发给持有 worker
+                        pod = self._owner_of(cmd.task_id)
+                        if pod:
+                            self._send_to(pod, {"type": "TERMINATE", "task_id": cmd.task_id})
                     else:
                         cmd.status = "failed"
                         cmd.error = f"unknown command: {cmd.command}"
-                        cmd.processed_at = now_local()
-                        db.commit()
-                        failed += 1
-                        continue
-                    if cmd.status == "processing":
-                        cmd.status = "done"
-                        cmd.processed_at = now_local()
-                        db.commit()
-                        processed += 1
                 except Exception as exc:
                     cmd.status = "failed"
                     cmd.error = str(exc)[:1000]
-                    cmd.processed_at = now_local()
-                    db.commit()
-                    failed += 1
-                    logger.error(
-                        "scheduler command failed: cmd=%s task=%s error=%s",
-                        cmd.command, cmd.task_id, exc, exc_info=True,
-                    )
+                if cmd.status == "processing":
+                    cmd.status = "done"
+                cmd.processed_at = now_local()
+                db.commit()
         finally:
             try:
                 next(db_gen)
             except StopIteration:
                 pass
-        return processed, failed
 
-    def _execute_cancel(self, db: Session, cmd: AppEaTaskCommand) -> None:
-        task_id = cmd.task_id
-        row = db.query(AppEaTask).filter(
-            AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False),
-        ).first()
-        if row is None:
-            return
-        if row.status in ("passed", "failed", "error", "cancelled"):
-            return
-
-        pod_name = self._get_owner(task_id)
-        if row.status == "running" and pod_name:
-            self._notify_worker_kill(pod_name, task_id)
-        try:
-            from app.service.worker_service import get_worker_service
-
-            get_worker_service().force_kill_all_pi_processes(
-                reason="scheduler_cancel",
-                task_id=task_id,
-            )
-        except Exception as exc:
-            logger.warning("scheduler cancel pi cleanup failed: task=%s error=%s", task_id, exc)
-
+    def _cmd_cancel(self, db: Session, cmd: AppEaTaskCommand) -> None:
         from app.service.task_service import (
             TASK_EVENT_SOURCE_SYSTEM, _event_dedupe_key, _safe_create_task_event,
         )
+        row = db.query(AppEaTask).filter(
+            AppEaTask.task_id == cmd.task_id, AppEaTask.is_deleted.is_(False),
+        ).first()
+        if row is None or row.status in ("passed", "failed", "error", "cancelled"):
+            return
+        pod = self._owner_of(cmd.task_id)
+        if row.status == "running" and pod:
+            # 先让 worker 杀进程+归档；worker 会回 DONE。这里也兜底置 cancelled。
+            self._send_to(pod, {"type": "TERMINATE", "task_id": cmd.task_id})
         now = now_local()
         row.cancel_requested = True
         row.cancel_requested_at = row.cancel_requested_at or now
@@ -269,559 +358,163 @@ class SchedulerService:
         row.owner_pod_ip = None
         row.lease_expires_at = None
         row.error = row.error or "任务已取消"
-
         _safe_create_task_event(
             db, task_id=row.task_id, project_id=row.project_id,
             event_type="task_cancelled", message="任务已由调度器取消",
-            source=TASK_EVENT_SOURCE_SYSTEM, status=row.status,
-            payload={"reason": "scheduler_command", "command_id": cmd.id,
-                      "previous_owner_pod": pod_name},
+            source=TASK_EVENT_SOURCE_SYSTEM, status="cancelled",
+            payload={"reason": "scheduler_command", "command_id": cmd.id, "previous_owner_pod": pod},
             dedupe_key=_event_dedupe_key(row.task_id, "task_cancelled", "scheduler_command", now),
         )
-        db.commit()
-        self._unassign_task(task_id)
-        logger.info("scheduler cancelled task %s", task_id)
+        with self._reg_lock:
+            self._task_owner.pop(cmd.task_id, None)
+            w = self._workers.get(pod) if pod else None
+            if w:
+                w.tasks.discard(cmd.task_id)
+        logger.info("scheduler cancelled task %s", cmd.task_id)
 
-    def _execute_restart(self, db: Session, cmd: AppEaTaskCommand) -> None:
-        task_id = cmd.task_id
+    def _cmd_restart(self, db: Session, cmd: AppEaTaskCommand) -> None:
+        from app.service.task_service import (
+            TASK_EVENT_SOURCE_EA, _event_dedupe_key, _reset_cancel_state, _safe_create_task_event,
+        )
         row = db.query(AppEaTask).filter(
-            AppEaTask.task_id == task_id, AppEaTask.is_deleted.is_(False),
+            AppEaTask.task_id == cmd.task_id, AppEaTask.is_deleted.is_(False),
         ).first()
-        if row is None:
-            return
-        if row.status == "pending":
+        if row is None or row.status == "pending":
             return
         if row.status == "running":
+            # 先取消（发 TERMINATE），再插一条 cancel 命令做收尾，restart 命令挂起等下一轮
+            pod = self._owner_of(cmd.task_id)
+            if pod:
+                self._send_to(pod, {"type": "TERMINATE", "task_id": cmd.task_id})
             sub = AppEaTaskCommand(
-                task_id=task_id, project_id=row.project_id,
+                task_id=cmd.task_id, project_id=row.project_id,
                 command="cancel", status="pending",
                 requested_by=f"scheduler_restart:{cmd.requested_by}",
             )
             db.add(sub)
-            cmd.status = "pending"
-            db.commit()
+            cmd.status = "pending"  # 下一轮：此时 status 已非 running，走下面的重置
             return
-        try:
-            from app.service.worker_service import get_worker_service
-
-            get_worker_service().force_kill_all_pi_processes(
-                reason="scheduler_restart_prepare",
-                task_id=task_id,
-            )
-        except Exception as exc:
-            logger.warning("scheduler restart pi cleanup failed: task=%s error=%s", task_id, exc)
-
-        from app.service.task_service import (
-            TASK_EVENT_SOURCE_EA, _event_dedupe_key, _reset_cancel_state, _safe_create_task_event,
-        )
+        # 非 running：直接重置为 pending，交派发循环重新 LAUNCH
+        pod = self._owner_of(cmd.task_id)
+        if pod:
+            self._send_to(pod, {"type": "TERMINATE", "task_id": cmd.task_id})
         row.status = "pending"
         _reset_cancel_state(row)
         _safe_create_task_event(
             db, task_id=row.task_id, project_id=row.project_id,
             event_type="task_retried", message="任务已由调度器重启",
-            source=TASK_EVENT_SOURCE_EA, status=row.status,
+            source=TASK_EVENT_SOURCE_EA, status="pending",
             payload={"operator": "scheduler", "restart_mode": "fresh_start", "command_id": cmd.id},
             dedupe_key=_event_dedupe_key(row.task_id, "task_retried", "scheduler", row.updated_at),
         )
-        db.commit()
-        self._unassign_task(task_id)
-        logger.info("scheduler restarted task %s", task_id)
+        with self._reg_lock:
+            self._task_owner.pop(cmd.task_id, None)
+            w = self._workers.get(pod) if pod else None
+            if w:
+                w.tasks.discard(cmd.task_id)
+        logger.info("scheduler restarted task %s", cmd.task_id)
 
-    def _execute_kill(self, db: Session, cmd: AppEaTaskCommand) -> None:
-        pod_name = self._get_owner(cmd.task_id)
-        if pod_name:
-            self._notify_worker_kill(pod_name, cmd.task_id)
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Worker notification (HTTP, sync)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _notify_worker_kill(self, pod_name: str, task_id: str) -> bool:
-        pod_ips = self._resolve_pod_ips(pod_name)
-        if not pod_ips:
-            logger.warning("scheduler kill: cannot resolve IP for pod %s", pod_name)
-            return False
-        for pod_ip in pod_ips:
-            for path in (f"/kill/{task_id}", f"/cancel/{task_id}"):
-                try:
-                    url = f"http://{pod_ip}:3001{path}"
-                    urllib.request.urlopen(url, timeout=3)
-                    logger.info("scheduler kill: notified worker %s via %s", pod_name, path)
-                    return True
-                except Exception:
-                    continue
-        return False
-
-    def _resolve_pod_ips(self, pod_name: str) -> list[str]:
-        db_gen = get_db()
-        db: Session = next(db_gen)
-        try:
-            from app.db.models import AppEaWorkerSlot
-            row = (
-                db.query(AppEaWorkerSlot.pod_ip)
-                .filter(
-                    AppEaWorkerSlot.pod_name == pod_name,
-                    AppEaWorkerSlot.pod_ip.is_not(None),
-                    AppEaWorkerSlot.pod_ip != "",
-                )
-                .order_by(AppEaWorkerSlot.last_heartbeat_at.desc())
-                .first()
-            )
-            if row and row[0]:
-                return [str(row[0]).strip()]
-        finally:
+    # ── 断联/心跳超时回收 ────────────────────────────────────────────────────
+    def _reclaim_loop(self) -> None:
+        while not self._stop.is_set():
             try:
-                next(db_gen)
-            except StopIteration:
-                pass
-        return []
-
-    def _resolve_all_pod_ips(self, pod_names: list[str]) -> dict[str, str]:
-        result: dict[str, str] = {}
-        # Source 1: K8s API
-        from app.service.worker_slot_service import get_worker_slot_service
-        try:
-            k8s_pods = get_worker_slot_service()._list_live_worker_pods_with_ips()
-            for pn, ip in k8s_pods.items():
-                if pn in pod_names and ip:
-                    result[pn] = ip
-        except Exception:
-            pass
-        # Source 2: DB heartbeat
-        db_gen = get_db()
-        db: Session = next(db_gen)
-        try:
-            from app.db.models import AppEaWorkerSlot
-            unresolved = [pn for pn in pod_names if pn not in result]
-            if unresolved:
-                rows = (
-                    db.query(AppEaWorkerSlot.pod_name, AppEaWorkerSlot.pod_ip)
-                    .filter(
-                        AppEaWorkerSlot.pod_name.in_(unresolved),
-                        AppEaWorkerSlot.pod_ip.is_not(None),
-                        AppEaWorkerSlot.pod_ip != "",
-                    )
-                    .all()
-                )
-                for pn, ip in rows:
-                    if pn and ip:
-                        result.setdefault(pn, str(ip).strip())
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-        return result
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Pod health tracking
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _pod_health_loop(self) -> None:
-        while self._running:
-            try:
-                with self._map_lock:
-                    active_pods = list(self._pod_tasks.keys())
-                if not active_pods:
-                    time.sleep(POD_HEALTH_CHECK_SECONDS)
-                    continue
-                pod_ips = self._resolve_all_pod_ips(active_pods)
-                for pod_name in active_pods:
-                    pod_ip = pod_ips.get(pod_name, "")
-                    is_healthy = self._tcp_probe_pod(pod_ip)
-                    with self._pod_health_lock:
-                        health = self._pod_health.setdefault(pod_name, {
-                            "consecutive_tcp_failures": 0,
-                            "last_tcp_ok": 0.0,
-                            "status": "unknown",
-                        })
-                        if is_healthy:
-                            health["consecutive_tcp_failures"] = 0
-                            health["last_tcp_ok"] = time.monotonic()
-                            health["status"] = "healthy"
-                        else:
-                            health["consecutive_tcp_failures"] += 1
-                            health["status"] = "unhealthy"
-                        hb_stale = self._is_heartbeat_stale(pod_name)
-                        tcp_dead = health["consecutive_tcp_failures"] >= POD_TCP_FAILURE_THRESHOLD
-                        if tcp_dead and hb_stale:
-                            health["status"] = "dead"
-                            logger.error(
-                                "scheduler pod DEAD: pod=%s tcp_failures=%s",
-                                pod_name, health["consecutive_tcp_failures"],
-                            )
-                            self._handle_dead_pod(pod_name)
-                        elif tcp_dead and not hb_stale:
-                            logger.warning(
-                                "scheduler pod SUSPICIOUS: pod=%s tcp_failures=%s heartbeat_ok",
-                                pod_name, health["consecutive_tcp_failures"],
-                            )
+                self._reclaim_stale()
             except Exception as exc:
-                logger.warning("scheduler pod health loop error: %s", exc)
-            time.sleep(POD_HEALTH_CHECK_SECONDS)
+                logger.warning("reclaim loop error: %s", exc)
+            self._stop.wait(WORKER_RECLAIM_INTERVAL_SECONDS)
 
-    def _tcp_probe_pod(self, pod_ip: str) -> bool:
-        if not pod_ip:
-            return False
-        try:
-            s = socket.create_connection((pod_ip, 18080), timeout=POD_TCP_PROBE_TIMEOUT_SECONDS)
-            s.close()
-            return True
-        except (OSError, socket.timeout):
-            return False
+    def _reclaim_stale(self) -> None:
+        now = time.time()
+        stale_workers: list[str] = []
+        orphan_tasks: set[str] = set()
+        with self._reg_lock:
+            for pod, w in list(self._workers.items()):
+                if (now - w.last_seen) > WORKER_HEARTBEAT_STALE_SECONDS:
+                    stale_workers.append(pod)
+                    orphan_tasks |= w.tasks
+                    w.closed = True
+                    for tid in w.tasks:
+                        self._task_owner.pop(tid, None)
+            for pod in stale_workers:
+                ww = self._workers.pop(pod, None)
+                if ww is not None:
+                    try:
+                        ww.conn.close()
+                    except Exception:
+                        pass
+        if orphan_tasks:
+            logger.warning("heartbeat stale, reclaim: workers=%s tasks=%d",
+                           stale_workers, len(orphan_tasks))
+            self._requeue_tasks(orphan_tasks, reason="worker_heartbeat_stale")
 
-    def _is_heartbeat_stale(self, pod_name: str) -> bool:
-        db_gen = get_db()
-        db: Session = next(db_gen)
-        try:
-            from app.db.models import AppEaWorkerSlot
-            row = (
-                db.query(AppEaWorkerSlot.last_heartbeat_at)
-                .filter(AppEaWorkerSlot.pod_name == pod_name)
-                .order_by(AppEaWorkerSlot.last_heartbeat_at.desc())
-                .first()
-            )
-            if not row or not row[0]:
-                return True
-            now = now_local()
-            age = (now - row[0]).total_seconds()
-            return age > WORKER_HEARTBEAT_STALE_SECONDS
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-
-    def _handle_dead_pod(self, pod_name: str) -> None:
-        db_gen = get_db()
-        db: Session = next(db_gen)
-        try:
-            from sqlalchemy import update as _up
-            task_ids = list(self._get_pod_tasks(pod_name))
-            if not task_ids:
-                return
-            now = now_local()
-            expired = now - timedelta(seconds=1)
-            result = db.execute(
-                _up(AppEaTask)
-                .where(
-                    AppEaTask.task_id.in_(task_ids),
-                    AppEaTask.status == "running",
-                    AppEaTask.owner_pod == pod_name,
-                )
-                .values(lease_expires_at=expired)
-            )
-            db.commit()
-            reclaimed = int(getattr(result, "rowcount", 0) or 0)
-            if reclaimed:
-                logger.warning("scheduler DEAD_POD: pod=%s expired %s task leases", pod_name, reclaimed)
-                self._notify_worker_kill(pod_name, "__all__")
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Task dispatch
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _dispatch_loop(self) -> None:
-        _tick = 0
-        while self._running:
-            _tick += 1
-            try:
-                assigned = self._dispatch_pending_tasks()
-                if _tick % 12 == 0:
-                    logger.info(
-                        "scheduler heartbeat: dispatch_loop alive (tick=%s assigned=%s)",
-                        _tick, assigned,
-                    )
-                elif assigned:
-                    logger.info("scheduler dispatched %s tasks", assigned)
-            except Exception as exc:
-                logger.warning("scheduler dispatch error: %s", exc, exc_info=True)
-            time.sleep(DISPATCH_POLL_SECONDS)
-
-    def _dispatch_pending_tasks(self) -> int:
-        db_gen = get_db()
-        db: Session = next(db_gen)
-        assigned = 0
-        try:
-            now = now_local()
-            pending = (
-                db.query(AppEaTask)
-                .filter(
-                    AppEaTask.is_deleted.is_(False),
-                    AppEaTask.status == "pending",
-                    AppEaTask.owner_pod.is_(None),
-                    AppEaTask.cancel_requested.is_(False),
-                )
-                .order_by(AppEaTask.created_at.asc())
-                .limit(DISPATCH_BATCH_SIZE)
-                .all()
-            )
-            if not pending:
-                return 0
-
-            from app.db.models import AppEaWorkerSlot
-            from app.service.worker_slot_service import STALE_AFTER_SECONDS
-            cutoff = now - timedelta(seconds=STALE_AFTER_SECONDS)
-            workers = (
-                db.query(AppEaWorkerSlot)
-                .filter(
-                    AppEaWorkerSlot.runtime_role == "worker",
-                    AppEaWorkerSlot.last_heartbeat_at >= cutoff,
-                )
-                .all()
-            )
-            if not workers:
-                logger.warning("scheduler dispatch: no healthy workers")
-                return 0
-
-            running_counts: dict[str, int] = {}
-            for w in workers:
-                pod = str(w.pod_name or "").strip()
-                if pod:
-                    running_counts[pod] = len(self._get_pod_tasks(pod))
-
-            from app.service.task_service import (
-                TASK_EVENT_SOURCE_SYSTEM, _event_dedupe_key, _safe_create_task_event,
-            )
-            from sqlalchemy import update as _up
-
-            for task in pending:
-                best_worker = None
-                best_count = 999
-                for w in workers:
-                    pod = str(w.pod_name or "").strip()
-                    if not pod:
-                        continue
-                    count = running_counts.get(pod, 0)
-                    max_tasks = max(1, int(getattr(w, "max_concurrent_tasks", 1) or 1))
-                    if count < max_tasks and count < best_count:
-                        best_worker = pod
-                        best_count = count
-                if best_worker is None:
-                    break
-
-                lease = now + timedelta(seconds=300)
-                result = db.execute(
-                    _up(AppEaTask)
-                    .where(
-                        AppEaTask.id == task.id,
-                        AppEaTask.status == "pending",
-                        AppEaTask.owner_pod.is_(None),
-                        AppEaTask.cancel_requested.is_(False),
-                    )
-                    .values(
-                        status="running", owner_pod=best_worker,
-                        lease_expires_at=lease, started_at=now,
-                    )
-                )
-                if int(getattr(result, "rowcount", 0) or 0) != 1:
-                    continue
-
-                self._assign_task(task.task_id, best_worker)
-                running_counts[best_worker] = running_counts.get(best_worker, 0) + 1
-                _safe_create_task_event(
-                    db, task_id=task.task_id, project_id=task.project_id,
-                    event_type="task_dispatched",
-                    message=f"任务已由调度器分发给 {best_worker}",
-                    source=TASK_EVENT_SOURCE_SYSTEM, status="running",
-                    payload={"owner_pod": best_worker, "dispatch_mode": "scheduler",
-                              "lease_expires_at": lease.isoformat()},
-                    dedupe_key=_event_dedupe_key(task.task_id, "task_dispatched", best_worker, "scheduler"),
-                )
-                assigned += 1
-                logger.info("scheduler dispatched task %s to %s (load=%s)", task.task_id, best_worker, best_count + 1)
-            db.commit()
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-        return assigned
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Reconcile cluster state
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _reconcile_loop(self) -> None:
-        _tick = 0
-        while self._running:
-            _tick += 1
-            try:
-                changed = self._reconcile_cluster_state()
-                if _tick % 12 == 0:
-                    logger.info(
-                        "scheduler heartbeat: reconcile_loop alive (tick=%s changed=%s task_map=%s pod_map=%s)",
-                        _tick, changed, len(self._task_owner), len(self._pod_tasks),
-                    )
-                elif changed:
-                    logger.info("scheduler reconciled %s stale tasks", changed)
-            except Exception as exc:
-                logger.warning("scheduler reconcile failed: %s", exc, exc_info=True)
-            time.sleep(SCHEDULER_POLL_SECONDS)
-
-    def _reconcile_cluster_state(self) -> int:
-        from app.service.task_service import (
-            TASK_EVENT_SOURCE_SYSTEM, _event_dedupe_key, _record_abnormal_reason,
-            _safe_create_task_event, _sync_task_abnormal_reason,
-        )
-        from app.service.worker_slot_service import get_worker_slot_service
-
-        db_gen = get_db()
-        db: Session = next(db_gen)
-        try:
-            now = now_local()
-            changed = 0
-
-            terminal_rows = (
-                db.query(AppEaTask)
-                .filter(
-                    AppEaTask.is_deleted.is_(False),
-                    AppEaTask.status.in_(["passed", "failed", "error", "cancelled"]),
-                    or_(AppEaTask.owner_pod.is_not(None), AppEaTask.lease_expires_at.is_not(None), AppEaTask.cancel_requested.is_(True)),
-                ).all()
-            )
-            for row in terminal_rows:
-                row.owner_pod = None
-                row.lease_expires_at = None
-                row.cancel_requested = False
-                self._unassign_task(row.task_id)
-                changed += 1
-
-            cancelled_rows = (
-                db.query(AppEaTask)
-                .filter(
-                    AppEaTask.is_deleted.is_(False), AppEaTask.status == "running",
-                    AppEaTask.cancel_requested.is_(True),
-                    AppEaTask.lease_expires_at.is_not(None), AppEaTask.lease_expires_at < now,
-                ).all()
-            )
-            for row in cancelled_rows:
-                previous_owner = row.owner_pod
-                row.status = "cancelled"
-                row.finished_at = row.finished_at or now
-                row.owner_pod = None
-                row.lease_expires_at = None
-                row.cancel_requested = False
-                row.error = row.error or "任务已取消"
-                reason, changed_reason = _sync_task_abnormal_reason(row)
-                _record_abnormal_reason(row, reason, changed=changed_reason)
-                _safe_create_task_event(
-                    db, task_id=row.task_id, project_id=row.project_id,
-                    event_type="task_cancelled", message="调度器兜底取消",
-                    source=TASK_EVENT_SOURCE_SYSTEM, level="warning",
-                    status=row.status, payload={"owner_pod": previous_owner, "reason": "scheduler_reconcile"},
-                    dedupe_key=_event_dedupe_key(row.task_id, "task_cancelled", row.finished_at, "scheduler_reconcile"),
-                )
-                self._unassign_task(row.task_id)
-                changed += 1
-
-            pending_rows = (
-                db.query(AppEaTask)
-                .filter(
-                    AppEaTask.is_deleted.is_(False), AppEaTask.status == "pending",
-                    or_(AppEaTask.owner_pod.is_not(None), AppEaTask.lease_expires_at.is_not(None)),
-                ).all()
-            )
-            for row in pending_rows:
-                row.owner_pod = None
-                row.lease_expires_at = None
-                self._unassign_task(row.task_id)
-                changed += 1
-
-            reconciled, owner_alive = self._reconcile_expired_running_tasks(db, now)
-            changed += reconciled
-            if owner_alive:
-                logger.info("scheduler observed %s expired running tasks with live owners", owner_alive)
-            changed += get_worker_slot_service().cleanup_retired_workers(db)
-            if changed:
-                db.commit()
-            self._rebuild_maps_from_db(db)
-            return changed
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-
-    def _reconcile_expired_running_tasks(self, db: Session, now) -> tuple[int, int]:
-        from app.service.task_service import (
-            _alive_entry_analysis_owner_pods, _requeue_expired_running_tasks,
-            _requeue_invalid_owner_running_tasks, _worker_registry_pods,
-        )
-        alive_owner_pods = _alive_entry_analysis_owner_pods(db, now)
-        registry_pods = _worker_registry_pods(db, now)
-        grace_cutoff = now - timedelta(seconds=INVALID_OWNER_GRACE_PERIOD_SECONDS)
-        invalid_reconciled, invalid_owner_alive = _requeue_invalid_owner_running_tasks(
-            db, now, limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
-            scheduler_instance="scheduler", alive_owner_pods=alive_owner_pods,
-            worker_registry_pods=registry_pods, started_before=grace_cutoff,
-        )
-        if invalid_reconciled:
-            for task_id in list(self._task_owner.keys()):
-                if self._task_owner[task_id] not in registry_pods:
-                    self._unassign_task(task_id)
-        reconciled, owner_alive = _requeue_expired_running_tasks(
-            db, now, limit=EXPIRED_RUNNING_RECONCILE_BATCH_SIZE,
-            scheduler_instance="scheduler", alive_owner_pods=alive_owner_pods,
-        )
-        _expired_running_reconcile_stats.observe(
-            reconciled=reconciled, owner_alive=owner_alive,
-            invalid_reconciled=invalid_reconciled, invalid_owner_alive=invalid_owner_alive,
-        )
-        return reconciled + invalid_reconciled, owner_alive + invalid_owner_alive
-
-    def runtime_reconcile_stats_snapshot(self) -> dict[str, int]:
-        return _expired_running_reconcile_stats.snapshot()
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Start / Stop
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def start(self) -> None:
-        if self._running:
+    def _requeue_tasks(self, task_ids: set[str], reason: str) -> None:
+        if not task_ids:
             return
-        self._running = True
         db_gen = get_db()
         db: Session = next(db_gen)
         try:
-            self._rebuild_maps_from_db(db)
+            rows = (
+                db.query(AppEaTask)
+                .filter(AppEaTask.task_id.in_(list(task_ids)),
+                        AppEaTask.status == "running")
+                .limit(RECLAIM_BATCH_SIZE)
+                .all()
+            )
+            for row in rows:
+                row.status = "pending"
+                row.owner_pod = None
+                row.owner_pod_ip = None
+                row.lease_expires_at = None
+                row.error = (row.error or f"requeued: {reason}")
+            if rows:
+                db.commit()
         finally:
             try:
                 next(db_gen)
             except StopIteration:
                 pass
-        self._threads = [
-            threading.Thread(target=self._command_loop, daemon=True, name="ea_cmd_loop"),
-            threading.Thread(target=self._reconcile_loop, daemon=True, name="ea_reconcile"),
-            threading.Thread(target=self._pod_health_loop, daemon=True, name="ea_health"),
-            threading.Thread(target=self._dispatch_loop, daemon=True, name="ea_dispatch"),
-        ]
-        for t in self._threads:
-            t.start()
-        logger.info(
-            "scheduler started (poll=%ss cmd=%ss health=%ss dispatch=%ss)",
-            SCHEDULER_POLL_SECONDS, COMMAND_POLL_SECONDS, POD_HEALTH_CHECK_SECONDS, DISPATCH_POLL_SECONDS,
-        )
 
-    def stop(self) -> None:
-        self._running = False
-        for t in self._threads:
-            t.join(timeout=5)
+    # ── 注册表/发送 工具 ────────────────────────────────────────────────────
+    def _has_free_worker(self) -> bool:
+        with self._reg_lock:
+            return any(w.free_slots > 0 and not w.closed for w in self._workers.values())
 
-    def is_running(self) -> bool:
-        return self._running
+    def _pick_worker(self) -> Optional[str]:
+        with self._reg_lock:
+            candidates = [(w.free_slots, w.pod) for w in self._workers.values()
+                          if w.free_slots > 0 and not w.closed]
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
+    def _owner_of(self, task_id: str) -> Optional[str]:
+        with self._reg_lock:
+            return self._task_owner.get(task_id)
+
+    def _send_to(self, pod: str, msg: dict) -> bool:
+        with self._reg_lock:
+            w = self._workers.get(pod)
+        if w is None or w.closed:
+            return False
+        with w.send_lock:
+            try:
+                w.conn.sendall((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+                return True
+            except OSError:
+                # 连接已断：触发回收（标记 last_seen 为 0，下个 reclaim 周期清掉）
+                with self._reg_lock:
+                    ww = self._workers.get(pod)
+                    if ww is not None:
+                        ww.last_seen = 0.0
+                return False
 
 
-_scheduler_service: Optional[SchedulerService] = None
+_scheduler: Optional[SchedulerService] = None
 
 
 def get_scheduler_service() -> SchedulerService:
-    global _scheduler_service
-    if _scheduler_service is None:
-        _scheduler_service = SchedulerService()
-    return _scheduler_service
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = SchedulerService()
+    return _scheduler

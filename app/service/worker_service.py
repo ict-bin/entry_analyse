@@ -612,55 +612,61 @@ class WorkerHealthSnapshot:
         return max(0.0, time.time() - self.last_success_at)
 
 
+def _task_roots_from_row(task_id: str, output_path: str | None, input_path: str | None) -> list[str]:
+    """Compute task filesystem roots for process cleanup matching."""
+    roots: list[str] = []
+    if output_path:
+        task_root = os.path.join(output_path, task_id)
+        roots.extend([
+            task_root,
+            os.path.join(task_root, "run"),
+            os.path.join(task_root, "run", "sessions"),
+            os.path.join(task_root, "output"),
+        ])
+    if input_path:
+        roots.append(input_path)
+    return roots
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WorkerService
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WorkerService（架构 v3）—— 瘦控制进程外壳
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# v3 进程模型：worker 主进程 = 控制进程（WorkerControl），不再跑引擎。
+# 任务 = 独立子进程（app.task_runner），由控制进程 Popen 拉起、killpg 终止。
+# 详见 app/service/worker_control.py 与 app/task_runner.py。
+#
+# 本类是保留给历史调用方的薄外壳：
+#   - start/stop/is_running → 委托 WorkerControl。
+#   - 智能体进程注册表（register/unregister/mark_live_agent_process）→ 进程内本地字典
+#     （在 task_runner 子进程里也成立，供该任务进程内的观测/槽位使用）。
+#   - force_kill* → 复用模块级 _kill_all_task_processes / force_kill_all_pi_processes 实现，
+#     用于孤儿 pi 进程清理（任务级终止由控制进程 killpg 负责）。
+#   - 删除：_execute_task / _dispatch_loop / _poll_assigned_task / 续租 / cancel-watch /
+#     health-server(PID探针) / heartbeat-subprocess / idle_pi_reaper —— 全部不再需要。
+
+from app.service.worker_control import WorkerControl
+
+
 class WorkerService:
-    """Entry-analysis task executor — one task at a time."""
+    """瘦控制进程外壳。runtime_role=worker 时启动控制进程。"""
 
     def __init__(self) -> None:
         self._running = False
-        self._infra_stop = threading.Event()
+        self._control = WorkerControl()
 
-        # Threads
-        self._dispatch_thread: threading.Thread | None = None
-        self._health_server_thread: threading.Thread | None = None
-        self._idle_pi_reaper_thread: threading.Thread | None = None
-        self._health_server_httpd: ThreadingHTTPServer | None = None
-        self._health_server_lock = threading.Lock()
-        self._health_server_stop = threading.Event()
-
-        # Single-task tracking
-        self._local_task_ids: set[str] = set()
-        self._task_abort_callbacks: dict[str, Callable[[], None]] = {}
-        self._task_lease_started_at: dict[str, float] = {}
-
-        # Agent process registry (used by runner.py)
+        # 智能体进程注册表（进程内本地；runner.py 在本进程/子进程内调用）
         self._agent_registry_lock = threading.Lock()
         self._live_agent_processes: dict[int, dict[str, Any]] = {}
         self._suspected_orphans: dict[int, dict[str, Any]] = {}
 
-        # Health
-        self._health = WorkerHealthSnapshot()
-        self._last_idle_pi_reaper_at: float | None = None
-        self._last_idle_pi_reaper_killed_count: int = 0
-        self._idle_pi_reaper_runs_total: int = 0
-        self._idle_pi_reaper_killed_pids_total: int = 0
-        self._idle_pi_reaper_failures_total: int = 0
-
-        # Heartbeat subprocess
-        self._heartbeat_proc: subprocess.Popen | None = None
-
-        # Main event loop reference (from asyncio context at startup)
-        self._main_event_loop: asyncio.AbstractEventLoop | None = None
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Public API
-    # ═══════════════════════════════════════════════════════════════════════
-
+    # ── 生命周期（委托控制进程）──────────────────────────────────────────
     def start(self) -> None:
-        """Start the worker: health server + heartbeat subprocess + dispatch loop."""
         if self._running:
             return
         if WORKER_RUNTIME_ROLE != RUNTIME_ROLE_WORKER:
@@ -669,83 +675,45 @@ class WorkerService:
                 WORKER_RUNTIME_ROLE, RUNTIME_ROLE_WORKER,
             )
             return
-
-        logger.info(
-            "worker starting: pod=%s role=%s", POD_NAME, WORKER_RUNTIME_ROLE,
-        )
         self._running = True
-        self._infra_stop.clear()
-
-        # Capture the main asyncio event loop (for cross-thread dispatch)
-        try:
-            self._main_event_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._main_event_loop = None
-
-        # 1. Start health HTTP server (thread)
-        self._start_health_server()
-
-        # 2. Start heartbeat subprocess (independent, writes AppEaWorkerSlot)
-        self._start_heartbeat_subprocess()
-
-        # 3. Start dispatch loop (thread)
-        self._dispatch_thread = threading.Thread(
-            target=self._dispatch_loop,
-            name="ea_worker_dispatch",
-            daemon=True,
-        )
-        self._dispatch_thread.start()
-        if IDLE_PI_REAPER_ENABLED:
-            self._idle_pi_reaper_thread = threading.Thread(
-                target=self._idle_pi_reaper_loop,
-                name="ea_idle_pi_reaper",
-                daemon=True,
-            )
-            self._idle_pi_reaper_thread.start()
-
-        self._health.bootstrapped = True
-        self._health.startup_phase = "ready"
-        self._health.probe_safe_ready = True
-        logger.info(
-            "worker started: pod=%s poll=%ss", POD_NAME, WORKER_POLL_SECONDS,
-        )
+        self._control.start()
+        logger.info("worker(control) started: pod=%s", POD_NAME)
 
     def stop(self) -> None:
-        """Stop the worker gracefully."""
         self._running = False
-        self._health.shutting_down = True
-        self._health.probe_safe_ready = False
-        self._infra_stop.set()
-
-        # Abort running task
-        for task_id, abort in list(self._task_abort_callbacks.items()):
-            try:
-                abort()
-            except Exception:
-                pass
-
-        # Wait for dispatch thread
-        if self._dispatch_thread and self._dispatch_thread.is_alive():
-            self._dispatch_thread.join(timeout=3.0)
-        if self._idle_pi_reaper_thread and self._idle_pi_reaper_thread.is_alive():
-            self._idle_pi_reaper_thread.join(timeout=3.0)
-
-        # Stop heartbeat subprocess
-        self._stop_heartbeat_subprocess()
-
-        # Stop health server
-        self._stop_health_server()
-
-        logger.info("worker stopped: pod=%s", POD_NAME)
+        self._control.stop()
+        logger.info("worker(control) stopped: pod=%s", POD_NAME)
 
     def is_running(self) -> bool:
         return self._running
 
+    # ── 任务计数（供观测/调度查询）──────────────────────────────────────
     def local_running_count(self) -> int:
-        return 1 if self._local_task_ids else 0
+        with self._control._lock:
+            return len(self._control._tasks)
 
     def claimed_running_task_count(self) -> int:
         return self.local_running_count()
+
+    def has_local_task(self, task_id: str) -> bool:
+        with self._control._lock:
+            return task_id in self._control._tasks
+
+    # ── 智能体进程注册表（进程内本地，runner.py 调用）────────────────────
+    def register_live_agent_process(self, pid: int, info: dict[str, Any]) -> None:
+        with self._agent_registry_lock:
+            self._live_agent_processes[int(pid)] = dict(info)
+
+    def mark_live_agent_process_terminating(self, pid: int, **extra: Any) -> None:
+        with self._agent_registry_lock:
+            rec = self._live_agent_processes.get(int(pid))
+            if rec is not None:
+                rec["terminating"] = True
+                rec.update(extra)
+
+    def unregister_live_agent_process(self, pid: int) -> None:
+        with self._agent_registry_lock:
+            self._live_agent_processes.pop(int(pid), None)
 
     def snapshot_live_agent_processes(self) -> list[dict[str, Any]]:
         with self._agent_registry_lock:
@@ -765,40 +733,29 @@ class WorkerService:
                     continue
                 orphan = self._suspected_orphans.get(pid)
                 if orphan is None:
-                    self._suspected_orphans[pid] = {
-                        "first_detected_at": current,
-                        "last_detected_at": current,
-                    }
+                    self._suspected_orphans[pid] = {"first_detected_at": current, "last_detected_at": current}
                 else:
                     orphan["last_detected_at"] = current
-            missing = [pid for pid in self._suspected_orphans if pid not in normalized]
-            for pid in missing:
+            for pid in [p for p in self._suspected_orphans if p not in normalized]:
                 self._suspected_orphans.pop(pid, None)
 
     def last_idle_pi_reaper_state(self) -> dict[str, Any]:
+        # idle pi reaper 已移除（控制进程模型下任务进程隔离，无需 pod 级清理）
         return {
-            "last_idle_pi_reaper_at": self._last_idle_pi_reaper_at,
-            "last_idle_pi_reaper_killed_count": self._last_idle_pi_reaper_killed_count,
-            "idle_pi_reaper_runs_total": self._idle_pi_reaper_runs_total,
-            "idle_pi_reaper_killed_pids_total": self._idle_pi_reaper_killed_pids_total,
-            "idle_pi_reaper_failures_total": self._idle_pi_reaper_failures_total,
+            "last_idle_pi_reaper_at": None,
+            "last_idle_pi_reaper_killed_count": 0,
+            "idle_pi_reaper_runs_total": 0,
+            "idle_pi_reaper_killed_pids_total": 0,
+            "idle_pi_reaper_failures_total": 0,
         }
 
-    def has_local_task(self, task_id: str) -> bool:
-        return task_id in self._local_task_ids
-
+    # ── 进程清理（复用模块级实现，用于孤儿 pi 清理 / 取消兜底）──────────
     def force_kill_task_processes(self, task_id: str) -> int:
-        """Force-kill ALL pi+python processes belonging to a task.
+        """杀掉某任务名下的所有 pi+python 进程（孤儿清理 / 兜底用）。
 
-        Called from the cancel HTTP server handler (port 3001) and can
-        run in any thread.  Does NOT depend on the asyncio event loop —
-        works even when the main loop is stuck in a long-running tree-sitter
-        parse or DB transaction.
-
-        Returns number of processes killed.
+        注意：v3 下任务级终止权威由控制进程 killpg 负责；此方法用于
+        DB 侧兜底（如任务记录残留、孤儿进程），扫描 /proc 按 task_roots/cmdline 清理。
         """
-        # Derive task roots from DB (the task may be running or recently
-        # cancelled — we still want to clean up its processes).
         task_roots: list[str] = []
         try:
             db_gen = get_db()
@@ -806,25 +763,22 @@ class WorkerService:
             try:
                 row = db.query(AppEaTask).filter_by(task_id=task_id).first()
                 if row is not None:
-                    from app.service.task_service import _task_runtime_roots
-                    task_roots = _task_runtime_roots(row)
+                    task_roots = _task_roots_from_row(
+                        row.task_id, row.output_path, row.input_path,
+                    )
             finally:
-                try:
+                with contextlib.suppress(StopIteration):
                     next(db_gen)
-                except StopIteration:
-                    pass
         except Exception as exc:
-            logger.warning(
-                "force_kill: DB lookup failed for %s: %s",
-                task_id, exc,
-            )
-
+            logger.warning("force_kill_task_processes: DB lookup failed %s: %s", task_id, exc)
         _close_task_fds(task_roots=task_roots, task_id=task_id)
-        return _kill_all_task_processes(
-            task_id=task_id, task_roots=task_roots,
-        )
+        return _kill_all_task_processes(task_id=task_id, task_roots=task_roots)
 
     def force_kill_all_pi_processes(self, *, reason: str = "", task_id: str | None = None) -> dict[str, Any]:
+        """杀掉本 pod 所有 pi/node 子进程（排除自身与基础设施进程）。
+
+        v3 下主要用于：控制进程拉起新任务前的预清理、观测侧孤儿清理。
+        """
         start = time.monotonic()
         main_pid = os.getpid()
         main_ppid = os.getppid()
@@ -853,1187 +807,67 @@ class WorkerService:
                 continue
             if pid == main_pid or pid == main_ppid or ppid == main_pid:
                 continue
-            if any(keyword in cmd for keyword in ("kill_server.py", "heartbeat_proc.py", "probe_process", "lease_renewer.py", "main.py")):
+            if any(kw in cmd for kw in ("kill_server.py", "heartbeat_proc.py", "probe_process",
+                                        "lease_renewer.py", "main.py", "task_runner")):
                 continue
-            matched_processes.append(
-                {
-                    "pid": pid,
-                    "ppid": ppid,
-                    "pgid": pgid,
-                    "comm": comm,
-                    "exe": exe,
-                    "cwd": cwd,
-                    "cmd": cmd[:500],
-                }
-            )
+            matched_processes.append({"pid": pid, "ppid": ppid, "pgid": pgid, "comm": comm,
+                                      "exe": exe, "cwd": cwd, "cmd": cmd[:500]})
             if pgid is not None and pgid > 1:
                 pgid_targets.add(int(pgid))
             else:
                 pid_targets.add(pid)
         for pgid in sorted(pgid_targets):
             try:
-                os.killpg(pgid, signal.SIGKILL)
-                killed_pgids.add(pgid)
-            except ProcessLookupError:
-                continue
-            except Exception as exc:
-                failed_pids.append({"pgid": pgid, "reason": str(exc)})
+                os.killpg(pgid, signal.SIGKILL); killed_pgids.add(pgid)
+            except (ProcessLookupError, Exception) as exc:
+                if not isinstance(exc, ProcessLookupError):
+                    failed_pids.append({"pgid": pgid, "reason": str(exc)})
         for pid in sorted(pid_targets):
             try:
-                os.kill(pid, signal.SIGKILL)
-                killed_pids.add(pid)
-            except ProcessLookupError:
-                continue
-            except Exception as exc:
-                failed_pids.append({"pid": pid, "reason": str(exc)})
+                os.kill(pid, signal.SIGKILL); killed_pids.add(pid)
+            except (ProcessLookupError, Exception) as exc:
+                if not isinstance(exc, ProcessLookupError):
+                    failed_pids.append({"pid": pid, "reason": str(exc)})
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            remaining = [
-                item for item in matched_processes
-                if _pl.Path(f"/proc/{int(item['pid'])}").exists()
-            ]
-            if not remaining:
+            if not any(_pl.Path(f"/proc/{int(it['pid'])}").exists() for it in matched_processes):
                 break
             time.sleep(0.05)
         result = {
-            "reason": reason or "unspecified",
-            "task_id": task_id,
+            "reason": reason or "unspecified", "task_id": task_id,
             "matched_processes": matched_processes,
-            "killed_pid_count": len(killed_pids),
-            "killed_pgid_count": len(killed_pgids),
-            "failed_pids": failed_pids,
-            "duration_ms": round((time.monotonic() - start) * 1000, 2),
+            "killed_pid_count": len(killed_pids), "killed_pgid_count": len(killed_pgids),
+            "failed_pids": failed_pids, "duration_ms": round((time.monotonic() - start) * 1000, 2),
         }
         logger.warning(
-            "force_kill_all_pi_processes done: reason=%s task_id=%s matched=%s killed_pid_count=%s killed_pgid_count=%s failed=%s duration_ms=%s",
-            result["reason"],
-            task_id,
-            len(matched_processes),
-            result["killed_pid_count"],
-            result["killed_pgid_count"],
-            len(failed_pids),
-            result["duration_ms"],
+            "force_kill_all_pi_processes done: reason=%s task_id=%s matched=%s killed_pid=%s killed_pgid=%s",
+            result["reason"], task_id, len(matched_processes),
+            result["killed_pid_count"], result["killed_pgid_count"],
         )
         return result
 
-    def _has_owned_running_task_in_db(self) -> bool:
-        db_gen = get_db()
-        db = next(db_gen)
+    def revalidate_kill_eligibility(self, pid: int) -> tuple[bool, str]:
+        """观测侧：复核某 pid 是否可杀（非自身/非基础设施）。"""
         try:
-            row = (
-                db.query(AppEaTask.task_id)
-                .filter(
-                    AppEaTask.is_deleted.is_(False),
-                    AppEaTask.status == "running",
-                    AppEaTask.owner_pod == POD_NAME,
-                )
-                .first()
-            )
-            return row is not None
-        finally:
-            with contextlib.suppress(StopIteration):
-                next(db_gen)
-
-    def _worker_idle_for_pi_reaping(self) -> bool:
-        return (
-            not self._local_task_ids
-            and self.claimed_running_task_count() == 0
-            and not self._has_owned_running_task_in_db()
-        )
-
-    def _idle_pi_reaper_loop(self) -> None:
-        while self._running and not self._infra_stop.wait(timeout=IDLE_PI_REAPER_INTERVAL_SECONDS):
-            self._idle_pi_reaper_runs_total += 1
-            if not self._worker_idle_for_pi_reaping():
-                continue
-            logger.info("idle_pi_reaper_scan_started: pod=%s", POD_NAME)
-            try:
-                result = self.force_kill_all_pi_processes(reason="idle_worker_reaper")
-                self._last_idle_pi_reaper_at = time.time()
-                self._last_idle_pi_reaper_killed_count = int(result.get("killed_pid_count") or 0)
-                self._idle_pi_reaper_killed_pids_total += self._last_idle_pi_reaper_killed_count
-                logger.info(
-                    "idle_pi_reaper_cleanup_finished: pod=%s killed_pid_count=%s failed=%s",
-                    POD_NAME,
-                    self._last_idle_pi_reaper_killed_count,
-                    len(result.get("failed_pids") or []),
-                )
-            except Exception as exc:
-                self._idle_pi_reaper_failures_total += 1
-                logger.warning("idle_pi_reaper_cleanup_failed: pod=%s error=%s", POD_NAME, exc)
-
-    def start_task(self, task_id: str) -> threading.Thread:
-        """Start a task in its own thread with a dedicated asyncio event loop.
-
-        Called by task_service._dispatch_pending_tasks after atomic claim.
-        """
-        if WORKER_RUNTIME_ROLE != RUNTIME_ROLE_WORKER:
-            raise RuntimeError(
-                f"non-worker pod cannot start tasks: role={WORKER_RUNTIME_ROLE}"
-            )
-
-        # Already running this task
-        if task_id in self._local_task_ids:
-            t = next(
-                (th for th in threading.enumerate()
-                 if th.name == f"ea_task_{task_id}"), None,
-            )
-            if t is not None and t.is_alive():
-                return t
-
-        # Clean up stale task_ids
-        done = [
-            tid for tid in self._local_task_ids
-            if not any(th.name == f"ea_task_{tid}" and th.is_alive()
-                       for th in threading.enumerate())
-        ]
-        for tid in done:
-            self._local_task_ids.discard(tid)
-
-        def _run_task() -> None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._execute_task(task_id))
-            except Exception as exc:
-                logger.error(
-                    "task thread failed: task=%s error=%s", task_id, exc,
-                    exc_info=True,
-                )
-            finally:
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-                self._local_task_ids.discard(task_id)
-
-        t = threading.Thread(
-            target=_run_task,
-            name=f"ea_task_{task_id}",
-            daemon=True,
-        )
-        self._local_task_ids.add(task_id)
-        t.start()
-        return t
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Dispatch loop
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _dispatch_loop(self) -> None:
-        """Poll for tasks assigned to this pod by the scheduler.
-
-        The scheduler sets owner_pod=POD_NAME + status=running + lease_expires_at.
-        This loop picks up such tasks and starts executing them.
-        """
-        while self._running and not self._infra_stop.wait(timeout=WORKER_POLL_SECONDS):
-            if self._local_task_ids:
-                continue  # busy with a task
-
-            try:
-                task_id = self._poll_assigned_task()
-                if task_id:
-                    logger.info(
-                        "worker picked up scheduler-assigned task: %s", task_id,
-                    )
-                    self.start_task(task_id)
-            except Exception as exc:
-                logger.warning("dispatch loop error: %s", exc)
-
-    def _poll_assigned_task(self) -> str | None:
-        """Find a task assigned to this pod by the scheduler.
-
-        Returns task_id if found, None otherwise.
-        """
-        db_gen = get_db()
-        db = next(db_gen)
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False, "invalid_pid"
+        if pid <= 1 or pid == os.getpid():
+            return False, "self_or_init"
         try:
-            from app.db.models import AppEaTask as _T
-            from app.time_utils import now_local as _nl
-            now = _nl()
-            row = (
-                db.query(_T.task_id)
-                .filter(
-                    _T.is_deleted.is_(False),
-                    _T.status == "running",
-                    _T.owner_pod == POD_NAME,
-                    _T.cancel_requested.is_(False),
-                    _T.lease_expires_at.is_not(None),
-                    _T.lease_expires_at > now,
-                )
-                .order_by(_T.started_at.asc())
-                .first()
-            )
-            return str(row[0]) if row else None
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
+            comm = _pl.Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+            exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+            cmd = _pl.Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        except (FileNotFoundError, ProcessLookupError, OSError):
+            return False, "process_gone"
+        is_pi = comm == "pi" or exe == "node"
+        if not is_pi:
+            return False, f"not_pi:{comm}"
+        if any(kw in cmd for kw in ("kill_server.py", "heartbeat_proc.py", "probe_process",
+                                    "lease_renewer.py", "main.py", "task_runner")):
+            return False, "infrastructure"
+        return True, "ok"
 
-    async def _claim_and_start_legacy(self, svc, project_id: str) -> None:
-        """Legacy self-claim dispatch (fallback)."""
-        try:
-            svc.schedule_dispatch(project_id)
-        except Exception as exc:
-            logger.warning("legacy dispatch failed for %s: %s", project_id, exc)
-
-    async def _schedule_dispatch_async(self, svc, project_id: str) -> None:
-        """Async wrapper so schedule_dispatch works from a thread."""
-        svc.schedule_dispatch(project_id)
-
-    def _discover_active_projects(self) -> list[str]:
-        """Return distinct project_ids that have pending tasks."""
-        db_gen = get_db()
-        db = next(db_gen)
-        try:
-            from app.db.models import AppEaTask as _T
-            rows = (
-                db.query(_T.project_id)
-                .filter(_T.is_deleted.is_(False), _T.status == "pending")
-                .distinct()
-                .all()
-            )
-            return [str(r[0]) for r in rows if r and r[0]]
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Task execution — the core
-    # ═══════════════════════════════════════════════════════════════════════
-
-    async def _execute_task(self, task_id: str) -> None:
-        """Run one task from claim to completion/cancellation.
-
-        Flow:
-          1. Environment reset: kill all pi+python processes for this task.
-          2. DB: set status=running, owner, lease.
-          3. Start lease renewal (update lease_expires_at in DB every 30s).
-          4. Start cancel watch (poll DB cancel_requested every 3s).
-          5. Run Orchestrator.execute() — the R1~R6 pipeline.
-          6. Environment reset: kill all pi+python processes.
-          7. DB: set final status (passed/failed/cancelled).
-        """
-        from app.service import task_service as task_mod
-
-        event_buffer: list[dict] = []
-        task_roots: list[str] = []
-        cancel_requested = False
-        preflight_cleanup_result: dict[str, Any] | None = None
-        last_progress_time = time.time()
-        _progress_lock = threading.Lock()
-        # 本地事件文件：写在 run/ 目录下，与 pipeline_state.json 同级。
-        # API Pod 通过 PVC 读取，Worker 不再推送 MySQL。
-        _events_path: _pl.Path | None = None
-
-        def _on_event(event: Any) -> None:
-            nonlocal last_progress_time
-            ts = task_mod._time.time()
-            entry = {"ts": ts, "type": event.type, "data": dict(getattr(event, "data", {}))}
-            event_buffer.append(entry)
-            # 写本地 JSONL（output_path 和 PVC 双写，API 读 PVC）
-            _line = json.dumps(entry, ensure_ascii=False) + "\n"
-            _seen: set[str] = set()
-            for _p in (_events_path, _events_path_pvc):
-                if _p is None:
-                    continue
-                _resolved = str(_p.resolve()) if hasattr(_p, 'resolve') else str(_p)
-                if _resolved in _seen:
-                    continue
-                _seen.add(_resolved)
-                try:
-                    _p.parent.mkdir(parents=True, exist_ok=True)
-                    with open(str(_p), "a", encoding="utf-8") as _ef:
-                        _ef.write(_line)
-                        _ef.flush()
-                except Exception:
-                    pass
-            with _progress_lock:
-                last_progress_time = time.time()
-
-        # ── Step 0: Claim the task in DB ──────────────────────────────────
-        db_gen = get_db()
-        db = next(db_gen)
-        try:
-            row = (
-                db.query(AppEaTask)
-                .filter_by(task_id=task_id)
-                .first()
-            )
-            if not row or row.status == "cancelled" or row.cancel_requested:
-                return
-            row.status = "running"
-            row.owner_pod = POD_NAME
-            row.owner_pod_ip = POD_IP or None
-            row.lease_expires_at = task_mod._lease_deadline()
-            row.started_at = now_local()
-            db.commit()
-
-            svc = task_mod._load_svc_config(db)
-            tcfg = task_mod._parse_task_config(row.task_config_json)
-            svc = task_mod._apply_task_config_overrides(svc, tcfg)
-            if row.output_path:
-                svc.output_dir = row.output_path
-            task_snapshot = SimpleNamespace(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                prompt_content=row.prompt_content,
-                input_path=row.input_path,
-                source_path=row.source_path,
-                module_name=row.module_name,
-                output_path=row.output_path,
-                status=row.status,
-                task_config_json=tcfg,
-            )
-            project_id = row.project_id
-            task_roots = _task_roots_from_row(
-                row.task_id, row.output_path, row.input_path,
-            )
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-
-        # ── Step 1: Environment reset (clean before starting) ─────────────
-        _t1_start = time.monotonic()
-        logger.info(
-            "_execute_task STEP1 cleanup_start: task=%s roots=%s",
-            task_id, [str(r) for r in task_roots],
-        )
-        if task_roots:
-            if FORCE_KILL_ALL_PI_ON_TASK_START:
-                preflight_cleanup_result = self.force_kill_all_pi_processes(
-                    reason="task_preflight",
-                    task_id=task_id,
-                )
-            killed = _kill_all_task_processes(
-                task_id=task_id, task_roots=task_roots,
-            )
-            closed = _close_task_fds(
-                task_roots=task_roots, task_id=task_id,
-            )
-            logger.info(
-                "_execute_task STEP1 cleanup_done: task=%s killed=%s closed_fds=%s duration=%.2fs",
-                task_id, killed, closed, time.monotonic() - _t1_start,
-            )
-        else:
-            logger.info(
-                "_execute_task STEP1 cleanup_skipped: task=%s (no task_roots)",
-                task_id,
-            )
-
-        # ── Step 2: Reset disk (clean run/ and output/ dirs) ──────────────
-        if task_snapshot.output_path:
-            task_dir = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id
-            for subdir in ("run", "output"):
-                d = task_dir / subdir
-                _rmtree_nfs_safe(str(d), task_id=task_id, subdir=subdir)
-                d.mkdir(parents=True, exist_ok=True)
-
-        # 初始化事件文件：写在 PVC 路径（API Pod 可读），同时写 output_path（本地）
-        _events_path: _pl.Path | None = None
-        _events_path_pvc: _pl.Path | None = None
-        if task_snapshot.output_path:
-            _events_path = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id / "run" / "events.jsonl"
-        if project_id:
-            _events_path_pvc = _pl.Path("/data/files") / project_id / "app" / "secflow-app-entry-analyse" / task_id / "run" / "events.jsonl"
-
-        # DB: clear runtime fields, stage_result_index
-        _db2_gen = get_db()
-        _db2 = next(_db2_gen)
-        try:
-            _r2 = _db2.query(AppEaTask).filter_by(task_id=task_id).first()
-            if _r2:
-                _r2.result_json = None
-                _r2.error = None
-                _r2.finished_at = None
-                _db2.commit()
-            _db2.query(AppEaStageResultIndex).filter(
-                AppEaStageResultIndex.task_id == task_id,
-            ).delete(synchronize_session=False)
-            _db2.commit()
-        finally:
-            try:
-                next(_db2_gen)
-            except StopIteration:
-                pass
-
-        # DB: emit task_started
-        _db3_gen = get_db()
-        _db3 = next(_db3_gen)
-        try:
-            _r3 = (
-                _db3.query(AppEaTask)
-                .filter_by(task_id=task_id)
-                .filter(AppEaTask.owner_pod == POD_NAME)
-                .first()
-            )
-            if _r3 and _r3.status == "running":
-                task_mod._safe_create_task_event(
-                    _db3,
-                    task_id=_r3.task_id,
-                    project_id=_r3.project_id,
-                    event_type="task_started",
-                    message="任务已开始执行",
-                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
-                    status=_r3.status,
-                    payload={
-                        "owner_pod": POD_NAME,
-                        "preflight_pi_cleanup": preflight_cleanup_result,
-                    },
-                    dedupe_key=task_mod._event_dedupe_key(
-                        _r3.task_id, "task_started", POD_NAME,
-                    ),
-                )
-                _db3.commit()
-        finally:
-            try:
-                next(_db3_gen)
-            except StopIteration:
-                pass
-
-        # ── Step 3: Build config & orchestrator ───────────────────────────
-        cfg = build_task_config(
-            svc, task_snapshot.prompt_content,
-            cwd=task_snapshot.input_path,
-            module_name=task_snapshot.module_name or "",
-            source_path=task_snapshot.source_path or "",
-            resume_task_id=tcfg.get("resume_task_id", ""),
-        )
-        task_root = str(Path(task_snapshot.output_path or "") / task_id) if task_snapshot.output_path else ""
-
-        # ── 先同步 models.json 到全局目录，再 materialize 到 per-role 目录 ──
-        # 新 Pod 启动时 /root/.pi/agent/models.json 尚不存在，
-        # 如果 _materialize_task_pi_runtime 在 sync 前执行，per-role dir 的
-        # models.json 会被写成 {"providers":{}}，导致后续 pi 找不到模型。
-        try:
-            from app.service.svc_config import get_service_yaml as _svc_yaml
-            _yaml = _svc_yaml()
-            await sync_providers_to_pi(
-                base_url=_yaml.configcenter.base_url,
-                token=_yaml.auth_service.service_machine_token,
-                timeout=_yaml.configcenter.timeout,
-            )
-        except Exception as _sync_err:
-            logger.warning("_execute_task pre-materialize sync failed: %s", _sync_err)
-
-        agent_task_key = _task_agent_key(tcfg)
-        task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(
-            agent_task_key=agent_task_key,
-        )
-        cfg.task_pi_dirs = dict(task_pi_dirs)
-        cfg.task_pi_dir = str(task_pi_dirs.get("workers", os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")))
-        (
-            agent_auth_json,
-            role_config_snapshot,
-            provider_runtime_summary,
-            llm_binding_snapshot,
-        ) = _build_runtime_config_snapshots(
-            cfg=cfg,
-            agent_task_key=agent_task_key,
-            task_pi_dirs=task_pi_dirs,
-            agent_runtime_mode=agent_runtime_mode,
-        )
-        _db_cfg_gen = get_db()
-        _db_cfg = next(_db_cfg_gen)
-        try:
-            _row_cfg = (
-                _db_cfg.query(AppEaTask)
-                .filter(
-                    AppEaTask.task_id == task_id,
-                    AppEaTask.owner_pod == POD_NAME,
-                )
-                .first()
-            )
-            if _row_cfg is not None and _row_cfg.status == "running":
-                _task_config_json = task_mod._parse_task_config(_row_cfg.task_config_json)
-                _row_cfg.task_config_json = {
-                    **_task_config_json,
-                    "agent_auth_json": agent_auth_json,
-                    "role_config_snapshot": role_config_snapshot,
-                    "provider_runtime_summary": provider_runtime_summary,
-                    "llm_binding_snapshot": llm_binding_snapshot,
-                    "agent_runtime_mode": agent_runtime_mode,
-                    "role_runtime_dirs": dict(task_pi_dirs),
-                }
-                _db_cfg.commit()
-        finally:
-            try:
-                next(_db_cfg_gen)
-            except StopIteration:
-                pass
-        orch = Orchestrator(config=cfg, on_event=_on_event)
-        self._task_abort_callbacks[task_id] = orch.abort
-        self._task_lease_started_at[task_id] = time.time()
-
-        # ── Step 4: Lease renewal (thread + independent subprocess) ──────
-        stop_lease = threading.Event()
-        lease_proc = None
-
-        # 4a. Independent subprocess (pymysql, survives worker crash)
-        lease_proc = _start_lease_renewer_subprocess(task_id, stop_lease)
-
-        # 4b. In-thread renewal as primary (updates lease_expires_at directly)
-        def _renew_lease() -> None:
-            failures = 0
-            while not stop_lease.wait(timeout=LEASE_RENEW_INTERVAL_SECONDS):
-                # ── Pipeline progress watchdog ───────────────────────────
-                with _progress_lock:
-                    stall_seconds = time.time() - last_progress_time
-                # Entry analysis can spend time inside agents without
-                # producing incremental progress events; keep the watchdog as a
-                # last-resort hang protection. 1h is enough since events are
-                # emitted frequently (R1/R3/R4/R5 stage transitions).
-                stall_limit = int(os.environ.get("EA_PIPELINE_STALL_LIMIT_SECONDS", "3600"))
-                if stall_seconds > stall_limit:
-                    logger.error(
-                        "pipeline stalled: no progress for %ds (limit=%ds, last_progress=%.1f), aborting task=%s",
-                        stall_seconds, stall_limit, last_progress_time, task_id,
-                    )
-                    orch.abort(reason="stalled")
-                    stop_lease.set()
-                    return
-                # ── Lease renewal ────────────────────────────────────────
-                try:
-                    _lg = get_db()
-                    _ld = next(_lg)
-                    try:
-                        _lr = (
-                            _ld.query(AppEaTask)
-                            .filter(
-                                AppEaTask.task_id == task_id,
-                                AppEaTask.owner_pod == POD_NAME,
-                            )
-                            .first()
-                        )
-                        if _lr is None or _lr.status != "running":
-                            stop_lease.set()
-                            return
-                        _lr.lease_expires_at = task_mod._lease_deadline()
-                        _ld.commit()
-                    finally:
-                        try:
-                            next(_lg)
-                        except StopIteration:
-                            pass
-                    failures = 0
-                except Exception as exc:
-                    failures += 1
-                    logger.warning(
-                        "lease renewal failed task=%s failures=%s: %s",
-                        task_id, failures, exc,
-                    )
-                    if failures >= GUARD_LEASE_FAILURE_THRESHOLD:
-                        logger.error(
-                            "lease renewal: consecutive failures=%s, aborting task=%s",
-                            failures, task_id,
-                        )
-                        orch.abort(reason="lease_failure")
-                        stop_lease.set()
-                        return
-
-        lease_thread = threading.Thread(
-            target=_renew_lease,
-            name=f"ea_lease_{task_id}",
-            daemon=True,
-        )
-        lease_thread.start()
-
-        # ── Step 5: Cancel watch (poll DB every 3s, or instantly via wake event) ─
-        _wake_ev = threading.Event()
-        with _cancel_wake_lock:
-            _cancel_wake_events[task_id] = _wake_ev
-
-        def _watch_cancel() -> None:
-            last_check = 0.0
-            while True:
-                # Wait for wake event or 1s, whichever comes first
-                woken = _wake_ev.wait(timeout=1.0)
-                _wake_ev.clear()
-                if stop_lease.is_set():
-                    return
-                now = time.monotonic()
-                # Wake event forces immediate check; otherwise poll at interval
-                if not woken and now - last_check < CANCEL_POLL_INTERVAL_SECONDS:
-                    continue
-                last_check = now
-                try:
-                    _cg = get_db()
-                    _cd = next(_cg)
-                    try:
-                        _cr = (
-                            _cd.query(AppEaTask)
-                            .filter(
-                                AppEaTask.task_id == task_id,
-                                AppEaTask.owner_pod == POD_NAME,
-                            )
-                            .first()
-                        )
-                        if _cr is None:
-                            stop_lease.set()
-                            orch.abort(reason="task_missing")
-                            return
-                        if _cr.cancel_requested:
-                            logger.warning(
-                                "cancel detected for task=%s, aborting", task_id,
-                            )
-                            nonlocal cancel_requested
-                            cancel_requested = True
-                            orch.abort(reason="cancelled")
-                            stop_lease.set()
-                            return
-                    finally:
-                        try:
-                            next(_cg)
-                        except StopIteration:
-                            pass
-                except Exception as exc:
-                    logger.warning("cancel watch DB error for %s: %s", task_id, exc)
-
-        cancel_thread = threading.Thread(
-            target=_watch_cancel,
-            name=f"ea_cancel_{task_id}",
-            daemon=True,
-        )
-        cancel_thread.start()
-
-        # ── Step 6: Run the pipeline ──────────────────────────────────────
-        _t6_start = time.monotonic()
-        logger.info(
-            "_execute_task STEP6 pipeline_start: task=%s last_progress_time=%.1f",
-            task_id, last_progress_time,
-        )
-        try:
-            result = await orch.execute(task_id)
-            logger.info(
-                "_execute_task STEP6 pipeline_done: task=%s result_status=%s duration=%.2fs",
-                task_id, getattr(result, 'status', None), time.monotonic() - _t6_start,
-            )
-        except Exception as exc:
-            logger.error("pipeline error for %s: %s", task_id, exc)
-            result = None
-
-        # ── Step 7: Stop lease/cancel monitors ────────────────────────────
-        stop_lease.set()
-        lease_thread.join(timeout=5.0)
-        cancel_thread.join(timeout=3.0)
-        if lease_proc is not None:
-            try:
-                lease_proc.terminate()
-                lease_proc.wait(timeout=5)
-            except Exception:
-                try:
-                    lease_proc.kill()
-                except Exception:
-                    pass
-
-        # ── Step 8: Environment cleanup ───────────────────────────────────
-        logger.info(
-            "_execute_task STEP8 cleanup_start: task=%s cancel_requested=%s",
-            task_id, cancel_requested,
-        )
-        terminal_cleanup_result: dict[str, Any] | None = None
-        if FORCE_KILL_ALL_PI_ON_TASK_TERMINAL:
-            terminal_cleanup_result = self.force_kill_all_pi_processes(
-                reason="task_terminal",
-                task_id=task_id,
-            )
-        if task_roots:
-            _close_task_fds(task_roots=task_roots, task_id=task_id)
-            _kill_all_task_processes(task_id=task_id, task_roots=task_roots)
-        logger.info(
-            "_execute_task STEP8 cleanup_done: task=%s",
-            task_id,
-        )
-
-        # ── Step 9: Finalize events file ──────────────────────────────────
-        # 事件已由 _on_event 逐条写入，此处只追加 done 标记。
-        final_entry = {"ts": time.time(), "type": "done", "data": {"status": result.status.value if result else "error"}}
-        _seen_final: set[str] = set()
-        for _p in (_events_path, _events_path_pvc):
-            if _p is None:
-                continue
-            _resolved = str(_p.resolve()) if hasattr(_p, 'resolve') else str(_p)
-            if _resolved in _seen_final:
-                continue
-            _seen_final.add(_resolved)
-            try:
-                _p.parent.mkdir(parents=True, exist_ok=True)
-                with open(str(_p), "a", encoding="utf-8") as _ef:
-                    _ef.write(json.dumps(final_entry, ensure_ascii=False) + "\n")
-                    _ef.flush()
-            except Exception as _exc:
-                    logger.warning("Failed to write final events.jsonl (%s): %s", _p, _exc)
-
-        # ── Step 10: Finalize DB status ───────────────────────────────────
-
-        _fg = get_db()
-        _fd = next(_fg)
-        try:
-            _fr = (
-                _fd.query(AppEaTask)
-                .filter(
-                    AppEaTask.task_id == task_id,
-                    AppEaTask.owner_pod == POD_NAME,
-                )
-                .first()
-            )
-            if not _fr:
-                return
-            if cancel_requested:
-                _fr.status = "cancelled"
-                _fr.error = "任务已取消"
-            elif result is not None:
-                _fr.status = result.status.value if result else "error"
-                _fr.error = getattr(result, "error", None)
-            else:
-                _fr.status = "error"
-                _fr.error = "pipeline returned None"
-            _fr.finished_at = now_local()
-            _fr.owner_pod = None
-            _fr.owner_pod_ip = None
-            _fr.lease_expires_at = None
-            _fr.cancel_requested = False
-            # 任务结束时同步事件到 MySQL 时间线表（前端通过 /timeline API 读取）
-            task_mod._sync_stage_events_to_timeline(_fd, _fr, event_buffer)
-            _fr.cancel_requested = False
-            reason, changed = task_mod._sync_task_abnormal_reason(_fr)
-            task_mod._record_abnormal_reason(_fr, reason, changed=changed)
-            task_mod._safe_create_task_event(
-                _fd,
-                task_id=_fr.task_id,
-                project_id=_fr.project_id,
-                event_type=(
-                    "task_cancelled" if cancel_requested
-                    else "task_passed" if _fr.status == "passed"
-                    else "task_failed"
-                ),
-                message=(
-                    "任务已取消" if cancel_requested
-                    else "任务执行完成" if _fr.status == "passed"
-                    else (_fr.error or "任务执行失败")
-                ),
-                source=task_mod.TASK_EVENT_SOURCE_WORKER,
-                level="warning" if cancel_requested
-                       else "error" if _fr.status in ("failed", "error")
-                       else "info",
-                payload={"owner_pod": POD_NAME},
-                dedupe_key=task_mod._event_dedupe_key(
-                    _fr.task_id, _fr.status, _fr.finished_at, "terminal",
-                ),
-            )
-            if terminal_cleanup_result is not None:
-                task_mod._safe_create_task_event(
-                    _fd,
-                    task_id=_fr.task_id,
-                    project_id=_fr.project_id,
-                    event_type="task_terminal_pi_cleanup_finished",
-                    message="任务终态前已执行全量 PI 清理",
-                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
-                    level="warning" if terminal_cleanup_result.get("failed_pids") else "info",
-                    status=_fr.status,
-                    payload={
-                        "cleanup_scope": "pod_all_pi",
-                        "terminal_status": _fr.status,
-                        **terminal_cleanup_result,
-                    },
-                    dedupe_key=task_mod._event_dedupe_key(
-                        _fr.task_id,
-                        "task_terminal_pi_cleanup_finished",
-                        _fr.finished_at,
-                        _fr.status,
-                    ),
-                )
-            _fd.commit()
-        finally:
-            try:
-                next(_fg)
-            except StopIteration:
-                pass
-
-        self._task_abort_callbacks.pop(task_id, None)
-        self._task_lease_started_at.pop(task_id, None)
-        with _cancel_wake_lock:
-            _cancel_wake_events.pop(task_id, None)
-
-        # Trigger dispatch for next task
-        if not stop_lease.is_set():
-            task_mod.get_task_service().schedule_dispatch(project_id)
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Health server
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _start_health_server(self) -> None:
-        if self._health_server_thread and self._health_server_thread.is_alive():
-            return
-        self._health_server_stop.clear()
-        service = self
-
-        class _Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                payload = service._health_payload()
-                if self.path in ("/healthz", "/health"):
-                    code = HTTPStatus.OK
-                elif self.path in ("/readyz", "/ready"):
-                    code = (
-                        HTTPStatus.OK
-                        if service._health.probe_safe_ready
-                        else HTTPStatus.SERVICE_UNAVAILABLE
-                    )
-                else:
-                    code = HTTPStatus.NOT_FOUND
-                    payload = {"status": "not_found"}
-                body = json.dumps(payload).encode("utf-8")
-                self.send_response(int(code))
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                service._health.last_success_at = time.time()
-
-            def log_message(self, fmt: str, *args: Any) -> None:
-                return  # suppress log noise
-
-        try:
-            httpd = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), _Handler)
-            httpd.daemon_threads = True
-            httpd.timeout = 1
-            self._health_server_httpd = httpd
-            self._health_server_thread = threading.Thread(
-                target=self._run_health_server,
-                name="ea_health_server",
-                daemon=True,
-            )
-            self._health_server_thread.start()
-        except OSError:
-            logger.warning("health server port %s already in use", HEALTH_PORT)
-
-    def _run_health_server(self) -> None:
-        httpd = self._health_server_httpd
-        if httpd is None:
-            return
-        while not self._health_server_stop.is_set():
-            httpd.handle_request()
-
-    def _stop_health_server(self) -> None:
-        self._health_server_stop.set()
-        httpd = self._health_server_httpd
-        if httpd is not None:
-            try:
-                httpd.server_close()
-            except Exception:
-                pass
-        t = self._health_server_thread
-        if t and t.is_alive():
-            t.join(timeout=1.0)
-
-    def _health_payload(self) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "bootstrapped": self._health.bootstrapped,
-            "startup_phase": self._health.startup_phase,
-            "probe_safe_ready": self._health.probe_safe_ready,
-            "local_running_count": self.local_running_count(),
-            "current_task_id": self._health.current_task_id,
-            "lease_consecutive_failures": self._health.lease_consecutive_failures,
-            "heartbeat_subprocess_alive": self._heartbeat_subprocess_alive(),
-            "last_error": self._health.last_error,
-            "shutting_down": self._health.shutting_down,
-        }
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Heartbeat subprocess
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _start_heartbeat_subprocess(self) -> None:
-        """Launch heartbeat_proc.py as independent subprocess."""
-        from app.db import _engine as _db_engine
-        if _db_engine is None or _db_engine.url is None:
-            return
-        url = _db_engine.url
-        script = os.path.join(os.path.dirname(__file__), "heartbeat_proc.py")
-        try:
-            self._heartbeat_proc = subprocess.Popen(
-                [
-                    sys.executable, script,
-                    "--worker_id", POD_NAME,
-                    "--pod_name", POD_NAME,
-                    "--host", str(url.host or "127.0.0.1"),
-                    "--port", str(url.port or 3306),
-                    "--user", str(url.username or ""),
-                    "--password", str(url.password or ""),
-                    "--database", str(url.database or ""),
-                    "--interval", "20",
-                    "--parent_pid", str(os.getpid()),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=open("/tmp/heartbeat_proc.log", "a"),
-                close_fds=True,
-            )
-            logger.info(
-                "heartbeat subprocess started pod=%s pid=%s",
-                POD_NAME, self._heartbeat_proc.pid,
-            )
-        except Exception as exc:
-            logger.warning("heartbeat subprocess failed: %s", exc)
-
-    def _stop_heartbeat_subprocess(self) -> None:
-        proc = self._heartbeat_proc
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        self._heartbeat_proc = None
-
-    def _heartbeat_subprocess_alive(self) -> bool:
-        proc = self._heartbeat_proc
-        return proc is not None and proc.poll() is None
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Agent process registry (used by runner.py for live process tracking)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def register_live_agent_process(
-        self, *,
-        pid: int | None,
-        task_id: str,
-        project_id: str | None = None,
-        runtime_kind: str | None = None,
-        stage_key: str | None = None,
-        role_kind: str | None = None,
-        workspace_root: str | None = None,
-        session_path: str | None = None,
-        cwd: str | None = None,
-        command: str | None = None,
-        pgid: int | None = None,
-        **_: Any,
-    ) -> None:
-        if not pid:
-            return
-        now_ts = time.time()
-        with self._agent_registry_lock:
-            self._live_agent_processes[int(pid)] = {
-                "pid": int(pid),
-                "pgid": pgid,
-                "task_id": task_id,
-                "project_id": project_id,
-                "runtime_kind": runtime_kind,
-                "stage_key": stage_key,
-                "role_kind": role_kind,
-                "workspace_root": workspace_root,
-                "session_path": session_path,
-                "cwd": cwd,
-                "command": command,
-                "registered_at": now_ts,
-                "last_seen_at": now_ts,
-                "state": "live",
-                "termination_reason": None,
-            }
-
-    def mark_live_agent_process_terminating(
-        self, pid: int | None, *, reason: str | None = None,
-    ) -> None:
-        if not pid:
-            return
-        with self._agent_registry_lock:
-            rec = self._live_agent_processes.get(int(pid))
-            if rec:
-                rec["state"] = "terminating"
-                rec["termination_reason"] = reason
-
-    def unregister_live_agent_process(
-        self, pid: int | None, *, reason: str | None = None,
-    ) -> None:
-        if not pid:
-            return
-        with self._agent_registry_lock:
-            rec = self._live_agent_processes.pop(int(pid), None)
-            if rec:
-                rec["state"] = "exited"
-                rec["termination_reason"] = reason or rec.get("termination_reason")
-
-    def revalidate_kill_eligibility(self, pid: int) -> tuple[bool, str | None]:
-        """Check if a process can be safely killed. Used by observability API."""
-        return True, None  # Simplified: always allow kill from API
-
-    def runtime_health_snapshot(self) -> dict[str, Any]:
-        """Return health metrics for the /metrics endpoint.
-
-        Returns a structure compatible with the existing metrics.py expectations.
-        """
-        self._health.local_running_count = self.local_running_count()
-        now_ts = time.time()
-        hb_alive = self._heartbeat_subprocess_alive()
-
-        def _ok(**kw: Any) -> dict[str, Any]:
-            defaults: dict[str, Any] = {
-                "last_success_at": now_ts if hb_alive else 0.0,
-                "last_duration_ms": 0.0,
-                "consecutive_failures": 0,
-                "last_error": None,
-                "last_phase": "ok",
-                "success_total": 1,
-                "failure_total": 0,
-                "age_seconds": 0.0 if hb_alive else 999.0,
-                "last_exception_type": None,
-                "phase_durations_ms": {},
-                "slow_total": 0,
-                "failure_counts": {},
-            }
-            defaults.update(kw)
-            return defaults
-
-        return {
-            "heartbeat": _ok(
-                last_success_at=now_ts if hb_alive else 0.0,
-                age_seconds=0.0 if hb_alive else 999.0,
-            ),
-            "lease": _ok(),
-            "maintenance": _ok(),
-            "runtime_config": _ok(),
-            "guard": {
-                "state": "healthy",
-                "reason": None,
-                "since": now_ts,
-                "transition_at": now_ts,
-                "degraded_task_id": None,
-                "local_running_task_count": self.local_running_count(),
-                "tracked_task_count": 0,
-                "guarded_task_count": 0,
-                "oldest_running_task_lease_age_seconds": 0.0,
-            },
-            "health_server": {
-                "status": "ok",
-                "bootstrapped": self._health.bootstrapped,
-                "main_loop_alive": True,
-                "startup_phase": self._health.startup_phase,
-                "startup_phase_duration_seconds": 0.0,
-                "worker_probe_safe_ready": self._health.probe_safe_ready,
-                "health_server_last_success_at": self._health.last_success_at,
-                "health_server_loop_age_seconds": (
-                    0.0
-                    if self._health.last_success_at <= 0
-                    else max(0.0, now_ts - self._health.last_success_at)
-                ),
-                "main_api_loop_age_seconds": 0.0,
-                "local_running_task_count": self.local_running_count(),
-                "heartbeat_age_seconds": 0.0 if hb_alive else 999.0,
-                "lease_age_seconds": None,
-                "guard_state": "healthy",
-                "guard_reason": None,
-                "last_error": self._health.last_error,
-                "shutting_down": self._health.shutting_down,
-            },
-            "effective_config": {
-                "max_concurrent_tasks": 1,
-                "agent_process_limit": 8,
-                "active_projects": [],
-                "refreshed_at": now_ts,
-                "refresh_duration_ms": 0.0,
-            },
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _start_lease_renewer_subprocess(
-    task_id: str, stop_event: threading.Event,
-) -> subprocess.Popen | None:
-    """Launch lease_renewer.py as an independent subprocess.
-
-    Uses pymysql directly (no shared SQLAlchemy pool), survives worker
-    crashes, and provides a second layer of lease renewal protection.
-    """
-    from app.db import _engine as _db_engine
-    from app.service import task_service as task_mod
-
-    try:
-        url = _db_engine.url if _db_engine is not None else None
-        if url is None:
-            return None
-
-        script = os.path.join(os.path.dirname(__file__), "lease_renewer.py")
-        proc = subprocess.Popen(
-            [
-                sys.executable, script,
-                "--task_id", task_id,
-                "--pod_name", POD_NAME,
-                "--host", str(url.host or "127.0.0.1"),
-                "--port", str(url.port or 3306),
-                "--user", str(url.username or ""),
-                "--password", str(url.password or ""),
-                "--database", str(url.database or ""),
-                "--interval", str(LEASE_RENEW_INTERVAL_SECONDS),
-                "--duration", str(LEASE_DURATION_SECONDS),
-                "--parent_pid", str(os.getpid()),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-        )
-        logger.info(
-            "lease_renewer subprocess started task=%s pid=%s",
-            task_id, proc.pid,
-        )
-
-        def _monitor() -> None:
-            try:
-                stdout_data, _ = proc.communicate(timeout=None)
-                out_tail = ""
-                if stdout_data:
-                    lines = stdout_data.decode("utf-8", errors="replace").splitlines()
-                    out_tail = " | ".join(lines[-10:])
-                logger.warning(
-                    "lease_renewer EXITED: task=%s pid=%s rc=%s output=%s",
-                    task_id, proc.pid, proc.returncode, out_tail[:500],
-                )
-            except Exception as e:
-                logger.error("lease_renewer monitor error: task=%s err=%s", task_id, e)
-            finally:
-                stop_event.set()
-
-        threading.Thread(
-            target=_monitor, name=f"ea_lease_mon_{task_id}", daemon=True,
-        ).start()
-
-        return proc
-    except Exception as exc:
-        logger.warning("lease_renewer subprocess failed: %s", exc)
-        return None
-
-
-def _task_roots_from_row(task_id: str, output_path: str | None, input_path: str | None) -> list[str]:
-    """Compute task filesystem roots for process cleanup matching."""
-    roots: list[str] = []
-    if output_path:
-        task_root = os.path.join(output_path, task_id)
-        roots.extend([
-            task_root,
-            os.path.join(task_root, "run"),
-            os.path.join(task_root, "run", "sessions"),
-            os.path.join(task_root, "output"),
-        ])
-    if input_path:
-        roots.append(input_path)
-    return roots
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Singleton
-# ═══════════════════════════════════════════════════════════════════════════════
 
 _worker_service: WorkerService | None = None
 

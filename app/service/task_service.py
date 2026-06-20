@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -10,13 +9,12 @@ import re
 import tempfile
 import time as _time
 import uuid
-import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import and_, or_, update
+
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -33,16 +31,10 @@ logger = logging.getLogger("ea.task_service")
 
 
 def _force_kill_all_worker_pi(*, task_id: str, reason: str) -> dict[str, Any] | None:
-    try:
-        from app.service.worker_service import get_worker_service
-
-        return get_worker_service().force_kill_all_pi_processes(
-            reason=reason,
-            task_id=task_id,
-        )
-    except Exception as exc:
-        logger.warning("force_kill_all_worker_pi failed: task_id=%s reason=%s error=%s", task_id, reason, exc)
-        return None
+    # 架构 v3：任务进程终止由调度器经 socket 下发 TERMINATE → 控制进程 killpg 负责。
+    # task_service 不再直接杀进程（跨 pod 无效）。保留函数签名供历史调用点，语义改为 no-op。
+    logger.debug("_force_kill_all_worker_pi no-op (v3: kill via scheduler TERMINATE): task=%s reason=%s", task_id, reason)
+    return None
 
 _PARENT_REUSABLE_TASK_STATUSES = {"pending", "running", "passed", "success"}
 TASK_EVENT_SOURCE_EA = "entry_analyse"
@@ -678,19 +670,6 @@ def _lease_deadline() -> datetime:
     return add_seconds_local(now_local(), LEASE_DURATION_SECONDS)
 
 
-def _lease_expired_expr():
-    now = now_local()
-    return or_(AppEaTask.lease_expires_at.is_(None), AppEaTask.lease_expires_at < now)
-
-
-def _current_runtime_role() -> str:
-    return get_runtime_role()
-
-
-def _worker_runtime_enforced() -> bool:
-    return _current_runtime_role() == RUNTIME_ROLE_WORKER
-
-
 def _owner_role_guess(owner_pod: str | None) -> str:
     owner = str(owner_pod or "").strip()
     if not owner:
@@ -718,288 +697,6 @@ def _is_valid_worker_owner(owner_pod: str | None, worker_registry_pods: set[str]
     if worker_registry_pods is not None and owner not in worker_registry_pods:
         return False
     return True
-
-
-def _alive_entry_analysis_owner_pods(db: Session, now: datetime | None = None) -> set[str]:
-    from app.service.worker_slot_service import STALE_AFTER_SECONDS, get_worker_slot_service
-
-    current = now or now_local()
-    live_pods = set(get_worker_slot_service()._list_live_worker_pods())
-    registry_cutoff = add_seconds_local(current, -STALE_AFTER_SECONDS)
-    registry_rows = (
-        db.query(AppEaWorkerSlot.pod_name)
-        .filter(
-            AppEaWorkerSlot.runtime_role == RUNTIME_ROLE_WORKER,
-            AppEaWorkerSlot.last_heartbeat_at.is_not(None),
-            AppEaWorkerSlot.last_heartbeat_at >= registry_cutoff,
-        )
-        .all()
-    )
-    for pod_name, in registry_rows:
-        pod = str(pod_name or "").strip()
-        if pod:
-            live_pods.add(pod)
-    return live_pods
-
-
-def _worker_registry_pods(db: Session, now: datetime | None = None) -> set[str]:
-    from app.service.worker_slot_service import STALE_AFTER_SECONDS
-
-    current = now or now_local()
-    registry_cutoff = add_seconds_local(current, -STALE_AFTER_SECONDS)
-    rows = (
-        db.query(AppEaWorkerSlot.pod_name)
-        .filter(
-            AppEaWorkerSlot.runtime_role == RUNTIME_ROLE_WORKER,
-            AppEaWorkerSlot.last_heartbeat_at.is_not(None),
-            AppEaWorkerSlot.last_heartbeat_at >= registry_cutoff,
-        )
-        .all()
-    )
-    pods: set[str] = set()
-    for pod_name, in rows:
-        pod = str(pod_name or "").strip()
-        if pod:
-            pods.add(pod)
-    return pods
-
-
-def _requeue_expired_running_tasks(
-    db: Session,
-    now: datetime | None = None,
-    *,
-    project_id: str | None = None,
-    owner_pod: str | None = None,
-    limit: int | None = None,
-    scheduler_instance: str = "scheduler",
-    alive_owner_pods: set[str] | None = None,
-) -> tuple[int, int]:
-    current = now or now_local()
-    owner_pods = alive_owner_pods if alive_owner_pods is not None else _alive_entry_analysis_owner_pods(db, current)
-    query = (
-        db.query(AppEaTask)
-        .filter(
-            AppEaTask.is_deleted.is_(False),
-            AppEaTask.status == "running",
-            AppEaTask.cancel_requested.is_(False),
-            or_(
-                AppEaTask.lease_expires_at.is_(None),
-                AppEaTask.lease_expires_at < current,
-            ),
-        )
-        .order_by(AppEaTask.updated_at.asc(), AppEaTask.id.asc())
-    )
-    if project_id:
-        query = query.filter(AppEaTask.project_id == project_id)
-    normalized_owner_pod = str(owner_pod or "").strip()
-    if normalized_owner_pod:
-        query = query.filter(AppEaTask.owner_pod == normalized_owner_pod)
-    if limit is not None and limit > 0:
-        query = query.limit(limit)
-    candidates = query.all()
-    requeued = 0
-    owner_alive_requeued = 0
-    for row in candidates:
-        previous_owner = str(row.owner_pod or "").strip() or None
-        _force_kill_all_worker_pi(task_id=row.task_id, reason="expired_lease_reconcile")
-        owner_is_alive = bool(previous_owner and previous_owner in owner_pods)
-        previous_owner_ip = row.owner_pod_ip
-        previous_lease_expires_at = row.lease_expires_at
-        update_filters = [
-            AppEaTask.id == row.id,
-            AppEaTask.status == "running",
-            AppEaTask.cancel_requested.is_(False),
-        ]
-        if previous_owner is None:
-            update_filters.append(AppEaTask.owner_pod.is_(None))
-        else:
-            update_filters.append(AppEaTask.owner_pod == previous_owner)
-        if previous_lease_expires_at is None:
-            update_filters.append(AppEaTask.lease_expires_at.is_(None))
-        else:
-            update_filters.append(AppEaTask.lease_expires_at == previous_lease_expires_at)
-        updated = db.execute(
-            update(AppEaTask)
-            .where(and_(*update_filters))
-            .values(
-                status="pending",
-                owner_pod=None,
-                owner_pod_ip=None,
-                lease_expires_at=None,
-                cancel_requested=False,
-                finished_at=None,
-                stages_json=None,
-                error=None,
-                result_json=None,
-                latest_abnormal_reason_json=None,
-                updated_at=now_local(),
-            )
-        )
-        if int(getattr(updated, "rowcount", 0) or 0) != 1:
-            continue
-        refreshed = db.query(AppEaTask).filter(AppEaTask.id == row.id).first()
-        if refreshed is None:
-            continue
-        if owner_is_alive:
-            owner_alive_requeued += 1
-        _safe_create_task_event(
-            db,
-            task_id=refreshed.task_id,
-            project_id=refreshed.project_id,
-            event_type="task_requeued_after_expired_lease_reconcile",
-            message="任务因过期租约被收回并重新进入调度队列",
-            source=TASK_EVENT_SOURCE_SYSTEM,
-            level="warning",
-            stage_key="entry_analysis",
-            file_path=refreshed.input_path,
-            status=refreshed.status,
-            payload={
-                "previous_owner_pod": previous_owner,
-                "previous_owner_pod_ip": previous_owner_ip,
-                "previous_lease_expires_at": previous_lease_expires_at.isoformat() if previous_lease_expires_at else None,
-                "reconcile_reason": "expired_lease_owner_alive" if owner_is_alive else "expired_lease_owner_missing",
-                "owner_pod_alive": owner_is_alive,
-                "scheduler_instance": scheduler_instance,
-                "reset_to_schedulable": True,
-                "restart_mode": "fresh_start",
-            },
-            dedupe_key=_event_dedupe_key(
-                refreshed.task_id,
-                "task_requeued_after_expired_lease_reconcile",
-                previous_owner,
-                previous_lease_expires_at,
-                owner_is_alive,
-                scheduler_instance,
-            ),
-        )
-        requeued += 1
-    return requeued, owner_alive_requeued
-
-
-def _requeue_invalid_owner_running_tasks(
-    db: Session,
-    now: datetime | None = None,
-    *,
-    project_id: str | None = None,
-    limit: int | None = None,
-    scheduler_instance: str = "scheduler",
-    alive_owner_pods: set[str] | None = None,
-    worker_registry_pods: set[str] | None = None,
-    started_before: datetime | None = None,
-) -> tuple[int, int]:
-    current = now or now_local()
-    owner_pods = alive_owner_pods if alive_owner_pods is not None else _alive_entry_analysis_owner_pods(db, current)
-    registry_pods = worker_registry_pods if worker_registry_pods is not None else _worker_registry_pods(db, current)
-    query = (
-        db.query(AppEaTask)
-        .filter(
-            AppEaTask.is_deleted.is_(False),
-            AppEaTask.status == "running",
-            AppEaTask.cancel_requested.is_(False),
-            AppEaTask.owner_pod.is_not(None),
-        )
-        .order_by(AppEaTask.updated_at.asc(), AppEaTask.id.asc())
-    )
-    if project_id:
-        query = query.filter(AppEaTask.project_id == project_id)
-    # 宽限期过滤：只对账运行超过 grace period 的任务，防止新分发的任务误伤
-    if started_before is not None:
-        from sqlalchemy import or_
-        query = query.filter(
-            or_(
-                AppEaTask.started_at.is_(None),
-                AppEaTask.started_at <= started_before,
-            )
-        )
-    if limit is not None and limit > 0:
-        query = query.limit(limit)
-    candidates = query.all()
-    requeued = 0
-    owner_alive_requeued = 0
-    for row in candidates:
-        previous_owner = str(row.owner_pod or "").strip() or None
-        if _is_valid_worker_owner(previous_owner, registry_pods):
-            continue
-        _force_kill_all_worker_pi(task_id=row.task_id, reason="invalid_owner_reconcile")
-        owner_is_alive = bool(previous_owner and previous_owner in owner_pods)
-        previous_owner_ip = row.owner_pod_ip
-        previous_lease_expires_at = row.lease_expires_at
-        updated = db.execute(
-            update(AppEaTask)
-            .where(
-                AppEaTask.id == row.id,
-                AppEaTask.status == "running",
-                AppEaTask.cancel_requested.is_(False),
-                AppEaTask.owner_pod == previous_owner,
-            )
-            .values(
-                status="pending",
-                owner_pod=None,
-                owner_pod_ip=None,
-                lease_expires_at=None,
-                cancel_requested=False,
-                finished_at=None,
-                stages_json=None,
-                error=None,
-                result_json=None,
-                latest_abnormal_reason_json=None,
-                updated_at=now_local(),
-            )
-        )
-        if int(getattr(updated, "rowcount", 0) or 0) != 1:
-            continue
-        refreshed = db.query(AppEaTask).filter(AppEaTask.id == row.id).first()
-        if refreshed is None:
-            continue
-        if owner_is_alive:
-            owner_alive_requeued += 1
-        _safe_create_task_event(
-            db,
-            task_id=refreshed.task_id,
-            project_id=refreshed.project_id,
-            event_type="task_invalid_owner_detected",
-            message="任务运行 owner 非法，已进入回收流程",
-            source=TASK_EVENT_SOURCE_SYSTEM,
-            level="warning",
-            stage_key="entry_analysis",
-            file_path=refreshed.input_path,
-            status="running",
-            payload={
-                "previous_owner_pod": previous_owner,
-                "previous_owner_role_guess": _owner_role_guess(previous_owner),
-                "live_owner_present": owner_is_alive,
-                "owner_valid": False,
-                "scheduler_instance": scheduler_instance,
-            },
-            dedupe_key=_event_dedupe_key(refreshed.task_id, "task_invalid_owner_detected", previous_owner, scheduler_instance),
-        )
-        _safe_create_task_event(
-            db,
-            task_id=refreshed.task_id,
-            project_id=refreshed.project_id,
-            event_type="task_requeued_after_invalid_owner_reconcile",
-            message="任务因非法 owner 被收回并重新进入调度队列",
-            source=TASK_EVENT_SOURCE_SYSTEM,
-            level="warning",
-            stage_key="entry_analysis",
-            file_path=refreshed.input_path,
-            status=refreshed.status,
-            payload={
-                "previous_owner_pod": previous_owner,
-                "previous_owner_pod_ip": previous_owner_ip,
-                "previous_owner_role_guess": _owner_role_guess(previous_owner),
-                "previous_lease_expires_at": previous_lease_expires_at.isoformat() if previous_lease_expires_at else None,
-                "reconcile_reason": "invalid_owner_alive" if owner_is_alive else "invalid_owner_missing",
-                "live_owner_present": owner_is_alive,
-                "owner_valid": False,
-                "scheduler_instance": scheduler_instance,
-                "reset_to_schedulable": True,
-                "restart_mode": "fresh_start",
-            },
-            dedupe_key=_event_dedupe_key(refreshed.task_id, "task_requeued_after_invalid_owner_reconcile", previous_owner, previous_lease_expires_at, owner_is_alive, scheduler_instance),
-        )
-        requeued += 1
-    return requeued, owner_alive_requeued
 
 
 def _task_root(row: AppEaTask) -> Path | None:
@@ -1050,8 +747,6 @@ def _cancel_phase(row: AppEaTask) -> str | None:
     if bool(row.cancel_requested):
         return "requested"
     return None
-
-
 
 
 def _build_function_catalog(row: AppEaTask) -> list[dict]:
@@ -2108,376 +1803,18 @@ class TaskService:
         )
 
     def schedule_dispatch(self, project_id: str) -> None:
-        # 修复：原先用 role_enabled('worker')，在 runtime_role=all 的 API pod 上也会返回 True，
-        # 导致 API pod 调度后被 _acquire_dispatch_lease 拒绝（log: dispatch lease denied for non-worker）。
-        # 改为：仅 worker 角色的 pod 才主动调度；API pod 不调度（只同步状态）。
-        if not _worker_runtime_enforced():
-            return
-        self._schedule_pending_dispatch(project_id)
+        # 架构 v3：派发由调度器 socket server 的 _dispatch_loop 轮询 pending 任务负责，
+        # 不再由 worker/API 进程主动派发。此处保留为 no-op（调用方无需改动）。
+        return
 
     @staticmethod
-    def _get_dispatch_lock(project_id: str) -> asyncio.Lock:
-        loop = asyncio.get_running_loop()
-        loop_locks = _dispatch_lock_registry.get(loop)
-        if loop_locks is None:
-            loop_locks = {}
-            _dispatch_lock_registry[loop] = loop_locks
-        lock = loop_locks.get(project_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            loop_locks[project_id] = lock
-        return lock
 
     @staticmethod
-    def _claim_task_row(db: Session, row_id: int) -> AppEaTask | None:
-        if not _worker_runtime_enforced():
-            logger.error(
-                "task claim denied for non-worker runtime_role=%s pod=%s row_id=%s",
-                _current_runtime_role(),
-                POD_NAME,
-                row_id,
-            )
-            db.rollback()
-            return None
-        row = (
-            db.query(AppEaTask)
-            .filter(
-                AppEaTask.id == row_id,
-                AppEaTask.is_deleted.is_(False),
-                AppEaTask.cancel_requested.is_(False),
-            )
-            .with_for_update()
-            .first()
-        )
-        if row is None:
-            return None
-        if row.status not in ("pending", "running"):
-            return None
-        if row.status == "running" and row.owner_pod and row.owner_pod != POD_NAME and row.lease_expires_at and row.lease_expires_at >= now_local():
-            return None
-        # pod 重启接管（lease 到期的 running 任务）→ 强制 restart，清空 stages_json
-        # 理由：resume 逻辑未完整实现，带旧 stages_json 的接管会走 resume 分支导致状态混乱；
-        #       清空后 worker_service.py 的 is_fresh_start=True 分支会清理磁盘残留文件后重新执行。
-        is_lease_takeover = (
-            row.status == "running"
-            and row.owner_pod is not None
-            # OOM 重启或其他同名 pod 接管：只要租约到期，无论是否同一 pod 名称都允许强制重启
-            # （租约未到期时不允许强制接管，避免冲突）
-            and (row.lease_expires_at is None or row.lease_expires_at < now_local())
-        )
-        if is_lease_takeover:
-            previous_owner_pod = row.owner_pod
-            row.stages_json = None  # 触发 worker_service.py 中的 is_fresh_start=True
-            row.error = None
-            row.result_json = None
-            row.latest_abnormal_reason_json = None
-            # 注意：不重置 started_at，保留任务真实开始时间
-            logger.info("Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",
-                        row.task_id, row.owner_pod)
-            _safe_create_task_event(
-                db,
-                task_id=row.task_id,
-                project_id=row.project_id,
-                event_type="task_lease_taken_over",
-                message="任务因旧租约过期被新 worker 接管",
-                source=TASK_EVENT_SOURCE_SYSTEM,
-                status="running",
-                stage_key="entry_analysis",
-                file_path=str(row.input_path or "").strip() or None,
-                payload={
-                    "previous_owner_pod": previous_owner_pod,
-                    "owner_pod": POD_NAME,
-                    "reason": "lease_takeover",
-                    "runtime_role": _current_runtime_role(),
-                    "worker_id": POD_NAME,
-                    "dispatch_source": "worker_dispatch",
-                },
-                dedupe_key=_event_dedupe_key(row.task_id, "task_lease_taken_over", previous_owner_pod, POD_NAME, row.lease_expires_at, row.updated_at),
-            )
-        row.status = "running"
-        row.owner_pod = POD_NAME
-        row.lease_expires_at = _lease_deadline()
-        _reset_cancel_state(row)
-        if row.started_at is None:
-            row.started_at = now_local()
-        _safe_create_task_event(
-            db,
-            task_id=row.task_id,
-            project_id=row.project_id,
-            event_type="task_dispatched",
-            message="任务已被调度并占用执行槽位",
-            source=TASK_EVENT_SOURCE_SYSTEM,
-            status=row.status,
-            stage_key="entry_analysis",
-            file_path=str(row.input_path or "").strip() or None,
-            payload={
-                "owner_pod": POD_NAME,
-                "dispatch_mode": "select_for_update",
-                "lease_expires_at": isoformat_local(row.lease_expires_at),
-                "lease_takeover": bool(is_lease_takeover),
-                "runtime_role": _current_runtime_role(),
-                "worker_id": POD_NAME,
-                "dispatch_source": "worker_dispatch",
-            },
-            dedupe_key=_event_dedupe_key(row.task_id, "task_dispatched", POD_NAME, row.started_at, row.lease_expires_at, "select_for_update"),
-        )
-        db.commit()
-        db.refresh(row)
-        return row
 
     @staticmethod
-    def _claim_task_row_atomic(db: Session, row_id: int) -> AppEaTask | None:
-        if not _worker_runtime_enforced():
-            logger.error(
-                "atomic task claim denied for non-worker runtime_role=%s pod=%s row_id=%s",
-                _current_runtime_role(),
-                POD_NAME,
-                row_id,
-            )
-            db.rollback()
-            return None
-        row = (
-            db.query(AppEaTask)
-            .filter(
-                AppEaTask.id == row_id,
-                AppEaTask.is_deleted.is_(False),
-            )
-            .first()
-        )
-        if row is None or row.cancel_requested:
-            return None
-        now = now_local()
-        previous_owner_pod = row.owner_pod
-        is_takeover = (
-            row.status == "running"
-            and row.owner_pod is not None
-            # OOM 重启或同名 pod 再启动：只要租约到期就允许接管（不强求 owner_pod != POD_NAME）
-            and (row.lease_expires_at is None or row.lease_expires_at < now)
-        )
-        if row.status not in ("pending", "running"):
-            return None
-        if row.status == "running" and not is_takeover:
-            return None
-        values: dict[str, Any] = {
-            "status": "running",
-            "owner_pod": POD_NAME,
-            "lease_expires_at": _lease_deadline(),
-            "cancel_requested": False,
-            "updated_at": now,
-        }
-        if row.started_at is None:
-            values["started_at"] = now
-        if is_takeover:
-            values["stages_json"] = None
-            values["error"] = None
-            values["result_json"] = None
-            values["latest_abnormal_reason_json"] = None
-        claim_filters = [
-            AppEaTask.id == row_id,
-            AppEaTask.is_deleted.is_(False),
-            AppEaTask.cancel_requested.is_(False),
-        ]
-        if row.status == "pending":
-            claim_filters.extend(
-                [
-                    AppEaTask.status == "pending",
-                    AppEaTask.owner_pod.is_(None),
-                ]
-            )
-        else:
-            claim_filters.extend(
-                [
-                    AppEaTask.status == "running",
-                    AppEaTask.owner_pod == row.owner_pod,
-                    AppEaTask.lease_expires_at == row.lease_expires_at,
-                    or_(AppEaTask.lease_expires_at.is_(None), AppEaTask.lease_expires_at < now),
-                ]
-            )
-        updated = db.execute(
-            update(AppEaTask)
-            .where(and_(*claim_filters))
-            .values(**values)
-        )
-        if int(getattr(updated, "rowcount", 0) or 0) != 1:
-            db.rollback()
-            return None
-        refreshed = db.query(AppEaTask).filter(AppEaTask.id == row_id).first()
-        if refreshed is not None:
-            if is_takeover:
-                _safe_create_task_event(
-                    db,
-                    task_id=refreshed.task_id,
-                    project_id=refreshed.project_id,
-                    event_type="task_lease_taken_over",
-                    message="任务因旧租约过期被新 worker 接管",
-                    source=TASK_EVENT_SOURCE_SYSTEM,
-                    status=refreshed.status,
-                    stage_key="entry_analysis",
-                    file_path=str(refreshed.input_path or "").strip() or None,
-                    payload={
-                        "previous_owner_pod": previous_owner_pod,
-                        "owner_pod": POD_NAME,
-                        "reason": "lease_takeover",
-                        "runtime_role": _current_runtime_role(),
-                        "worker_id": POD_NAME,
-                        "dispatch_source": "worker_dispatch",
-                    },
-                    dedupe_key=_event_dedupe_key(refreshed.task_id, "task_lease_taken_over", previous_owner_pod, POD_NAME, row.lease_expires_at, refreshed.updated_at),
-                )
-            _safe_create_task_event(
-                db,
-                task_id=refreshed.task_id,
-                project_id=refreshed.project_id,
-                event_type="task_dispatched",
-                message="任务已被调度并占用执行槽位",
-                source=TASK_EVENT_SOURCE_SYSTEM,
-                status=refreshed.status,
-                stage_key="entry_analysis",
-                file_path=str(refreshed.input_path or "").strip() or None,
-                payload={
-                    "owner_pod": POD_NAME,
-                    "dispatch_mode": "atomic_claim",
-                    "lease_expires_at": isoformat_local(refreshed.lease_expires_at),
-                    "lease_takeover": bool(is_takeover),
-                    "runtime_role": _current_runtime_role(),
-                    "worker_id": POD_NAME,
-                    "dispatch_source": "worker_dispatch",
-                },
-                dedupe_key=_event_dedupe_key(refreshed.task_id, "task_dispatched", POD_NAME, refreshed.started_at, refreshed.lease_expires_at, "atomic_claim"),
-            )
-        db.commit()
-        if refreshed is not None and is_takeover:
-            logger.info(
-                "Lease takeover: reset stages_json for restart (task=%s old_pod=%s)",
-                refreshed.task_id,
-                row.owner_pod,
-            )
-        return refreshed
 
     @staticmethod
-    def _active_running_count(db: Session, project_id: str) -> int:
-        return int(
-            db.query(AppEaTask)
-            .filter(
-                AppEaTask.project_id == project_id,
-                AppEaTask.is_deleted.is_(False),
-                AppEaTask.status == "running",
-                AppEaTask.cancel_requested.is_(False),
-                AppEaTask.lease_expires_at.is_not(None),
-                AppEaTask.lease_expires_at >= now_local(),
-            )
-            .count()
-        )
 
-    def _schedule_pending_dispatch(self, project_id: str) -> None:
-        if not role_enabled("worker"):
-            return
-        existing = _dispatch_tasks.get(project_id)
-        if existing and not existing.done():
-            return
-        # 修复：sync API handler 会在 FastAPI threadpool 中调用本函数，无 event loop。
-        # 改为检测：若主线程或当前线程有 running loop，就直接 create_task；
-        # 否则用独立线程 + asyncio.run() 隔离（仅作为 fire-and-forget 调度）。
-        try:
-            _current_loop = asyncio.get_running_loop()
-            task = asyncio.create_task(
-                self._dispatch_pending_tasks(project_id),
-                name=f"ea_dispatch_{project_id}",
-            )
-            _dispatch_tasks[project_id] = task
-        except RuntimeError:
-            # 无 running loop（如 FastAPI threadpool 调同步 handler 后转 worker 路径）。
-            # 在新线程中独立运行业务逻辑。fire-and-forget，错误不外传。
-            import threading as _threading
-            def _run_dispatch() -> None:
-                try:
-                    _loop2 = asyncio.new_event_loop()
-                    try:
-                        asyncio.set_event_loop(_loop2)
-                        _loop2.run_until_complete(
-                            self._dispatch_pending_tasks(project_id)
-                        )
-                    finally:
-                        try:
-                            _loop2.close()
-                        except Exception:
-                            pass
-                except Exception as _dispatch_exc:
-                    logger.warning("isolated dispatch thread failed for %s: %s",
-                                   project_id, _dispatch_exc)
-            _t = _threading.Thread(
-                target=_run_dispatch, name=f"ea_dispatch_iso_{project_id}", daemon=True
-            )
-            _t.start()
-
-    async def _dispatch_pending_tasks(self, project_id: str) -> None:
-        from app.db import get_db
-
-        lock = self._get_dispatch_lock(project_id)
-        async with lock:
-            db_gen = get_db()
-            db: Session = next(db_gen)
-            try:
-                reclaimed_count, reclaimed_owner_alive = _requeue_expired_running_tasks(
-                    db,
-                    project_id=project_id,
-                    limit=DISPATCH_CLAIM_BATCH_SIZE * 4,
-                    scheduler_instance=f"dispatch:{POD_NAME}",
-                )
-                if reclaimed_count:
-                    db.commit()
-                    logger.warning(
-                        "dispatch reclaimed %s expired entry-analysis tasks before claiming new work project_id=%s owner_alive=%s",
-                        reclaimed_count,
-                        project_id,
-                        reclaimed_owner_alive,
-                    )
-                from app.service.worker_service import get_worker_service
-                worker_service = get_worker_service()
-                local_running_count = worker_service.local_running_count()
-                worker_available_slots = max(0, 1 - local_running_count)
-                if worker_available_slots <= 0:
-                    return
-                claim_slots = min(worker_available_slots, DISPATCH_CLAIM_BATCH_SIZE)
-                if claim_slots <= 0:
-                    return
-                candidate_rows = (
-                    db.query(AppEaTask)
-                    .filter(
-                        AppEaTask.project_id == project_id,
-                        AppEaTask.is_deleted.is_(False),
-                        AppEaTask.cancel_requested.is_(False),
-                        or_(
-                            AppEaTask.status == "pending",
-                            (AppEaTask.status == "running") & _lease_expired_expr(),
-                        ),
-                    )
-                    .order_by(AppEaTask.created_at.asc(), AppEaTask.id.asc())
-                    .limit(claim_slots * 2)
-                    .all()
-                )
-                claimed_count = 0
-                for row in candidate_rows:
-                    if local_running_count >= 1 or claimed_count >= claim_slots:
-                        break
-                    if worker_service.has_local_task(row.task_id):
-                        continue
-                    if worker_service.local_running_count() >= 1:
-                        break
-                    claimed = self._claim_task_row_atomic(db, row.id)
-                    if claimed is None:
-                        continue
-                    worker_service.start_task(claimed.task_id)
-                    local_running_count += 1
-                    claimed_count += 1
-            except Exception as exc:
-                logger.warning("dispatch pending entry-analysis tasks failed for %s: %s", project_id, exc)
-            finally:
-                _dispatch_tasks.pop(project_id, None)
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
 
     def list_tasks(
         self,
@@ -3461,7 +2798,6 @@ class TaskService:
                 logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
         # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
         if owner_pod_ip and row.status == "running":
-            import asyncio as _asyncio
             _asyncio.create_task(self._notify_cancel(owner_pod_ip, task_id))
         result = self._row_to_dict(row, db=db)
         result["cancel_phase"] = "requested"
