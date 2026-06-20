@@ -177,28 +177,64 @@ class EntryTaskTimelineTests(unittest.TestCase):
         db = self.SessionLocal()
         try:
             task = self._create_task(db, task_id="eat_rate_limit", status="running")
-            task_service._safe_create_task_event(
-                db,
-                task_id=task.task_id,
-                project_id=task.project_id,
-                event_type="task_rate_limited_retrying",
-                message="智能体请求被 429 限流，30 秒后自动重试",
-                source=task_service.TASK_EVENT_SOURCE_WORKER,
-                status=task.status,
-                payload={
-                    "http_status": 429,
-                    "retry_delay_seconds": 30,
-                    "consecutive_rate_limit_count": 10,
-                    "stage": "r3_w",
-                },
-                dedupe_key="rate-limit-r3-w",
-            )
+            with patch.dict(task_service.os.environ, {
+                "EA_RUNTIME_ROLE": "worker",
+                "EA_POD_NAME": "ea-worker-0",
+                "EA_POD_IP": "10.1.2.3",
+                "EA_NODE_NAME": "node-a",
+                "HOSTNAME": "ea-worker-0",
+            }, clear=False):
+                task_service._safe_create_task_event(
+                    db,
+                    task_id=task.task_id,
+                    project_id=task.project_id,
+                    event_type="task_rate_limited_retrying",
+                    message="智能体请求被 429 限流，30 秒后自动重试",
+                    source=task_service.TASK_EVENT_SOURCE_WORKER,
+                    status=task.status,
+                    payload={
+                        "http_status": 429,
+                        "retry_delay_seconds": 30,
+                        "consecutive_rate_limit_count": 10,
+                        "stage": "r3_w",
+                    },
+                    dedupe_key="rate-limit-r3-w",
+                )
             db.commit()
 
             timeline = self.service.get_task_timeline(db, task)
             self.assertEqual(["task_rate_limited_retrying"], [event["event_type"] for event in timeline["events"]])
             self.assertEqual(429, timeline["events"][0]["payload"]["http_status"])
             self.assertEqual(30, timeline["events"][0]["payload"]["retry_delay_seconds"])
+            self.assertEqual("worker", timeline["events"][0]["payload"]["recorder"]["role"])
+            self.assertEqual("ea-worker-0", timeline["events"][0]["payload"]["recorder"]["pod_name"])
+            self.assertEqual("node-a", timeline["events"][0]["payload"]["recorder"]["node_name"])
+            self.assertEqual("ea-worker-0", timeline["events"][0]["recorder_pod_name"])
+        finally:
+            db.close()
+
+    def test_get_task_timeline_keeps_old_events_without_recorder_compatible(self):
+        db = self.SessionLocal()
+        try:
+            task = self._create_task(db, task_id="eat_old_timeline", status="running")
+            legacy = AppEaTaskEvent(
+                id="evt-old",
+                task_id=task.task_id,
+                project_id=task.project_id,
+                source="system",
+                level="info",
+                event_type="task_started",
+                message="started",
+                dedupe_key="legacy-event",
+            )
+            legacy.payload_json = "{\"legacy\": true}"
+            db.add(legacy)
+            db.commit()
+
+            timeline = self.service.get_task_timeline(db, task)
+            self.assertEqual(1, len(timeline["events"]))
+            self.assertIsNone(timeline["events"][0]["recorder_pod_name"])
+            self.assertEqual({"legacy": True}, timeline["events"][0]["payload"])
         finally:
             db.close()
 

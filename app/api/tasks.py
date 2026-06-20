@@ -143,6 +143,18 @@ class AppEaTaskEventResponse(BaseModel):
     status: Optional[str] = None
     message: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    recorder_instance_id: Optional[str] = None
+    recorder_hostname: Optional[str] = None
+    recorder_pod_name: Optional[str] = None
+    recorder_node_name: Optional[str] = None
+    recorder_pod_ip: Optional[str] = None
+    recorder_role: Optional[str] = None
+    origin_instance_id: Optional[str] = None
+    origin_hostname: Optional[str] = None
+    origin_pod_name: Optional[str] = None
+    origin_node_name: Optional[str] = None
+    origin_pod_ip: Optional[str] = None
+    origin_role: Optional[str] = None
     created_at: Optional[str] = None
 
 

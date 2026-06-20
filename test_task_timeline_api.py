@@ -58,28 +58,35 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         finally:
             db.close()
 
-    def _insert_event(self, *, task_id: str, event_id: str, event_type: str, message: str) -> None:
+    def _insert_event(self, *, task_id: str, event_id: str, event_type: str, message: str, payload_json: str | None = None) -> None:
         db = self.SessionLocal()
         try:
-            db.add(
-                AppEaTaskEvent(
-                    id=event_id,
-                    task_id=task_id,
-                    project_id="p1",
-                    source="system",
-                    level="info",
-                    event_type=event_type,
-                    message=message,
-                    dedupe_key=f"dedupe-{event_id}",
-                )
+            event = AppEaTaskEvent(
+                id=event_id,
+                task_id=task_id,
+                project_id="p1",
+                source="system",
+                level="info",
+                event_type=event_type,
+                message=message,
+                dedupe_key=f"dedupe-{event_id}",
             )
+            if payload_json is not None:
+                event.payload_json = payload_json
+            db.add(event)
             db.commit()
         finally:
             db.close()
 
     def test_get_timeline_returns_events(self):
         self._insert_task()
-        self._insert_event(task_id="eat_api_timeline", event_id="evt1", event_type="task_started", message="started")
+        self._insert_event(
+            task_id="eat_api_timeline",
+            event_id="evt1",
+            event_type="task_started",
+            message="started",
+            payload_json='{"recorder":{"service":"entry-analysis","role":"api","instance_id":"ea-api-1","hostname":"ea-api-1","pod_name":"ea-api-1","node_name":"node-x","pod_ip":"10.0.0.1"}}',
+        )
 
         response = self.client.get("/api/app/entry-analyse/tasks/eat_api_timeline/timeline")
         self.assertEqual(200, response.status_code)
@@ -87,6 +94,9 @@ class EntryTaskTimelineApiTests(unittest.TestCase):
         self.assertEqual("eat_api_timeline", payload["task_id"])
         self.assertEqual(1, len(payload["events"]))
         self.assertEqual("task_started", payload["events"][0]["event_type"])
+        self.assertEqual("ea-api-1", payload["events"][0]["recorder_pod_name"])
+        self.assertEqual("node-x", payload["events"][0]["recorder_node_name"])
+        self.assertEqual("api", payload["events"][0]["recorder_role"])
 
     def test_clear_timeline_returns_deleted_count(self):
         self._insert_task()

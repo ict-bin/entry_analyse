@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import socket
 import tempfile
 import time as _time
 import uuid
@@ -110,6 +111,11 @@ POD_IP = (
     os.environ.get("EA_POD_IP")
     or os.environ.get("MY_POD_IP")
     or os.environ.get("POD_IP")
+    or ""
+)
+NODE_NAME = (
+    os.environ.get("EA_NODE_NAME")
+    or os.environ.get("NODE_NAME")
     or ""
 )
 WORKER_OWNER_POD_RE = re.compile(r"^secflow-app-entry-analyse-worker(?:-adaptive)?-[a-z0-9]+-[a-z0-9]+$")
@@ -225,6 +231,76 @@ def _event_dedupe_key(*parts: object) -> str:
     return raw
 
 
+def _timeline_runtime_role() -> str:
+    role = str(get_runtime_role() or "").strip().lower()
+    if role in {"api", "worker", "scheduler", "runner"}:
+        return role
+    return "api"
+
+
+def _timeline_instance_id(*, payload: dict[str, Any] | None = None) -> str | None:
+    data = payload if isinstance(payload, dict) else {}
+    candidates = (
+        os.environ.get("EA_INSTANCE_ID"),
+        os.environ.get("WORKER_INSTANCE_ID"),
+        os.environ.get("EA_WORKER_ID"),
+        os.environ.get("EA_POD_NAME"),
+        os.environ.get("POD_NAME"),
+        data.get("worker_id"),
+        data.get("execution_owner_id"),
+        data.get("owner_pod"),
+        POD_NAME,
+    )
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _build_timeline_recorder_metadata(
+    *,
+    payload: dict[str, Any] | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    resolved_role = str(role or _timeline_runtime_role()).strip().lower() or "api"
+    hostname = str(os.environ.get("HOSTNAME") or "").strip() or socket.gethostname()
+    pod_name = str(os.environ.get("EA_POD_NAME") or os.environ.get("POD_NAME") or hostname).strip() or hostname
+    pod_ip = str(os.environ.get("EA_POD_IP") or os.environ.get("MY_POD_IP") or os.environ.get("POD_IP") or "").strip() or None
+    node_name = str(os.environ.get("EA_NODE_NAME") or os.environ.get("NODE_NAME") or "").strip() or None
+    return {
+        "service": "entry-analysis",
+        "role": resolved_role,
+        "instance_id": _timeline_instance_id(payload=payload),
+        "hostname": hostname or None,
+        "pod_name": pod_name or None,
+        "node_name": node_name,
+        "pod_ip": pod_ip,
+    }
+
+
+def _merge_timeline_recorder_payload(
+    payload: dict[str, Any] | None,
+    *,
+    role: str | None = None,
+    origin: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    merged = dict(payload) if isinstance(payload, dict) else {}
+    merged["recorder"] = _build_timeline_recorder_metadata(payload=merged, role=role)
+    if isinstance(origin, dict) and origin:
+        merged["event_origin"] = dict(origin)
+    return merged
+
+
+def _timeline_party_from_payload(payload: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    party = payload.get(key)
+    if not isinstance(party, dict):
+        return None
+    return party
+
+
 DB_TIMELINE_EVENT_LIMIT = 10_000
 
 
@@ -299,6 +375,13 @@ def _normalize_timeline_event(evt: dict[str, Any]) -> dict[str, Any]:
         attempt = int(attempt_value) if attempt_value is not None else None
     except Exception:
         attempt = None
+    payload = _merge_timeline_recorder_payload(
+        {
+            "timestamp": evt.get("timestamp"),
+            "ts": evt.get("ts"),
+            "data": data,
+        }
+    )
     return {
         "event_type": str(evt.get("event") or evt.get("type") or "stage_event").strip() or "stage_event",
         "source": TASK_EVENT_SOURCE_EA,
@@ -311,11 +394,7 @@ def _normalize_timeline_event(evt: dict[str, Any]) -> dict[str, Any]:
         "attempt": attempt,
         "status": status,
         "message": message,
-        "payload": {
-            "timestamp": evt.get("timestamp"),
-            "ts": evt.get("ts"),
-            "data": data,
-        },
+        "payload": payload,
     }
 
 
@@ -353,6 +432,7 @@ def _create_task_event(
     attempt: int | None = None,
     status: str | None = None,
     payload: dict[str, Any] | None = None,
+    origin: dict[str, Any] | None = None,
     dedupe_key: str | None = None,
 ) -> None:
     if not should_persist_user_timeline_event(event_type, source, payload):
@@ -390,7 +470,7 @@ def _create_task_event(
         dedupe_key=key,
         created_at=now_local(),
     )
-    event.payload = payload or {}
+    event.payload = _merge_timeline_recorder_payload(payload, origin=origin)
     db.add(event)
     db.flush()
     _trim_task_timeline_events(db, task_id)
@@ -469,6 +549,18 @@ def get_task_timeline(db: Session, task: AppEaTask) -> dict[str, Any]:
                 "status": row.status,
                 "message": row.message,
                 "payload": row.payload,
+                "recorder_instance_id": (_timeline_party_from_payload(row.payload, "recorder") or {}).get("instance_id"),
+                "recorder_hostname": (_timeline_party_from_payload(row.payload, "recorder") or {}).get("hostname"),
+                "recorder_pod_name": (_timeline_party_from_payload(row.payload, "recorder") or {}).get("pod_name"),
+                "recorder_node_name": (_timeline_party_from_payload(row.payload, "recorder") or {}).get("node_name"),
+                "recorder_pod_ip": (_timeline_party_from_payload(row.payload, "recorder") or {}).get("pod_ip"),
+                "recorder_role": (_timeline_party_from_payload(row.payload, "recorder") or {}).get("role"),
+                "origin_instance_id": (_timeline_party_from_payload(row.payload, "event_origin") or {}).get("instance_id"),
+                "origin_hostname": (_timeline_party_from_payload(row.payload, "event_origin") or {}).get("hostname"),
+                "origin_pod_name": (_timeline_party_from_payload(row.payload, "event_origin") or {}).get("pod_name"),
+                "origin_node_name": (_timeline_party_from_payload(row.payload, "event_origin") or {}).get("node_name"),
+                "origin_pod_ip": (_timeline_party_from_payload(row.payload, "event_origin") or {}).get("pod_ip"),
+                "origin_role": (_timeline_party_from_payload(row.payload, "event_origin") or {}).get("role"),
                 "created_at": isoformat_local(row.created_at),
             }
             for row in rows
