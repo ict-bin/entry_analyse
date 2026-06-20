@@ -109,6 +109,12 @@ async def run_task(task_id: str, pod_name: str) -> None:
                 pass
         last_progress_time = time.time()
 
+    # ── 初始化 DB engine（任务子进程独立进程，worker 主进程的 SQLAlchemy pool 不共享）──
+    from app.service.svc_config import get_service_yaml as _get_svc_yaml
+    _sy = _get_svc_yaml()
+    from app.db import init_db
+    init_db(_sy.database.url, _sy.database.pool_size, _sy.database.max_overflow)
+
     # ── Step 0: Claim the task in DB ──────────────────────────────────
     db_gen = get_db()
     db = next(db_gen)
