@@ -2791,31 +2791,10 @@ class TaskService:
                 )
             except Exception as exc:
                 logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
-        # 如果 worker pod IP 可知，异步发送内部取消信号，无需等待轮询到期
-        if owner_pod_ip and row.status == "running":
-            _asyncio.create_task(self._notify_cancel(owner_pod_ip, task_id))
+        # V3: 取消走 AppEaTaskCommand → 调度器 socket TERMINATE，不再 HTTP 直发 worker 3001。
         result = self._row_to_dict(row, db=db)
         result["cancel_phase"] = "requested"
         return result
-
-    @staticmethod
-    async def _notify_cancel(pod_ip: str, task_id: str) -> None:
-        """HTTP POST 到 worker 内置 cancel server（双路径），封装网络错误不抛出。
-
-        路径 1: /cancel/{task_id} — 触发 instant_cancel + 强制杀进程（新版本）
-        路径 2: /kill/{task_id}   — 仅强制杀进程（新旧版本均兼容）
-        """
-        import asyncio as _asyncio
-        import urllib.request
-        for path in (f"/cancel/{task_id}", f"/kill/{task_id}"):
-            try:
-                url = f"http://{pod_ip}:3001{path}"
-                await _asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda u=url: urllib.request.urlopen(u, timeout=2)
-                )
-            except Exception:
-                pass  # 发送失败无关紧要，轮询机制不受影响
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
         """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务不允许删除。"""
