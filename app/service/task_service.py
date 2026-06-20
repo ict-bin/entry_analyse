@@ -1802,15 +1802,6 @@ class TaskService:
         # 不再由 worker/API 进程主动派发。此处保留为 no-op（调用方无需改动）。
         return
 
-    @staticmethod
-
-    @staticmethod
-
-    @staticmethod
-
-    @staticmethod
-
-
     def list_tasks(
         self,
         db: Session,
