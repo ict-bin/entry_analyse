@@ -191,12 +191,21 @@ class SchedulerService:
         if pod is None:
             return None
         # 刷新 last_seen
+        # 关键：事件驱动派发 — worker 状态变化立即触发派发下一个。
+        # 上一版 hang 的根本原因：dispatch_loop 周期性扫表给所有 free worker
+        # 一次性发 LAUNCH，任一卡住则整个 batch hang。改成 "DONE 驱动"
+        # 后，LAUNCH 发送时机 = worker 释放 capacity 那一刻 (亳秒级)，
+        # socket buffer 不再堵，scheduler 也不会一轮发多个任务被卡。
         with self._reg_lock:
             w = self._workers.get(pod)
             if w is not None:
                 w.last_seen = time.time()
+                triggered_pod: Optional[str] = None
                 if mtype == "HEARTBEAT":
-                    w.free_slots = int(msg.get("free_slots", w.free_slots))
+                    new_free = int(msg.get("free_slots", w.free_slots))
+                    if new_free > w.free_slots:
+                        triggered_pod = pod  # worker 报告有空闲 → 派发
+                    w.free_slots = new_free
                 elif mtype == "STATUS":
                     tid = msg.get("task_id")
                     state = msg.get("state")
@@ -204,14 +213,23 @@ class SchedulerService:
                         self._task_owner[tid] = pod
                         w.tasks.add(tid)
                     elif tid and state == "rejected":
-                        # worker 拒收（无空闲）—— 解除归属，交回派发
+                        # worker 拒收（无空闲）—— 解除归属，派下一个（不限于同 worker）
                         self._task_owner.pop(tid, None)
                         w.tasks.discard(tid)
+                        triggered_pod = pod
                 elif mtype == "DONE":
                     tid = msg.get("task_id")
                     if tid:
                         self._task_owner.pop(tid, None)
                         w.tasks.discard(tid)
+                    w.free_slots = min(w.capacity, w.free_slots + 1)
+                    triggered_pod = pod  # DONE → 立即派发下一个给该 worker
+                elif mtype == "HELLO":
+                    # 重连后调度该 worker 之前持有的任务（drain orphans）
+                    triggered_pod = pod
+        if triggered_pod:
+            # 必须在 _reg_lock 外派发，避免 dispatch_one 内部 _pick_worker 与 _reg_lock 重入
+            self._dispatch_one_to(triggered_pod)
         return pod
 
     def _worker_stale(self, pod: str) -> bool:
@@ -234,6 +252,11 @@ class SchedulerService:
 
     # ── 派发：pending → 选 worker → LAUNCH ─────────────────────────────────
     def _dispatch_loop(self) -> None:
+        # 事件驱动派发：worker DONE/HEARTBEAT/HELLO 立即触发 _dispatch_one_to(pod)。
+        # 本循环仅作兜底对账：周期 10s 防 CB 幂等状态被多
+        # dispatch (e.g. worker 重启后 _reg_lock 中 state 不对)，或 DB 中
+        # pending 任务在旁路被插入 (人工/API 跳过 scheduler) 。正常工作下
+        # 几乎都是返回 0。
         idle_streak = 0
         while not self._stop.is_set():
             try:
@@ -243,7 +266,6 @@ class SchedulerService:
                 dispatched = 0
             if dispatched == 0:
                 idle_streak += 1
-                # 30 轮（30s * 30 = 15min）连续 0 派发 → 输出诊断
                 if idle_streak % 30 == 1:
                     with self._reg_lock:
                         workers_dump = [
@@ -251,47 +273,66 @@ class SchedulerService:
                             f"tasks={len(w.tasks)} age={time.time()-w.last_seen:.1f}s"
                             for w in self._workers.values()
                         ]
-                    logger.warning("dispatch idle streak=%d: workers=[%s]",
-                                   idle_streak, "; ".join(workers_dump) or "<none>")
+                    logger.info("dispatch idle streak=%d: workers=[%s]",
+                                idle_streak, "; ".join(workers_dump) or "<none>")
             else:
                 idle_streak = 0
-            self._stop.wait(DISPATCH_POLL_SECONDS)
+            self._stop.wait(DISPATCH_POLL_SECONDS * 10)  # 兜底对账频率 10s
 
     def _dispatch_once(self) -> int:
-        if not self._has_free_worker():
+        # 事件驱动为主，但保留一轮扫表能力作为兜底。
+        # 查所有 pending，依次给首个 free worker 派发一个。
+        with self._reg_lock:
+            free_pods = [w.pod for w in self._workers.values()
+                         if w.free_slots > 0 and not w.closed]
+        if not free_pods:
             return 0
+        # 只取 1 个 pending，给首个 free pod
+        for pod in free_pods:
+            if self._dispatch_one_to(pod) > 0:
+                return 1
+        return 0
+
+    def _dispatch_one_to(self, pod: str) -> int:
+        """事件驱动核心：给指定 pod 派发 1 个 pending 任务。返回派发数 0/1。
+
+        必须在 _reg_lock 外调用（避免重入）。会临时拿 _reg_lock 检查 pod
+        状态、取 1 个 pending task、发 LAUNCH、然后再拿 _reg_lock 扣
+        free_slots / 改 DB。
+        """
+        with self._reg_lock:
+            w = self._workers.get(pod)
+            if w is None or w.closed or w.free_slots <= 0:
+                return 0
+        # 拿 1 个 pending 任务
         db_gen = get_db()
         db: Session = next(db_gen)
-        claimed: list[str] = []
         try:
-            rows = (
+            row = (
                 db.query(AppEaTask)
                 .filter(AppEaTask.is_deleted.is_(False), AppEaTask.status == "pending")
                 .order_by(AppEaTask.created_at.asc())
-                .limit(DISPATCH_BATCH_SIZE)
-                .all()
+                .limit(1)
+                .first()
             )
-            for row in rows:
-                pod = self._pick_worker()
-                if pod is None:
-                    break  # 无空闲 worker
-                ok = self._send_to(pod, {"type": "LAUNCH", "task_id": row.task_id})
-                if not ok:
-                    continue
-                # 立即占位（避免下一轮重复派发同一任务）；worker HELLO/STATUS 会确认
-                with self._reg_lock:
-                    w = self._workers.get(pod)
-                    if w is not None:
-                        w.free_slots = max(0, w.free_slots - 1)
-                        w.tasks.add(row.task_id)
-                        self._task_owner[row.task_id] = pod
-                row.status = "running"
-                row.owner_pod = pod
-                row.started_at = now_local()
-                claimed.append(row.task_id)
-            if claimed:
-                db.commit()
-            return len(claimed)
+            if row is None:
+                return 0
+            ok = self._send_to(pod, {"type": "LAUNCH", "task_id": row.task_id})
+            if not ok:
+                logger.warning("dispatch_one_to: send LAUNCH to %s failed for %s", pod, row.task_id)
+                return 0
+            with self._reg_lock:
+                ww = self._workers.get(pod)
+                if ww is not None and not ww.closed:
+                    ww.free_slots = max(0, ww.free_slots - 1)
+                    ww.tasks.add(row.task_id)
+                    self._task_owner[row.task_id] = pod
+            row.status = "running"
+            row.owner_pod = pod
+            row.started_at = now_local()
+            db.commit()
+            logger.info("dispatched task %s to %s", row.task_id, pod)
+            return 1
         finally:
             try:
                 next(db_gen)
