@@ -461,11 +461,24 @@ class SchedulerService:
             cmd.status = "pending"  # 下一轮：此时 status 已非 running，走下面的重置
             return
         # 非 running：直接重置为 pending，交派发循环重新 LAUNCH
+        # 状态机修复（方案 4）：不再调 _send_to(TERMINATE) —— _cmd_cancel
+        # 第一次处理时已发 TERMINATE (status==running 路径)，worker_control
+        # 收 TERMINATE 杀 task_runner。这里再发会造成 race：worker_control
+        # 可能先看到 cancel_requested=1 改 status=cancelled，后被本锁内
+        # 设的 status=pending 覆盖。去掉 _send_to 后不会发出重复 TERMINATE。
         pod = self._owner_of(cmd.task_id)
-        if pod:
-            self._send_to(pod, {"type": "TERMINATE", "task_id": cmd.task_id})
-        row.status = "pending"
-        _reset_cancel_state(row)
+        # 不调 _send_to(TERMINATE) —— 任务已 cancelled 且 worker_control 已
+        # 收到过 TERMINATE (_cmd_cancel running 分支发的)。
+        with self._reg_lock:
+            self._task_owner.pop(cmd.task_id, None)
+            w = self._workers.get(pod) if pod else None
+            if w:
+                w.tasks.discard(cmd.task_id)
+                w.free_slots = min(w.capacity, w.free_slots + 1)
+            # 锁内原子改 status + 清 cancel_requested（状态机一致性）
+            row.cancel_requested = False
+            row.status = "pending"
+        _reset_cancel_state(row)  # 锁外清理其他 cancel 字段（in-memory 操作）
         _safe_create_task_event(
             db, task_id=row.task_id, project_id=row.project_id,
             event_type="task_retried", message="任务已由调度器重启",
@@ -473,12 +486,6 @@ class SchedulerService:
             payload={"operator": "scheduler", "restart_mode": "fresh_start", "command_id": cmd.id},
             dedupe_key=_event_dedupe_key(row.task_id, "task_retried", "scheduler", row.updated_at),
         )
-        with self._reg_lock:
-            self._task_owner.pop(cmd.task_id, None)
-            w = self._workers.get(pod) if pod else None
-            if w:
-                w.tasks.discard(cmd.task_id)
-                w.free_slots = min(w.capacity, w.free_slots + 1)
         logger.info("scheduler restarted task %s (pod=%s)", cmd.task_id, pod or "<any>")
         # 关键：reset 完成后立即派发下一个。不要等兑底 10s —
         # 10s 内可能多个 restart 命令到达却都被兑底推后，会造成人感知的

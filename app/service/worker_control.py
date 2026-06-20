@@ -329,6 +329,23 @@ class WorkerControl:
             try:
                 row = db.query(AppEaTask).filter_by(task_id=task_id).first()
                 if row is not None and row.status not in ("passed", "failed", "cancelled"):
+                    # 状态机 守卫（方案 4）：仅在 cancel_requested=1 + status=running 
+                    # 中间态时才改 status=cancelled。这样 V3 调度器并发场景下：
+                    #   - _cmd_restart 非 running 分支锁内已改 status=pending + 清 cancel_requested
+                    #   - worker_control 收到 TERMINATE 后看到 cancel_requested=0 → 完全跳过
+                    #   - 避免 _archive_cancelled 覆盖 restart 设的 pending 导致 race
+                    if not row.cancel_requested:
+                        # cancel_requested=0 → 不是调度器发的 cancel (可能被 restart 清掉)，
+                        # 不改 status、不写 cancelled 事件、只写一条 info 供排查
+                        task_mod._safe_create_task_event(
+                            db, task_id=row.task_id, project_id=row.project_id,
+                            event_type="task_terminate_ignored", message="worker 收到 TERMINATE 但 cancel_requested=0（被 restart 清掉）",
+                            source=task_mod.TASK_EVENT_SOURCE_SYSTEM, status=row.status,
+                            payload={"reason": reason, "by": "worker_control", "ignored": True},
+                            dedupe_key=task_mod._event_dedupe_key(row.task_id, "task_terminate_ignored", "wc", now_local()),
+                        )
+                        db.commit()
+                        return
                     row.status = "cancelled"
                     row.error = row.error or "任务已取消"
                     row.cancel_requested = True
