@@ -570,6 +570,30 @@ class SchedulerService:
         with self._reg_lock:
             return self._task_owner.get(task_id)
 
+    def get_workers_state(self) -> list[dict]:
+        """给 WorkerSlotService 提供 V3 worker 状态快照（取代 V2 worker_slot 表读取）。
+
+        返回 list[{pod, capacity, free_slots, running_tasks, last_seen_age, closed}]
+        """
+        with self._reg_lock:
+            now = time.time()
+            return [
+                {
+                    "pod": w.pod,
+                    "capacity": w.capacity,
+                    "free_slots": w.free_slots,
+                    "running_tasks": list(w.tasks),
+                    "last_seen_age": now - w.last_seen,
+                    "closed": w.closed,
+                }
+                for w in self._workers.values()
+            ]
+
+    def get_running_tasks(self) -> list[str]:
+        """返回所有 V3 在跑任务的 task_id 列表。WorkerSlotService 用作 running_tasks 计数。"""
+        with self._reg_lock:
+            return [tid for pod, tid in self._task_owner.items()]
+
     def _send_to(self, pod: str, msg: dict) -> bool:
         with self._reg_lock:
             w = self._workers.get(pod)

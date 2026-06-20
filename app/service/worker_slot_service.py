@@ -263,7 +263,135 @@ class WorkerSlotService:
         self._last_cleanup_deleted_rows = deleted
         return deleted
 
+    def _v3_workers_state(self) -> Optional[list[dict]]:
+        """V3 优先：如果 SchedulerService 有 workers 返回状态列表，否则返回 None 兑底 V2。
+
+        检测方式：调 get_scheduler_service() 拿 _workers dict。
+        V3 worker_control 启动后 connect scheduler 会调 _handle_worker_msg HELLO，
+        _workers 会被填上。V3 调度器启动后几秒内就应该有 4 个 workers。
+        """
+        try:
+            from app.service.scheduler_service import get_scheduler_service
+            sched = get_scheduler_service()
+            workers = sched.get_workers_state()
+            return workers if workers else None
+        except Exception as exc:
+            logger.warning("_v3_workers_state failed, fallback to V2: %s", exc)
+            return None
+
+    def _build_snapshot_from_v3(self, db: Session, v3_workers: list[dict], *, project_id: Optional[str]) -> dict[str, Any]:
+        """从 V3 scheduler _workers dict 构造 cluster snapshot（保持 V2 response schema 兼容）。
+
+        V3 _workers dict 包含：pod, capacity, free_slots, running_tasks, last_seen_age, closed
+        V2 response schema 包含：worker_count, healthy_workers, total_capacity, busy_slots,
+        available_slots, dispatch_*, workers[], retired_workers[], stale_owner_workers[]
+        """
+        now = now_local()
+        live_workers: list[WorkerSlotSnapshot] = []
+        retired_workers_payload: list[dict[str, Any]] = []
+        live_stale_workers = 0
+        retired_workers = 0
+        for w in v3_workers:
+            pod_name = w["pod"]
+            running_tasks_count = len(w["running_tasks"])
+            available = max(0, w["capacity"] - running_tasks_count)
+            # active_tasks 从 DB 读 task 名 (V3 _workers 只有 task_id list)
+            active_tasks = []
+            for tid in w["running_tasks"]:
+                row = db.query(AppEaTask).filter(
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.status == "running",
+                    AppEaTask.task_id == tid,
+                ).first()
+                if row:
+                    active_tasks.append({
+                        "task_id": row.task_id,
+                        "entry_id": row.parent_stage_item_id or row.parent_stage_item_key or row.module_name,
+                        "status": row.status,
+                        "lease_expires_at": isoformat_local(row.lease_expires_at),
+                    })
+            healthy = not w["closed"] and w["last_seen_age"] < 90.0
+            if w["closed"]:
+                worker_role_state = "retired"
+                source = "v3_scheduler_retired"
+                error = "v3 worker closed (disconnect/timeout)"
+                retired_workers += 1
+                target = retired_workers_payload
+            else:
+                worker_role_state = "healthy" if healthy else "stale_live"
+                source = "v3_scheduler"
+                error = None if healthy else "v3 worker heartbeat stale"
+                if not healthy:
+                    live_stale_workers += 1
+                target = live_workers
+            snapshot = WorkerSlotSnapshot(
+                worker_id=f"v3::{pod_name}",
+                pod_name=pod_name,
+                pod_ip=None,
+                healthy=healthy,
+                max_concurrent_tasks=int(w["capacity"]),
+                running_tasks=running_tasks_count,
+                available_slots=available,
+                agent_process_limit=0,
+                agent_process_in_use=0,
+                agent_process_available=0,
+                agent_waiting_requests=0,
+                agent_waiting_tasks=0,
+                agent_queue_oldest_wait_seconds=0.0,
+                agent_rss_total_bytes=0,
+                agent_rss_max_bytes=0,
+                agent_snapshot_at=None,
+                last_heartbeat_at=now,
+                heartbeat_age_seconds=float(w["last_seen_age"]),
+                consecutive_heartbeat_failures=0,
+                last_heartbeat_error=None,
+                last_heartbeat_duration_ms=None,
+                worker_role_state=worker_role_state,
+                source=source,
+                error=error,
+                active_tasks=sorted(active_tasks, key=lambda item: item["task_id"]),
+            )
+            target.append(self._worker_payload_from_snapshot(snapshot))
+        # queued task count
+        queued_query = db.query(AppEaTask).filter(
+            AppEaTask.is_deleted.is_(False),
+            AppEaTask.status == "pending",
+        )
+        if str(project_id or "").strip():
+            queued_query = queued_query.filter(AppEaTask.project_id == project_id)
+        queued_tasks = int(queued_query.count())
+        total_capacity = sum(int(item["max_concurrent_tasks"]) for item in live_workers)
+        busy_slots = sum(int(item["running_tasks"]) for item in live_workers)
+        healthy_workers = sum(1 for item in live_workers if item["healthy"])
+        dispatch_limit = total_capacity
+        dispatch_running = busy_slots
+        dispatch_available = max(0, total_capacity - busy_slots)
+        return {
+            "worker_count": len(live_workers),
+            "healthy_workers": healthy_workers,
+            "stale_workers": live_stale_workers,
+            "live_stale_workers": live_stale_workers,
+            "retired_workers": retired_workers,
+            "stale_owner_workers": 0,
+            "total_capacity": total_capacity,
+            "busy_slots": busy_slots,
+            "running_jobs": busy_slots,
+            "available_slots": dispatch_available,
+            "dispatch_limit": dispatch_limit,
+            "dispatch_running": dispatch_running,
+            "queued_tasks": queued_tasks,
+            "workers": live_workers,
+            "retired_workers_payload": retired_workers_payload,
+            "stale_owner_workers_payload": [],
+            "source": "v3_scheduler",
+        }
+
     def get_cluster_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
+        # V3 优先：V3 scheduler 有 workers 走 V3 路径
+        v3_workers = self._v3_workers_state()
+        if v3_workers is not None:
+            return self._build_snapshot_from_v3(db, v3_workers, project_id=project_id)
+        # V2 兑底：查 V2 worker_slot 表
         now = now_local()
         stale_cutoff = add_seconds_local(now, -STALE_AFTER_SECONDS)
         live_pods = self._list_live_worker_pods()
