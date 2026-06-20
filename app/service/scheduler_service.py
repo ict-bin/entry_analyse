@@ -470,7 +470,19 @@ class SchedulerService:
             w = self._workers.get(pod) if pod else None
             if w:
                 w.tasks.discard(cmd.task_id)
-        logger.info("scheduler restarted task %s", cmd.task_id)
+                w.free_slots = min(w.capacity, w.free_slots + 1)
+        logger.info("scheduler restarted task %s (pod=%s)", cmd.task_id, pod or "<any>")
+        # 关键：reset 完成后立即派发下一个。不要等兑底 10s —
+        # 10s 内可能多个 restart 命令到达却都被兑底推后，会造成人感知的
+        # “重启不生效”。优先派给原 pod （worker 刚释放 capacity），
+        # 原 pod 不在则兑底选任意 free worker。
+        if pod and self._dispatch_one_to(pod) > 0:
+            return
+        with self._reg_lock:
+            any_pod = next((wp.pod for wp in self._workers.values()
+                            if wp.free_slots > 0 and not wp.closed), None)
+        if any_pod:
+            self._dispatch_one_to(any_pod)
 
     # ── 断联/心跳超时回收 ────────────────────────────────────────────────────
     def _reclaim_loop(self) -> None:
