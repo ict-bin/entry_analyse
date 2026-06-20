@@ -114,11 +114,6 @@ POD_IP = (
 )
 WORKER_OWNER_POD_RE = re.compile(r"^secflow-app-entry-analyse-worker(?:-adaptive)?-[a-z0-9]+-[a-z0-9]+$")
 
-_dispatch_tasks: dict[str, asyncio.Task] = {}
-_dispatch_lock_registry: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
-] = weakref.WeakKeyDictionary()
-
 _TASK_LIST_SORT_COLUMNS = {
     "created_at": AppEaTask.created_at,
     "updated_at": AppEaTask.updated_at,
