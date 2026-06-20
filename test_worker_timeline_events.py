@@ -93,6 +93,10 @@ def test_worker_execute_task_records_task_started_event() -> None:
         assert "task_started" in [event["event_type"] for event in timeline["events"]]
         assert "task_finished" in [event["event_type"] for event in timeline["events"]]
         assert "task_end" not in [event["event_type"] for event in timeline["events"]]
+        started = next(event for event in timeline["events"] if event["event_type"] == "task_started")
+        assert started["recorder_role"] == "worker"
+        assert started["recorder_pod_name"] == "test-pod"
+        assert started["recorder_pod_ip"] == "10.0.0.8"
     finally:
         verify.close()
 
