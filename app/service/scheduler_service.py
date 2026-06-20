@@ -234,16 +234,32 @@ class SchedulerService:
 
     # ── 派发：pending → 选 worker → LAUNCH ─────────────────────────────────
     def _dispatch_loop(self) -> None:
+        idle_streak = 0
         while not self._stop.is_set():
             try:
-                self._dispatch_once()
+                dispatched = self._dispatch_once()
             except Exception as exc:
                 logger.warning("dispatch loop error: %s", exc)
+                dispatched = 0
+            if dispatched == 0:
+                idle_streak += 1
+                # 30 轮（30s * 30 = 15min）连续 0 派发 → 输出诊断
+                if idle_streak % 30 == 1:
+                    with self._reg_lock:
+                        workers_dump = [
+                            f"pod={w.pod} free={w.free_slots} closed={w.closed} "
+                            f"tasks={len(w.tasks)} age={time.time()-w.last_seen:.1f}s"
+                            for w in self._workers.values()
+                        ]
+                    logger.warning("dispatch idle streak=%d: workers=[%s]",
+                                   idle_streak, "; ".join(workers_dump) or "<none>")
+            else:
+                idle_streak = 0
             self._stop.wait(DISPATCH_POLL_SECONDS)
 
-    def _dispatch_once(self) -> None:
+    def _dispatch_once(self) -> int:
         if not self._has_free_worker():
-            return
+            return 0
         db_gen = get_db()
         db: Session = next(db_gen)
         claimed: list[str] = []
@@ -275,6 +291,7 @@ class SchedulerService:
                 claimed.append(row.task_id)
             if claimed:
                 db.commit()
+            return len(claimed)
         finally:
             try:
                 next(db_gen)
@@ -499,10 +516,17 @@ class SchedulerService:
             return False
         with w.send_lock:
             try:
+                # 关键：设 SO_SNDTIMEO 防 sendall 永久阻塞。
+                # 场景：worker TCP 接收 buffer 满（worker 端 socket reader 慢/挂），
+                # 不超时会让同一 worker 后续 _send_to 全部 hang，进而 dispatch/command/reclaim
+                # 拿不到 send_lock 全在 futex 等，调度器变砖。
+                w.conn.settimeout(3.0)
                 w.conn.sendall((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
                 return True
-            except OSError:
-                # 连接已断：触发回收（标记 last_seen 为 0，下个 reclaim 周期清掉）
+            except (socket.timeout, OSError) as exc:
+                # 超时/断联：标记 worker stale（last_seen=0），下个 reclaim 周期清掉 + reclaim
+                # 其名下任务。下个 dispatch_loop 轮能选其他 worker。
+                logger.warning("send to %s failed (%s), marking stale", pod, exc)
                 with self._reg_lock:
                     ww = self._workers.get(pod)
                     if ww is not None:
