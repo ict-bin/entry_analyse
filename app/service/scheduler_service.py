@@ -395,7 +395,11 @@ class SchedulerService:
         row = db.query(AppEaTask).filter(
             AppEaTask.task_id == cmd.task_id, AppEaTask.is_deleted.is_(False),
         ).first()
-        if row is None or row.status in ("passed", "failed", "error", "cancelled"):
+        # 跳过已结束或待重发的状态：
+        #   - terminal: passed/failed/error/cancelled — 无意义
+        #   - pending: 由 _cmd_restart 重置后等待重派发，cancel 反而会
+        #     把它改回 cancelled 导致 restart/cancel 死循环。
+        if row is None or row.status in ("passed", "failed", "error", "cancelled", "pending"):
             return
         pod = self._owner_of(cmd.task_id)
         if row.status == "running" and pod:
