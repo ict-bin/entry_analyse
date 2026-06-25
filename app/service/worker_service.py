@@ -476,7 +476,7 @@ def _materialize_task_pi_runtime(*, agent_task_key: dict | None = None) -> tuple
     """
     返回 Pod 全局 PI 配置目录。
     一个 Pod 一个任务，无需任务级隔离。
-    models.json / settings.json / auth.json 均为 Pod 启动时全局生成。
+    models.json 由任务启动时按 secret/模型就地改写 apiKey；不再生成 auth.json。
     """
     global_dir = str(Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")))
     return {"workers": global_dir, "judges": global_dir}, "global"
@@ -491,37 +491,32 @@ async def _prepare_task_llm_runtime(
 ) -> dict[str, Any]:
     """任务启动前准备 LLM 运行时（models.json + 任务级模型）。
 
-    两种路径：
-      - 网关路径（非手动任务 + WSK）：用 WSK 校验网关密钥（失败重试 key_validate_retries 次，
-        仍失败则报错退出），通过后构建只含网关 provider 的 models.json（apiKey=WSK）。
-      - 模型配置中心路径（手动任务 / 无 WSK）：sync_providers_to_pi 拉取全量 provider（含 SK）。
-
-    未下发 model 时默认 gaiasec/auto（网关）或 gaiasec/auto（配置中心）。
+    统一逻辑（按是否传入 secret/模型决策，不再区分任务来源）：
+      1. 始终 sync_providers_to_pi 拉取配置中心全量 provider（含各 SK）写入 models.json。
+      2. 有 secret 传入 → 直接把 models.json 里网关 provider(gaiasec) 的 apiKey 替换为 secret；
+         模型 = 下发模型 / 默认 auto。
+      3. 无 secret → 手动模式：沿用配置中心 SK + 参数配置界面模型（cfg.workers.default_model）；
+         下发了模型则用该模型。
+      密钥错误由运行时 401 立即致命处理（不再预校验）。
     返回 resolved_key_info 供快照与前端展示。
     """
     from app.config import apply_task_model
     from app.service.llm_provider_sync import (
-        build_gateway_models_json,
+        _mask_secret,
+        patch_provider_apikey,
         sync_providers_to_pi,
-        validate_gateway_key,
-        write_models_json,
     )
-    from app.runner import PiFatalError
 
     tc = task_config if isinstance(task_config, dict) else {}
     agent_task_key = tc.get("agent_task_key") if isinstance(tc.get("agent_task_key"), dict) else {}
-    wsk = str(agent_task_key.get("secret") or "").strip()
+    secret = str(agent_task_key.get("secret") or "").strip()
     raw_model = str(tc.get("model") or "").strip()
     origin_norm = str(origin or "manual").strip() or "manual"
-    is_gateway = origin_norm == "binary_security" and bool(wsk)
 
     gw = getattr(svc_yaml, "ai_gateway", None)
     gw_base_url = getattr(gw, "openai_base_url", "http://gaiasec-api-gateway/v1") if gw else "http://gaiasec-api-gateway/v1"
     gw_provider_key = getattr(gw, "provider_key", "gaiasec") if gw else "gaiasec"
     gw_default_model = getattr(gw, "default_model", "auto") if gw else "auto"
-    gw_retries = int(getattr(gw, "key_validate_retries", 3) if gw else 3)
-    gw_retry_delay = float(getattr(gw, "key_validate_retry_delay", 5.0) if gw else 5.0)
-    gw_timeout = int(getattr(gw, "timeout", 15) if gw else 15)
 
     def _strip_provider(m: str) -> str:
         m = str(m or "").strip()
@@ -529,55 +524,7 @@ async def _prepare_task_llm_runtime(
             return m.split("/", 1)[1]
         return m
 
-    if is_gateway:
-        # ── 网关路径：校验 WSK（key 错误重试 key_validate_retries 次后报错退出）──
-        available: list[str] | None = None
-        last_err: str | None = None
-        for attempt in range(1, gw_retries + 1):
-            ok, models, err = await validate_gateway_key(gw_base_url, wsk, timeout=gw_timeout)
-            if ok:
-                available = models or []
-                last_err = None
-                break
-            last_err = err or "unknown"
-            logger.warning(
-                "网关密钥校验失败 attempt=%d/%d: %s", attempt, gw_retries, last_err,
-            )
-            if attempt < gw_retries:
-                await asyncio.sleep(gw_retry_delay)
-        if last_err is not None:
-            raise PiFatalError(
-                f"LLM 网关密钥(WSK)连续 {gw_retries} 次校验失败，任务终止: {last_err}"
-            )
-        target_model = _strip_provider(raw_model) or gw_default_model
-        models_json = build_gateway_models_json(
-            base_url=gw_base_url, wsk=wsk, provider_key=gw_provider_key,
-            model=target_model, default_model=gw_default_model,
-            available_models=available,
-        )
-        write_models_json(models_json)
-        resolved_model = f"{gw_provider_key}/{target_model}"
-        apply_task_model(cfg, resolved_model)
-        from app.service.llm_provider_sync import _mask_secret
-        resolved_key_info = {
-            "source": "gateway",
-            "model": resolved_model,
-            "dispatched_model": raw_model or None,
-            "key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
-            "key_masked": _mask_secret(wsk),
-            "key_source": str(agent_task_key.get("source") or "").strip() or None,
-            "task_origin_type": origin_norm,
-            "gateway_available_models": available,
-        }
-        logger.info(
-            "_prepare_task_llm_runtime gateway: provider=%s model=%s available=%s",
-            gw_provider_key, resolved_model, available,
-        )
-        return resolved_key_info
-
-    # ── 模型配置中心路径（手动任务 / 无 WSK）：SK 自动取 provider apiKey ──
-    # 默认模型沿用「参数配置界面」配置的 workers/judges 模型（cfg 已由 build_task_config 从全局配置载入），
-    # 仅当任务显式下发了 model 时才覆盖。
+    # 1. 始终同步配置中心 models.json（含各 provider 的 SK）
     try:
         await sync_providers_to_pi(
             base_url=svc_yaml.configcenter.base_url,
@@ -585,43 +532,47 @@ async def _prepare_task_llm_runtime(
             timeout=svc_yaml.configcenter.timeout,
         )
     except Exception as _e:
-        logger.warning("sync_providers_to_pi failed (config_center path): %s", _e)
+        logger.warning("sync_providers_to_pi failed: %s", _e)
+
     cfg_default_model = (
         str(getattr(cfg.workers, "default_model", "") or "").strip()
         or (cfg.workers.agents[0].model if cfg.workers.agents else "")
         or f"{gw_provider_key}/{gw_default_model}"
     )
-    if raw_model:
-        resolved_model = raw_model
-        apply_task_model(cfg, resolved_model)
+
+    if secret:
+        # 2. 有 secret → 直接替换网关 provider 的 apiKey；模型 = 下发 / 默认 auto
+        target = _strip_provider(raw_model) or gw_default_model
+        patch_provider_apikey(gw_provider_key, secret, base_url=gw_base_url, ensure_model=target)
+        resolved_model = f"{gw_provider_key}/{target}"
+        source = "gateway"
+        key_prefix = str(agent_task_key.get("prefix") or "").strip() or None
+        key_masked = _mask_secret(secret)
+        key_source = str(agent_task_key.get("source") or "").strip() or None
+        logger.info(
+            "_prepare_task_llm_runtime gateway: provider=%s model=%s (apikey replaced)",
+            gw_provider_key, resolved_model,
+        )
     else:
-        resolved_model = cfg_default_model  # 沿用参数配置界面的模型
+        # 3. 无 secret → 手动模式：配置中心 SK + 参数配置界面模型
+        resolved_model = raw_model or cfg_default_model
+        source = "config_center"
+        key_prefix = None
+        key_masked = None
+        key_source = None
+        logger.info("_prepare_task_llm_runtime config_center: model=%s", resolved_model)
+
+    apply_task_model(cfg, resolved_model)
     resolved_key_info = {
-        "source": "config_center",
+        "source": source,
         "model": resolved_model,
         "dispatched_model": raw_model or None,
-        "key_prefix": None,
-        "key_masked": None,
-        "key_source": None,
+        "key_prefix": key_prefix,
+        "key_masked": key_masked,
+        "key_source": key_source,
         "task_origin_type": origin_norm,
     }
-    logger.info(
-        "_prepare_task_llm_runtime config_center: model=%s", resolved_model,
-    )
     return resolved_key_info
-
-
-def _normalize_agent_auth_snapshot(agent_task_key: dict | None) -> dict[str, Any] | None:
-    if not isinstance(agent_task_key, dict):
-        return None
-    payload = {
-        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
-        "agent_task_key_name": str(agent_task_key.get("name") or "").strip() or None,
-        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
-        "agent_task_key_secret": str(agent_task_key.get("secret") or "").strip() or None,
-        "agent_task_key_source": str(agent_task_key.get("source") or "").strip() or None,
-    }
-    return payload if any(payload.values()) else None
 
 
 def _build_role_runtime_summary(
@@ -666,7 +617,7 @@ def _build_runtime_config_snapshots(
     agent_runtime_mode: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any], dict[str, Any]]:
     frozen_at = now_local().isoformat()
-    agent_auth_json = _normalize_agent_auth_snapshot(agent_task_key)
+    agent_auth_json = None  # auth.json 已废除：密钥直接替换进 models.json，不再单独快照
     role_dirs = task_pi_dirs if isinstance(task_pi_dirs, dict) else {}
     role_config_snapshot: dict[str, Any] = {}
     provider_runtime_summary: dict[str, Any] = {"workers": None, "judges": None}
@@ -676,12 +627,11 @@ def _build_runtime_config_snapshots(
         runtime_path = Path(runtime_dir) if runtime_dir else None
         models_json = _read_json_file(runtime_path / "models.json" if runtime_path else None)
         settings_json = _read_json_file(runtime_path / "settings.json" if runtime_path else None)
-        auth_json = _read_json_file(runtime_path / "auth.json" if runtime_path else None)
         role_runtime_files[role_name] = {
             "runtime_dir": runtime_dir,
             "models_json": models_json,
             "settings_json": settings_json,
-            "auth_json": auth_json,
+            "auth_json": None,
         }
         role_config_snapshot[role_name] = {
             "config": role_config.model_dump(mode="json") if hasattr(role_config, "model_dump") else {},
@@ -689,7 +639,7 @@ def _build_runtime_config_snapshots(
             "runtime_files": {
                 "models_json": models_json,
                 "settings_json": settings_json,
-                "auth_json": auth_json,
+                "auth_json": None,
             },
         }
         provider_runtime_summary[role_name] = _build_role_runtime_summary(
@@ -698,19 +648,13 @@ def _build_runtime_config_snapshots(
             runtime_dir=runtime_dir,
             models_json=models_json,
             settings_json=settings_json,
-            auth_json=auth_json,
+            auth_json=None,
         )
     llm_binding_snapshot = {
-        "version": 1,
+        "version": 2,
         "frozen_at": frozen_at,
         "agent_runtime_mode": agent_runtime_mode,
-        "agent_task_key": {
-            "id": str((agent_task_key or {}).get("id") or "").strip() or None,
-            "name": str((agent_task_key or {}).get("name") or "").strip() or None,
-            "prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
-            "secret": str((agent_task_key or {}).get("secret") or "").strip() or None,
-            "source": str((agent_task_key or {}).get("source") or "").strip() or None,
-        } if isinstance(agent_task_key, dict) else None,
+        "agent_task_key": None,  # 已废除，密钥信息见 resolved_key_info
         "runtime_files": role_runtime_files,
         "roles": role_config_snapshot,
     }
