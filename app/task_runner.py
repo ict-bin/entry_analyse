@@ -76,7 +76,6 @@ async def run_task(task_id: str, pod_name: str) -> None:
         _build_runtime_config_snapshots,
     )
     from app.agent_process import cleanup_task_pi_processes
-    from app.service.llm_provider_sync import sync_providers_to_pi
     from app.time_utils import now_local
     from app.logging_utils import log_event
 
@@ -144,6 +143,7 @@ async def run_task(task_id: str, pod_name: str) -> None:
             output_path=row.output_path,
             status=row.status,
             task_config_json=tcfg,
+            task_origin_type=str(row.task_origin_type or "manual").strip() or "manual",
         )
         project_id = row.project_id
         task_roots = _task_roots_from_row(
@@ -244,14 +244,45 @@ async def run_task(task_id: str, pod_name: str) -> None:
 
     try:
         from app.service.svc_config import get_service_yaml as _svc_yaml
+        from app.service.worker_service import _prepare_task_llm_runtime
         _yaml = _svc_yaml()
-        await sync_providers_to_pi(
-            base_url=_yaml.configcenter.base_url,
-            token=_yaml.auth_service.service_machine_token,
-            timeout=_yaml.configcenter.timeout,
+        # 任务级 LLM 运行时：按任务来源解析 model + key，写入 models.json
+        #   - 非手动(binary_security)+WSK → 网关路径，校验 WSK（失败 key_validate_retries 次后报错退出）
+        #   - 手动 / 无 WSK → 模型配置中心路径，SK 自动取 provider apiKey
+        #   - 未下发 model → 默认 gaiasec/auto
+        resolved_key_info = await _prepare_task_llm_runtime(
+            cfg=cfg, task_config=tcfg,
+            origin=task_snapshot.task_origin_type, svc_yaml=_yaml,
         )
-    except Exception as _e:
-        logger.warning("pre-materialize sync failed: %s", _e)
+    except Exception as _llm_err:
+        # LLM key/model 致命错误（如 WSK 连续校验失败）：写终态后退出
+        logger.error("_run_task STEP3 llm_runtime failed: task=%s err=%s",
+                     task_id, _llm_err, exc_info=True)
+        _lf = get_db(); _ld = next(_lf)
+        try:
+            _lr = _ld.query(AppEaTask).filter(AppEaTask.task_id == task_id).first()
+            if _lr:
+                _lr.status = "failed"
+                _lr.error = f"LLM 运行时准备失败: {str(_llm_err)[:400]}"
+                _lr.finished_at = now_local()
+                _lr.owner_pod = None
+                task_mod._safe_create_task_event(
+                    _ld, task_id=_lr.task_id, project_id=_lr.project_id,
+                    event_type="task_failed",
+                    message=str(_lr.error),
+                    source=task_mod.TASK_EVENT_SOURCE_WORKER,
+                    level="error",
+                    status="failed",
+                    payload={"owner_pod": pod_name},
+                    dedupe_key=task_mod._event_dedupe_key(_lr.task_id, "task_failed", _lr.finished_at, "llm_runtime"),
+                )
+                _ld.commit()
+        finally:
+            try:
+                next(_lf)
+            except StopIteration:
+                pass
+        return
 
     agent_task_key = _task_agent_key(tcfg)
     task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(agent_task_key=agent_task_key)
@@ -286,6 +317,7 @@ async def run_task(task_id: str, pod_name: str) -> None:
                 "llm_binding_snapshot": llm_binding_snapshot,
                 "agent_runtime_mode": agent_runtime_mode,
                 "role_runtime_dirs": dict(task_pi_dirs),
+                "resolved_key_info": resolved_key_info,
             }
             _db_cfg.commit()
     finally:

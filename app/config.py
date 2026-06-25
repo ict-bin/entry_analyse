@@ -153,6 +153,20 @@ def _backfill_role(role: RoleConfig) -> None:
             agent.thinking_level = role.default_thinking_level
 
 
+def apply_task_model(cfg: TaskConfig, model: str) -> None:
+    """将任务级模型应用到 workers/judges 的所有 agent + default_model。
+
+    用于任务创建时下发的模型（手动任务从模型配置中心选；非手动任务从编排器下发或默认 auto）。
+    """
+    resolved = str(model or "").strip()
+    if not resolved:
+        return
+    for role in (cfg.workers, cfg.judges):
+        role.default_model = resolved
+        for agent in role.agents:
+            agent.model = resolved
+
+
 def load_system_prompts(prompt_dir: str, count: int) -> list[str]:
     """从文件夹加载 system prompt。"""
     prompt_dir = os.path.abspath(prompt_dir)

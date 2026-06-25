@@ -99,6 +99,7 @@ class TaskCreateRequest(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    model: Optional[str] = None                 # 任务级模型（手动任务从模型配置中心选；非手动由编排器下发，缺省 auto）
     agent_task_key_id: Optional[str] = None
     agent_task_key_name: Optional[str] = None
     agent_task_key_prefix: Optional[str] = None
@@ -1114,6 +1115,7 @@ async def create_task(
         parent_stage_item_id=body.parent_stage_item_id,
         parent_stage_item_key=body.parent_stage_item_key,
         task_config_json={
+            **({"model": body.model} if body.model else {}),
             **({
                 "agent_task_key": {
                     "id": body.agent_task_key_id,

@@ -1646,6 +1646,46 @@ def _task_config_snapshot_payload(row: AppEaTask) -> dict[str, object]:
     }
 
 
+def _mask_secret(secret: str | None) -> str | None:
+    s = str(secret or "").strip()
+    if not s:
+        return None
+    if len(s) <= 8:
+        return s[:2] + "****"
+    return f"{s[:4]}****{s[-4:]}"
+
+
+def _resolved_key_info_payload(row: AppEaTask) -> dict[str, object]:
+    """任务解析后使用的 LLM key 信息（供前端详情页展示）。"""
+    task_config = _parse_task_config(row.task_config_json)
+    agent_task_key = task_config.get("agent_task_key") if isinstance(task_config.get("agent_task_key"), dict) else {}
+    secret = str(agent_task_key.get("secret") or "").strip()
+    origin = str(row.task_origin_type or "manual").strip() or "manual"
+    # 非手动任务且带 WSK → 网关路径；否则 → 模型配置中心（SK）路径
+    is_gateway = origin == "binary_security" and bool(secret)
+    model = str(task_config.get("model") or "").strip()
+    # 运行后 role_config_snapshot 记录了实际生效的模型；未运行时用下发值或默认
+    role_snapshot = task_config.get("role_config_snapshot") if isinstance(task_config.get("role_config_snapshot"), dict) else {}
+    workers_cfg = role_snapshot.get("workers") if isinstance(role_snapshot.get("workers"), dict) else {}
+    resolved_model = (
+        str((workers_cfg.get("config") or {}).get("default_model") or "").strip()
+        or str(workers_cfg.get("default_model") or "").strip()
+        or model
+        or "gaiasec/auto"
+    )
+    return {
+        "resolved_key_info": {
+            "source": "gateway" if is_gateway else "config_center",
+            "model": resolved_model,
+            "dispatched_model": model or None,
+            "key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+            "key_masked": _mask_secret(secret) if secret else None,
+            "key_source": str(agent_task_key.get("source") or "").strip() or None,
+            "task_origin_type": origin,
+        }
+    }
+
+
 def _is_binary_security_origin_task(task_origin_type: Optional[str], parent_task_id: Optional[str], parent_stage_name: Optional[str]) -> bool:
     del parent_task_id, parent_stage_name
     return str(task_origin_type or "").strip() == "binary_security"
@@ -3144,6 +3184,7 @@ class TaskService:
             "event_summary": _build_task_event_summary(db, row.task_id) if db is not None else None,
             **_agent_runtime_payload(row),
             **_task_config_snapshot_payload(row),
+            **_resolved_key_info_payload(row),
         })
         if include_function_catalog:
             payload["function_catalog"] = _build_function_catalog(row)

@@ -180,3 +180,112 @@ async def sync_providers_to_pi(
     except Exception as e:
         logger.exception("同步 LLM Provider 时发生未知错误: %s", e)
     return False
+
+
+# ── AI 网关（WSK）路径 ──────────────────────────────────────────────────────
+
+def _mask_secret(secret: str) -> str:
+    """脱敏：保留前4 + 末4，中间用 **** 代替。"""
+    s = str(secret or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return s[:2] + "****"
+    return f"{s[:4]}****{s[-4:]}"
+
+
+async def validate_gateway_key(
+    base_url: str,
+    wsk: str,
+    timeout: int = 15,
+) -> tuple[bool, list[str] | None, str | None]:
+    """用 WSK 探测网关 GET /v1/models，校验密钥是否有效。
+
+    Returns:
+        (ok, models, error)
+        - ok=True 时 models 为网关可用模型 alias 列表
+        - ok=False 时 error 为错误描述（如 'invalid llm key'）
+    """
+    url = f"{base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {wsk}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return False, None, f"HTTP {resp.status}: {text[:200]}"
+                # 网关对无效 key 也可能返回 200 + 'invalid llm key' 文本
+                low = text.strip().lower()
+                if low.startswith("invalid") or "invalid llm key" in low:
+                    return False, None, "invalid llm key"
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    return False, None, f"non-JSON response: {text[:200]}"
+                models = [
+                    str(m.get("id") or "").strip()
+                    for m in (data.get("data") or [])
+                    if isinstance(m, dict)
+                ]
+                models = [m for m in models if m]
+                return True, models, None
+    except aiohttp.ClientError as e:
+        return False, None, f"连接网关失败: {e}"
+    except Exception as e:
+        return False, None, f"校验网关密钥时发生未知错误: {e}"
+
+
+def build_gateway_models_json(
+    *,
+    base_url: str,
+    wsk: str,
+    provider_key: str,
+    model: str | None = None,
+    default_model: str = "auto",
+    available_models: list[str] | None = None,
+) -> dict:
+    """构建只含网关 provider 的 pi models.json（WSK 作为 apiKey）。
+
+    Args:
+        model: 期望使用的模型 alias；为空则用 default_model。
+        available_models: validate_gateway_key 返回的可用 alias 列表；
+            若提供且 model 不在其中则回退到 default_model。
+    """
+    target = str(model or "").strip() or default_model
+    if available_models and target not in available_models:
+        logger.warning(
+            "网关模型 %r 不在可用列表 %s，回退到 %r",
+            target, available_models, default_model,
+        )
+        target = default_model if default_model in available_models else (available_models[0] if available_models else default_model)
+    models_list = available_models or [target]
+    # 保证目标模型在列表中（兜底）
+    if target not in models_list:
+        models_list = [target, *models_list]
+    return {
+        "providers": {
+            provider_key: {
+                "baseUrl": base_url.rstrip("/"),
+                "api": "openai-completions",
+                "apiKey": str(wsk or "").strip(),
+                "models": [{"id": m, "reasoning": False} for m in models_list],
+            }
+        }
+    }
+
+
+def write_models_json(models_json: dict) -> str:
+    """将 models.json 写入 pi 配置目录，返回写入路径。"""
+    pi_dir = Path(_PI_DIR)
+    pi_dir.mkdir(parents=True, exist_ok=True)
+    models_path = pi_dir / "models.json"
+    if models_path.is_symlink():
+        models_path.unlink()
+    models_path.write_text(
+        json.dumps(models_json, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return str(models_path)

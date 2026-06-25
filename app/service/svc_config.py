@@ -55,6 +55,21 @@ class ConfigCenterConfig:
     timeout: int = 30
 
 
+@dataclass
+class AiGatewayConfig:
+    """AI 网关（网关配置 / WSK）OpenAI 兼容入口配置。
+
+    非手动任务（binary_security 编排）使用 WSK 鉴权访问该网关；
+    手动任务使用模型配置中心（configcenter）的 provider + SK。
+    """
+    openai_base_url: str = "http://gaiasec-api-gateway/v1"
+    provider_key: str = "gaiasec"
+    default_model: str = "auto"
+    key_validate_retries: int = 3
+    key_validate_retry_delay: float = 5.0
+    timeout: int = 15
+
+
 # Lazy import to avoid circular
 class ServiceYaml:
     def __init__(
@@ -64,12 +79,14 @@ class ServiceYaml:
         registry,
         app: AppConfig,
         configcenter: "ConfigCenterConfig | None" = None,
+        ai_gateway: "AiGatewayConfig | None" = None,
     ):
         self.database = database
         self.auth_service = auth_service
         self.registry = registry
         self.app = app
         self.configcenter = configcenter or ConfigCenterConfig()
+        self.ai_gateway = ai_gateway or AiGatewayConfig()
 
 
 def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> "ServiceYaml":
@@ -124,7 +141,17 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> "ServiceYaml":
         timeout=int(cc_raw.get("timeout", 30)),
     )
 
-    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg, configcenter=configcenter)
+    gw_raw = raw.get("ai_gateway", raw.get("aigw", {}))
+    ai_gateway = AiGatewayConfig(
+        openai_base_url=str(gw_raw.get("openai_base_url") or gw_raw.get("base_url") or "http://gaiasec-api-gateway/v1"),
+        provider_key=str(gw_raw.get("provider_key") or "gaiasec"),
+        default_model=str(gw_raw.get("default_model") or "auto"),
+        key_validate_retries=int(gw_raw.get("key_validate_retries", 3)),
+        key_validate_retry_delay=float(gw_raw.get("key_validate_retry_delay", 5.0)),
+        timeout=int(gw_raw.get("timeout", 15)),
+    )
+
+    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg, configcenter=configcenter, ai_gateway=ai_gateway)
 
 
 _service_yaml: Optional[ServiceYaml] = None
