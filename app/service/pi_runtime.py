@@ -166,11 +166,32 @@ def write_models_json_from_db(svc_yaml: Any) -> bool:
             if target is None:
                 target = {"baseUrl": gw_base, "api": "openai-completions", "apiKey": "", "models": []}
                 providers[gw_key] = target
-            # 来源 2 是网关的权威模型列表，替换网关 provider 的 models
-            target["models"] = [
-                {"id": a["alias"], "reasoning": False, **({"maxTokens": a["max_tokens"]} if a.get("max_tokens") else {})}
-                for a in aliases
-            ]
+            # 从来源1的网关 provider 现有模型里取 contextWindow（兜底 128000）
+            gw_context_window = 0
+            for _mod in (target.get("models") or []):
+                if isinstance(_mod, dict) and _mod.get("contextWindow"):
+                    try:
+                        gw_context_window = int(_mod["contextWindow"])
+                    except Exception:
+                        pass
+                    break
+            if gw_context_window <= 0:
+                gw_context_window = 128000
+            # 来源 2 是网关的权威模型列表，替换网关 provider 的 models；补全 pi 所需字段
+            def _alias_entry(a: dict[str, Any]) -> dict[str, Any]:
+                e: dict[str, Any] = {
+                    "id": a["alias"],
+                    "name": a["alias"],
+                    "reasoning": False,
+                    "thinkingLevelMap": {"disabled": "disabled"},
+                    "input": ["text"],
+                    "contextWindow": gw_context_window,
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                }
+                if a.get("max_tokens"):
+                    e["maxTokens"] = a["max_tokens"]
+                return e
+            target["models"] = [_alias_entry(a) for a in aliases]
 
         if not providers:
             logger.warning("两个数据库均无模型数据，models.json 未更新")
