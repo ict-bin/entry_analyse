@@ -38,7 +38,6 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.agent_process import cleanup_task_pi_processes
-from app.service.llm_provider_sync import sync_providers_to_pi
 from app.agent_slots import (
     AgentProcessSlotManager,
     SemPriority,
@@ -488,23 +487,27 @@ async def _prepare_task_llm_runtime(
     task_config: dict | None,
     origin: str,
     svc_yaml: Any,
+    db: Any = None,
 ) -> dict[str, Any]:
     """任务启动前准备 LLM 运行时（models.json + 任务级模型）。
 
-    统一逻辑（按是否传入 secret/模型决策，不再区分任务来源）：
-      1. 始终 sync_providers_to_pi 拉取配置中心全量 provider（含各 SK）写入 models.json。
-      2. 有 secret 传入 → 直接把 models.json 里网关 provider(gaiasec) 的 apiKey 替换为 secret；
-         模型 = 下发模型 / 默认 auto。
-      3. 无 secret → 手动模式：沿用配置中心 SK + 参数配置界面模型（cfg.workers.default_model）；
-         下发了模型则用该模型。
-      密钥错误由运行时 401 立即致命处理（不再预校验）。
+    统一逻辑（参考 DVS pi_runtime，按是否传入 secret/模型决策）：
+      1. write_models_json_from_db(db) 从数据库(模型配置界面 AppEaModelsConfig)
+         读取 providers 写入 models.json —— 不再从配置中心 HTTP 拉取。
+      2. 模型决策：
+         - 有 model(且非auto) → 用该 model
+         - 有 secret 无 model → gaiasec/auto
+         - 无 secret 无 model → 手动模式，用参数配置界面默认模型
+      3. materialize_pi_runtime(secret)：有 secret → 把 secret 注入 models.json
+         里 **所有** provider 的 apiKey；无 secret → 保持模型配置界面的 SK。
+      密钥错误由运行时 401 立即致命处理。
     返回 resolved_key_info 供快照与前端展示。
     """
     from app.config import apply_task_model
-    from app.service.llm_provider_sync import (
+    from app.service.pi_runtime import (
         _mask_secret,
-        patch_provider_apikey,
-        sync_providers_to_pi,
+        materialize_pi_runtime,
+        write_models_json_from_db,
     )
 
     tc = task_config if isinstance(task_config, dict) else {}
@@ -514,25 +517,11 @@ async def _prepare_task_llm_runtime(
     origin_norm = str(origin or "manual").strip() or "manual"
 
     gw = getattr(svc_yaml, "ai_gateway", None)
-    gw_base_url = getattr(gw, "openai_base_url", "http://gaiasec-api-gateway/v1") if gw else "http://gaiasec-api-gateway/v1"
     gw_provider_key = getattr(gw, "provider_key", "gaiasec") if gw else "gaiasec"
     gw_default_model = getattr(gw, "default_model", "auto") if gw else "auto"
 
-    def _strip_provider(m: str) -> str:
-        m = str(m or "").strip()
-        if "/" in m and m.split("/", 1)[0] == gw_provider_key:
-            return m.split("/", 1)[1]
-        return m
-
-    # 1. 始终同步配置中心 models.json（含各 provider 的 SK）
-    try:
-        await sync_providers_to_pi(
-            base_url=svc_yaml.configcenter.base_url,
-            token=svc_yaml.auth_service.service_machine_token,
-            timeout=svc_yaml.configcenter.timeout,
-        )
-    except Exception as _e:
-        logger.warning("sync_providers_to_pi failed: %s", _e)
+    # 1. 从数据库(模型配置界面)写 models.json
+    write_models_json_from_db(db)
 
     cfg_default_model = (
         str(getattr(cfg.workers, "default_model", "") or "").strip()
@@ -540,38 +529,37 @@ async def _prepare_task_llm_runtime(
         or f"{gw_provider_key}/{gw_default_model}"
     )
 
-    if secret:
-        # 2. 有 secret → 直接替换网关 provider 的 apiKey；模型 = 下发 / 默认 auto
-        target = _strip_provider(raw_model) or gw_default_model
-        patch_provider_apikey(gw_provider_key, secret, base_url=gw_base_url, ensure_model=target)
-        resolved_model = f"{gw_provider_key}/{target}"
+    # 2. 模型决策（DVS 模式）
+    if raw_model and raw_model != "auto":
+        # 有 model → 用该 model
+        resolved_model = raw_model
+        source = "gateway" if secret else "config_center"
+    elif secret:
+        # 有 secret 无 model → auto
+        resolved_model = f"{gw_provider_key}/{gw_default_model}"
         source = "gateway"
-        key_prefix = str(agent_task_key.get("prefix") or "").strip() or None
-        key_masked = _mask_secret(secret)
-        key_source = str(agent_task_key.get("source") or "").strip() or None
-        logger.info(
-            "_prepare_task_llm_runtime gateway: provider=%s model=%s (apikey replaced)",
-            gw_provider_key, resolved_model,
-        )
     else:
-        # 3. 无 secret → 手动模式：配置中心 SK + 参数配置界面模型
-        resolved_model = raw_model or cfg_default_model
+        # 无 secret 无 model → 手动模式(参数配置界面默认)
+        resolved_model = cfg_default_model
         source = "config_center"
-        key_prefix = None
-        key_masked = None
-        key_source = None
-        logger.info("_prepare_task_llm_runtime config_center: model=%s", resolved_model)
-
     apply_task_model(cfg, resolved_model)
+
+    # 3. 有 secret → 注入所有 provider 的 apiKey
+    materialize_pi_runtime(secret=secret)
+
     resolved_key_info = {
         "source": source,
         "model": resolved_model,
         "dispatched_model": raw_model or None,
-        "key_prefix": key_prefix,
-        "key_masked": key_masked,
-        "key_source": key_source,
+        "key_prefix": str(agent_task_key.get("prefix") or "").strip() or None if secret else None,
+        "key_masked": _mask_secret(secret) if secret else None,
+        "key_source": str(agent_task_key.get("source") or "").strip() or None if secret else None,
         "task_origin_type": origin_norm,
     }
+    logger.info(
+        "_prepare_task_llm_runtime: source=%s model=%s secret=%s",
+        source, resolved_model, bool(secret),
+    )
     return resolved_key_info
 
 

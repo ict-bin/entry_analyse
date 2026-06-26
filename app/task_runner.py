@@ -246,14 +246,22 @@ async def run_task(task_id: str, pod_name: str) -> None:
         from app.service.svc_config import get_service_yaml as _svc_yaml
         from app.service.worker_service import _prepare_task_llm_runtime
         _yaml = _svc_yaml()
-        # 任务级 LLM 运行时：按任务来源解析 model + key，写入 models.json
-        #   - 非手动(binary_security)+WSK → 网关路径，校验 WSK（失败 key_validate_retries 次后报错退出）
-        #   - 手动 / 无 WSK → 模型配置中心路径，SK 自动取 provider apiKey
-        #   - 未下发 model → 默认 gaiasec/auto
-        resolved_key_info = await _prepare_task_llm_runtime(
-            cfg=cfg, task_config=tcfg,
-            origin=task_snapshot.task_origin_type, svc_yaml=_yaml,
-        )
+        # 任务级 LLM 运行时：从数据库(模型配置界面)写 models.json + 解析 model + 注入 secret
+        #   - 有 secret → 注入所有 provider 的 apiKey；模型=下发/auto
+        #   - 无 secret → 手动模式：模型配置界面 SK + 参数配置界面默认模型
+        _llm_db_gen = get_db()
+        _llm_db = next(_llm_db_gen)
+        try:
+            resolved_key_info = await _prepare_task_llm_runtime(
+                cfg=cfg, task_config=tcfg,
+                origin=task_snapshot.task_origin_type, svc_yaml=_yaml,
+                db=_llm_db,
+            )
+        finally:
+            try:
+                next(_llm_db_gen)
+            except StopIteration:
+                pass
     except Exception as _llm_err:
         # LLM key/model 致命错误（如 WSK 连续校验失败）：写终态后退出
         logger.error("_run_task STEP3 llm_runtime failed: task=%s err=%s",

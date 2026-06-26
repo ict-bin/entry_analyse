@@ -113,8 +113,6 @@ from .models import (
 )
 from .module_loader import load_module, resolve_file_path
 from .runner import PiFatalError
-from .service.llm_provider_sync import sync_providers_to_pi
-from .service.svc_config import get_service_yaml
 
 logger = logging.getLogger("ea.orchestrator")
 
@@ -179,19 +177,6 @@ class Orchestrator:
         source_dir = os.path.abspath(cfg.source_path) if cfg.source_path else target_dir
         self._cancel_event = asyncio.Event()
         self._abort_reason = None
-
-        # ── 同步 LLM Provider → pi models.json ──────────────────────────────
-        try:
-            svc = get_service_yaml()
-            await sync_providers_to_pi(
-                base_url=svc.configcenter.base_url,
-                token=svc.auth_service.service_machine_token,
-                timeout=svc.configcenter.timeout,
-            )
-        except Exception as _sync_err:
-            import logging as _log
-            _log.getLogger("ea.orchestrator").warning(
-                "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err)
 
         # ── 目录初始化 ───────────────────────────────────────────────────────
         base_dir  = Path(os.path.abspath(cfg.output_dir)) / task_id
