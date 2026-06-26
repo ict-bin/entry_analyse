@@ -2827,7 +2827,7 @@ class TaskService:
         row = self._get_or_404(db, task_id)
         task_roots = _task_runtime_roots(row)
         if row.status in ("passed", "failed", "error", "cancelled"):
-            return self._row_to_dict(row, db=db)
+            raise HTTPException(status_code=409, detail=f"任务已结束（{row.status}），不能取消")
         row.cancel_requested = True
         row.cancel_requested_at = row.cancel_requested_at or now_local()
         row.cancel_acknowledged = False
@@ -2920,7 +2920,7 @@ class TaskService:
         return result
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
-        """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务不允许删除。"""
+        """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务自动先取消后删除（无条件删除）。"""
         import shutil as _shutil
         from fastapi import HTTPException
         row = (
@@ -2935,7 +2935,46 @@ class TaskService:
         if row.is_deleted:
             return {"deleted_event_count": 0}
         if row.status == "running":
-            raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+            # 无条件删除：运行中任务先自动取消（cancel_requested + 命令队列 → 调度器 TERMINATE worker），再继续删除
+            row.cancel_requested = True
+            row.cancel_requested_at = row.cancel_requested_at or now_local()
+            row.cancel_owner_pod = row.owner_pod
+            row.cancel_acknowledged = False
+            row.cancel_process_cleanup_done = False
+            row.cancel_finalized = False
+            _safe_create_task_event(
+                db,
+                task_id=row.task_id,
+                project_id=row.project_id,
+                event_type="task_cancel_requested",
+                message="删除运行中任务，自动触发取消",
+                source=TASK_EVENT_SOURCE_EA,
+                status=row.status,
+                payload={"reason": "delete_running"},
+                dedupe_key=_event_dedupe_key(row.task_id, "task_cancel_requested", row.updated_at, "delete"),
+            )
+            try:
+                db.add(AppEaTaskCommand(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    command="cancel",
+                    status="pending",
+                    requested_by="api_delete",
+                ))
+            except Exception as _cmd_exc:
+                logger.warning("delete_task: failed to enqueue cancel command for %s: %s", row.task_id, _cmd_exc)
+            _force_kill_all_worker_pi(task_id=row.task_id, reason="api_delete")
+            try:
+                cleanup_task_pi_processes(
+                    logger.warning,
+                    label="ea_delete_task_cancel",
+                    task_id=row.task_id,
+                    task_roots=task_roots,
+                )
+            except Exception as _exc:
+                logger.warning("delete_task: pi cleanup during auto-cancel for %s: %s", row.task_id, _exc)
+            db.commit()
+            db.refresh(row)
         row.is_deleted = True
         db.commit()
         cleanup: dict[str, Any] = {
