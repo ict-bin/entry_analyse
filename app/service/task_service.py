@@ -1938,7 +1938,7 @@ class TaskService:
         self,
         db: Session,
         *,
-        project_id: str,
+        project_id: str | None,
         page: int = 1,
         per_page: int = 50,
         status: Optional[str] = None,
@@ -1950,10 +1950,9 @@ class TaskService:
         sort_by: str = "created_at",
         sort_order: str = "desc",
     ) -> dict:
-        query = db.query(AppEaTask).filter(
-            AppEaTask.project_id == project_id,
-            AppEaTask.is_deleted.is_(False),
-        )
+        query = db.query(AppEaTask).filter(AppEaTask.is_deleted.is_(False))
+        if project_id:
+            query = query.filter(AppEaTask.project_id == project_id)
         if status:
             query = query.filter(AppEaTask.status == status)
         normalized_mode = str(mode or "").strip().lower()

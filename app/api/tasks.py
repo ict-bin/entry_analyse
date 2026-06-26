@@ -1140,7 +1140,7 @@ async def create_task(
 
 @router.get("/tasks")
 def list_tasks(
-    project_id: str = Query(...),
+    project_id: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None),
@@ -1152,7 +1152,7 @@ def list_tasks(
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
-    _=Depends(require_project_access),
+    _=Depends(get_current_user),
 ):
     return get_task_service().list_tasks(
         db,
