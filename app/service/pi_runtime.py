@@ -186,6 +186,7 @@ def write_models_json_from_db(svc_yaml: Any) -> bool:
                     "thinkingLevelMap": {"disabled": "disabled"},
                     "input": ["text"],
                     "contextWindow": gw_context_window,
+                    "contextLength": gw_context_window,  # 与 contextWindow 同值，兼容读 contextLength 的 pi/下游
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 }
                 if a.get("max_tokens"):

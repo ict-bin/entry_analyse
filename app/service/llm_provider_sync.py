@@ -72,6 +72,7 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         entry["thinkingLevelMap"] = thinking_level_map
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
+        entry.setdefault("contextLength", context_window)  # 部分 pi 版本/下游读 contextLength，与 contextWindow 同值
         if max_tokens > 0:
             entry.setdefault("maxTokens", max_tokens)
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
