@@ -60,35 +60,128 @@ def _mask_secret(secret: str) -> str:
     return f"{s[:4]}****{s[-4:]}"
 
 
-def write_models_json_from_db(db: Any) -> bool:
-    """从数据库（AppEaModelsConfig，模型配置界面）读取并写入 pi 的 models.json。
+def _query_source1_providers(svc_yaml: Any) -> list[dict[str, Any]]:
+    """来源 1（模型配置中心）：从 secflow DB 读 secflow_config_provider_llm。"""
+    import pymysql
+    db = svc_yaml.database
+    conn = pymysql.connect(
+        host=db.host, port=int(db.port),
+        user=db.username, password=db.password, database=db.name,
+        read_timeout=10, connect_timeout=10,
+    )
+    try:
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        cur.execute(
+            "SELECT provider_key, provider_type, enabled, is_default, "
+            "api_base, model, api_key, extra_config, model_context_window "
+            "FROM secflow_config_provider_llm WHERE enabled=1"
+        )
+        rows = cur.fetchall() or []
+        # extra_config 可能是 JSON 字符串
+        for r in rows:
+            ec = r.get("extra_config")
+            if isinstance(ec, str):
+                try:
+                    import json as _json
+                    r["extra_config"] = _json.loads(ec) if ec else {}
+                except Exception:
+                    r["extra_config"] = {}
+            r["enabled"] = bool(r.get("enabled"))
+        return [dict(r) for r in rows]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-    Returns True 表示已写入；False 表示 DB 为空/异常，保留现有 models.json。
+
+def _query_source2_aliases(svc_yaml: Any) -> list[dict[str, Any]]:
+    """来源 2（网关配置）：从 aigw DB 读 model_aliases（网关可用模型 alias）。"""
+    gw = getattr(svc_yaml, "ai_gateway", None)
+    gw_db = getattr(gw, "database", None) if gw else None
+    if gw_db is None or not gw_db.host:
+        return []
+    import pymysql
+    conn = pymysql.connect(
+        host=gw_db.host, port=int(gw_db.port),
+        user=gw_db.username, password=gw_db.password, database=gw_db.name,
+        read_timeout=10, connect_timeout=10,
+    )
+    try:
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        cur.execute(
+            "SELECT alias_name, max_tokens_default, enabled "
+            "FROM model_aliases WHERE enabled=1 ORDER BY id"
+        )
+        rows = cur.fetchall() or []
+        return [
+            {"alias": str(r.get("alias_name") or "").strip(),
+             "max_tokens": int(r.get("max_tokens_default") or 0)}
+            for r in rows if r.get("alias_name")
+        ]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _same_base(a: str, b: str) -> bool:
+    return str(a or "").rstrip("/").lower() == str(b or "").rstrip("/").lower()
+
+
+def write_models_json_from_db(svc_yaml: Any) -> bool:
+    """任务启动时从 **两个数据库** 拉取最新模型生成 pi 的 models.json。
+
+    - 来源 1（模型配置中心, secflow_config_provider_llm, secflow DB）：
+      构建 providers（含各 provider 的 SK + 模型）。
+    - 来源 2（网关配置, model_aliases, aigw DB）：
+      网关可用模型 alias，合并进网关 provider(gaiasec) 的 models 列表。
+    合并后写入 models.json。Returns True 表示已写入。
     """
     try:
-        from app.service.config_service import get_model_config_service
+        from app.service.llm_provider_sync import build_models_json
 
-        cfg = get_model_config_service().get_models_config(db)
-        providers = cfg.get("providers") if isinstance(cfg, dict) else None
-        if not isinstance(providers, dict) or not providers:
-            logger.warning(
-                "AppEaModelsConfig（模型配置界面）为空，models.json 未更新，保留现有"
+        # 来源 1
+        rows = _query_source1_providers(svc_yaml)
+        models_json = build_models_json(rows)
+        providers = models_json.get("providers") if isinstance(models_json, dict) else {}
+        if not isinstance(providers, dict):
+            providers = {}
+
+        # 来源 2
+        aliases = _query_source2_aliases(svc_yaml)
+        gw = getattr(svc_yaml, "ai_gateway", None)
+        gw_base = str(getattr(gw, "openai_base_url", "") or "").rstrip("/")
+        gw_key = str(getattr(gw, "provider_key", "gaiasec") or "gaiasec")
+
+        # 找到网关 provider：先按 provider_key，再按 api_base 匹配
+        target = providers.get(gw_key) if isinstance(providers.get(gw_key), dict) else None
+        if target is None or not _same_base(target.get("baseUrl"), gw_base):
+            target = next(
+                (p for p in providers.values() if isinstance(p, dict) and _same_base(p.get("baseUrl"), gw_base)),
+                None,
             )
+        if aliases:
+            if target is None:
+                target = {"baseUrl": gw_base, "api": "openai-completions", "apiKey": "", "models": []}
+                providers[gw_key] = target
+            # 来源 2 是网关的权威模型列表，替换网关 provider 的 models
+            target["models"] = [
+                {"id": a["alias"], "reasoning": False, **({"maxTokens": a["max_tokens"]} if a.get("max_tokens") else {})}
+                for a in aliases
+            ]
+
+        if not providers:
+            logger.warning("两个数据库均无模型数据，models.json 未更新")
             return False
-        models_json = {"providers": providers}
+
         _GLOBAL_PI_DIR.mkdir(parents=True, exist_ok=True)
-        _write_json(_GLOBAL_PI_DIR / "models.json", models_json)
+        _write_json(_GLOBAL_PI_DIR / "models.json", {"providers": providers})
         logger.info(
-            "已从数据库(AppEaModelsConfig)写入 models.json: %d providers",
-            len(providers),
+            "已从两个数据库生成 models.json: %d providers (来源1), 网关 %s models=%s",
+            len(providers), gw_key, [a["alias"] for a in aliases],
         )
-        for key, pcfg in providers.items():
-            if isinstance(pcfg, dict):
-                logger.info(
-                    "  provider %s models=%s",
-                    key,
-                    [m.get("id") for m in (pcfg.get("models") or []) if isinstance(m, dict)],
-                )
         return True
     except Exception as exc:
         logger.warning("write_models_json_from_db failed: %s", exc, exc_info=True)

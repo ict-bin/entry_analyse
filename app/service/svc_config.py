@@ -56,11 +56,24 @@ class ConfigCenterConfig:
 
 
 @dataclass
+class AiGatewayDbConfig:
+    """网关配置（aigw / gaiasec-llm-gateway）数据库连接 —— 来源 2。"""
+    host: str = "gaiasec-llm-gateway-mysql"
+    port: int = 3306
+    username: str = "sa"
+    password: str = ""
+    name: str = "gaiasec_llm_gateway"
+
+
+@dataclass
 class AiGatewayConfig:
     """AI 网关（网关配置 / WSK）OpenAI 兼容入口配置。
 
-    非手动任务（binary_security 编排）使用 WSK 鉴权访问该网关；
-    手动任务使用模型配置中心（configcenter）的 provider + SK。
+    models.json 在任务启动时从两个数据库拉取合并生成：
+      - 来源 1（模型配置中心）：secflow_config_provider_llm（secflow DB，svc_yaml.database）
+      - 来源 2（网关配置）：model_aliases（ai_gateway.database，本配置）
+    手动配置（/providers 下拉）只展示来源 1。
+    非手动任务用 WSK 鉴权访问 openai_base_url 网关。
     """
     openai_base_url: str = "http://gaiasec-api-gateway/v1"
     provider_key: str = "gaiasec"
@@ -68,6 +81,7 @@ class AiGatewayConfig:
     key_validate_retries: int = 3
     key_validate_retry_delay: float = 5.0
     timeout: int = 15
+    database: "AiGatewayDbConfig | None" = None
 
 
 # Lazy import to avoid circular
@@ -142,6 +156,7 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> "ServiceYaml":
     )
 
     gw_raw = raw.get("ai_gateway", raw.get("aigw", {}))
+    gw_db_raw = gw_raw.get("database", {})
     ai_gateway = AiGatewayConfig(
         openai_base_url=str(gw_raw.get("openai_base_url") or gw_raw.get("base_url") or "http://gaiasec-api-gateway/v1"),
         provider_key=str(gw_raw.get("provider_key") or "gaiasec"),
@@ -149,6 +164,13 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> "ServiceYaml":
         key_validate_retries=int(gw_raw.get("key_validate_retries", 3)),
         key_validate_retry_delay=float(gw_raw.get("key_validate_retry_delay", 5.0)),
         timeout=int(gw_raw.get("timeout", 15)),
+        database=AiGatewayDbConfig(
+            host=str(gw_db_raw.get("host") or "gaiasec-llm-gateway-mysql"),
+            port=int(gw_db_raw.get("port", 3306)),
+            username=str(gw_db_raw.get("username") or "sa"),
+            password=str(gw_db_raw.get("password") or ""),
+            name=str(gw_db_raw.get("name") or "gaiasec_llm_gateway"),
+        ) if gw_db_raw else None,
     )
 
     return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg, configcenter=configcenter, ai_gateway=ai_gateway)

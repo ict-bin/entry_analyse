@@ -487,19 +487,19 @@ async def _prepare_task_llm_runtime(
     task_config: dict | None,
     origin: str,
     svc_yaml: Any,
-    db: Any = None,
 ) -> dict[str, Any]:
     """任务启动前准备 LLM 运行时（models.json + 任务级模型）。
 
     统一逻辑（参考 DVS pi_runtime，按是否传入 secret/模型决策）：
-      1. write_models_json_from_db(db) 从数据库(模型配置界面 AppEaModelsConfig)
-         读取 providers 写入 models.json —— 不再从配置中心 HTTP 拉取。
+      1. write_models_json_from_db(svc_yaml) 从 **两个数据库** 拉取最新模型生成 models.json：
+         - 来源1(模型配置中心) secflow_config_provider_llm(secflow DB) → 各 provider + SK
+         - 来源2(网关配置) model_aliases(aigw DB) → 网关 provider 的模型 alias
       2. 模型决策：
          - 有 model(且非auto) → 用该 model
          - 有 secret 无 model → gaiasec/auto
          - 无 secret 无 model → 手动模式，用参数配置界面默认模型
       3. materialize_pi_runtime(secret)：有 secret → 把 secret 注入 models.json
-         里 **所有** provider 的 apiKey；无 secret → 保持模型配置界面的 SK。
+         里 **所有** provider 的 apiKey；无 secret → 保持来源1的 SK。
       密钥错误由运行时 401 立即致命处理。
     返回 resolved_key_info 供快照与前端展示。
     """
@@ -520,8 +520,8 @@ async def _prepare_task_llm_runtime(
     gw_provider_key = getattr(gw, "provider_key", "gaiasec") if gw else "gaiasec"
     gw_default_model = getattr(gw, "default_model", "auto") if gw else "auto"
 
-    # 1. 从数据库(模型配置界面)写 models.json
-    write_models_json_from_db(db)
+    # 1. 从两个数据库生成 models.json
+    write_models_json_from_db(svc_yaml)
 
     cfg_default_model = (
         str(getattr(cfg.workers, "default_model", "") or "").strip()
