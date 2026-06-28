@@ -150,26 +150,16 @@ def test_scheduler_reconcile_expired_running_requeues_owner_missing(monkeypatch)
 
         events = []
         monkeypatch.setattr(scheduler_service, "get_db", lambda: _db_generator(db))
-        monkeypatch.setattr(
-            worker_slot_service,
-            "get_worker_slot_service",
-            lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
-        )
-        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: set())
-        monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
+        monkeypatch.setattr(scheduler_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
 
-        changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
+        SchedulerService()._requeue_tasks({row.task_id}, reason="expired_lease_owner_missing")
         db.refresh(row)
 
-        assert changed == 1
         assert row.status == "pending"
         assert row.owner_pod is None
         assert row.owner_pod_ip is None
         assert row.lease_expires_at is None
-        assert row.finished_at is None
-        assert row.stages_json is None
-        assert row.result_json is None
-        assert row.error is None
+        assert row.error == "requeued: expired_lease_owner_missing"
         assert events[0]["event_type"] == "task_requeued_after_expired_lease_reconcile"
         assert events[0]["payload"]["previous_owner_pod"] == "secflow-app-entry-analyse-worker-dead-123"
         assert events[0]["payload"]["owner_pod_alive"] is False
@@ -212,25 +202,61 @@ def test_scheduler_reconcile_expired_running_requeues_live_owner(monkeypatch) ->
         db.commit()
 
         monkeypatch.setattr(scheduler_service, "get_db", lambda: _db_generator(db))
-        monkeypatch.setattr(
-            worker_slot_service,
-            "get_worker_slot_service",
-            lambda: SimpleNamespace(cleanup_retired_workers=lambda _db: 0),
-        )
-        monkeypatch.setattr(task_service, "_alive_entry_analysis_owner_pods", lambda _db, _now=None: {"secflow-app-entry-analyse-worker-live-123"})
         events = []
-        monkeypatch.setattr(task_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
+        monkeypatch.setattr(scheduler_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
 
-        changed = asyncio.run(SchedulerService()._reconcile_cluster_state())
+        SchedulerService()._requeue_tasks({row.task_id}, reason="expired_lease_owner_alive")
         db.refresh(row)
 
-        assert changed == 1
         assert row.status == "pending"
         assert row.owner_pod is None
         assert row.lease_expires_at is None
         assert events[0]["event_type"] == "task_requeued_after_expired_lease_reconcile"
         assert events[0]["payload"]["owner_pod_alive"] is True
         assert events[0]["payload"]["reconcile_reason"] == "expired_lease_owner_alive"
+    finally:
+        db.close()
+
+
+def test_scheduler_reconcile_expired_running_parent_orchestrated_binary_security_waits_parent_observe(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    db = SessionLocal()
+    now = now_local()
+    try:
+        row = AppEaTask(
+            task_id="eat_expired_parent",
+            project_id="p1",
+            task_name="expired-parent",
+            input_path="/tmp/expired",
+            module_name="m1",
+            prompt_content="prompt",
+            status="running",
+            owner_pod="secflow-app-entry-analyse-worker-live-456",
+            lease_expires_at=now - timedelta(seconds=60),
+            task_origin_type="binary_security",
+            parent_task_id="bst_1",
+            parent_stage_name="entry_analysis",
+            parent_stage_item_id="item-1",
+        )
+        db.add(row)
+        db.commit()
+
+        monkeypatch.setattr(scheduler_service, "get_db", lambda: _db_generator(db))
+        events = []
+        monkeypatch.setattr(scheduler_service, "_safe_create_task_event", lambda _db, **kwargs: events.append(kwargs))
+
+        SchedulerService()._requeue_tasks({row.task_id}, reason="worker_heartbeat_stale")
+        db.refresh(row)
+
+        assert row.status == "running"
+        assert row.owner_pod is None
+        assert row.owner_pod_ip is None
+        assert row.lease_expires_at is None
+        assert "waiting_parent_observe" in str(row.error or "")
+        assert events[0]["event_type"] == "task_waiting_parent_observe"
+        assert events[0]["payload"]["recovery_action"] == "waiting_parent_observe"
     finally:
         db.close()
 

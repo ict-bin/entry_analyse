@@ -58,6 +58,7 @@ _USER_TIMELINE_EVENT_TYPES: set[str] = {
     "task_dispatch_skipped_no_capacity",
     "task_lease_taken_over",
     "task_requeued_after_expired_lease_reconcile",
+    "task_waiting_parent_observe",
     "task_requeued_after_invalid_owner_reconcile",
     "task_requeued_after_orphaned_running_reconcile",
     "task_requeued_after_dispatch_timeout",

@@ -31,6 +31,13 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.db.models import AppEaTask, AppEaTaskCommand
 from app.time_utils import now_local
+from app.service.task_service import (
+    TASK_EVENT_SOURCE_SYSTEM,
+    _event_dedupe_key,
+    _is_binary_security_origin_task,
+    _origin_payload,
+    _safe_create_task_event,
+)
 
 logger = logging.getLogger("ea.scheduler")
 
@@ -546,11 +553,55 @@ class SchedulerService:
                 .all()
             )
             for row in rows:
+                is_parent_orchestrated = _is_binary_security_origin_task(
+                    row.task_origin_type,
+                    row.parent_task_id,
+                    row.parent_stage_name,
+                ) and bool(str(row.parent_stage_item_id or "").strip() or str(row.parent_stage_item_key or "").strip())
+                previous_owner_pod = row.owner_pod
+                if is_parent_orchestrated:
+                    row.owner_pod = None
+                    row.owner_pod_ip = None
+                    row.lease_expires_at = None
+                    row.error = row.error or f"waiting_parent_observe: {reason}"
+                    _safe_create_task_event(
+                        db,
+                        task_id=row.task_id,
+                        project_id=row.project_id,
+                        event_type="task_waiting_parent_observe",
+                        message="任务租约失效，等待父任务恢复观测，不自动重排",
+                        source=TASK_EVENT_SOURCE_SYSTEM,
+                        status=row.status,
+                        payload={
+                            **_origin_payload(row),
+                            "reason": reason,
+                            "previous_owner_pod": previous_owner_pod,
+                            "recovery_action": "waiting_parent_observe",
+                        },
+                        dedupe_key=_event_dedupe_key(row.task_id, "task_waiting_parent_observe", reason, previous_owner_pod, row.updated_at),
+                    )
+                    continue
                 row.status = "pending"
                 row.owner_pod = None
                 row.owner_pod_ip = None
                 row.lease_expires_at = None
                 row.error = (row.error or f"requeued: {reason}")
+                _safe_create_task_event(
+                    db,
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    event_type="task_requeued_after_expired_lease_reconcile",
+                    message="任务租约过期，已回收到待执行队列",
+                    source=TASK_EVENT_SOURCE_SYSTEM,
+                    status=row.status,
+                    payload={
+                        **_origin_payload(row),
+                        "previous_owner_pod": previous_owner_pod,
+                        "owner_pod_alive": reason == "expired_lease_owner_alive",
+                        "reconcile_reason": reason,
+                    },
+                    dedupe_key=_event_dedupe_key(row.task_id, "task_requeued_after_expired_lease_reconcile", reason, previous_owner_pod, row.updated_at),
+                )
             if rows:
                 db.commit()
         finally:
