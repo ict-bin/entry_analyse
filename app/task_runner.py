@@ -169,12 +169,31 @@ async def run_task(task_id: str, pod_name: str) -> None:
         logger.info("_run_task STEP1 cleanup_done: killed=%s closed_fds=%s", killed, closed)
 
     # ── Step 2: Reset disk (clean run/ and output/ dirs) ──────────────
+    # 注意：events.jsonl 跨运行保留（重启/取消等操作都不清空日志），新运行追加写入
     if task_snapshot.output_path:
         task_dir = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id
+        run_dir = task_dir / "run"
+        events_file = run_dir / "events.jsonl"
+        events_backup = task_dir / "events.jsonl.preserve"  # run/ 的兄弟文件，不被 rmtree 触及
+        _preserved_events = False
+        if events_file.is_file():
+            try:
+                if events_backup.exists():
+                    events_backup.unlink()
+                events_file.rename(events_backup)
+                _preserved_events = True
+            except Exception as _e:
+                logger.warning("STEP2: back up events.jsonl failed: %s", _e)
         for subdir in ("run", "output"):
             d = task_dir / subdir
             _rmtree_nfs_safe(str(d), task_id=task_id, subdir=subdir)
             d.mkdir(parents=True, exist_ok=True)
+        if _preserved_events and events_backup.is_file():
+            try:
+                events_backup.rename(events_file)
+                logger.info("STEP2: preserved events.jsonl across run reset (append mode)")
+            except Exception as _e:
+                logger.warning("STEP2: restore events.jsonl failed: %s", _e)
 
     if task_snapshot.output_path:
         _events_path = _pl.Path(task_snapshot.output_path) / task_snapshot.task_id / "run" / "events.jsonl"
