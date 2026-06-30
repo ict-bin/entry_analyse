@@ -305,49 +305,85 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
         cwd_candidates += [os.getcwd(), "/tmp"]
         cwd = next((c for c in cwd_candidates if c and os.path.isdir(c)), "/tmp")
 
-        # ── 3. 调 LLM(pi) 现场诊断 ───────────────────────────────────────
-        logger.info("debug_runner calling LLM: report=%s task=%s model=%s",
-                    report_id, task_id, model)
-        ar = await run_agent(
-            prompt=prompt,
-            model=model,
-            tools=["read", "bash"],
-            system_prompt=_DEBUG_SYSTEM_PROMPT,
-            cwd=cwd,
-            thinking_level="medium",
-            session_file=None,
-            cancel_event=None,
-            max_retries=2,
-            retry_delay=10.0,
-            run_timeout_seconds=1800,
-            timeout_retry_enabled=True,
-            timeout_max_retries=1,
-            pi_max_retries=2,
-            pi_retry_delay=5.0,
-            max_consecutive_empty_responses=3,
-            task_id=task_id,
-            stage_key="debug",
-            role_kind="worker",
-            priority=SemPriority.DEFAULT,
-            task_pi_dir=str(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")),
-            use_slot=False,
-        )
+        # ── 3. 分段产出(同一 session 多轮, 格式错误用 user 纠正重做) ──────────
+        session_file = None
+        if task_dir is not None:
+            session_file = str(task_dir / "run" / "sessions" / f"debug-{report_id}.jsonl")
+            Path(session_file).parent.mkdir(parents=True, exist_ok=True)
 
-        raw_output = getattr(ar, "output", "") or getattr(ar, "text", "") or ""
-        if not raw_output:
-            # run_agent 的输出可能在 .output / .raw / .text 不同属性
-            for attr in ("raw", "text", "response", "content"):
-                v = getattr(ar, attr, None)
-                if v:
-                    raw_output = str(v)
+        field_prompts: dict[str, str] = {
+            "phenomenon": "先调查任务失败（用 bash/read 查看 run/ 目录的 sessions、stage-results、pipeline_state.json 和源码），然后输出【问题现象】段：观察到的失败、错误信息、哪个阶段失败。用 XML 标签 <phenomenon>...</phenomenon> 包裹，只输出这一段。",
+            "root_cause": "现在输出【问题根因】段：深入分析为什么会失败（代码bug/配置错误/LLM输出格式不符/环境问题等），具体到文件名行号。用 <root_cause>...</root_cause> 包裹，只输出这一段。",
+            "solution": "现在输出【解决方法】段：具体可执行的修复步骤。用 <solution>...</solution> 包裹，只输出这一段。",
+            "code_scene": "现在输出【代码现场】段：相关源码文件路径、关键函数、关键代码片段（含行号），用 markdown 代码块。用 <code_scene>...</code_scene> 包裹，只输出这一段。",
+            "patch_code": "现在输出【补丁代码】段：若适用给出补丁 diff 或修改后代码；不适用则写“无”。用 <patch_code>...</patch_code> 包裹，只输出这一段。",
+        }
+
+        pi_dir = str(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+        fields: dict[str, str] = {}
+        raw_parts: list[str] = []
+        fatal = False
+        ar_error = ""
+        logger.info("debug_runner multi-turn start: report=%s task=%s model=%s", report_id, task_id, model)
+        for idx, f in enumerate(_FIELDS):
+            got = ""
+            for attempt in range(3):  # 每段最多3次(含格式纠正重做)
+                is_first = (idx == 0 and attempt == 0)
+                sys_prompt = _DEBUG_SYSTEM_PROMPT if is_first else ""
+                if attempt == 0:
+                    user_prompt = (prompt + "\n\n" + field_prompts[f]) if is_first else field_prompts[f]
+                else:
+                    user_prompt = (f"你上一轮没有按格式输出 <{f}>...</{f}> 标签（或内容为空）。"
+                                   f"请重新输出【{_FIELD_LABELS[f]}】段，严格用 <{f}>...</{f}> XML 标签包裹，只输出这一段。")
+                try:
+                    ar = await run_agent(
+                        prompt=user_prompt,
+                        model=model,
+                        tools=["read", "bash"],
+                        system_prompt=sys_prompt,
+                        cwd=cwd,
+                        thinking_level="medium",
+                        session_file=session_file,
+                        cancel_event=None,
+                        max_retries=1,
+                        retry_delay=10.0,
+                        run_timeout_seconds=900,
+                        timeout_retry_enabled=False,
+                        pi_max_retries=1,
+                        pi_retry_delay=5.0,
+                        max_consecutive_empty_responses=2,
+                        task_id=task_id,
+                        stage_key="debug",
+                        role_kind="worker",
+                        priority=SemPriority.DEFAULT,
+                        task_pi_dir=pi_dir,
+                        use_slot=False,
+                    )
+                except Exception as exc:
+                    ar_error = str(exc)[:1000]
+                    logger.warning("debug_runner field=%s attempt=%d error: %s", f, attempt, exc)
                     break
-        exit_code = getattr(ar, "exit_code", 0)
-        fatal = getattr(ar, "fatal", False)
-        ar_error = getattr(ar, "error", "") or ""
-
-        # ── 4. 解析 + 写报告 ─────────────────────────────────────────────
-        fields = _parse_report_output(raw_output)
-        success = bool(raw_output) and not fatal
+                raw = getattr(ar, "output", "") or ""
+                if not raw:
+                    for attr in ("text", "raw", "response", "content"):
+                        v = getattr(ar, attr, None)
+                        if v:
+                            raw = str(v); break
+                if getattr(ar, "fatal", False):
+                    fatal = True
+                    ar_error = getattr(ar, "error", "") or ar_error
+                parsed = _parse_report_output(raw)
+                got = parsed.get(f) or ""
+                logger.info("debug_runner field=%s attempt=%d got=%dchars", f, attempt, len(got))
+                if got:
+                    raw_parts.append(f"<{f}>{got}</{f}>")
+                    break
+                # 格式错误 → 下一轮 user 指出错误重做
+            fields[f] = got
+            if fatal:
+                break
+        raw_output = "\n".join(raw_parts)
+        success = any(fields.values()) and not fatal
 
         # 写 Markdown 到 NFS 任务输出目录
         report_path_str = ""
