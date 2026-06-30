@@ -20,6 +20,12 @@ from app.service.runtime_role import get_runtime_role, role_enabled
 from app.service.scheduler_service import get_scheduler_service
 from app.service.worker_service import get_worker_service
 
+# 后台角色(scheduler/debugger)也配置 INFO 日志，便于观察连接/分发
+import logging as _logging
+_logging.basicConfig(level=_logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                    stream=sys.stdout)
+
 load_dotenv()
 
 _CANCEL_SERVER_PORT = int(os.environ.get("EA_CANCEL_SERVER_PORT", "3001"))

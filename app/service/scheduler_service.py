@@ -164,7 +164,7 @@ class SchedulerService:
                     data = conn.recv(65536)
                 except socket.timeout:
                     # 超时无数据：若也超过心跳阈值，视为断联
-                    if pod and self._worker_stale(pod):
+                    if pod and self._pod_stale(pod):
                         break
                     continue
                 except OSError:
@@ -181,7 +181,12 @@ class SchedulerService:
                         msg = json.loads(line.decode("utf-8"))
                     except Exception:
                         continue
-                    pod = self._handle_worker_msg(conn, addr, pod, msg)
+                    try:
+                        pod = self._handle_worker_msg(conn, addr, pod, msg)
+                    except Exception as exc:
+                        # 处理消息异常不能杀死整个连接（否则 worker/debugger 反复断连重连）
+                        logger.warning("handle msg error pod=%s type=%s: %s",
+                                       pod, msg.get("type"), exc, exc_info=True)
         finally:
             try:
                 conn.close()
@@ -260,6 +265,18 @@ class SchedulerService:
 
     def _worker_stale(self, pod: str) -> bool:
         with self._reg_lock:
+            w = self._workers.get(pod)
+            return w is None or (time.time() - w.last_seen) > WORKER_HEARTBEAT_STALE_SECONDS
+
+    def _pod_stale(self, pod: str) -> bool:
+        """统一 staleness 检查：pod 是 worker 还是 debugger 查对应注册表。
+
+        _serve_worker 超时路径用它替代 _worker_stale —— 否则 debugger pod
+        不在 _workers 中会被误判 stale 导致连接被杀。"""
+        with self._reg_lock:
+            if pod in self._debuggers:
+                w = self._debuggers.get(pod)
+                return w is None or (time.time() - w.last_seen) > DEBUGGER_HEARTBEAT_STALE_SECONDS
             w = self._workers.get(pod)
             return w is None or (time.time() - w.last_seen) > WORKER_HEARTBEAT_STALE_SECONDS
 
