@@ -42,6 +42,29 @@ _FIELD_LABELS = {
     "patch_code": "补丁代码",
 }
 
+# ── 非本微服务错误分类（命中则跳过 LLM 分析）──────────────────────────────
+import re as _re
+_SKIP_PATTERNS: list[tuple[_re.Pattern, str]] = [
+    # 1. 任务源文件丢失：源码/输入路径/模块分析文件不存在（外部，未提供源码）
+    (_re.compile(r"FileNotFoundError|No such file or directory|ENOENT|\u627e\u4e0d\u5230\u6a21\u5757|module not found|files\.list.*\u4e0d\u5b58\u5728|source_code.*\u4e0d\u5b58\u5728|\u6e90\u6587\u4ef6\u4e22\u5931", _re.IGNORECASE), "任务源文件丢失"),
+    # 2. 模型选择错误：模型名无效/未找到
+    (_re.compile(r"model.*(not found|invalid|unknown|not available)|invalid model|unknown model|\u672a\u627e\u5230\u6a21\u578b|\u6a21\u578b.*(\u9519\u8bef|\u65e0\u6548|\u4e0d\u5b58\u5728)|\u6a21\u578b\u9009\u62e9\u9519\u8bef", _re.IGNORECASE), "模型选择错误"),
+    # 3. key 错误：401/鉴权失败/密钥无效
+    (_re.compile(r"\b401\b|Unauthorized|invalid.*api.?key|api.?key.*invalid|authentication failed|\u5bc6\u94a5.*(\u9519\u8bef|\u65e0\u6548)|\u9274\u6743\u5931\u8d25", _re.IGNORECASE), "key错误"),
+    # 4. 模型超时/限流
+    (_re.compile(r"timeout|timed out|TimeoutError|deadline exceeded|\u8d85\u65f6|\b429\b|rate.?limit|\u9650\u6d41", _re.IGNORECASE), "模型超时/限流"),
+]
+
+
+def classify_skip_reason(error: str | None) -> str | None:
+    """若错误属于非本微服务的 4 类错误，返回跳过原因；否则 None。"""
+    if not error:
+        return None
+    for pat, label in _SKIP_PATTERNS:
+        if pat.search(error):
+            return label
+    return None
+
 
 def _setup_logging() -> None:
     logging.basicConfig(
@@ -187,6 +210,64 @@ async def _prepare_debug_llm_runtime(cfg: Any, task_config: dict, origin: str) -
     )
 
 
+def _finish_report(
+    report_id: str,
+    *,
+    status: str,
+    model: str | None,
+    error: str | None,
+    fields: dict[str, str],
+    raw_output: str,
+    report_path: str | None,
+    task_dir: "Path | None",
+    task_id: str,
+    task_name: str,
+) -> str | None:
+    """写 debug-report.md + 更新 DB 报告行终态。返回最终 report_path。"""
+    from app.db import get_db
+    from app.db.models import AppEaDebugReport
+    from app.time_utils import now_local
+
+    # 写 Markdown 到 NFS 任务输出目录
+    if task_dir is not None and not report_path:
+        try:
+            out_dir = task_dir / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            md_path = out_dir / "debug-report.md"
+            md_content = _build_markdown(report_id, task_id, task_name,
+                                         model, fields, raw_output)
+            md_path.write_text(md_content, encoding="utf-8")
+            report_path = str(md_path)
+        except Exception as exc:
+            logger.warning("write debug-report.md failed: %s", exc)
+
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        r = db.query(AppEaDebugReport).filter_by(report_id=report_id).first()
+        if r is not None:
+            r.status = status
+            r.error = (error or "")[:4000] or None
+            r.model = model
+            r.phenomenon = (fields.get("phenomenon") or "")[:16000]
+            r.root_cause = (fields.get("root_cause") or "")[:16000]
+            r.solution = (fields.get("solution") or "")[:16000]
+            r.code_scene = (fields.get("code_scene") or "")[:16000]
+            r.patch_code = (fields.get("patch_code") or "")[:16000]
+            r.report_path = report_path or None
+            r.raw_output = (raw_output or "")[:16000]
+            r.finished_at = now_local()
+            db.commit()
+            logger.info("debug_runner finished: report=%s status=%s path=%s",
+                        report_id, status, report_path)
+    finally:
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
+    return report_path
+
+
 # ── 诊断 prompt 构造 ────────────────────────────────────────────────────────
 _DEBUG_SYSTEM_PROMPT = """你是一名资深的代码诊断工程师。用户的一个"入口分析"自动化任务失败了，你的任务是：
 1. 阅读任务失败信息、事件时间线、流水线状态和 run/ 目录下的产物（session 日志、stage-result 等）。
@@ -272,6 +353,16 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
         report.task_status = task.status
         report.task_error = (task.error or "")[:8000]
         db.commit()
+
+        # ── 0. 非本微服务错误跳过（不调 LLM）────────────────────────────
+        skip_reason = classify_skip_reason(task.error)
+        if skip_reason:
+            logger.info("debug_runner skip (non-microservice error): report=%s reason=%s", report_id, skip_reason)
+            _finish_report(report_id, status="skipped", model=None,
+                           error=f"跳过分析：{skip_reason}（非本微服务错误）",
+                           fields={}, raw_output="", report_path=None,
+                           task_dir=task_dir, task_id=task_id, task_name=task.task_name)
+            return 0
 
         # ── 1. 构建 cfg + LLM 运行时（与原任务一致）──────────────────────
         svc = task_mod._load_svc_config(db)
@@ -385,46 +476,19 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
         raw_output = "\n".join(raw_parts)
         success = any(fields.values()) and not fatal
 
-        # 写 Markdown 到 NFS 任务输出目录
-        report_path_str = ""
-        if task_dir is not None:
-            try:
-                out_dir = task_dir / "output"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                md_path = out_dir / "debug-report.md"
-                md_content = _build_markdown(report_id, task_id, task.task_name,
-                                             model, fields, raw_output)
-                md_path.write_text(md_content, encoding="utf-8")
-                report_path_str = str(md_path)
-            except Exception as exc:
-                logger.warning("write debug-report.md failed: %s", exc)
-
-        # ── 5. 更新 DB 报告行 ────────────────────────────────────────────
-        db_gen2 = get_db()
-        db2 = next(db_gen2)
-        try:
-            r = db2.query(AppEaDebugReport).filter_by(report_id=report_id).first()
-            if r is not None:
-                r.status = "passed" if success else "failed"
-                if ar_error and not success:
-                    r.error = ar_error[:4000]
-                r.model = model
-                r.phenomenon = (fields.get("phenomenon") or "")[:16000]
-                r.root_cause = (fields.get("root_cause") or "")[:16000]
-                r.solution = (fields.get("solution") or "")[:16000]
-                r.code_scene = (fields.get("code_scene") or "")[:16000]
-                r.patch_code = (fields.get("patch_code") or "")[:16000]
-                r.report_path = report_path_str or None
-                r.raw_output = (raw_output or "")[:16000]
-                r.finished_at = now_local()
-                db2.commit()
-                logger.info("debug_runner done: report=%s status=%s path=%s",
-                            report_id, r.status, r.report_path)
-        finally:
-            try:
-                next(db_gen2)
-            except StopIteration:
-                pass
+        # ── 4. 写报告 + 更新 DB ─────────────────────────────────
+        _finish_report(
+            report_id,
+            status="passed" if success else "failed",
+            model=model,
+            error=ar_error if not success else None,
+            fields=fields,
+            raw_output=raw_output,
+            report_path=None,
+            task_dir=task_dir,
+            task_id=task_id,
+            task_name=task.task_name,
+        )
         return 0 if success else 1
     finally:
         try:

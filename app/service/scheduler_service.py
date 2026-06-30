@@ -469,18 +469,23 @@ class SchedulerService:
 
     def _create_debug_report(self, db: Session, task: AppEaTask) -> None:
         import uuid
+        from app.debug_runner import classify_skip_reason
+        skip = classify_skip_reason(task.error)
         report = AppEaDebugReport(
             report_id=f"dr-{uuid.uuid4().hex[:24]}",
             task_id=task.task_id,
             project_id=task.project_id,
             task_name=task.task_name,
-            status="pending",
+            status="skipped" if skip else "pending",
             task_status=task.status,
             task_error=(task.error or "")[:8000],
-            model=self._resolve_task_model_for_debug(task),
+            error=(f"跳过分析：{skip}（非本微服务错误）" if skip else None),
+            model=self._resolve_task_model_for_debug(task) if not skip else None,
+            finished_at=now_local() if skip else None,
         )
         db.add(report)
-        logger.info("created debug report %s for failed task %s", report.report_id, task.task_id)
+        logger.info("created debug report %s for failed task %s%s", report.report_id, task.task_id,
+                    f" (skipped: {skip})" if skip else "")
 
     def _resolve_task_model_for_debug(self, task: AppEaTask) -> Optional[str]:
         """从任务快照推断诊断用的模型（与原任务一致）。"""
