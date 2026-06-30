@@ -226,13 +226,18 @@ def _build_debug_prompt(task_row: Any, task_dir: Path, source_path: str,
 
 
 async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
-    from app.db import get_db
+    from app.db import get_db, init_db
     from app.db.models import AppEaTask, AppEaDebugReport
     from app.time_utils import now_local
     from app.config import build_task_config
     from app.runner import run_agent
     from app.agent_slots import SemPriority
     from app.service import task_service as task_mod
+    from app.service.svc_config import get_service_yaml
+
+    # 子进程需独立初始化 DB engine（不继承父进程内存状态）
+    _svc_yaml = get_service_yaml()
+    init_db(_svc_yaml.database.url)
 
     db_gen = get_db()
     db = next(db_gen)
