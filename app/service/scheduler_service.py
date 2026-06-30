@@ -300,6 +300,8 @@ class SchedulerService:
         if pod is None:
             return None
         triggered_pod: Optional[str] = None
+        done_rid: Optional[str] = None
+        done_result: Optional[str] = None
         with self._reg_lock:
             w = self._debuggers.get(pod)
             if w is not None:
@@ -326,6 +328,11 @@ class SchedulerService:
                         w.tasks.discard(rid)
                     w.free_slots = min(w.capacity, w.free_slots + 1)
                     triggered_pod = pod
+                    done_rid = rid
+                    done_result = msg.get("result")
+        # debug_runner 崩溃(rc!=0)时报告会卡在 running（没写终态）→ 重置 pending 重试
+        if done_rid and done_result != "passed":
+            self._reset_stuck_running_report(done_rid)
         if triggered_pod:
             self._debug_dispatch_one_to(triggered_pod)
         return pod
@@ -366,6 +373,25 @@ class SchedulerService:
                 r.error = (r.error or f"requeued: {reason}")
             if rows:
                 db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _reset_stuck_running_report(self, report_id: str) -> None:
+        """debug_runner 崩溃(没写终态)时把卡在 running 的报告重置为 pending 重试。"""
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            r = db.query(AppEaDebugReport).filter_by(report_id=report_id).first()
+            if r is not None and r.status == "running":
+                r.status = "pending"
+                r.owner_pod = None
+                r.error = (r.error or "debug_runner crashed, auto-retry")
+                r.started_at = None
+                db.commit()
+                logger.warning("debug report %s stuck running -> pending (auto-retry)", report_id)
         finally:
             try:
                 next(db_gen)
