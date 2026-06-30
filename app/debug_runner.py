@@ -112,17 +112,35 @@ def _list_dir_tree(path: Path, max_depth: int = 1, max_entries: int = 50) -> str
 
 
 def _parse_report_output(raw: str) -> dict[str, str]:
-    """从 LLM 原始输出中提取 <report>...</report> 内的各字段。"""
+    """从 LLM 原始输出中提取各字段，容忍截断/未闭合标签/markdown 标题格式。"""
     fields: dict[str, str] = {}
-    # 优先匹配 <report> 块
-    block_match = re.search(r"<report>(.*?)</report>", raw, re.DOTALL)
+    # 优先匹配 <report> 块（不要求 </report> 闭合，容忍截断）
+    block_match = re.search(r"<report>(.*)", raw, re.DOTALL)
     block = block_match.group(1) if block_match else raw
+    tag_alt = "|".join(_FIELDS)
     for f in _FIELDS:
-        # <phenomenon>...</phenomenon> 或 <root_cause>...</root_cause>
+        # 1. 闭合标签 <f>...</f>
         m = re.search(rf"<{f}>(.*?)</{f}>", block, re.DOTALL)
         if m:
             fields[f] = m.group(1).strip()
-    # 兜底：若一个字段都没匹配到，把整个输出作为 phenomenon
+            continue
+        # 2. 未闭合标签 <f>... 取到下一个字段标签或结尾（截断容错）
+        m = re.search(rf"<{f}>(.*)", block, re.DOTALL)
+        if m:
+            rest = m.group(1)
+            next_tag = re.search(rf"<(?:{tag_alt})>", rest)
+            content = rest[:next_tag.start()] if next_tag else rest
+            content = content.strip()
+            if content:
+                fields[f] = content
+    # 3. 兜底：markdown 标题 ## 问题现象
+    if not fields:
+        for f in _FIELDS:
+            label = _FIELD_LABELS[f]
+            m = re.search(rf"#{{1,3}}\s*{label}[\s\n]*(.*?)(?=#{{1,3}}\s|$)", block, re.DOTALL)
+            if m and m.group(1).strip():
+                fields[f] = m.group(1).strip()
+    # 4. 全失败：整段 raw 塞 phenomenon
     if not fields:
         fields["phenomenon"] = raw.strip()[:20000]
     return fields
