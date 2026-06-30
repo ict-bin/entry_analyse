@@ -4,4 +4,4 @@ from fastapi import APIRouter
 
 router = APIRouter(prefix="/api/app/entry-analyse")
 
-from . import tasks, prompts, config  # noqa: E402, F401
+from . import tasks, prompts, config, debug_reports  # noqa: E402, F401

@@ -24,6 +24,7 @@ class RuntimeBootstrapStatus:
     management_api_ready: bool = False
     scheduler_ready: bool = False
     worker_ready: bool = False
+    debugger_ready: bool = False
     last_error: str | None = None
     attempts: int = 0
 
@@ -84,6 +85,11 @@ class RuntimeBootstrap:
                     made_progress = self._attempt_component_start(
                         "worker",
                         self._start_worker,
+                    ) or made_progress
+                if role_enabled("debugger") and not self._status.debugger_ready:
+                    made_progress = self._attempt_component_start(
+                        "debugger",
+                        self._start_debugger,
                     ) or made_progress
                 if self._all_required_components_ready():
                     return
@@ -149,6 +155,12 @@ class RuntimeBootstrap:
         get_worker_service().start()
         self._status.worker_ready = True
 
+    def _start_debugger(self) -> None:
+        from app.service.debugger_service import get_debugger_service
+
+        get_debugger_service().start()
+        self._status.debugger_ready = True
+
     def _all_required_components_ready(self) -> bool:
         if not self._status.db_ready:
             return False
@@ -157,6 +169,8 @@ class RuntimeBootstrap:
         if role_enabled("scheduler") and not self._status.scheduler_ready:
             return False
         if role_enabled("worker") and not self._status.worker_ready:
+            return False
+        if role_enabled("debugger") and not self._status.debugger_ready:
             return False
         return True
 

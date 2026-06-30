@@ -143,7 +143,7 @@ if __name__ == "__main__":
             port=port,
             reload=os.environ.get("DEV", "") == "1",
         )
-    elif role_enabled("scheduler"):
+    elif role_enabled("scheduler") or role_enabled("debugger"):
         print(f"""
 ╔═══════════════════════════════════════════════════════╗
 ║           entry_analyse Background Runtime           ║

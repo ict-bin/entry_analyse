@@ -29,7 +29,7 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.db.models import AppEaTask, AppEaTaskCommand
+from app.db.models import AppEaTask, AppEaTaskCommand, AppEaDebugReport
 from app.time_utils import now_local
 from app.service.task_service import (
     TASK_EVENT_SOURCE_SYSTEM,
@@ -49,6 +49,10 @@ DISPATCH_BATCH_SIZE = max(1, int(os.environ.get("EA_DISPATCH_BATCH_SIZE", "10"))
 WORKER_HEARTBEAT_STALE_SECONDS = int(os.environ.get("EA_WORKER_HEARTBEAT_STALE_SECONDS", "45"))
 WORKER_RECLAIM_INTERVAL_SECONDS = int(os.environ.get("EA_WORKER_RECLAIM_INTERVAL_SECONDS", "10"))
 RECLAIM_BATCH_SIZE = max(1, int(os.environ.get("EA_RECLAIM_BATCH_SIZE", "50")))
+
+DEBUG_DISPATCH_POLL_SECONDS = int(os.environ.get("EA_DEBUG_DISPATCH_POLL_SECONDS", "5"))
+DEBUG_DISPATCH_BATCH_SIZE = max(1, int(os.environ.get("EA_DEBUG_DISPATCH_BATCH_SIZE", "10")))
+DEBUGGER_HEARTBEAT_STALE_SECONDS = int(os.environ.get("EA_DEBUGGER_HEARTBEAT_STALE_SECONDS", "45"))
 
 LISTEN_HOST = os.environ.get("EA_SCHEDULER_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("EA_SCHEDULER_SOCKET_PORT", "18090"))
@@ -87,6 +91,10 @@ class SchedulerService:
         self._workers: dict[str, _Worker] = {}          # pod -> _Worker
         self._task_owner: dict[str, str] = {}           # task_id -> pod
 
+        # debugger 注册表（与 worker 同构但独立，消息类型 DEBUG_*）
+        self._debuggers: dict[str, _Worker] = {}        # pod -> _Worker
+        self._debug_owner: dict[str, str] = {}          # report_id -> pod
+
     # ── 公共 ────────────────────────────────────────────────────────────────
     def start(self) -> None:
         if self._running:
@@ -104,6 +112,12 @@ class SchedulerService:
         t.start(); self._threads.append(t)
         # 断联回收线程（心跳超时 → 任务回 pending）
         t = threading.Thread(target=self._reclaim_loop, name="sch_reclaim", daemon=True)
+        t.start(); self._threads.append(t)
+        # 失败诊断分发线程（failed/error 任务 → debugger pod）
+        t = threading.Thread(target=self._debug_dispatch_loop, name="sch_debug_dispatch", daemon=True)
+        t.start(); self._threads.append(t)
+        # debugger 断联回收线程
+        t = threading.Thread(target=self._debug_reclaim_loop, name="sch_debug_reclaim", daemon=True)
         t.start(); self._threads.append(t)
         logger.info("SchedulerService started: listen=%s:%s", LISTEN_HOST, LISTEN_PORT)
 
@@ -174,11 +188,16 @@ class SchedulerService:
             except Exception:
                 pass
             if pod:
+                # pod 可能是 worker 或 debugger（角色互斥），两个清理都调，未命中者 no-op
                 self._on_worker_disconnect(pod)
+                self._on_debugger_disconnect(pod)
 
     def _handle_worker_msg(self, conn: socket.socket, addr: Any,
                            pod: Optional[str], msg: dict) -> Optional[str]:
         mtype = msg.get("type")
+        # ── DEBUG_* 消息走 debugger 注册表（与 worker 独立）──
+        if mtype and str(mtype).startswith("DEBUG_"):
+            return self._handle_debugger_msg(conn, addr, pod, msg)
         if mtype == "HELLO":
             pod = str(msg.get("pod") or "")
             cap = int(msg.get("capacity") or 1)
@@ -256,6 +275,274 @@ class SchedulerService:
         if orphan_tasks:
             logger.warning("worker disconnect: pod=%s, reclaiming %d task(s)", pod, len(orphan_tasks))
             self._requeue_tasks(orphan_tasks, reason=f"worker_disconnect:{pod}")
+
+    # ── debugger 消息处理 / 诊断分发 ───────────────────────────────
+    def _handle_debugger_msg(self, conn: socket.socket, addr: Any,
+                             pod: Optional[str], msg: dict) -> Optional[str]:
+        mtype = msg.get("type")
+        if mtype == "DEBUG_HELLO":
+            pod = str(msg.get("pod") or "")
+            cap = int(msg.get("capacity") or 1)
+            free = int(msg.get("free_slots", cap))
+            with self._reg_lock:
+                w = self._debuggers.get(pod)
+                if w is not None and not w.closed:
+                    try:
+                        w.conn.close()
+                    except Exception:
+                        pass
+                w = _Worker(pod=pod, conn=conn, addr=addr, capacity=cap, free_slots=free)
+                self._debuggers[pod] = w
+            logger.info("debugger DEBUG_HELLO: pod=%s capacity=%s free=%s", pod, cap, free)
+            # 重连后立即尝试派发待诊报告
+            self._debug_dispatch_one_to(pod)
+            return pod
+        if pod is None:
+            return None
+        triggered_pod: Optional[str] = None
+        with self._reg_lock:
+            w = self._debuggers.get(pod)
+            if w is not None:
+                w.last_seen = time.time()
+                if mtype == "DEBUG_HEARTBEAT":
+                    new_free = int(msg.get("free_slots", w.free_slots))
+                    if new_free > w.free_slots:
+                        triggered_pod = pod
+                    w.free_slots = new_free
+                elif mtype == "DEBUG_STATUS":
+                    rid = msg.get("report_id")
+                    state = msg.get("state")
+                    if rid and state == "running":
+                        self._debug_owner[rid] = pod
+                        w.tasks.add(rid)
+                    elif rid and state == "rejected":
+                        self._debug_owner.pop(rid, None)
+                        w.tasks.discard(rid)
+                        triggered_pod = pod
+                elif mtype == "DEBUG_DONE":
+                    rid = msg.get("report_id")
+                    if rid:
+                        self._debug_owner.pop(rid, None)
+                        w.tasks.discard(rid)
+                    w.free_slots = min(w.capacity, w.free_slots + 1)
+                    triggered_pod = pod
+        if triggered_pod:
+            self._debug_dispatch_one_to(triggered_pod)
+        return pod
+
+    def _debugger_stale(self, pod: str) -> bool:
+        with self._reg_lock:
+            w = self._debuggers.get(pod)
+            return w is None or (time.time() - w.last_seen) > DEBUGGER_HEARTBEAT_STALE_SECONDS
+
+    def _on_debugger_disconnect(self, pod: str) -> None:
+        with self._reg_lock:
+            w = self._debuggers.pop(pod, None)
+            orphan: set[str] = set()
+            if w is not None:
+                w.closed = True
+                orphan = set(w.tasks)
+                for rid in orphan:
+                    self._debug_owner.pop(rid, None)
+        if orphan:
+            logger.warning("debugger disconnect: pod=%s, resetting %d report(s) to pending", pod, len(orphan))
+            self._reset_debug_reports(orphan, reason=f"debugger_disconnect:{pod}")
+
+    def _reset_debug_reports(self, report_ids: set[str], reason: str) -> None:
+        if not report_ids:
+            return
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            rows = (
+                db.query(AppEaDebugReport)
+                .filter(AppEaDebugReport.report_id.in_(list(report_ids)),
+                        AppEaDebugReport.status == "running")
+                .all()
+            )
+            for r in rows:
+                r.status = "pending"
+                r.owner_pod = None
+                r.error = (r.error or f"requeued: {reason}")
+            if rows:
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _debug_dispatch_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._debug_dispatch_once()
+            except Exception as exc:
+                logger.warning("debug dispatch loop error: %s", exc)
+            self._stop.wait(DEBUG_DISPATCH_POLL_SECONDS)
+
+    def _debug_dispatch_once(self) -> int:
+        """扫描 failed/error 任务，为无报告者创建 pending 报告，然后派发给空闲 debugger。"""
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        dispatched = 0
+        try:
+            # 1. 找 failed/error 且未删除、且无（未删除）诊断报告的任务
+            tasks = (
+                db.query(AppEaTask)
+                .filter(
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.status.in_(["failed", "error"]),
+                    AppEaTask.finished_at.is_not(None),
+                )
+                .order_by(AppEaTask.finished_at.desc())
+                .limit(DEBUG_DISPATCH_BATCH_SIZE * 4)
+                .all()
+            )
+            for t in tasks:
+                existing = (
+                    db.query(AppEaDebugReport)
+                    .filter(AppEaDebugReport.task_id == t.task_id,
+                            AppEaDebugReport.is_deleted.is_(False))
+                    .first()
+                )
+                if existing is None:
+                    self._create_debug_report(db, t)
+            db.commit()
+            # 2. 派发 pending 报告给空闲 debugger
+            with self._reg_lock:
+                free_pods = [w.pod for w in self._debuggers.values()
+                             if w.free_slots > 0 and not w.closed]
+            if not free_pods:
+                return 0
+            for pod in free_pods:
+                if self._debug_dispatch_one_to(pod) > 0:
+                    dispatched += 1
+            return dispatched
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _create_debug_report(self, db: Session, task: AppEaTask) -> None:
+        import uuid
+        report = AppEaDebugReport(
+            report_id=f"dr-{uuid.uuid4().hex[:24]}",
+            task_id=task.task_id,
+            project_id=task.project_id,
+            task_name=task.task_name,
+            status="pending",
+            task_status=task.status,
+            task_error=(task.error or "")[:8000],
+            model=self._resolve_task_model_for_debug(task),
+        )
+        db.add(report)
+        logger.info("created debug report %s for failed task %s", report.report_id, task.task_id)
+
+    def _resolve_task_model_for_debug(self, task: AppEaTask) -> Optional[str]:
+        """从任务快照推断诊断用的模型（与原任务一致）。"""
+        try:
+            tc = task.task_config_json if isinstance(task.task_config_json, dict) else {}
+            model = str(tc.get("model") or "").strip()
+            if model and model != "auto":
+                return model
+            atk = tc.get("agent_task_key") if isinstance(tc.get("agent_task_key"), dict) else {}
+            if atk.get("secret"):
+                return "gaiasec/auto"
+        except Exception:
+            pass
+        return None
+
+    def _debug_dispatch_one_to(self, pod: str) -> int:
+        """给指定 debugger pod 派发 1 个 pending 诊断报告。"""
+        with self._reg_lock:
+            w = self._debuggers.get(pod)
+            if w is None or w.closed or w.free_slots <= 0:
+                return 0
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            row = (
+                db.query(AppEaDebugReport)
+                .filter(AppEaDebugReport.status == "pending",
+                        AppEaDebugReport.is_deleted.is_(False))
+                .order_by(AppEaDebugReport.created_at.asc())
+                .limit(1)
+                .first()
+            )
+            if row is None:
+                return 0
+            ok = self._debug_send_to(pod, {"type": "DEBUG_LAUNCH",
+                                            "task_id": row.task_id, "report_id": row.report_id})
+            if not ok:
+                logger.warning("debug dispatch to %s failed for %s", pod, row.report_id)
+                return 0
+            with self._reg_lock:
+                ww = self._debuggers.get(pod)
+                if ww is not None and not ww.closed:
+                    ww.free_slots = max(0, ww.free_slots - 1)
+                    ww.tasks.add(row.report_id)
+                    self._debug_owner[row.report_id] = pod
+            row.status = "running"
+            row.owner_pod = pod
+            row.started_at = now_local()
+            db.commit()
+            logger.info("dispatched debug report %s (task %s) to %s", row.report_id, row.task_id, pod)
+            return 1
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _debug_reclaim_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._debug_reclaim_stale()
+            except Exception as exc:
+                logger.warning("debug reclaim loop error: %s", exc)
+            self._stop.wait(WORKER_RECLAIM_INTERVAL_SECONDS)
+
+    def _debug_reclaim_stale(self) -> None:
+        now = time.time()
+        stale: list[str] = []
+        orphan: set[str] = set()
+        with self._reg_lock:
+            for pod, w in list(self._debuggers.items()):
+                if (now - w.last_seen) > DEBUGGER_HEARTBEAT_STALE_SECONDS:
+                    stale.append(pod)
+                    orphan |= w.tasks
+                    w.closed = True
+                    for rid in w.tasks:
+                        self._debug_owner.pop(rid, None)
+            for pod in stale:
+                ww = self._debuggers.pop(pod, None)
+                if ww is not None:
+                    try:
+                        ww.conn.close()
+                    except Exception:
+                        pass
+        if orphan:
+            logger.warning("debugger heartbeat stale, reclaim: pods=%s reports=%d", stale, len(orphan))
+            self._reset_debug_reports(orphan, reason="debugger_heartbeat_stale")
+
+    def _debug_send_to(self, pod: str, msg: dict) -> bool:
+        with self._reg_lock:
+            w = self._debuggers.get(pod)
+        if w is None or w.closed:
+            return False
+        with w.send_lock:
+            try:
+                w.conn.settimeout(3.0)
+                w.conn.sendall((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+                return True
+            except (socket.timeout, OSError) as exc:
+                logger.warning("debug send to %s failed (%s), marking stale", pod, exc)
+                with self._reg_lock:
+                    ww = self._debuggers.get(pod)
+                    if ww is not None:
+                        ww.last_seen = 0.0
+                return False
 
     # ── 派发：pending → 选 worker → LAUNCH ─────────────────────────────────
     def _dispatch_loop(self) -> None:

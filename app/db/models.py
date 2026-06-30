@@ -219,6 +219,46 @@ class AppEaModelsConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
 
 
+class AppEaDebugReport(Base):
+    """LLM 失败诊断报告 —— 任务失败时由 debugger pod 用 LLM 分析生成。
+
+    存放问题现象/根因/解决方法/代码现场/补丁代码的结构化定位报告；
+    完整 Markdown 报告同时写入 NFS 任务输出目录（report_path）。
+    """
+    __tablename__ = "secflow_app_ea_debug_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    report_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 诊断任务自身状态: pending | running | passed | failed | error
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    owner_pod: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 原任务失败快照
+    task_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    task_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 结构化诊断结论
+    phenomenon: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    root_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    solution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    code_scene: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    patch_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 完整 Markdown 报告 NFS 路径 + LLM 原始输出
+    report_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    raw_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
 class AppEaStageResultIndex(Base):
     """Stage result index: DB stores only metadata/index, full content remains on disk."""
     __tablename__ = "secflow_app_ea_stage_result_index"
