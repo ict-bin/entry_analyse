@@ -135,6 +135,21 @@ def download_debug_report(
     )
 
 
+@router.delete("/debug-reports/{report_id}", response_model=dict)
+def delete_debug_report(
+    report_id: str,
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """软删除诊断报告（标记已处理）。"""
+    r = db.query(AppEaDebugReport).filter_by(report_id=report_id, is_deleted=False).first()
+    if not r:
+        raise HTTPException(404, f"诊断报告不存在: {report_id}")
+    r.is_deleted = True
+    db.commit()
+    return {"report_id": report_id, "deleted": True}
+
+
 @router.post("/debug-reports/{report_id}/reanalyze", response_model=dict)
 def reanalyze_debug_report(
     report_id: str,
