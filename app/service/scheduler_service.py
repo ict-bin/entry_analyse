@@ -29,7 +29,7 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.db.models import AppEaTask, AppEaTaskCommand, AppEaDebugReport
+from app.db.models import AppEaTask, AppEaTaskCommand, AppEaDebugReport, AppEaWorkerSlot
 from app.time_utils import now_local
 from app.service.task_service import (
     TASK_EVENT_SOURCE_SYSTEM,
@@ -53,6 +53,8 @@ RECLAIM_BATCH_SIZE = max(1, int(os.environ.get("EA_RECLAIM_BATCH_SIZE", "50")))
 DEBUG_DISPATCH_POLL_SECONDS = int(os.environ.get("EA_DEBUG_DISPATCH_POLL_SECONDS", "5"))
 DEBUG_DISPATCH_BATCH_SIZE = max(1, int(os.environ.get("EA_DEBUG_DISPATCH_BATCH_SIZE", "10")))
 DEBUGGER_HEARTBEAT_STALE_SECONDS = int(os.environ.get("EA_DEBUGGER_HEARTBEAT_STALE_SECONDS", "45"))
+
+WORKER_DB_SNAPSHOT_INTERVAL_SECONDS = int(os.environ.get("EA_WORKER_DB_SNAPSHOT_SECONDS", "10"))
 
 LISTEN_HOST = os.environ.get("EA_SCHEDULER_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("EA_SCHEDULER_SOCKET_PORT", "18090"))
@@ -118,6 +120,9 @@ class SchedulerService:
         t.start(); self._threads.append(t)
         # debugger 断联回收线程
         t = threading.Thread(target=self._debug_reclaim_loop, name="sch_debug_reclaim", daemon=True)
+        t.start(); self._threads.append(t)
+        # worker 状态写 DB 快照线程（供 API pod 的 slot-cluster 读取）
+        t = threading.Thread(target=self._worker_db_snapshot_loop, name="sch_worker_snapshot", daemon=True)
         t.start(); self._threads.append(t)
         logger.info("SchedulerService started: listen=%s:%s", LISTEN_HOST, LISTEN_PORT)
 
@@ -986,6 +991,72 @@ class SchedulerService:
         """返回所有 V3 在跑任务的 task_id 列表。WorkerSlotService 用作 running_tasks 计数。"""
         with self._reg_lock:
             return [tid for pod, tid in self._task_owner.items()]
+
+    # ── worker 状态写 DB 快照（供 API pod slot-cluster 读取）─────────────
+    def _worker_db_snapshot_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._snapshot_workers_to_db()
+            except Exception as exc:
+                logger.warning("worker db snapshot loop error: %s", exc)
+            self._stop.wait(WORKER_DB_SNAPSHOT_INTERVAL_SECONDS)
+
+    def _snapshot_workers_to_db(self) -> None:
+        """把内存 _workers 状态 upsert 到 AppEaWorkerSlot，让 API pod 能读到新鲜槽位数据。"""
+        state = self.get_workers_state()
+        if not state:
+            return
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            now = now_local()
+            seen_pods: set[str] = set()
+            for w in state:
+                pod = str(w.get("pod") or "")
+                if not pod:
+                    continue
+                seen_pods.add(pod)
+                cap = int(w.get("capacity", 1) or 1)
+                free = int(w.get("free_slots", cap) or 0)
+                running = len(w.get("running_tasks") or [])
+                closed = bool(w.get("closed"))
+                row = db.query(AppEaWorkerSlot).filter(AppEaWorkerSlot.worker_id == pod).first()
+                if row is None:
+                    row = AppEaWorkerSlot(
+                        worker_id=pod, pod_name=pod, runtime_role="worker",
+                        http_port=8080, max_concurrent_tasks=cap,
+                    )
+                    db.add(row)
+                row.pod_name = pod
+                row.runtime_role = "worker"
+                row.max_concurrent_tasks = cap
+                row.agent_process_limit = cap
+                row.agent_process_in_use = max(0, cap - free)
+                row.agent_process_available = free
+                row.last_seen_status = "retired" if closed else "running"
+                row.last_heartbeat_at = now
+                row.heartbeat_failure_count = 0
+                row.updated_at = now
+                # 用 running 任务数打 agent_snapshot_at 便于排查
+                if running:
+                    row.agent_snapshot_at = now
+            # 不在 state 里的旧行标 retired（心跳过期，V2 fallback 会过滤）
+            if seen_pods:
+                stale_rows = (
+                    db.query(AppEaWorkerSlot)
+                    .filter(AppEaWorkerSlot.worker_id.notin_(list(seen_pods)),
+                            AppEaWorkerSlot.last_seen_status == "running")
+                    .all()
+                )
+                for sr in stale_rows:
+                    sr.last_seen_status = "retired"
+                    sr.updated_at = now
+            db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
 
     def _send_to(self, pod: str, msg: dict) -> bool:
         with self._reg_lock:
