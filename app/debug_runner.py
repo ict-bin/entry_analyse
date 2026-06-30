@@ -280,6 +280,13 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
         prompt = _build_debug_prompt(task, task_dir or Path(""), source_path,
                                      events_tail, run_tree)
 
+        # pi 需要一个存在的 cwd 才能启动；源码可能已删，按优先级选第一个存在目录
+        cwd_candidates = [source_path]
+        if task_dir is not None:
+            cwd_candidates += [str(task_dir / "run"), str(task_dir)]
+        cwd_candidates += [os.getcwd(), "/tmp"]
+        cwd = next((c for c in cwd_candidates if c and os.path.isdir(c)), "/tmp")
+
         # ── 3. 调 LLM(pi) 现场诊断 ───────────────────────────────────────
         logger.info("debug_runner calling LLM: report=%s task=%s model=%s",
                     report_id, task_id, model)
@@ -288,7 +295,7 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
             model=model,
             tools=["read", "bash"],
             system_prompt=_DEBUG_SYSTEM_PROMPT,
-            cwd=os.path.abspath(source_path) if source_path else os.getcwd(),
+            cwd=cwd,
             thinking_level="medium",
             session_file=None,
             cancel_event=None,
