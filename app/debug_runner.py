@@ -51,7 +51,7 @@ def _setup_logging() -> None:
     )
 
 
-def _read_events_tail(events_path: Path, n: int = 60) -> str:
+def _read_events_tail(events_path: Path, n: int = 25) -> str:
     if not events_path.is_file():
         return ""
     try:
@@ -76,7 +76,7 @@ def _read_events_tail(events_path: Path, n: int = 60) -> str:
         return f"<读取 events.jsonl 失败: {exc}>"
 
 
-def _list_dir_tree(path: Path, max_depth: int = 2, max_entries: int = 80) -> str:
+def _list_dir_tree(path: Path, max_depth: int = 1, max_entries: int = 50) -> str:
     if not path.is_dir():
         return ""
     lines: list[str] = []
