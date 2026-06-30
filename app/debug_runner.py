@@ -159,26 +159,14 @@ def _build_markdown(report_id: str, task_id: str, task_name: str,
 
 
 # ── LLM 运行时准备（复用 worker_service 的统一逻辑）────────────────────────
-def _prepare_debug_llm_runtime(cfg: Any, task_config: dict, origin: str) -> dict[str, Any]:
+async def _prepare_debug_llm_runtime(cfg: Any, task_config: dict, origin: str) -> dict[str, Any]:
     from app.service.svc_config import get_service_yaml
     from app.service.worker_service import _prepare_task_llm_runtime
 
     svc_yaml = get_service_yaml()
-    # _prepare_task_llm_runtime 是 async 但内部全同步；用 asyncio 事件循环驱动
-    try:
-        loop = asyncio.new_event_loop()
-        try:
-            resolved = loop.run_until_complete(_prepare_task_llm_runtime(
-                cfg=cfg, task_config=task_config, origin=origin, svc_yaml=svc_yaml,
-            ))
-        finally:
-            loop.close()
-    except Exception:
-        # 退一步：直接同步调用（部分版本签名可能非 async）
-        resolved = _prepare_task_llm_runtime(
-            cfg=cfg, task_config=task_config, origin=origin, svc_yaml=svc_yaml,
-        )
-    return resolved
+    return await _prepare_task_llm_runtime(
+        cfg=cfg, task_config=task_config, origin=origin, svc_yaml=svc_yaml,
+    )
 
 
 # ── 诊断 prompt 构造 ────────────────────────────────────────────────────────
@@ -243,7 +231,7 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
     from app.time_utils import now_local
     from app.config import build_task_config
     from app.runner import run_agent
-    from app.models import SemPriority
+    from app.agent_slots import SemPriority
     from app.service import task_service as task_mod
 
     db_gen = get_db()
@@ -272,7 +260,7 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
             module_name=task.module_name or "",
             source_path=task.source_path or "",
         )
-        resolved = _prepare_debug_llm_runtime(cfg, tcfg, task.task_origin_type or "manual")
+        resolved = await _prepare_debug_llm_runtime(cfg, tcfg, task.task_origin_type or "manual")
         model = resolved.get("model") or ""
 
         # ── 2. 收集上下文 ────────────────────────────────────────────────
