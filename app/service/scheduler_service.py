@@ -237,6 +237,7 @@ class SchedulerService:
             if w is not None:
                 w.last_seen = time.time()
                 triggered_pod: Optional[str] = None
+                done_task_id: Optional[str] = None
                 if mtype == "HEARTBEAT":
                     new_free = int(msg.get("free_slots", w.free_slots))
                     if new_free > w.free_slots:
@@ -260,12 +261,19 @@ class SchedulerService:
                         w.tasks.discard(tid)
                     w.free_slots = min(w.capacity, w.free_slots + 1)
                     triggered_pod = pod  # DONE → 立即派发下一个给该 worker
+                    done_task_id = tid  # 事件驱动触发失败诊断
                 elif mtype == "HELLO":
                     # 重连后调度该 worker 之前持有的任务（drain orphans）
                     triggered_pod = pod
         if triggered_pod:
             # 必须在 _reg_lock 外派发，避免 dispatch_one 内部 _pick_worker 与 _reg_lock 重入
             self._dispatch_one_to(triggered_pod)
+        # 事件驱动：任务 DONE 时若 failed/error 则触发诊断（不扫任务表）
+        if done_task_id:
+            try:
+                self._on_task_done_debug_trigger(done_task_id)
+            except Exception as exc:
+                logger.warning("debug trigger on DONE failed task=%s: %s", done_task_id, exc)
         return pod
 
     def _worker_stale(self, pod: str) -> bool:
@@ -429,48 +437,56 @@ class SchedulerService:
             self._stop.wait(DEBUG_DISPATCH_POLL_SECONDS)
 
     def _debug_dispatch_once(self) -> int:
-        """扫描 failed/error 任务，为无报告者创建 pending 报告，然后派发给空闲 debugger。"""
+        """兜底派发 pending 报告给空闲 debugger。
+
+        报告由任务 DONE 事件触发创建（_on_task_done_debug_trigger），
+        本方法仅处理当时无 debugger 可派、后补派发的 pending 报告。
+        """
+        with self._reg_lock:
+            free_pods = [w.pod for w in self._debuggers.values()
+                         if w.free_slots > 0 and not w.closed]
+        if not free_pods:
+            return 0
+        dispatched = 0
+        for pod in free_pods:
+            if self._debug_dispatch_one_to(pod) > 0:
+                dispatched += 1
+        return dispatched
+
+    def _on_task_done_debug_trigger(self, task_id: str) -> None:
+        """任务结束(worker DONE)事件驱动触发：
+        若任务 failed/error 且无未删除报告 → 建报告(含跳过分类)+派发。
+        不扫描任务表，只在 DONE 事件点触发，避免删了又重建。
+        """
+        from app.db.models import AppEaTask
         db_gen = get_db()
         db: Session = next(db_gen)
-        dispatched = 0
+        should_dispatch = False
         try:
-            # 1. 找 failed/error 且未删除、且无（未删除）诊断报告的任务
-            tasks = (
-                db.query(AppEaTask)
-                .filter(
-                    AppEaTask.is_deleted.is_(False),
-                    AppEaTask.status.in_(["failed", "error"]),
-                    AppEaTask.finished_at.is_not(None),
-                )
-                .order_by(AppEaTask.finished_at.desc())
-                .limit(DEBUG_DISPATCH_BATCH_SIZE * 4)
-                .all()
-            )
-            for t in tasks:
-                existing = (
-                    db.query(AppEaDebugReport)
-                    .filter(AppEaDebugReport.task_id == t.task_id,
-                            AppEaDebugReport.is_deleted.is_(False))
-                    .first()
-                )
-                if existing is None:
-                    self._create_debug_report(db, t)
+            task = db.query(AppEaTask).filter_by(task_id=task_id, is_deleted=False).first()
+            if task is None or task.status not in ("failed", "error"):
+                return
+            # 已有未删除报告则不重建（尊重删除）
+            existing = db.query(AppEaDebugReport).filter(
+                AppEaDebugReport.task_id == task_id,
+                AppEaDebugReport.is_deleted.is_(False),
+            ).first()
+            if existing is not None:
+                return
+            self._create_debug_report(db, task)
             db.commit()
-            # 2. 派发 pending 报告给空闲 debugger
-            with self._reg_lock:
-                free_pods = [w.pod for w in self._debuggers.values()
-                             if w.free_slots > 0 and not w.closed]
-            if not free_pods:
-                return 0
-            for pod in free_pods:
-                if self._debug_dispatch_one_to(pod) > 0:
-                    dispatched += 1
-            return dispatched
+            should_dispatch = True
         finally:
             try:
                 next(db_gen)
             except StopIteration:
                 pass
+        if should_dispatch:
+            with self._reg_lock:
+                pod = next((w.pod for w in self._debuggers.values()
+                            if w.free_slots > 0 and not w.closed), None)
+            if pod:
+                self._debug_dispatch_one_to(pod)
 
     def _create_debug_report(self, db: Session, task: AppEaTask) -> None:
         import uuid
