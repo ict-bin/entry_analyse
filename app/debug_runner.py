@@ -66,6 +66,25 @@ def classify_skip_reason(error: str | None) -> str | None:
     return None
 
 
+def _read_debugger_model() -> str | None:
+    """读取 debugger 模型配置（AppEaModelsConfig config_key=debugger）。None=用任务原模型。"""
+    try:
+        from app.db import get_db
+        from app.db.models import AppEaModelsConfig
+        g = get_db(); db = next(g)
+        try:
+            row = db.query(AppEaModelsConfig).filter_by(config_key="debugger").first()
+            if row is not None and isinstance(row.config_json, dict):
+                m = str(row.config_json.get("model") or "").strip()
+                return m or None
+        finally:
+            try: next(g)
+            except StopIteration: pass
+    except Exception as exc:
+        logger.warning("_read_debugger_model failed: %s", exc)
+    return None
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -376,6 +395,11 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
         )
         resolved = await _prepare_debug_llm_runtime(cfg, tcfg, task.task_origin_type or "manual")
         model = resolved.get("model") or ""
+        # debugger 模型配置覆盖任务原模型（微服务级统一配置）
+        _dbg_model = _read_debugger_model()
+        if _dbg_model:
+            model = _dbg_model
+            logger.info("debug_runner using configured debugger model: %s", _dbg_model)
 
         # ── 2. 收集上下文 ────────────────────────────────────────────────
         task_dir = Path(task.output_path or "") / task_id if task.output_path else None

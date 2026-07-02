@@ -49,6 +49,10 @@ class DebugReportListResponse(BaseModel):
     items: list[DebugReportItem]
 
 
+class DebugConfigRequest(BaseModel):
+    model: Optional[str] = None
+
+
 def _to_item(r: AppEaDebugReport, detail: bool = False) -> DebugReportItem:
     def _short(v: Optional[str], n: int) -> Optional[str]:
         if v is None:
@@ -75,6 +79,39 @@ def _to_item(r: AppEaDebugReport, detail: bool = False) -> DebugReportItem:
         started_at=r.started_at.isoformat() if r.started_at else None,
         finished_at=r.finished_at.isoformat() if r.finished_at else None,
     )
+
+
+@router.get("/debug-reports/config", response_model=dict)
+def get_debug_config(
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """读取 debugger 模型配置（None=用任务原模型）。"""
+    from app.db.models import AppEaModelsConfig
+    row = db.query(AppEaModelsConfig).filter_by(config_key="debugger").first()
+    model = None
+    if row is not None and isinstance(row.config_json, dict):
+        model = row.config_json.get("model")
+    return {"model": model}
+
+
+@router.put("/debug-reports/config", response_model=dict)
+def put_debug_config(
+    body: DebugConfigRequest,
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """保存 debugger 模型配置。"""
+    from app.db.models import AppEaModelsConfig
+    row = db.query(AppEaModelsConfig).filter_by(config_key="debugger").first()
+    model_val = (body.model or "").strip() or None
+    if row is None:
+        row = AppEaModelsConfig(config_key="debugger", config_json={"model": model_val})
+        db.add(row)
+    else:
+        row.config_json = {"model": model_val}
+    db.commit()
+    return {"model": model_val}
 
 
 @router.get("/debug-reports", response_model=DebugReportListResponse)
