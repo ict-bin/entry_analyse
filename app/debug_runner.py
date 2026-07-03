@@ -526,7 +526,7 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
             _finish_report(report_id, status="skipped", model=None,
                            error=f"跳过分析：{skip_reason}（非本微服务错误）",
                            fields={}, raw_output="", report_path=None,
-                           task_dir=task_dir, task_id=task_id, task_name=task.task_name)
+                           task_dir=None, task_id=task_id, task_name=task.task_name)
             return 0
 
         # ── 1. 构建 cfg + LLM 运行时（与原任务一致）──────────────────────
