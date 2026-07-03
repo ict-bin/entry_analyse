@@ -199,8 +199,9 @@ class SchedulerService:
                 pass
             if pod:
                 # pod 可能是 worker 或 debugger（角色互斥），两个清理都调，未命中者 no-op
-                self._on_worker_disconnect(pod)
-                self._on_debugger_disconnect(pod)
+                # 传 conn：只在注册表里仍是本连接时才 pop，避免重连后旧 finally 误删新连接(race)
+                self._on_worker_disconnect(pod, conn)
+                self._on_debugger_disconnect(pod, conn)
 
     def _handle_worker_msg(self, conn: socket.socket, addr: Any,
                            pod: Optional[str], msg: dict) -> Optional[str]:
@@ -293,15 +294,17 @@ class SchedulerService:
             w = self._workers.get(pod)
             return w is None or (time.time() - w.last_seen) > WORKER_HEARTBEAT_STALE_SECONDS
 
-    def _on_worker_disconnect(self, pod: str) -> None:
+    def _on_worker_disconnect(self, pod: str, conn: socket.socket) -> None:
         with self._reg_lock:
-            w = self._workers.pop(pod, None)
-            orphan_tasks: set[str] = set()
-            if w is not None:
-                w.closed = True
-                orphan_tasks = set(w.tasks)
-                for tid in orphan_tasks:
-                    self._task_owner.pop(tid, None)
+            w = self._workers.get(pod)
+            # 只在注册表里仍是本连接(未重连换新)时才 pop+回收，避免旧 finally 误删新连接
+            if w is None or w.conn is not conn:
+                return
+            w.closed = True
+            orphan_tasks: set[str] = set(w.tasks)
+            for tid in orphan_tasks:
+                self._task_owner.pop(tid, None)
+            self._workers.pop(pod, None)
         if orphan_tasks:
             logger.warning("worker disconnect: pod=%s, reclaiming %d task(s)", pod, len(orphan_tasks))
             self._requeue_tasks(orphan_tasks, reason=f"worker_disconnect:{pod}")
@@ -372,15 +375,16 @@ class SchedulerService:
             w = self._debuggers.get(pod)
             return w is None or (time.time() - w.last_seen) > DEBUGGER_HEARTBEAT_STALE_SECONDS
 
-    def _on_debugger_disconnect(self, pod: str) -> None:
+    def _on_debugger_disconnect(self, pod: str, conn: socket.socket) -> None:
         with self._reg_lock:
-            w = self._debuggers.pop(pod, None)
-            orphan: set[str] = set()
-            if w is not None:
-                w.closed = True
-                orphan = set(w.tasks)
-                for rid in orphan:
-                    self._debug_owner.pop(rid, None)
+            w = self._debuggers.get(pod)
+            if w is None or w.conn is not conn:
+                return
+            w.closed = True
+            orphan: set[str] = set(w.tasks)
+            for rid in orphan:
+                self._debug_owner.pop(rid, None)
+            self._debuggers.pop(pod, None)
         if orphan:
             logger.warning("debugger disconnect: pod=%s, resetting %d report(s) to pending", pod, len(orphan))
             self._reset_debug_reports(orphan, reason=f"debugger_disconnect:{pod}")

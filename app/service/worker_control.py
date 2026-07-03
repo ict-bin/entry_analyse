@@ -107,6 +107,7 @@ class WorkerControl:
     # ── socket 连接/重连 ────────────────────────────────────────────────────
     def _connect_loop(self) -> None:
         while not self._stop.is_set():
+            self._close_sock()  # 清掉上一轮可能泄漏的旧 socket，再建新连接
             try:
                 sock = socket.create_connection((SCHEDULER_HOST, SCHEDULER_PORT), timeout=5)
                 sock.settimeout(None)
@@ -130,14 +131,14 @@ class WorkerControl:
                 self._stop.wait(RECONNECT_DELAY)
 
     def _recv_loop(self, sock: socket.socket) -> None:
-        # 在一个连接的生命周期内读命令；连接断开则回到 _connect_loop
+        # 在一个连接的生命周期内读命令；对端关闭 → raise 让 _connect_loop 走 except(打日志+延迟+清旧sock)
         while not self._stop.is_set():
             try:
                 data = sock.recv(65536)
-            except OSError:
-                break
+            except OSError as exc:
+                raise ConnectionError(f"recv error: {exc}") from exc
             if not data:
-                break
+                raise ConnectionError("scheduler closed connection (peer closed)")
             self._recv_buf += data
             while b"\n" in self._recv_buf:
                 line, self._recv_buf = self._recv_buf.split(b"\n", 1)

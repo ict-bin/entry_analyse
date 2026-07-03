@@ -102,6 +102,7 @@ class DebuggerControl:
     # ── socket 连接/重连 ────────────────────────────────────────────────────
     def _connect_loop(self) -> None:
         while not self._stop.is_set():
+            self._close_sock()  # 清掉上一轮可能泄漏的旧 socket，再建新连接
             try:
                 sock = socket.create_connection((SCHEDULER_HOST, SCHEDULER_PORT), timeout=5)
                 sock.settimeout(None)
@@ -129,10 +130,12 @@ class DebuggerControl:
         while not self._stop.is_set():
             try:
                 data = sock.recv(65536)
-            except OSError:
-                break
+            except OSError as exc:
+                raise ConnectionError(f"recv error: {exc}") from exc
             if not data:
-                break
+                # 对端关闭连接 → raise 让 _connect_loop 走 except(打日志+延迟+清旧sock)
+                # 避免静默瞬时重连 + 旧 socket 泄漏
+                raise ConnectionError("scheduler closed connection (peer closed)")
             self._recv_buf += data
             while b"\n" in self._recv_buf:
                 line, self._recv_buf = self._recv_buf.split(b"\n", 1)
