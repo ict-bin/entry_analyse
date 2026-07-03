@@ -288,6 +288,121 @@ def _finish_report(
 
 
 # ── 诊断 prompt 构造 ────────────────────────────────────────────────────────
+
+async def _rpc_run_debug(*, model: str, prompt: str, system_prompt: str,
+                         cwd: str, pi_dir: str, timeout: float = 1800) -> tuple[str, str | None]:
+    """用 pi RPC 模式跑诊断（启用官方自动压缩），返回 (assistant 文本, 错误)。
+
+    单次 RPC 会话内完成调查+报告；上下文超阈值时 pi 自动 compact，
+    无需自製分段策略。assistant 文本从 agent_end.messages 取（完整可靠）。
+    """
+    from app.agent_process import find_pi_command
+    import tempfile
+    import shutil as _shutil
+
+    pi_cmd = find_pi_command()
+    tmp_dir = tempfile.mkdtemp(prefix="ea-debug-")
+    sys_file = os.path.join(tmp_dir, "system.md")
+    Path(sys_file).write_text(system_prompt, encoding="utf-8")
+
+    args = [*pi_cmd, "--mode", "rpc", "--no-session",
+            "--model", model, "--tools", "read,bash",
+            "--append-system-prompt", sys_file]
+    env = dict(os.environ)
+    env["PI_CODING_AGENT_DIR"] = pi_dir
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd, env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        return "", f"spawn pi rpc failed: {exc}"
+
+    text_parts: list[str] = []
+    error: str | None = None
+
+    async def _send(cmd: dict) -> None:
+        proc.stdin.write((json.dumps(cmd, ensure_ascii=False) + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+
+    try:
+        # 1. 启用官方自动压缩
+        await _send({"type": "set_auto_compaction", "enabled": True})
+        # 2. 发诊断 prompt
+        await _send({"type": "prompt", "message": prompt})
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error = f"rpc debug timeout after {timeout}s"
+                break
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                error = f"rpc debug timeout after {timeout}s"
+                break
+            if not line:
+                error = error or "rpc process stdout closed"
+                break
+            try:
+                evt = json.loads(line.decode("utf-8", "replace").strip())
+            except Exception:
+                continue
+            t = evt.get("type")
+            if t == "message_update":
+                delta = evt.get("assistantMessageEvent") or {}
+                if delta.get("type") == "text_delta":
+                    text_parts.append(delta.get("delta") or "")
+            elif t == "compaction_start":
+                logger.info("debug rpc compaction_start: %s", evt.get("reason"))
+            elif t == "compaction_end":
+                r = evt.get("result") or {}
+                logger.info("debug rpc compaction_end: %s before=%s after=%s",
+                            evt.get("reason"), r.get("tokensBefore"), r.get("estimatedTokensAfter"))
+            elif t == "agent_end":
+                # 从 messages 取 assistant 文本（完整，覆盖流式片段）
+                atext: list[str] = []
+                for m in evt.get("messages") or []:
+                    if m.get("role") != "assistant":
+                        continue
+                    content = m.get("content")
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                atext.append(c.get("text") or "")
+                    elif isinstance(content, str):
+                        atext.append(content)
+                if atext:
+                    text_parts = atext
+                break
+            elif t == "response" and not evt.get("success"):
+                err = evt.get("error") or "rpc command failed"
+                if evt.get("command") == "prompt":
+                    error = err
+                    break
+                logger.warning("debug rpc cmd %s failed: %s", evt.get("command"), err)
+            elif t == "extension_ui_request":
+                # read/bash 无需 UI；万一来了 confirm/select，自动取消避免卡死
+                if evt.get("method") in ("select", "confirm", "input", "editor"):
+                    await _send({"type": "extension_ui_response", "id": evt.get("id"), "cancelled": True})
+    finally:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+    return "".join(text_parts), error
+
 _DEBUG_SYSTEM_PROMPT = """你是一名资深的代码诊断工程师。用户的一个"入口分析"自动化任务失败了，你的任务是：
 1. 阅读任务失败信息、事件时间线、流水线状态和 run/ 目录下的产物（session 日志、stage-result 等）。
 2. 用 read/bash 工具实地查看源码、定位失败根因。
@@ -348,8 +463,6 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
     from app.db.models import AppEaTask, AppEaDebugReport
     from app.time_utils import now_local
     from app.config import build_task_config
-    from app.runner import run_agent
-    from app.agent_slots import SemPriority
     from app.service import task_service as task_mod
     from app.service.svc_config import get_service_yaml
 
@@ -420,85 +533,15 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
         cwd_candidates += [os.getcwd(), "/tmp"]
         cwd = next((c for c in cwd_candidates if c and os.path.isdir(c)), "/tmp")
 
-        # ── 3. 分段产出(同一 session 多轮, 格式错误用 user 纠正重做) ──────────
-        session_file = None
-        if task_dir is not None:
-            session_file = str(task_dir / "run" / "sessions" / f"debug-{report_id}.jsonl")
-            Path(session_file).parent.mkdir(parents=True, exist_ok=True)
-
-        field_prompts: dict[str, str] = {
-            "phenomenon": "先调查任务失败（用 bash/read 查看 run/ 目录的 sessions、stage-results、pipeline_state.json 和源码），然后输出【问题现象】段：观察到的失败、错误信息、哪个阶段失败。用 XML 标签 <phenomenon>...</phenomenon> 包裹，只输出这一段。",
-            "root_cause": "现在输出【问题根因】段：深入分析为什么会失败（代码bug/配置错误/LLM输出格式不符/环境问题等），具体到文件名行号。用 <root_cause>...</root_cause> 包裹，只输出这一段。",
-            "solution": "现在输出【解决方法】段：具体可执行的修复步骤。用 <solution>...</solution> 包裹，只输出这一段。",
-            "code_scene": "现在输出【代码现场】段：相关源码文件路径、关键函数、关键代码片段（含行号），用 markdown 代码块。用 <code_scene>...</code_scene> 包裹，只输出这一段。",
-            "patch_code": "现在输出【补丁代码】段：若适用给出补丁 diff 或修改后代码；不适用则写“无”。用 <patch_code>...</patch_code> 包裹，只输出这一段。",
-        }
-
+        # ── 3. RPC 模式跑诊断（pi 官方自动压缩，单会话完成）──────────────
         pi_dir = str(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
-        fields: dict[str, str] = {}
-        raw_parts: list[str] = []
-        fatal = False
-        ar_error = ""
-        logger.info("debug_runner multi-turn start: report=%s task=%s model=%s", report_id, task_id, model)
-        for idx, f in enumerate(_FIELDS):
-            got = ""
-            for attempt in range(3):  # 每段最多3次(含格式纠正重做)
-                is_first = (idx == 0 and attempt == 0)
-                sys_prompt = _DEBUG_SYSTEM_PROMPT if is_first else ""
-                if attempt == 0:
-                    user_prompt = (prompt + "\n\n" + field_prompts[f]) if is_first else field_prompts[f]
-                else:
-                    user_prompt = (f"你上一轮没有按格式输出 <{f}>...</{f}> 标签（或内容为空）。"
-                                   f"请重新输出【{_FIELD_LABELS[f]}】段，严格用 <{f}>...</{f}> XML 标签包裹，只输出这一段。")
-                try:
-                    ar = await run_agent(
-                        prompt=user_prompt,
-                        model=model,
-                        tools=["read", "bash"],
-                        system_prompt=sys_prompt,
-                        cwd=cwd,
-                        thinking_level="medium",
-                        session_file=session_file,
-                        cancel_event=None,
-                        max_retries=1,
-                        retry_delay=10.0,
-                        run_timeout_seconds=900,
-                        timeout_retry_enabled=False,
-                        pi_max_retries=1,
-                        pi_retry_delay=5.0,
-                        max_consecutive_empty_responses=2,
-                        task_id=task_id,
-                        stage_key="debug",
-                        role_kind="worker",
-                        priority=SemPriority.DEFAULT,
-                        task_pi_dir=pi_dir,
-                        use_slot=False,
-                    )
-                except Exception as exc:
-                    ar_error = str(exc)[:1000]
-                    logger.warning("debug_runner field=%s attempt=%d error: %s", f, attempt, exc)
-                    break
-                raw = getattr(ar, "output", "") or ""
-                if not raw:
-                    for attr in ("text", "raw", "response", "content"):
-                        v = getattr(ar, attr, None)
-                        if v:
-                            raw = str(v); break
-                if getattr(ar, "fatal", False):
-                    fatal = True
-                    ar_error = getattr(ar, "error", "") or ar_error
-                parsed = _parse_report_output(raw)
-                got = parsed.get(f) or ""
-                logger.info("debug_runner field=%s attempt=%d got=%dchars", f, attempt, len(got))
-                if got:
-                    raw_parts.append(f"<{f}>{got}</{f}>")
-                    break
-                # 格式错误 → 下一轮 user 指出错误重做
-            fields[f] = got
-            if fatal:
-                break
-        raw_output = "\n".join(raw_parts)
-        success = any(fields.values()) and not fatal
+        logger.info("debug_runner rpc start: report=%s task=%s model=%s", report_id, task_id, model)
+        raw_output, ar_error = await _rpc_run_debug(
+            model=model, prompt=prompt, system_prompt=_DEBUG_SYSTEM_PROMPT,
+            cwd=cwd, pi_dir=pi_dir, timeout=1800,
+        )
+        fields = _parse_report_output(raw_output)
+        success = bool(raw_output) and not ar_error
 
         # ── 4. 写报告 + 更新 DB ─────────────────────────────────
         _finish_report(
