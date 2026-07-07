@@ -377,9 +377,10 @@ class Orchestrator:
             json.dumps(_fl_ext, ensure_ascii=False, indent=2), encoding="utf-8")
         Path(handler_list_path).write_text(
             json.dumps(_fl_hdl, ensure_ascii=False, indent=2), encoding="utf-8")
-        # entry-details.json 包含全量（供前端消费）
+        # entry-details.json = functions.list + handler.list（autofix 清理后，与两者一致）
+        # 之前写 _fl_all(未清理) 导致空 taints 条目残留，与 functions.list 不一致
         Path(entry_details_path).write_text(
-            json.dumps(_fl_all, ensure_ascii=False, indent=2), encoding="utf-8")
+            json.dumps(_fl_ext + _fl_hdl, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # 兼容性别名（generate_final_report 等后续使用 _fl）
         _fl = _fl_ext
