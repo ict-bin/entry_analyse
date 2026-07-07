@@ -1029,8 +1029,8 @@ class PipelineEngine:
             return
 
         # r4_decision 由 _run_r3_analysis_w 直接从 decision 字段设置
-        # has_external_input=False 时 W 已设 r4_decision=filter；兜底保障
-        if not func_state.has_external_input and not func_state.r4_decision:
+        # has_external_input=False 时强制 filter（覆盖 LLM 自相矛盾的 keep）
+        if not func_state.has_external_input:
             func_state.r4_decision = "filter"
             await run_in_script_thread(state.save, dirs.state_file)
 
@@ -1651,8 +1651,9 @@ class PipelineEngine:
                         func_state.r4_decision = "filter"
                     elif decision == "keep":
                         func_state.r4_decision = "keep"
-                    # 若 has_external_input=False 且 W 未给 decision，引擎兜底 filter
-                    if not has_input and not func_state.r4_decision:
+                    # has_external_input=False 时强制 filter（覆盖 LLM 自相矛盾的 keep）
+                    # 避免「判 false 却 decision=keep」的函数残留进入口输出
+                    if not has_input:
                         func_state.r4_decision = "filter"
                     if has_input and decision != "filter":
                         from ..functions_list import VALID_ENTRY_ROLES

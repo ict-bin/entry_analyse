@@ -284,17 +284,19 @@ def build_r3_w_prompt(
     if body_lines <= 60:
         step2 = (
             "**步骤 2**：判断是否有外部输入：\n\n"
-            "   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context 等）\n"
+            "   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context/arg 等）\n"
             "   **主动型（A）**：函数体调用 %s 等\n\n" % _PATTERNS
-            + "   **服务生命周期函数必须 filter**：函数名含 *_init/*_start/*_stop/*_free/*_register/*_setup 且无外部 I/O 调用 → false\n\n"
+            + "   ⚠️ **不要信任签名里的 `ATTRIBUTE_UNUSED` / `__attribute__((unused))` 注解**——它只是编译器提示用于消除警告，不代表参数真没被函数体使用。判断参数是否为外部输入要看**函数体是否引用该参数**（如函数体里有 `func(arg)`/`x = arg` 即使用了 arg，即使签名标了 ATTRIBUTE_UNUSED）\n\n"
+            "   **服务生命周期函数必须 filter**：函数名含 *_init/*_start/*_stop/*_free/*_register/*_setup 且无外部 I/O 调用 → false\n\n"
             "   **请求-响应模式不得 filter**：函数名含 Proc+Msg/Handle+Msg/OnMsg + 签名有 *message/*msg/*request 参数 + 日志有 Received/Recv → true\n"
         )
     else:
         step2 = (
             "**步骤 2**：分析结果：\n\n"
-            "   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet 类名称 → false\n"
+            "   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet/arg 类名称 → false\n"
             "   - 有命中行：确认后分析\n"
             "   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）→ true\n\n"
+            "   ⚠️ **不要信任签名里的 `ATTRIBUTE_UNUSED` / `__attribute__((unused))` 注解**——它只是编译器提示，不代表参数真没被函数体使用；判断要看函数体是否引用该参数\n\n"
             "   **服务生命周期函数必须 filter**\n"
             "   **请求-响应模式不得 filter**\n"
         )
