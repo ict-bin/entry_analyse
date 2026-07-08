@@ -128,11 +128,7 @@ async def lifespan(app: FastAPI):
         get_registry_service().stop()
     except Exception:
         pass
-    try:
-        from .dispatcher import get_dispatcher
-        get_dispatcher().stop()
-    except Exception:
-        pass
+    # v4 Celery: scheduler/worker/debugger 不再是本进程的子服务，无需 stop。
 
 
 class TaskEntry:
@@ -229,6 +225,7 @@ def health():
         "management_api_ready": bootstrap["management_api_ready"],
         "bootstrap_attempts": bootstrap["attempts"],
         "bootstrap_error": bootstrap["last_error"],
+        "scheduler_mode": "celery",
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
         **build_service_meta(),

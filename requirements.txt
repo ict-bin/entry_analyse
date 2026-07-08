@@ -12,8 +12,5 @@ cryptography
 tree-sitter>=0.21
 tree-sitter-c>=0.21
 tree-sitter-cpp>=0.23
-
-# Celery 调度框架
 celery>=5.3,<6
 redis>=5.0
-kombu>=5.3

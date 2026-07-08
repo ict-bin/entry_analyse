@@ -30,10 +30,12 @@ class Dispatcher:
     def start(self) -> None:
         self._stop.clear()
         self._startup_reset()
-        for name, target in (("ea_disp_pump", self._pump_loop),
-                             ("ea_disp_stale", self._stale_loop),
-                             ("ea_disp_debug_pump", self._debug_pump_loop),
-                             ("ea_disp_debug_stale", self._debug_stale_loop)):
+        for name, target in (
+            ("ea_disp_pump", self._pump_loop),
+            ("ea_disp_stale", self._stale_loop),
+            ("ea_disp_debug_pump", self._debug_pump_loop),
+            ("ea_disp_debug_stale", self._debug_stale_loop),
+        ):
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
@@ -42,7 +44,7 @@ class Dispatcher:
     def stop(self) -> None:
         self._stop.set()
 
-    # ── 启动重置: Redis 丢队列 → running 全回 pending + 清 stale celery_id ──
+    # ── 启动重置: Redis 丢队列 → running 全回 pending + pending 的 stale celery_id 清掉 ──
     def _startup_reset(self) -> None:
         from app.db import get_db
         from app.db.models import AppEaTask, AppEaDebugReport
@@ -52,45 +54,55 @@ class Dispatcher:
             n_running = db.query(AppEaTask).filter(
                 AppEaTask.status == "running", AppEaTask.is_deleted.is_(False),
             ).update(
-                {AppEaTask.status: "pending",
-                 AppEaTask.celery_task_id: None,
-                 AppEaTask.owner_pod: None,
-                 AppEaTask.owner_pod_ip: None,
-                 AppEaTask.lease_expires_at: None,
-                 AppEaTask.execution_heartbeat_at: None},
+                {
+                    AppEaTask.status: "pending",
+                    AppEaTask.celery_task_id: None,
+                    AppEaTask.owner_pod: None,
+                    AppEaTask.owner_pod_ip: None,
+                    AppEaTask.lease_expires_at: None,
+                    AppEaTask.execution_epoch: 0,
+                },
                 synchronize_session=False,
             )
             n_pending = db.query(AppEaTask).filter(
-                AppEaTask.status == "pending", AppEaTask.is_deleted.is_(False),
+                AppEaTask.status == "pending",
+                AppEaTask.is_deleted.is_(False),
                 AppEaTask.celery_task_id.is_not(None),
             ).update(
-                {AppEaTask.celery_task_id: None,
-                 AppEaTask.owner_pod: None,
-                 AppEaTask.lease_expires_at: None},
+                {
+                    AppEaTask.celery_task_id: None,
+                    AppEaTask.owner_pod: None,
+                    AppEaTask.lease_expires_at: None,
+                    AppEaTask.execution_epoch: 0,
+                },
                 synchronize_session=False,
             )
-            # debug 报告: running → pending, 清 owner/celery_id
-            n_dbg = db.query(AppEaDebugReport).filter(
-                AppEaDebugReport.status == "running",
-                AppEaDebugReport.is_deleted.is_(False),
+            # debugger 报告同理
+            d_running = db.query(AppEaDebugReport).filter(
+                AppEaDebugReport.status == "running", AppEaDebugReport.is_deleted.is_(False),
             ).update(
-                {AppEaDebugReport.status: "pending",
-                 AppEaDebugReport.celery_task_id: None,
-                 AppEaDebugReport.owner_pod: None},
+                {
+                    AppEaDebugReport.status: "pending",
+                    AppEaDebugReport.celery_task_id: None,
+                    AppEaDebugReport.owner_pod: None,
+                    AppEaDebugReport.lease_expires_at: None,
+                    AppEaDebugReport.execution_epoch: 0,
+                },
                 synchronize_session=False,
             )
             db.commit()
-            if n_running or n_pending or n_dbg:
-                logger.warning("startup_reset: %d task running→pending, %d task stale celery_id cleared, "
-                               "%d debug running→pending (redis queue rebuilt)",
-                               n_running, n_pending, n_dbg)
+            if n_running or n_pending or d_running:
+                logger.warning(
+                    "startup_reset: %d running→pending, %d pending stale cleared, %d debug running→pending",
+                    n_running, n_pending, d_running,
+                )
         finally:
             try:
                 next(db_gen)
             except StopIteration:
                 pass
 
-    # ── 泵: pending task (celery_task_id IS NULL) → 发布 ea_task ──
+    # ── 任务泵: pending(celery_task_id IS NULL) → 发布到 Celery ea_task ──
     def _pump_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -109,9 +121,11 @@ class Dispatcher:
         try:
             rows = (
                 db.query(AppEaTask)
-                .filter(AppEaTask.status == "pending",
-                        AppEaTask.is_deleted.is_(False),
-                        AppEaTask.celery_task_id.is_(None))
+                .filter(
+                    AppEaTask.status == "pending",
+                    AppEaTask.is_deleted.is_(False),
+                    AppEaTask.celery_task_id.is_(None),
+                )
                 .order_by(AppEaTask.created_at.asc())
                 .limit(PUMP_BATCH)
                 .all()
@@ -134,7 +148,7 @@ class Dispatcher:
                 pass
         return published
 
-    # ── stale 扫描: DB running 但无活 worker 在跑 → 重置 pending 重排 ──
+    # ── 任务 stale: DB running 但无活 worker 在跑 → 重置 pending 重排 ──
     def _stale_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -146,20 +160,9 @@ class Dispatcher:
     def _stale_once(self) -> int:
         from app.db import get_db
         from app.db.models import AppEaTask
-        from app.celery_app import app as celery_app
         from app.time_utils import now_local
-        active_ids: set[str] = set()
-        try:
-            inspect = celery_app.control.inspect(timeout=INSPECT_TIMEOUT)
-            active = inspect.active() or {}
-            for _pod, tasks in active.items():
-                for t in (tasks or []):
-                    cid = t.get("id") if isinstance(t, dict) else None
-                    if cid:
-                        active_ids.add(cid)
-        except Exception as exc:
-            logger.warning("inspect.active failed: %s (skip this round)", exc)
-            return 0
+        from app.celery_app import app as celery_app
+        active_ids = self._active_ids()
         db_gen = get_db()
         db = next(db_gen)
         reset = 0
@@ -171,12 +174,12 @@ class Dispatcher:
             for row in rows:
                 cid = row.celery_task_id
                 in_active = cid is not None and cid in active_ids
-                hb_stale = (
-                    row.execution_heartbeat_at is None
-                    or (now - row.execution_heartbeat_at).total_seconds() > STALE_HEARTBEAT_SECONDS
+                hb = row.execution_heartbeat_at
+                heartbeat_stale = (
+                    hb is None or (now - hb).total_seconds() > STALE_HEARTBEAT_SECONDS
                 )
-                if in_active and not hb_stale:
-                    continue  # 正常在跑
+                if in_active and not heartbeat_stale:
+                    continue
                 if cid:
                     try:
                         celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
@@ -187,10 +190,10 @@ class Dispatcher:
                 row.owner_pod = None
                 row.owner_pod_ip = None
                 row.lease_expires_at = None
-                row.execution_heartbeat_at = None
+                row.execution_epoch = 0
                 reset += 1
                 logger.warning("stale reset task=%s celery_id=%s in_active=%s hb_stale=%s",
-                               row.task_id, cid, in_active, hb_stale)
+                               row.task_id, cid, in_active, heartbeat_stale)
             if reset:
                 db.commit()
         finally:
@@ -200,13 +203,13 @@ class Dispatcher:
                 pass
         return reset
 
-    # ── debug 泵: pending debug report → 发布 ea_debug ──
+    # ── debugger 报告泵 + stale ──
     def _debug_pump_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self._debug_pump_once()
             except Exception as exc:
-                logger.warning("debug pump loop error: %s", exc, exc_info=True)
+                logger.warning("debug pump error: %s", exc, exc_info=True)
             self._stop.wait(PUMP_INTERVAL)
 
     def _debug_pump_once(self) -> int:
@@ -219,9 +222,11 @@ class Dispatcher:
         try:
             rows = (
                 db.query(AppEaDebugReport)
-                .filter(AppEaDebugReport.status == "pending",
-                        AppEaDebugReport.is_deleted.is_(False),
-                        AppEaDebugReport.celery_task_id.is_(None))
+                .filter(
+                    AppEaDebugReport.status == "pending",
+                    AppEaDebugReport.is_deleted.is_(False),
+                    AppEaDebugReport.celery_task_id.is_(None),
+                )
                 .order_by(AppEaDebugReport.created_at.asc())
                 .limit(PUMP_BATCH)
                 .all()
@@ -234,7 +239,7 @@ class Dispatcher:
                     published += 1
                     logger.info("published debug report=%s celery_id=%s", row.report_id, ar.id)
                 except Exception as exc:
-                    logger.warning("publish debug failed report=%s: %s", row.report_id, exc)
+                    logger.warning("debug publish failed report=%s: %s", row.report_id, exc)
                     db.rollback()
                     break
         finally:
@@ -244,18 +249,60 @@ class Dispatcher:
                 pass
         return published
 
-    # ── debug stale: running report 不在 active → 重置 ──
     def _debug_stale_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self._debug_stale_once()
             except Exception as exc:
-                logger.warning("debug stale loop error: %s", exc, exc_info=True)
+                logger.warning("debug stale error: %s", exc, exc_info=True)
             self._stop.wait(STALE_INTERVAL)
 
     def _debug_stale_once(self) -> int:
         from app.db import get_db
         from app.db.models import AppEaDebugReport
+        from app.time_utils import now_local
+        from app.celery_app import app as celery_app
+        active_ids = self._active_ids()
+        db_gen = get_db()
+        db = next(db_gen)
+        reset = 0
+        try:
+            now = now_local()
+            rows = db.query(AppEaDebugReport).filter(
+                AppEaDebugReport.status == "running", AppEaDebugReport.is_deleted.is_(False),
+            ).all()
+            for row in rows:
+                cid = row.celery_task_id
+                in_active = cid is not None and cid in active_ids
+                hb = row.execution_heartbeat_at
+                heartbeat_stale = (
+                    hb is None or (now - hb).total_seconds() > STALE_HEARTBEAT_SECONDS
+                )
+                if in_active and not heartbeat_stale:
+                    continue
+                if cid:
+                    try:
+                        celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
+                    except Exception:
+                        pass
+                row.status = "pending"
+                row.celery_task_id = None
+                row.owner_pod = None
+                row.lease_expires_at = None
+                row.execution_epoch = 0
+                reset += 1
+                logger.warning("debug stale reset report=%s celery_id=%s", row.report_id, cid)
+            if reset:
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+        return reset
+
+    # ── 工具: 取所有活 worker 在跑的 celery_id ──
+    def _active_ids(self) -> set[str]:
         from app.celery_app import app as celery_app
         active_ids: set[str] = set()
         try:
@@ -267,38 +314,8 @@ class Dispatcher:
                     if cid:
                         active_ids.add(cid)
         except Exception as exc:
-            logger.warning("debug inspect.active failed: %s (skip)", exc)
-            return 0
-        db_gen = get_db()
-        db = next(db_gen)
-        reset = 0
-        try:
-            rows = db.query(AppEaDebugReport).filter(
-                AppEaDebugReport.status == "running",
-                AppEaDebugReport.is_deleted.is_(False),
-            ).all()
-            for row in rows:
-                cid = row.celery_task_id
-                if cid is not None and cid in active_ids:
-                    continue
-                if cid:
-                    try:
-                        celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
-                    except Exception:
-                        pass
-                row.status = "pending"
-                row.celery_task_id = None
-                row.owner_pod = None
-                reset += 1
-                logger.warning("debug stale reset report=%s celery_id=%s", row.report_id, cid)
-            if reset:
-                db.commit()
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-        return reset
+            logger.warning("inspect.active failed: %s (skip this round)", exc)
+        return active_ids
 
 
 _dispatcher: Dispatcher | None = None
@@ -322,6 +339,7 @@ def main() -> None:
 
     def _handle(signum, frame):
         disp.stop()
+
     _sig.signal(_sig.SIGTERM, _handle)
     _sig.signal(_sig.SIGINT, _handle)
     while not disp._stop.is_set():
