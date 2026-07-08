@@ -509,9 +509,11 @@ class WorkerSlotService:
             "agent_rss_max_bytes": 0,
             "agent_queue_oldest_wait_seconds": 0.0,
             "queued_tasks": queued_tasks,
+            "queued_jobs": queued_tasks,
+            "updated_at": isoformat_local(now),
             "workers": live_workers,
-            "retired_workers": [],
-            "stale_owner_workers": [],
+            "retired_worker_rows": [],
+            "stale_owner_worker_rows": [],
         }
 
     def get_cluster_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
@@ -690,6 +692,7 @@ class WorkerSlotService:
             "updated_at": isoformat_local(now),
             "workers": workers_payload,
             "retired_worker_rows": retired_workers_payload,
+            "stale_owner_worker_rows": stale_owner_payload,
         }
 
     def _worker_payload_from_snapshot(self, worker: WorkerSlotSnapshot) -> dict[str, Any]:

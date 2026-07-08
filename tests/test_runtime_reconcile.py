@@ -1,5 +1,6 @@
 import asyncio
 from datetime import timedelta
+import sys
 import time
 from types import SimpleNamespace
 
@@ -302,6 +303,54 @@ def test_worker_slot_snapshot_filters_expired_and_cancel_requested_tasks(monkeyp
     assert snapshot["workers"][0]["running_tasks"] == 1
     assert len(snapshot["workers"][0]["active_tasks"]) == 1
     assert snapshot["workers"][0]["worker_role_state"] == "healthy"
+
+
+def test_celery_cluster_snapshot_keeps_count_fields_integer(monkeypatch) -> None:
+    fake_celery_app = SimpleNamespace(
+        control=SimpleNamespace(
+            inspect=lambda timeout=3: SimpleNamespace(
+                ping=lambda: {"ea-w@secflow-app-entry-analyse-worker-a": {"ok": "pong"}},
+                active=lambda: {
+                    "ea-w@secflow-app-entry-analyse-worker-a": [
+                        {"id": "celery-1"},
+                    ]
+                },
+                stats=lambda: {
+                    "ea-w@secflow-app-entry-analyse-worker-a": {
+                        "pool": {"max-concurrency": 4},
+                    }
+                },
+            )
+        )
+    )
+    monkeypatch.setitem(sys.modules, "app.celery_app", SimpleNamespace(app=fake_celery_app))
+
+    now = now_local()
+    running_row = SimpleNamespace(
+        task_id="eat_live",
+        celery_task_id="celery-1",
+        parent_stage_item_id=None,
+        parent_stage_item_key=None,
+        module_name="m1",
+        status="running",
+        lease_expires_at=now + timedelta(seconds=60),
+    )
+    db = _FakeDb([
+        [running_row],
+        [SimpleNamespace(), SimpleNamespace()],
+    ])
+
+    snapshot = WorkerSlotService().get_cluster_snapshot(db, project_id="p1")
+    validated = tasks_api.EntryAnalyseSlotClusterResponse.model_validate(snapshot)
+
+    assert snapshot["retired_workers"] == 0
+    assert snapshot["stale_owner_workers"] == 0
+    assert snapshot["retired_worker_rows"] == []
+    assert snapshot["stale_owner_worker_rows"] == []
+    assert snapshot["queued_jobs"] == 2
+    assert validated.retired_workers == 0
+    assert validated.stale_owner_workers == 0
+    assert validated.queued_jobs == 2
 
 
 def test_metrics_expose_expired_running_lease_diagnostics(monkeypatch) -> None:
