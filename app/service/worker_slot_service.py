@@ -386,8 +386,143 @@ class WorkerSlotService:
             "source": "v3_scheduler",
         }
 
+    def _build_snapshot_from_celery(self, db: Session, *, project_id: str | None = None) -> Optional[dict[str, Any]]:
+        """v4: 用 celery inspect(ping/active/stats) 构建集群快照。
+
+        返回与 V2 兼容的响应 schema; inspect 不可达(非 EA worker)返回 None 走兑底。
+        """
+        try:
+            from app.celery_app import app as celery_app
+        except Exception:
+            return None
+        try:
+            inspect = celery_app.control.inspect(timeout=3)
+            ping = inspect.ping() or {}
+            active = inspect.active() or {}
+            stats = inspect.stats() or {}
+        except Exception as exc:
+            logger.warning("celery inspect failed: %s", exc)
+            return None
+        if not ping:
+            return None
+
+        # celery_id → DB running task 映射（跨项目，不过滤）
+        from app.db.models import AppEaTask
+        now = now_local()
+        running_rows = (
+            db.query(AppEaTask)
+            .filter(
+                AppEaTask.is_deleted.is_(False),
+                AppEaTask.status == "running",
+                AppEaTask.celery_task_id.is_not(None),
+            )
+            .all()
+        )
+        cid_to_task: dict[str, AppEaTask] = {
+            str(r.celery_task_id): r for r in running_rows if r.celery_task_id
+        }
+        queued_query = db.query(AppEaTask).filter(
+            AppEaTask.is_deleted.is_(False), AppEaTask.status == "pending",
+        )
+        if str(project_id or "").strip():
+            queued_query = queued_query.filter(AppEaTask.project_id == project_id)
+        queued_tasks = int(queued_query.count())
+
+        live_workers: list[dict[str, Any]] = []
+        for wname, _ in ping.items():
+            # wname 形如 "ea-w@secflow-app-entry-analyse-worker-xxxx" 或 "ea-dbg@..."
+            pod_name = str(wname).split("@", 1)[-1] if "@" in str(wname) else str(wname)
+            is_debugger = str(wname).startswith("ea-dbg")
+            st = stats.get(wname, {}) or {}
+            pool = st.get("pool", {}) or {}
+            max_concurrency = int(pool.get("max-concurrency") or 1)
+            active_tasks_raw = active.get(wname, []) or []
+            active_tasks: list[dict[str, Any]] = []
+            for t in active_tasks_raw:
+                cid = t.get("id") if isinstance(t, dict) else None
+                if not cid:
+                    continue
+                row = cid_to_task.get(cid)
+                if row is not None:
+                    active_tasks.append({
+                        "task_id": row.task_id,
+                        "entry_id": row.parent_stage_item_id or row.parent_stage_item_key or row.module_name,
+                        "status": row.status,
+                        "lease_expires_at": isoformat_local(row.lease_expires_at),
+                    })
+                else:
+                    active_tasks.append({"task_id": cid[:12], "entry_id": "(debug)", "status": "running", "lease_expires_at": None})
+            running_tasks = len(active_tasks_raw)
+            available = max(0, max_concurrency - running_tasks)
+            payload = WorkerSlotSnapshot(
+                worker_id=str(wname),
+                pod_name=pod_name,
+                pod_ip=None,
+                healthy=True,
+                max_concurrent_tasks=max_concurrency,
+                running_tasks=running_tasks,
+                available_slots=available,
+                agent_process_limit=0,
+                agent_process_in_use=0,
+                agent_process_available=0,
+                agent_waiting_requests=0,
+                agent_waiting_tasks=0,
+                agent_queue_oldest_wait_seconds=0.0,
+                agent_rss_total_bytes=0,
+                agent_rss_max_bytes=0,
+                agent_snapshot_at=None,
+                last_heartbeat_at=isoformat_local(now),
+                heartbeat_age_seconds=0,
+                consecutive_heartbeat_failures=0,
+                last_heartbeat_error=None,
+                last_heartbeat_duration_ms=None,
+                worker_role_state="debugger" if is_debugger else "healthy",
+                source="celery_inspect",
+                error=None,
+                active_tasks=active_tasks,
+            )
+            live_workers.append(self._worker_payload_from_snapshot(payload))
+
+        total_capacity = sum(int(item["max_concurrent_tasks"]) for item in live_workers)
+        busy_slots = sum(int(item["running_tasks"]) for item in live_workers)
+        healthy_workers = sum(1 for item in live_workers if item["healthy"])
+        return {
+            "worker_count": len(live_workers),
+            "healthy_workers": healthy_workers,
+            "stale_workers": 0,
+            "live_stale_workers": 0,
+            "retired_workers": 0,
+            "stale_owner_workers": 0,
+            "total_capacity": total_capacity,
+            "busy_slots": busy_slots,
+            "running_jobs": busy_slots,
+            "available_slots": max(0, total_capacity - busy_slots),
+            "dispatch_limit": total_capacity,
+            "dispatch_running": busy_slots,
+            "dispatch_available": max(0, total_capacity - busy_slots),
+            "agent_total_capacity": 0,
+            "agent_in_use": 0,
+            "agent_available": 0,
+            "agent_waiting_requests": 0,
+            "agent_waiting_tasks": 0,
+            "agent_rss_total_bytes": 0,
+            "agent_rss_max_bytes": 0,
+            "agent_queue_oldest_wait_seconds": 0.0,
+            "queued_tasks": queued_tasks,
+            "workers": live_workers,
+            "retired_workers": [],
+            "stale_owner_workers": [],
+        }
+
     def get_cluster_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
-        # V3 优先：V3 scheduler 有 workers 走 V3 路径
+        # v4 Celery 优先：用 inspect 拿活 worker + 在跑任务
+        try:
+            snap = self._build_snapshot_from_celery(db, project_id=project_id)
+            if snap is not None:
+                return snap
+        except Exception as exc:
+            logger.warning("celery snapshot failed, fallback: %s", exc, exc_info=True)
+        # V3 兑底：V3 scheduler 有 workers 走 V3 路径
         v3_workers = self._v3_workers_state()
         if v3_workers is not None:
             return self._build_snapshot_from_v3(db, v3_workers, project_id=project_id)
