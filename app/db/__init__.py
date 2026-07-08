@@ -103,6 +103,17 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN heartbeat_error TEXT NULL",
     "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN heartbeat_duration_ms DOUBLE NULL",
     "ALTER TABLE secflow_app_ea_worker_slots ADD COLUMN heartbeat_failure_count INTEGER NOT NULL DEFAULT 0",
+    # Celery v4 调度字段
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN celery_task_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN execution_heartbeat_at DATETIME NULL",
+    "CREATE INDEX ix_ea_tasks_celery_task_id ON secflow_app_ea_tasks (celery_task_id)",
+    "CREATE INDEX ix_ea_tasks_execution_heartbeat_at ON secflow_app_ea_tasks (execution_heartbeat_at)",
+    "ALTER TABLE secflow_app_ea_debug_reports ADD COLUMN celery_task_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_ea_debug_reports ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_ea_debug_reports ADD COLUMN execution_heartbeat_at DATETIME NULL",
+    "ALTER TABLE secflow_app_ea_debug_reports ADD COLUMN lease_expires_at DATETIME NULL",
+    "CREATE INDEX ix_ea_debug_reports_celery_task_id ON secflow_app_ea_debug_reports (celery_task_id)",
     """
     CREATE TABLE secflow_app_ea_dispatch_leases (
         id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,

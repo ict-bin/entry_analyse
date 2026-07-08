@@ -192,7 +192,10 @@ def _render_task_metrics() -> list[str]:
     invalid_owner_running_alive = 0
     now = now_local()
     live_owner_pods = set()
-    scheduler_stats = get_scheduler_service().runtime_reconcile_stats_snapshot()
+    try:
+        scheduler_stats = get_scheduler_service().runtime_reconcile_stats_snapshot()
+    except Exception:
+        scheduler_stats = {}
     if db_up:
         try:
             live_owner_pods = set(get_worker_slot_service()._list_live_worker_pods())
@@ -304,7 +307,10 @@ def _render_task_metrics() -> list[str]:
     except Exception:
         worker_service = None
     worker_running = 1 if worker_service and worker_service.is_running() else 0
-    worker_runtime_health = worker_service.runtime_health_snapshot() if worker_service is not None else {}
+    try:
+        worker_runtime_health = worker_service.runtime_health_snapshot() if worker_service is not None else {}
+    except Exception:
+        worker_runtime_health = {}
     slot_total_capacity = 0
     slot_busy = 0
     slot_available = 0

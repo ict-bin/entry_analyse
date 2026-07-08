@@ -128,16 +128,7 @@ async def lifespan(app: FastAPI):
         get_registry_service().stop()
     except Exception:
         pass
-    try:
-        from .service.scheduler_service import get_scheduler_service
-        get_scheduler_service().stop()
-    except Exception:
-        pass
-    try:
-        from .service.worker_service import get_worker_service
-        get_worker_service().stop()
-    except Exception:
-        pass
+    # v4 Celery: scheduler/worker/debugger 不再是本进程的子服务，无需 stop。
 
 
 class TaskEntry:
@@ -226,34 +217,6 @@ class AnalyseRequest(BaseModel):
 @app.get("/api/app/entry-analyse/health")
 def health():
     bootstrap = get_runtime_bootstrap().status()
-    scheduler_running = False
-    worker_running = False
-    scheduler_map_stats: dict = {}
-    try:
-        from .service.scheduler_service import get_scheduler_service
-        s = get_scheduler_service()
-        scheduler_running = s.is_running()
-        scheduler_map_stats = {
-            "task_owner_map_size": len(s._task_owner),
-            "pod_task_map_size": len(s._pod_tasks),
-            "pod_count": len(s._pod_tasks),
-            "reconcile_stats": s.runtime_reconcile_stats_snapshot(),
-            "pod_health": {
-                pn: {
-                    "status": h.get("status", "unknown"),
-                    "tcp_failures": h.get("consecutive_tcp_failures", 0),
-                    "tasks": len(s._get_pod_tasks(pn)),
-                }
-                for pn, h in s._pod_health.items()
-            },
-        }
-    except Exception:
-        scheduler_running = False
-    try:
-        from .service.worker_service import get_worker_service
-        worker_running = get_worker_service().is_running()
-    except Exception:
-        worker_running = False
     return {
         "status": "ok" if bootstrap["db_ready"] else "degraded",
         "role": get_runtime_role(),
@@ -261,9 +224,7 @@ def health():
         "management_api_ready": bootstrap["management_api_ready"],
         "bootstrap_attempts": bootstrap["attempts"],
         "bootstrap_error": bootstrap["last_error"],
-        "scheduler_running": scheduler_running,
-        "scheduler_map": scheduler_map_stats,
-        "worker_running": worker_running,
+        "scheduler_mode": "celery",
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
         **build_service_meta(),
