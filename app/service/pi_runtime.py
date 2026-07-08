@@ -23,6 +23,11 @@ from typing import Any
 
 logger = logging.getLogger("ea.pi_runtime")
 
+# 网关配置下限兜底：contextWindow 最小 128K, max_output_tokens 最小 32K
+# 防止 model_aliases / 来源1 配置了过小的窗口导致任务上下文/输出被截断
+_GW_CONTEXT_WINDOW_MIN = 128_000
+_GW_MAX_OUTPUT_TOKENS_MIN = 32_000
+
 _GLOBAL_PI_DIR = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
 
 _PI_COMPACTION_SETTINGS = {
@@ -175,10 +180,12 @@ def write_models_json_from_db(svc_yaml: Any) -> bool:
                     except Exception:
                         pass
                     break
-            if gw_context_window <= 0:
-                gw_context_window = 128000
+            # 下限兜底：网关配置 contextWindow 最小 128K (128000)
+            gw_context_window = max(gw_context_window, _GW_CONTEXT_WINDOW_MIN)
             # 来源 2 是网关的权威模型列表，替换网关 provider 的 models；补全 pi 所需字段
             def _alias_entry(a: dict[str, Any]) -> dict[str, Any]:
+                # 下限兜底：网关配置 max_output_tokens (maxTokens) 最小 32K (32000)
+                _max_tokens = max(int(a.get("max_tokens") or 0), _GW_MAX_OUTPUT_TOKENS_MIN)
                 e: dict[str, Any] = {
                     "id": a["alias"],
                     "name": a["alias"],
@@ -187,10 +194,9 @@ def write_models_json_from_db(svc_yaml: Any) -> bool:
                     "input": ["text"],
                     "contextWindow": gw_context_window,
                     "contextLength": gw_context_window,  # 与 contextWindow 同值，兼容读 contextLength 的 pi/下游
+                    "maxTokens": _max_tokens,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 }
-                if a.get("max_tokens"):
-                    e["maxTokens"] = a["max_tokens"]
                 return e
             target["models"] = [_alias_entry(a) for a in aliases]
 
