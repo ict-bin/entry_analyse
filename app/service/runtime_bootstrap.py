@@ -144,21 +144,19 @@ class RuntimeBootstrap:
         logger.info("Management API routes enabled")
 
     def _start_scheduler(self) -> None:
-        from app.service.scheduler_service import get_scheduler_service
-
-        get_scheduler_service().start()
+        # Celery 架构：scheduler 角色 = dispatcher（DB→Celery 泵 + stale 扫描）
+        # 独立 scheduler pod 用 `python -m app.dispatcher` 运行；此处供 role=scheduler 经 main.py 启动时使用
+        from app.dispatcher import get_dispatcher
+        get_dispatcher().start()
         self._status.scheduler_ready = True
+        logger.info("Dispatcher started (scheduler role)")
 
     def _start_worker(self) -> None:
-        from app.service.worker_service import get_worker_service
-
-        get_worker_service().start()
+        # Celery 架构：worker 由 `celery worker` CLI 运行，不经 runtime_bootstrap
         self._status.worker_ready = True
 
     def _start_debugger(self) -> None:
-        from app.service.debugger_service import get_debugger_service
-
-        get_debugger_service().start()
+        # Celery 架构：debugger 由 `celery worker -Q ea_debug` CLI 运行，不经 runtime_bootstrap
         self._status.debugger_ready = True
 
     def _all_required_components_ready(self) -> bool:

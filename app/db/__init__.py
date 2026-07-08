@@ -142,6 +142,15 @@ _MIGRATIONS = [
     "CREATE INDEX ix_ea_task_event_task_created ON secflow_app_ea_task_event (task_id, created_at)",
     "CREATE INDEX ix_ea_task_event_task_event_type ON secflow_app_ea_task_event (task_id, event_type, created_at)",
     "CREATE INDEX ix_ea_task_event_task_stage_key ON secflow_app_ea_task_event (task_id, stage_key, created_at)",
+    # Celery 调度字段 (added 2026-07)
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN celery_task_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN execution_epoch INT NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_ea_tasks ADD COLUMN execution_heartbeat_at DATETIME NULL",
+    "CREATE INDEX ix_ea_tasks_celery_task_id ON secflow_app_ea_tasks (celery_task_id)",
+    "CREATE INDEX ix_ea_tasks_exec_heartbeat ON secflow_app_ea_tasks (execution_heartbeat_at)",
+    "ALTER TABLE secflow_app_ea_debug_reports ADD COLUMN celery_task_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_ea_debug_reports ADD COLUMN execution_epoch INT NOT NULL DEFAULT 0",
+    "CREATE INDEX ix_ea_debug_reports_celery_task_id ON secflow_app_ea_debug_reports (celery_task_id)",
 ]
 
 

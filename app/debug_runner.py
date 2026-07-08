@@ -492,7 +492,7 @@ def _build_debug_prompt(task_row: Any, task_dir: Path, source_path: str,
 
 
 async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
-    from app.db import get_db, init_db
+    from app.db import get_db, init_db, _engine as _existing_engine
     from app.db.models import AppEaTask, AppEaDebugReport
     from app.time_utils import now_local
     from app.config import build_task_config
@@ -501,7 +501,8 @@ async def _run_debug(task_id: str, report_id: str, pod_name: str) -> int:
 
     # 子进程需独立初始化 DB engine（不继承父进程内存状态）
     _svc_yaml = get_service_yaml()
-    init_db(_svc_yaml.database.url)
+    if _existing_engine is None:
+        init_db(_svc_yaml.database.url)
 
     db_gen = get_db()
     db = next(db_gen)

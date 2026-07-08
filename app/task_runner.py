@@ -111,8 +111,9 @@ async def run_task(task_id: str, pod_name: str) -> None:
     # ── 初始化 DB engine（任务子进程独立进程，worker 主进程的 SQLAlchemy pool 不共享）──
     from app.service.svc_config import get_service_yaml as _get_svc_yaml
     _sy = _get_svc_yaml()
-    from app.db import init_db
-    init_db(_sy.database.url, _sy.database.pool_size, _sy.database.max_overflow)
+    from app.db import init_db, _engine as _existing_engine
+    if _existing_engine is None:
+        init_db(_sy.database.url, _sy.database.pool_size, _sy.database.max_overflow)
 
     # ── Step 0: Claim the task in DB ──────────────────────────────────
     db_gen = get_db()
@@ -402,17 +403,41 @@ async def run_task(task_id: str, pod_name: str) -> None:
         )
         if not _fr:
             return
-        if result is not None:
-            _fr.status = result.status.value if result else "error"
-            _fr.error = getattr(result, "error", None)
-        else:
-            _fr.status = "error"
-            _fr.error = "pipeline returned None"
-        _fr.finished_at = now_local()
+        _final_status = (result.status.value if result else "error") if result is not None else "error"
+        _final_error = getattr(result, "error", None) if result is not None else "pipeline returned None"
+        # 条件 UPDATE：仅当仍 running 且 owner_pod 本 pod 时写终态（防 cancel 已定 cancelled 被覆盖）
+        _now = now_local()
+        _updated = (
+            _fd.query(AppEaTask)
+            .filter(
+                AppEaTask.task_id == task_id,
+                AppEaTask.owner_pod == pod_name,
+                AppEaTask.status == "running",
+            )
+            .update({
+                AppEaTask.status: _final_status,
+                AppEaTask.error: _final_error,
+                AppEaTask.finished_at: _now,
+                AppEaTask.owner_pod: None,
+                AppEaTask.owner_pod_ip: None,
+                AppEaTask.lease_expires_at: None,
+                AppEaTask.execution_heartbeat_at: None,
+                AppEaTask.celery_task_id: None,
+                AppEaTask.cancel_requested: False,
+            }, synchronize_session=False)
+        )
+        if not _updated:
+            # 已被 cancel 定为 cancelled 或被别的 pod 抢 → 不覆写
+            logger.info("task %s terminal update affected 0 rows (status changed by cancel/reassign)", task_id)
+            return
+        _fr.status = _final_status
+        _fr.error = _final_error
+        _fr.finished_at = _now
         _fr.owner_pod = None
         _fr.owner_pod_ip = None
-        # lease_expires_at 不再使用，置空
         _fr.lease_expires_at = None
+        _fr.execution_heartbeat_at = None
+        _fr.celery_task_id = None
         _fr.cancel_requested = False
         task_mod._sync_stage_events_to_timeline(_fd, _fr, event_buffer)
         reason, changed = task_mod._sync_task_abnormal_reason(_fr)

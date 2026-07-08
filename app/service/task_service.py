@@ -32,10 +32,35 @@ logger = logging.getLogger("ea.task_service")
 
 
 def _force_kill_all_worker_pi(*, task_id: str, reason: str) -> dict[str, Any] | None:
-    # 架构 v3：任务进程终止由调度器经 socket 下发 TERMINATE → 控制进程 killpg 负责。
-    # task_service 不再直接杀进程（跨 pod 无效）。保留函数签名供历史调用点，语义改为 no-op。
-    logger.debug("_force_kill_all_worker_pi no-op (v3: kill via scheduler TERMINATE): task=%s reason=%s", task_id, reason)
+    # Celery 架构：任务进程终止由 control.revoke(terminate) → task_revoked 信号 killpg 负责。
+    # 保留函数签名供历史调用点，语义改为 no-op（revoke 由 _revoke_celery_task 显式调用）。
+    logger.debug("_force_kill_all_worker_pi no-op (celery: kill via revoke): task=%s reason=%s", task_id, reason)
     return None
+
+
+def _revoke_celery_task(row: AppEaTask) -> None:
+    """Celery cancel: revoke(terminate SIGKILL) worker prefork 子进程 + pi 全树。
+    经 Redis 发控制命令 → worker 收到 → task_revoked 信号 killpg。
+    幂等：cid 为空/已结束 → no-op。"""
+    cid = getattr(row, "celery_task_id", None)
+    if not cid:
+        return
+    try:
+        from app.celery_app import app as celery_app
+        celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
+        logger.info("celery revoke sent: task=%s celery_id=%s", row.task_id, cid)
+    except Exception as exc:
+        logger.warning("celery revoke failed (stale scan will recover): task=%s cid=%s err=%s",
+                       row.task_id, cid, exc)
+
+
+def _clear_celery_dispatch_state(row: AppEaTask) -> None:
+    """清任务 Celery 派发状态（restart/pending 时调用，让 pump 重新发布）。"""
+    row.celery_task_id = None
+    row.owner_pod = None
+    row.owner_pod_ip = None
+    row.lease_expires_at = None
+    row.execution_heartbeat_at = None
 
 _PARENT_REUSABLE_TASK_STATUSES = {"pending", "running", "passed", "success"}
 TASK_EVENT_SOURCE_EA = "entry_analyse"
@@ -2727,21 +2752,30 @@ class TaskService:
     def restart_task(self, db: Session, task_id: str) -> dict:
         """Reset and restart an existing task in-place, reusing the same task ID.
 
-        restart_task() 只做最少量的事情：
-          - 检查状态（不允许 pending/running 时重启）
-          - 设置 status = pending
-          - 清除 cancel_* 字段（确保调度器能拾起任务）
-
-        其余所有清理（DB 字段、关联表、磁盘）全部由 worker 在拾起任务时执行。
-        这样可避免直接删除类操作与仍在运行的 pi 子进程发生竞争。
+        支持运行中任务重启：自动先 cancel（revoke + killpg）再置 pending。
+        - running/pending: 先 revoke 杀 worker 子进程 + pi 全树，再 status=pending
+        - 终态: 直接 status=pending
+        清 celery_task_id 让 dispatcher pump 重新发布。
+        其余清理（DB 字段、磁盘）由 worker 拾起时执行（task_runner Step2）。
         """
         row = self._get_or_404(db, task_id)
-        if row.status in ("pending", "running"):
-            from fastapi import HTTPException
-            raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
-
+        was_running = row.status in ("pending", "running")
+        if was_running:
+            # 自动先 cancel: revoke 杀 worker + pi 全树
+            row.cancel_requested = True
+            row.cancel_requested_at = row.cancel_requested_at or now_local()
+            _revoke_celery_task(row)
+            _safe_create_task_event(
+                db, task_id=row.task_id, project_id=row.project_id,
+                event_type="task_cancel_requested",
+                message="重启运行中任务，自动触发取消",
+                source=TASK_EVENT_SOURCE_EA, status=row.status,
+                payload={"reason": "restart_running"},
+                dedupe_key=_event_dedupe_key(row.task_id, "task_cancel_requested", row.updated_at, "restart"),
+            )
         row.status = "pending"
         _reset_cancel_state(row)
+        _clear_celery_dispatch_state(row)
         _safe_create_task_event(
             db,
             task_id=row.task_id,
@@ -2758,24 +2792,9 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_retried", row.updated_at, row.status),
         )
         db.commit()
-        # ── 写入命令队列：确保调度器兜底处理 ──
-        try:
-            cmd = AppEaTaskCommand(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                command="restart",
-                status="pending",
-                requested_by="api_restart",
-            )
-            db.add(cmd)
-            db.commit()
-        except Exception as _cmd_exc:
-            logger.warning("failed to enqueue restart command for %s: %s", row.task_id, _cmd_exc)
-        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_restart_prepare")
-
-        self.schedule_dispatch(row.project_id)
+        # Celery: 清了 celery_task_id 后 dispatcher pump 会重新发布；无需命令队列
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
-                  task_id=task_id, project_id=row.project_id)
+                  task_id=task_id, project_id=row.project_id, was_running=was_running)
         return self._row_to_dict(row, db=db)
 
     def resume_task(self, db: Session, task_id: str) -> dict:
@@ -2803,22 +2822,7 @@ class TaskService:
             dedupe_key=_event_dedupe_key(row.task_id, "task_resumed", row.updated_at, row.status),
         )
         db.commit()
-        # ── 写入命令队列：确保调度器兜底处理 ──
-        try:
-            cmd = AppEaTaskCommand(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                command="restart",
-                status="pending",
-                requested_by="api_resume",
-            )
-            db.add(cmd)
-            db.commit()
-        except Exception as _cmd_exc:
-            logger.warning("failed to enqueue resume command for %s: %s", row.task_id, _cmd_exc)
-        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_resume_prepare")
-
-        self.schedule_dispatch(row.project_id)
+        # Celery: 清了 celery_task_id 后 dispatcher pump 会重新发布；无需命令队列
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row, db=db)
@@ -2890,20 +2894,8 @@ class TaskService:
                 dedupe_key=_event_dedupe_key(row.task_id, "abnormal_reason_recorded", reason.get("code"), reason.get("message")),
             )
         db.commit(); db.refresh(row)
-        # ── 写入命令队列：确保调度器兜底处理（即使本 Pod 的 HTTP 通知失败）──
-        try:
-            cmd = AppEaTaskCommand(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                command="cancel",
-                status="pending",
-                requested_by="api_cancel",
-            )
-            db.add(cmd)
-            db.commit()
-        except Exception as _cmd_exc:
-            logger.warning("failed to enqueue cancel command for %s: %s", row.task_id, _cmd_exc)
-        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_cancel")
+        # Celery: revoke 杀 worker prefork 子进程 + pi 全树 (task_revoked 信号 killpg)
+        _revoke_celery_task(row)
         if row.status == "running":
             try:
                 cleanup_task_pi_processes(
@@ -2914,9 +2906,32 @@ class TaskService:
                 )
             except Exception as exc:
                 logger.warning("task-scoped pi cleanup failed during cancel for %s: %s", row.task_id, exc)
-        # V3: 取消走 AppEaTaskCommand → 调度器 socket TERMINATE，不再 HTTP 直发 worker 3001。
+        # Celery: revoke 杀 worker 后 worker 不会自写终态 → 条件定 cancelled（仅当仍 running；防覆盖 worker 抢先写的 passed/failed）
+        if row.status == "running":
+            row.status = "cancelled"
+            row.finished_at = now_local()
+            row.cancel_acknowledged = True
+            row.cancel_finalized = True
+            row.cancel_process_cleanup_done = True
+            row.cancel_acknowledged_at = row.cancel_acknowledged_at or row.finished_at
+            row.cancel_process_cleanup_at = row.finished_at
+            row.cancel_finalized_at = row.finished_at
+            row.owner_pod = None
+            row.owner_pod_ip = None
+            row.celery_task_id = None
+            row.lease_expires_at = None
+            row.execution_heartbeat_at = None
+            _safe_create_task_event(
+                db, task_id=row.task_id, project_id=row.project_id,
+                event_type="task_cancelled",
+                message="任务已取消（celery revoke）",
+                source=TASK_EVENT_SOURCE_EA, status=row.status,
+                payload={"reason": "running_cancel", "cancel_phase": "finalized"},
+                dedupe_key=_event_dedupe_key(row.task_id, "task_cancelled", "running_celery"),
+            )
+            db.commit(); db.refresh(row)
         result = self._row_to_dict(row, db=db)
-        result["cancel_phase"] = "requested"
+        result["cancel_phase"] = "finalized"
         return result
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
@@ -2963,7 +2978,7 @@ class TaskService:
                 ))
             except Exception as _cmd_exc:
                 logger.warning("delete_task: failed to enqueue cancel command for %s: %s", row.task_id, _cmd_exc)
-            _force_kill_all_worker_pi(task_id=row.task_id, reason="api_delete")
+            _revoke_celery_task(row)
             try:
                 cleanup_task_pi_processes(
                     logger.warning,

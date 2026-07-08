@@ -48,6 +48,10 @@ class AppEaTask(Base):
     owner_pod: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
     owner_pod_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    # Celery 调度字段
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    execution_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     cancel_acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     cancel_process_cleanup_done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -235,6 +239,9 @@ class AppEaDebugReport(Base):
     # 诊断任务自身状态: pending | running | passed | failed | error
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     owner_pod: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    # Celery 调度字段
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # 原任务失败快照
