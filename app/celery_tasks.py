@@ -121,20 +121,28 @@ def run_ea_task(self, task_id: str) -> dict:
         _fd = next(_fg)
         try:
             clear_running_dispatch_fields(_fd, task_id)
+            # 查 output_path/input_path 以计算 task_roots，供兜底清理
+            from app.db.models import AppEaTask
+            _r = _fd.query(AppEaTask).filter_by(task_id=task_id).first()
+            _out = _r.output_path if _r else None
+            _inp = _r.input_path if _r else None
         finally:
             try:
                 next(_fg)
             except StopIteration:
                 pass
-        # best-effort 清理残留 pi/node
+        # best-effort 清理本任务残留 pi/node（带 task_roots 才有效；task_runner Step8 已清，此为崩溃兜底）
         try:
             from app.agent_process import cleanup_task_pi_processes
-            cleanup_task_pi_processes(logger.warning, label="celery_task_done", task_id=task_id)
+            from app.service.worker_service import _task_roots_from_row
+            _roots = _task_roots_from_row(task_id, _out, _inp) if (_out or _inp) else []
+            cleanup_task_pi_processes(logger.warning, label="celery_task_done",
+                                      task_id=task_id, task_roots=_roots or None)
         except Exception:
             logger.debug("pi cleanup failed", exc_info=True)
         with _PGID_LOCK:
             _PGID.pop(celery_id, None)
-        # 事件驱动触发 debugger
+        # 事件驱动触发 debugger（仅建报告 pending，由调度器 debug pump 派发）
         try:
             _maybe_trigger_debug(task_id)
         except Exception as _de:
@@ -290,11 +298,13 @@ def _ensure_debug_terminal_error(report_id: str, err: str) -> None:
 
 
 def _maybe_trigger_debug(task_id: str) -> None:
-    """事件驱动: task failed/error + 无未删除报告 → 建报告 + run_ea_debug.delay。"""
+    """事件驱动: task failed/error + 无未删除报告 → 仅建报告(pending)。
+
+    不直接 delay——由调度器 dispatcher 的 debug pump 派发（pending+celery_id IS NULL → run_ea_debug.delay）。
+    这样派发路径统一，且不重旧任务（只对当前刚结束的 failed/error 任务触发）。
+    """
     from app.db import get_db
     from app.db.models import AppEaTask, AppEaDebugReport
-    from app.time_utils import now_local
-    from app.service import task_service as task_mod
     import uuid
 
     g = get_db()
@@ -325,8 +335,8 @@ def _maybe_trigger_debug(task_id: str) -> None:
         d.add(rpt)
         d.commit()
         d.refresh(rpt)
-        logger.info("debug triggered task=%s report=%s", task_id, rpt.report_id)
-        run_ea_debug.delay(rpt.report_id)
+        logger.info("debug report created task=%s report=%s (pending, dispatcher will dispatch)",
+                    task_id, rpt.report_id)
     finally:
         try:
             next(g)

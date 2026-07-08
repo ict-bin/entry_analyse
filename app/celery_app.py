@@ -43,7 +43,7 @@ app.conf.update(
     broker_transport_options={"visibility_timeout": _VIS_TIMEOUT},
     result_backend_transport_options={"visibility_timeout": _VIS_TIMEOUT},
     worker_prefetch_multiplier=1,        # 长任务, 不预取多余
-    worker_max_tasks_per_child=int(os.environ.get("EA_CELERY_MAX_TASKS_PER_CHILD", "10")),
+    worker_max_tasks_per_child=int(os.environ.get("EA_CELERY_MAX_TASKS_PER_CHILD", "1")),
     worker_send_task_events=True,
     task_send_sent_events=True,
     broker_connection_retry_on_startup=True,
