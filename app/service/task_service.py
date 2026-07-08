@@ -2803,7 +2803,6 @@ class TaskService:
         row.finished_at = None
         row.error = None
         _reset_cancel_state(row)
-        _clear_celery_dispatch_state(row)
         _safe_create_task_event(
             db, task_id=row.task_id, project_id=row.project_id,
             event_type="task_retried",
