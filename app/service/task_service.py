@@ -2765,6 +2765,7 @@ class TaskService:
         """
         row = self._get_or_404(db, task_id)
         _task_roots = _task_runtime_roots(row)
+        was_running = row.status in ("running", "pending")
 
         if row.status in ("running", "pending"):
             # 运行中/排队中重启 = 先 cancel 再 restart
