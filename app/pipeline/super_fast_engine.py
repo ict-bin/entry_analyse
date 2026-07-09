@@ -3551,7 +3551,11 @@ class SuperFastPipelineEngine:
 
         # CC 在独立线程跑(R1全完成后)
         def _cc_thread():
-            # 等R1阶段完成(queue空)
+            # 等R1队列非空(sqp.run填入后再join, 避免空队列join立即返回)
+            import time as _time
+            while stages[0].queue.empty() and not self._cancel.is_set():
+                _time.sleep(0.5)
+            # 等R1阶段完成(queue全部处理完)
             stages[0].queue.join()
             if r1_finished_flag is not None:
                 r1_finished_flag[0] = True
