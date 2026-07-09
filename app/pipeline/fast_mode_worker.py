@@ -39,25 +39,7 @@ _PARSE_FEEDBACK = (
 
 
 def _build_batch_prompt(batch: list[dict]) -> str:
-    """
-    构造批次分类 prompt。
-
-    格式：
-        ```
-        请分析以下 20 个函数，判断哪些是模块的外部入口。
-
-        - func_hash: xxx
-          name: HandleRequest(const char *data, int len)
-          file: server.cpp
-          callees: parse_message, send_response, recv
-
-        - func_hash: yyy
-          name: parse_message(const char *raw)
-          file: parser.cpp
-          callees: strchr, strtok, sscanf
-        ...
-        ```
-    """
+    """构造 Phase1 入口分类批 prompt(keep/filter, 带签名)。"""
     lines = [
         f"请分析以下 {len(batch)} 个函数，判断哪些是模块的潜在外部入口。",
         "",
@@ -261,3 +243,87 @@ async def run_fast_mode_classification(
 
     # 不应到达此处
     return batch_func_hashes
+
+
+def _parse_taint_result(output: str) -> list[dict] | None:
+    """解析 Phase2 taint 批输出: JSON数组, 每元素含func_hash+taints等。"""
+    m = _RESULT_RE.search(output)
+    if not m:
+        # 兜底: 找裸 JSON 数组
+        m2 = re.search(r"\[[\s\S]*\]", output or "")
+        if not m2:
+            return None
+        text = m2.group(0)
+    else:
+        text = m.group(1).strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text).strip()
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(data, list):
+        valid = [d for d in data if isinstance(d, dict) and d.get("func_hash")]
+        if valid:
+            return valid
+    return None
+
+
+async def run_fast_mode_taint_batch(
+    batch: list[dict],
+    *,
+    batch_idx: int,
+    stage_cwd: Path,
+    session_file: str,
+    cfg,
+    task_id: str,
+    on_event: Callable | None = None,
+    cancel_event: asyncio.Event | None = None,
+) -> list[dict]:
+    """Phase2 taint 批处理: 20个keep函数/批, 一次LLM拿全taints。
+
+    Returns: list[dict], 每元素 {func_hash, tag, entry_role, taints, ...}。
+    """
+    from .prompts import build_r3_w_taint_batch_prompt
+    system_prompt = _load_system_prompt(cfg)
+    prompt = build_r3_w_taint_batch_prompt(batch)
+    current_prompt = prompt
+    max_parse_retries = 3
+
+    for parse_attempt in range(1, max_parse_retries + 1):
+        if cancel_event and cancel_event.is_set():
+            return []
+        result = await run_agent(
+            prompt=current_prompt,
+            model=cfg.workers.agents[0].model,
+            tools=["read", "bash", "edit", "write"],
+            system_prompt=system_prompt,
+            cwd=str(stage_cwd),
+            session_file=session_file,
+            thinking_level=cfg.workers.agents[0].thinking_level or "off",
+            cancel_event=cancel_event,
+            max_retries=cfg.agent_max_retries,
+            retry_delay=cfg.agent_retry_delay,
+            run_timeout_seconds=cfg.agent_run_timeout_seconds,
+            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+            timeout_max_retries=cfg.agent_timeout_max_retries,
+            pi_max_retries=cfg.pi_max_retries,
+            pi_retry_delay=cfg.pi_retry_delay,
+            max_consecutive_empty_responses=cfg.max_consecutive_empty_responses,
+            task_id=task_id,
+            stage_key="fast_mode_taint",
+            role_kind="worker",
+            priority=SemPriority.R3_W,
+            use_slot=False,
+        )
+        parsed = _parse_taint_result(result.output or "")
+        if parsed is not None:
+            logger.info("fast_mode taint batch %d: %d/%d funcs got taints (%d attempts)",
+                        batch_idx, len(parsed), len(batch), parse_attempt)
+            return parsed
+        if parse_attempt < max_parse_retries:
+            current_prompt = prompt + f"\n(第{parse_attempt}次重试, 请输出合法JSON数组)"
+        else:
+            logger.warning("fast_mode taint batch %d: unparseable after %d, returning empty", batch_idx, max_parse_retries)
+            return []
+    return []

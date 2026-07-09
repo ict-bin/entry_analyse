@@ -1105,6 +1105,28 @@ class PipelineEngine:
             fs.r1_j_state = NodeState.PASSED
             state.save(dirs.state_file)
             return
+        # fast_mode/super_fast_mode: 跳过 gap-LLM, 纯 tree-sitter 静态提取(快)
+        if getattr(self.cfg, "fast_mode", False) or getattr(self.cfg, "super_fast_mode", False):
+            try:
+                from .extractor import extract_functions_static, compute_func_hash
+                static_funcs = await run_in_script_thread(extract_functions_static, file_path)
+                func_hashes = [compute_func_hash(file_path, fe.name, fe.start_line)
+                              for fe in static_funcs]
+                state.register_functions(
+                    file_hash,
+                    [(fh, fe.name, fe.signature, fe.start_line, fe.end_line)
+                     for fe, fh in zip(static_funcs, func_hashes)],
+                )
+                fs.r1_w_state = NodeState.PASSED
+                fs.r1_j_state = NodeState.PASSED
+                state.save(dirs.state_file)
+                logger.info("R1_pass(fast_mode, no-gap): file=%s funcs=%s", basename, len(static_funcs))
+            except Exception as exc:
+                logger.error("R1(fast) failed for %s: %s", file_path, exc)
+                fs.r1_w_state = NodeState.FAILED
+                fs.r1_j_state = NodeState.FAILED
+                state.save(dirs.state_file)
+            return
         try:
             acfg = self.cfg.workers.agents[0]
             token_usage, funcs, func_hashes = await run_r1_worker(

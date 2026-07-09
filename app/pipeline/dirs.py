@@ -84,7 +84,12 @@ class PipelineDirs:
 
     @property
     def state_file(self) -> Path:
-        return self.run / "pipeline_state.json"
+        # 本地 /tmp (不写 NFS): state 是内部运行态(resume 已移除, crash=restart),
+        # 无需持久化到 NFS; 避免多线程并发写 NFS state 串行化拖慢 R1
+        import os, tempfile
+        _d = Path(tempfile.gettempdir()) / f"ea-state-{os.getpid()}"
+        _d.mkdir(parents=True, exist_ok=True)
+        return _d / "pipeline_state.json"
 
     @property
     def module_db(self) -> Path:

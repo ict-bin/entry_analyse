@@ -48,6 +48,8 @@ class FastModeBatchProcessor:
         task_id: str,
         on_emit: Callable[..., None],
         cancel_event: asyncio.Event | None,
+        processor_fn: Callable | None = None,  # None=Phase1入口分类; 传=Phase2 taint等
+        result_mode: str = "entry",  # "entry"=keep/filter | "taint"=analysis dict
     ):
         self._state = state
         self._dirs = dirs
@@ -55,6 +57,8 @@ class FastModeBatchProcessor:
         self._task_id = task_id
         self._on_emit = on_emit
         self._cancel = cancel_event
+        self._processor_fn = processor_fn  # None → 默认 run_fast_mode_classification
+        self._result_mode = result_mode
 
         self._lock = threading.Lock()
         self._pending: list[tuple[dict, threading.Event]] = []
@@ -215,14 +219,14 @@ class FastModeBatchProcessor:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                from .fast_mode_worker import run_fast_mode_classification
-
-                session = self._dirs.sessions / f"fast-mode-batch-{batch_idx:03d}.jsonl"
-                stage_cwd = self._dirs.stage_cwd(f"fast_mode_b{batch_idx:03d}")
+                from .fast_mode_worker import run_fast_mode_classification as _default_fn
+                _fn = self._processor_fn or _default_fn
+                _tag = "taint" if self._result_mode == "taint" else "entry"
+                session = self._dirs.sessions / f"fast-mode-{_tag}-batch-{batch_idx:03d}.jsonl"
+                stage_cwd = self._dirs.stage_cwd(f"fast_mode_{_tag}_b{batch_idx:03d}")
                 stage_cwd.mkdir(parents=True, exist_ok=True)
-
-                entry_hashes = loop.run_until_complete(
-                    run_fast_mode_classification(
+                batch_result = loop.run_until_complete(
+                    _fn(
                         batch=funcs,
                         batch_idx=batch_idx,
                         stage_cwd=stage_cwd,
@@ -236,10 +240,46 @@ class FastModeBatchProcessor:
             finally:
                 loop.close()
         except Exception as exc:
-            logger.warning("fast_mode batch %d failed: %s, keeping all", batch_idx, exc)
-            entry_hashes = [f["func_hash"] for f in funcs]
+            logger.warning("fast_mode %s batch %d failed: %s", self._result_mode, batch_idx, exc)
+            batch_result = [f["func_hash"] for f in funcs] if self._result_mode == "entry" else {}
 
-        # 写入 Funcdb + State
+        from .funcdb import FunctionDB
+
+        if self._result_mode == "taint":
+            # Phase2 taint: batch_result = list[dict] (每函数analysis), 存入 func_state
+            analysis_map = {str(a.get("func_hash")): a for a in (batch_result or []) if isinstance(a, dict)}
+            for func_info in funcs:
+                fh = func_info["func_hash"]
+                file_hash = func_info.get("file_hash", "")
+                a = analysis_map.get(fh, {})
+                with self._lock:
+                    self._results[fh] = a  # enqueue 返回 analysis dict
+                if file_hash:
+                    fs = self._state.files.get(file_hash)
+                    if fs and fh in fs.functions:
+                        fn = fs.functions[fh]
+                        if a.get("taints"):
+                            fn.has_external_input = True
+                            fn.r4_decision = "keep"
+                            fn.entry_role = str(a.get("entry_role") or "").strip() or None
+                            # 存 taints 到 funcdb analysis
+                            try:
+                                _full = {"has_external_input": True, "decision": "keep",
+                                         "tag": a.get("tag"), "entry_role": a.get("entry_role"),
+                                         "taints": a.get("taints"),
+                                         "function_description": a.get("function_description"),
+                                         "entry_reason": a.get("entry_reason")}
+                                FunctionDB.open(self._dirs.r1, file_hash).set_analysis(fh, _full)
+                            except Exception:
+                                pass
+            self._on_emit("fast_mode_batch_done", batch=batch_idx,
+                          count=len(funcs), keep=len(analysis_map), filter=0, total=len(funcs))
+            for _info, _evt in batch:
+                _evt.set()
+            return
+
+        # Phase1 entry: batch_result = list[func_hash] (keep)
+        entry_hashes = batch_result if isinstance(batch_result, list) else [f["func_hash"] for f in funcs]
         entry_set = set(entry_hashes)
         keep_count = 0
         filter_count = 0

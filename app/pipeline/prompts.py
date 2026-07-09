@@ -360,6 +360,42 @@ def build_r3_w_taint_prompt(
     )
 
 
+def build_r3_w_taint_batch_prompt(batch: list[dict]) -> str:
+    """R3-W Phase2 taint 批处理: 20个keep函数/批, 带函数体, 一次LLM拿全taints。
+
+    batch: [{func_hash, name, signature, file, body, callees}, ...] (均为Phase1判keep的函数)
+    输出: JSON数组, 每元素 {func_hash, tag, entry_role, taints, function_description, entry_reason}
+    (has_external_input=true, decision=keep 已由Phase1确定, 此处只补taints)
+    """
+    lines = [
+        f"以下 {len(batch)} 个函数已确认为外部入口(Phase1判keep)。请逐个分析污点：",
+        "",
+        "对每个函数给出：",
+        "1. tag: P(被动,参数传入外部数据) 或 A(主动,函数体调用recv/read等)",
+        "2. entry_role: boundary/callback/dispatch_target/ipc_handler",
+        "3. taints: 承载外部数据的参数名/变量名列表(非空, 不含路径)",
+        "4. function_description: 一句话功能",
+        "5. entry_reason: 为什么是入口",
+        "",
+        "## 输出(JSON数组, 每函数一个元素)",
+        '```',
+        '[{"func_hash":"xxx", "tag":"P", "entry_role":"boundary", "taints":["param1"], "function_description":"...", "entry_reason":"..."}, ...]',
+        '```',
+        "",
+    ]
+    for func in batch:
+        callees_str = ", ".join(func.get("callees", [])) if func.get("callees") else "(无)"
+        sig = func.get("signature") or func.get("name", "")
+        body = str(func.get("body") or "")[:1500]
+        lines.append(f"- func_hash: {func.get('func_hash', '')}")
+        lines.append(f"  signature: {sig}")
+        lines.append(f"  body:")
+        lines.append(body)
+        lines.append(f"  callees: {callees_str}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ─── R3 Judge（函数级） ──────────────────────────────────────────────────────
 
 def build_r3_j_prompt(

@@ -721,11 +721,33 @@ class SuperFastPipelineEngine:
                 decision = await fm.enqueue({
                     "func_hash": func_hash,
                     "name": func_state.name,
+                    "signature": func_state.signature or func_state.name,
                     "file": os.path.basename(file_path),
                     "file_hash": file_hash,
                     "callees": callees,
                 })
                 if decision == "filter":
+                    return
+                # Phase2 taint 批处理(keep函数走批taint, 跳过逐函数R3-W)
+                if fm2 is not None:
+                    _taint_analysis = await fm2.enqueue({
+                        "func_hash": func_hash,
+                        "name": func_state.name,
+                        "signature": func_state.signature or func_state.name,
+                        "file": os.path.basename(file_path),
+                        "file_hash": file_hash,
+                        "body": body,
+                        "callees": callees,
+                    })
+                    # fm2 返回 analysis dict(含taints); 已由 _process_batch 写 funcdb+state
+                    # 跳过逐函数 R3-W/J, 直接进 R4
+                    func_state.r3_w_state = NodeState.PASSED
+                    func_state.r3_j_state = NodeState.PASSED
+                    await cc_done_event.wait()
+                    if self._cancel.is_set():
+                        return
+                    # 直进 R4
+                    await self._run_r4_for_func(func_hash, file_hash, file_path, dirs, state)
                     return
 
             # ── R3 分析: 入口判断 + 污点分析 W+J（与 CC 并行）────────────────
@@ -897,10 +919,19 @@ class SuperFastPipelineEngine:
 
         # ── 快速模式批处理器 ─────────────────────────────────────────
         from .fast_mode_engine import FastModeBatchProcessor
+        from .fast_mode_worker import run_fast_mode_taint_batch
         fm = FastModeBatchProcessor(
             state=state, dirs=dirs, cfg=self.cfg,
             task_id=self.task_id, on_emit=self._emit,
             cancel_event=self._cancel,
+        ) if self.cfg.fast_mode else None
+        # Phase2 taint 批处理器(keep函数走批taint, 跳过逐函数R3-W)
+        fm2 = FastModeBatchProcessor(
+            state=state, dirs=dirs, cfg=self.cfg,
+            task_id=self.task_id, on_emit=self._emit,
+            cancel_event=self._cancel,
+            processor_fn=run_fast_mode_taint_batch,
+            result_mode="taint",
         ) if self.cfg.fast_mode else None
 
         # ── 后台定期同步 events 到 NFS ──────────────────────────────────
@@ -916,6 +947,9 @@ class SuperFastPipelineEngine:
         )
         if fm is not None:
             await fm.flush()
+            _sync_evt()
+        if fm2 is not None:
+            await fm2.flush()
             _sync_evt()
         if self._cancel.is_set():
             _move_to_nfs()
