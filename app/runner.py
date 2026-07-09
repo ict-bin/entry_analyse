@@ -1040,16 +1040,14 @@ async def _run_with_pi_retry(
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
+            # Model not found / Unauthorized / invalid api key 等 → 立即终止, 不重试
             if _is_fatal_error(result) or result.fatal:
-                fatal_retry_count += 1
                 reason = str(result.error or "").strip() or "fatal error"
-                _mark_infinite_retry(result, kind="fatal", count=fatal_retry_count, reason=reason)
-                _log_warn(f"pi 基础设施异常 [{fatal_retry_count}/∞], 30s 后重试: {reason[:200]}")
+                _log_error(f"pi 致命错误(不可重试), 立即终止: {reason[:300]}")
                 if on_stream:
-                    on_stream("\n⚠️ 智能体基础设施异常，30 秒后自动重试...\n")
-                if await _sleep_cancel_first(30.0, cancel_event):
-                    return result
-                continue
+                    on_stream(f"\n❌ 智能体致命错误(模型不存在/API Key认证失败), 任务终止: {reason[:200]}\n")
+                result.fatal = True
+                return result
 
             # ── pi 进程崩溃 → 交由外层重试 ──
             if _is_pi_crash(result):
@@ -1071,20 +1069,18 @@ async def _run_with_pi_retry(
                 return r
 
             # ── 检查异常信息中是否藏着致命错误 ──
+            # Model not found / Unauthorized 等 → 立即终止, 不重试
             err_lower = str(exc).lower()
             for pattern in _FATAL_PATTERNS:
                 if all(p in err_lower for p in pattern):
-                    fatal_retry_count += 1
                     r = AgentResult()
                     r.error = str(exc)
                     r.exit_code = -1
-                    _mark_infinite_retry(r, kind="fatal", count=fatal_retry_count, reason=str(exc))
-                    _log_warn(f"pi 基础设施异常 [{fatal_retry_count}/∞], 30s 后重试: {exc}")
+                    r.fatal = True
+                    _log_error(f"pi 致命错误(不可重试), 立即终止: {exc}")
                     if on_stream:
-                        on_stream("\n⚠️ 智能体基础设施异常，30 秒后自动重试...\n")
-                    if await _sleep_cancel_first(30.0, cancel_event):
-                        return r
-                    break
+                        on_stream(f"\n❌ 智能体致命错误(模型不存在/API Key认证失败), 任务终止: {str(exc)[:200]}\n")
+                    return r
 
             if _should_retry(pi_attempt, pi_max_retries, cancel_event):
                 delay = _backoff(pi_retry_delay, pi_attempt)
