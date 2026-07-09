@@ -3445,10 +3445,14 @@ class SuperFastPipelineEngine:
             pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
             _bidx = pipeline._next_batch_idx("phase1")
             self._emit("fast_mode_batch_start", batch=_bidx, count=len(funcs))
-            keep_hashes = asyncio.run(run_fast_mode_classification(
-                batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
-                session_file=str(pipeline._dirs.sessions / f"r3-phase1-{_bidx:03d}.jsonl"),
-                cfg=self.cfg, task_id=self.task_id))
+            pipeline._agent_sem.acquire()
+            try:
+                keep_hashes = asyncio.run(run_fast_mode_classification(
+                    batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
+                    session_file=str(pipeline._dirs.sessions / f"r3-phase1-{_bidx:03d}.jsonl"),
+                    cfg=self.cfg, task_id=self.task_id))
+            finally:
+                pipeline._agent_sem.release()
             keep_set = set(keep_hashes)
             results = []
             for fh, file_hash, file_path in batch:
@@ -3490,10 +3494,14 @@ class SuperFastPipelineEngine:
             _sc2 = pipeline._dirs.stage_cwd("sq_r3")
             _sc2.mkdir(parents=True, exist_ok=True)
             _bidx2 = pipeline._next_batch_idx("r3")
-            analyses = asyncio.run(run_fast_mode_taint_batch(
-                batch=funcs, batch_idx=_bidx2, stage_cwd=_sc2,
-                session_file=str(pipeline._dirs.sessions / f"r3-taint-{_bidx2:03d}.jsonl"),
-                cfg=self.cfg, task_id=self.task_id))
+            pipeline._agent_sem.acquire()
+            try:
+                analyses = asyncio.run(run_fast_mode_taint_batch(
+                    batch=funcs, batch_idx=_bidx2, stage_cwd=_sc2,
+                    session_file=str(pipeline._dirs.sessions / f"r3-taint-{_bidx2:03d}.jsonl"),
+                    cfg=self.cfg, task_id=self.task_id))
+            finally:
+                pipeline._agent_sem.release()
             amap = {str(a.get("func_hash")): a for a in (analyses or []) if isinstance(a, dict)}
             results = []
             for fh, file_hash, file_path in batch:
@@ -3525,7 +3533,11 @@ class SuperFastPipelineEngine:
             # 等CC完成
             if hasattr(pipeline, '_cc_done') and not pipeline._cc_done.is_set():
                 pipeline._cc_done.wait()
-            asyncio.run(self._run_r4_for_func(fh, file_hash, file_path, pipeline._dirs, pipeline._state))
+            pipeline._agent_sem.acquire()
+            try:
+                asyncio.run(self._run_r4_for_func(fh, file_hash, file_path, pipeline._dirs, pipeline._state))
+            finally:
+                pipeline._agent_sem.release()
             # 不 emit per-function 事件; funcdb 已存 r4_decision
         except Exception as exc:
             logger.error("SQ R4 %s: %s", fh, exc, exc_info=True)
