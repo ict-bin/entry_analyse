@@ -1273,7 +1273,7 @@ class SuperFastPipelineEngine:
                           for fe in static_funcs]
             rel = os.path.relpath(os.path.abspath(file_path), self._source_dir) if self._source_dir else basename
             from .funcdb import FunctionDB as _FDB
-            _FDB.open_per_file(dirs.r1, file_hash).write_functions(
+            _FDB.open(dirs.r1, file_hash).write_functions(
                 file_hash, file_path, static_funcs, func_hashes, rel_path=rel
             )
             for fe, fh in zip(static_funcs, func_hashes):
@@ -3328,8 +3328,7 @@ class SuperFastPipelineEngine:
         file_hash, file_path = item
         try:
             asyncio.run(self._run_r1(file_hash, file_path, pipeline._dirs, pipeline._state))
-            # 合入总functions.db(单文件, 供NFS同步)
-            self._merge_funcdb(file_hash, pipeline._dirs)
+            # 直接写总库 functions.db(无需分库+合并)
             # fast_mode: 跳R2, 直接标PASSED
             fs = pipeline._state.files.get(file_hash)
             results = []
