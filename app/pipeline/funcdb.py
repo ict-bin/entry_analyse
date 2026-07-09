@@ -700,15 +700,14 @@ class FunctionDB:
 
 
     @classmethod
-    def open(cls, out_dir: Path, file_hash: str) -> "FunctionDB":
-        """
-        打开（或创建）函数数据库。
+    def open(cls, out_dir: Path, file_hash: str = "") -> "FunctionDB":
+        """后续阶段: 打开总库 functions.db(file_hash参数保留兼容但忽略)。
 
-        Args:
-            out_dir:   r1-functions/ 目录路径
-            file_hash: 12位文件 hash
-
-        Returns:
-            FunctionDB 实例（已初始化 schema）
+        R1 用 open_per_file 写分库, 合并后清理; 后续阶段全用总库。
         """
+        return cls(out_dir / "functions.db")
+
+    @classmethod
+    def open_per_file(cls, out_dir: Path, file_hash: str) -> "FunctionDB":
+        """R1专用: 打开分库 {file_hash}_functions.db。"""
         return cls(out_dir / f"{file_hash}_functions.db")

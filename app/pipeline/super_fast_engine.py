@@ -1273,7 +1273,7 @@ class SuperFastPipelineEngine:
                           for fe in static_funcs]
             rel = os.path.relpath(os.path.abspath(file_path), self._source_dir) if self._source_dir else basename
             from .funcdb import FunctionDB as _FDB
-            _FDB.open(dirs.r1, file_hash).write_functions(
+            _FDB.open_per_file(dirs.r1, file_hash).write_functions(
                 file_hash, file_path, static_funcs, func_hashes, rel_path=rel
             )
             for fe, fh in zip(static_funcs, func_hashes):
@@ -3365,6 +3365,11 @@ class SuperFastPipelineEngine:
             conn.execute("DETACH pf")
             conn.commit()
             conn.close()
+            # 合并完成, 清理分库
+            try:
+                per_file.unlink()
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("merge_funcdb %s failed: %s", file_hash, exc)
 
