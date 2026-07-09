@@ -71,8 +71,9 @@ def _build_batch_prompt(batch: list[dict]) -> str:
     ]
     for func in batch:
         callees_str = ", ".join(func.get("callees", [])) if func.get("callees") else "(无)"
+        sig = func.get("signature") or func.get("name", "")
         lines.append(f"- func_hash: {func.get('func_hash', '')}")
-        lines.append(f"  name: {func.get('name', '')}")
+        lines.append(f"  signature: {sig}")
         lines.append(f"  file: {func.get('file', '')}")
         lines.append(f"  callees: {callees_str}")
         lines.append("")

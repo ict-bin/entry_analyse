@@ -623,6 +623,7 @@ class PipelineEngine:
                 decision = await fm.enqueue({
                     "func_hash": func_hash,
                     "name": func_state.name,
+                    "signature": func_state.signature or func_state.name,
                     "file": os.path.basename(file_path),
                     "file_hash": file_hash,
                     "callees": callees,

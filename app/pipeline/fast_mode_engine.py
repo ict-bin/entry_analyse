@@ -88,7 +88,7 @@ class FastModeBatchProcessor:
         self._stop_flusher = threading.Event()
         self._tail_idle_seconds = max(
             10, int(os.environ.get('EA_FAST_MODE_TAIL_IDLE_SECONDS',
-                                   '15' if getattr(cfg, 'super_fast_mode', False) else '90')))  # super_fast: 函数到齐后15s提交大batch
+                                   '60' if getattr(cfg, 'super_fast_mode', False) else '90')))  # super_fast: 60s避免R2中途暂停触发部分batch
         self._flusher_thread = threading.Thread(
             target=self._idle_flush_loop,
             name=f"fm-idle-flush-{task_id[:8]}",
