@@ -3343,25 +3343,48 @@ class SuperFastPipelineEngine:
             logger.error("SQ R1 %s: %s", file_hash, exc, exc_info=True)
             return []
 
-    def _sq_api_filter_processor(self, item, pipeline):
-        """api_filter: 签名级轻量预筛(direct LLM, 看签名) → keep入Phase1-Queue。"""
-        fh, file_hash, file_path = item
+    def _sq_api_filter_processor(self, batch, pipeline):
+        """api_filter: 批签名预筛(batch_size/批, 只看签名) → keep入Phase1-Queue。"""
+        if isinstance(batch, tuple):  # batch_size=1 时传入单item
+            batch = [batch]
+        from .funcdb import FunctionDB as _FDB
+        funcs = []
+        for fh, file_hash, file_path in batch:
+            fs = pipeline._state.files.get(file_hash)
+            if fs and fh in fs.functions:
+                fn = fs.functions[fh]
+                funcs.append({"func_hash": fh, "name": fn.name,
+                              "signature": fn.signature or fn.name,
+                              "file": os.path.basename(file_path),
+                              "file_hash": file_hash})
+        if not funcs:
+            return []
+        # 批LLM: 只看签名, 判断keep/filter (复用Phase1 prompt但只传签名)
+        from .fast_mode_worker import run_fast_mode_classification
         try:
-            is_entry = asyncio.run(self._run_api_filter(
-                file_hash, fh, file_path, pipeline._dirs, pipeline._state))
-            if is_entry:
-                return [(fh, file_hash, file_path)]
-            else:
-                # filter: 标记funcdb + 丢弃
-                from .funcdb import FunctionDB as _FDB
+            _sc = pipeline._dirs.stage_cwd("sq_af")
+            _sc.mkdir(parents=True, exist_ok=True)
+            pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
+            _bidx = pipeline._next_batch_idx("af")
+            keep_hashes = asyncio.run(run_fast_mode_classification(
+                batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
+                session_file=str(pipeline._dirs.sessions / f"sq-af-{_bidx:03d}.jsonl"),
+                cfg=self.cfg, task_id=self.task_id))
+            keep_set = set(keep_hashes)
+            results = []
+            for fh, file_hash, file_path in batch:
+                decision = "keep" if fh in keep_set else "filter"
                 try:
-                    _FDB.open(pipeline._dirs.r1, file_hash).set_fast_mode_result(fh, "filter", 0)
+                    _FDB.open(pipeline._dirs.r1, file_hash).set_fast_mode_result(
+                        fh, decision, 1 if decision == "keep" else 0)
                 except Exception:
                     pass
-                return []
+                if decision == "keep":
+                    results.append((fh, file_hash, file_path))
+            return results
         except Exception as exc:
-            logger.error("SQ api_filter %s: %s", fh, exc, exc_info=True)
-            return [(fh, file_hash, file_path)]  # 失败保守keep
+            logger.error("SQ api_filter batch: %s", exc, exc_info=True)
+            return [(fh, fhash, fp) for fh, fhash, fp in batch]  # 失败保守keep
 
     def _sq_phase1_processor(self, batch, pipeline):
         """Phase1: 批入口分类(20/批) → keep入R3-Queue。"""
@@ -3482,11 +3505,11 @@ class SuperFastPipelineEngine:
 
         slot = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
         r1_w = max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8')))
-        batch_sz = int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+        batch_sz = 1000 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
 
         stages = [
             Stage("r1", r1_w, self._sq_r1_processor, batch_size=1),
-            Stage("api_filter", slot, self._sq_api_filter_processor, batch_size=1),
+            Stage("api_filter", slot, self._sq_api_filter_processor, batch_size=batch_sz),
             Stage("phase1", slot, self._sq_phase1_processor, batch_size=batch_sz),
             Stage("r3", slot, self._sq_r3_processor, batch_size=batch_sz),
             Stage("r4", slot, self._sq_r4_processor, batch_size=1),
