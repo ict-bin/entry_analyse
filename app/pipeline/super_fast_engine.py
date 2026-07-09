@@ -3539,7 +3539,9 @@ class SuperFastPipelineEngine:
                 pipeline._cc_done.wait()
             pipeline._agent_sem.acquire()
             try:
-                asyncio.run(self._run_r4_for_func(fh, file_hash, file_path, pipeline._dirs, pipeline._state))
+                asyncio.run(self._run_r4_for_func(
+                    {"func_hash": fh, "file_hash": file_hash, "file_path": file_path},
+                    pipeline._dirs, pipeline._state))
             finally:
                 pipeline._agent_sem.release()
             # 不 emit per-function 事件; funcdb 已存 r4_decision
