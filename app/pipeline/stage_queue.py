@@ -8,10 +8,10 @@ worker 从 queue 取任务 → processor 处理 → 结果入下一阶段 queue�
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import queue
 import threading
+import time
 from typing import Any, Callable
 
 logger = logging.getLogger("ea.pipeline.stage_queue")
@@ -58,7 +58,7 @@ class StageQueuePipeline:
         self._batch_counters: dict[str, int] = {}
 
     def _cancelled(self) -> bool:
-        return self._stop.is_set() or self._cancel.is_set()
+        return self._stop.is_set() or (self._cancel and self._cancel.is_set())
 
     def _next_batch_idx(self, stage_name: str) -> int:
         """Thread-safe batch counter per stage."""
@@ -69,87 +69,80 @@ class StageQueuePipeline:
             return idx
 
     def _next_queue(self, stage_idx: int) -> queue.Queue | None:
-        """下一阶段的 queue（最后一阶段返回 None）。"""
         if stage_idx + 1 < len(self._stages):
             return self._stages[stage_idx + 1].queue
         return None
 
     def _worker(self, stage: Stage, stage_idx: int):
-        logger.info("StageQueue worker %s[%d] started", stage.name, stage_idx)
+        logger.info("StageQueue worker %s[%d] started, batch_size=%d", stage.name, stage_idx, stage.batch_size)
         next_q = self._next_queue(stage_idx)
         try:
             while not self._cancelled():
-                # batch 模式: 凑满 batch_size 个 item
+                # ── batch 模式 ──
                 if stage.batch_size > 1:
-                batch = []
+                    batch = []
+                    try:
+                        first = stage.queue.get(timeout=1)
+                    except queue.Empty:
+                        continue
+                    if first is None:
+                        stage.queue.task_done()
+                        break
+                    batch.append(first)
+                    _deadline = time.monotonic() + 2.0
+                    while len(batch) < stage.batch_size and time.monotonic() < _deadline:
+                        try:
+                            batch.append(stage.queue.get_nowait())
+                        except queue.Empty:
+                            time.sleep(0.05)
+                    try:
+                        if self._done[stage_idx] < 3:
+                            logger.info("StageQueue %s: got batch of %d, calling processor", stage.name, len(batch))
+                        results = stage.processor(batch, self)
+                        if next_q and results:
+                            for r in results:
+                                next_q.put(r)
+                        with self._lock:
+                            self._done[stage_idx] += len(batch)
+                            if self._done[stage_idx] <= 3 or self._done[stage_idx] % 100 == 0:
+                                logger.info("StageQueue %s batch: done=%d, results=%d", stage.name, self._done[stage_idx], len(results) if results else 0)
+                    except Exception as exc:
+                        logger.error("StageQueue %s batch error: %s", stage.name, exc, exc_info=True)
+                    finally:
+                        for _ in batch:
+                            stage.queue.task_done()
+                    continue
+
+                # ── 逐项模式 ──
                 try:
-                    first = stage.queue.get(timeout=1)
+                    item = stage.queue.get(timeout=1)
                 except queue.Empty:
-                    continue  # 不break, 只等None哨兵
-                if first is None:
+                    continue
+                if item is None:
                     stage.queue.task_done()
                     break
-                batch.append(first)
-                _deadline = time.monotonic() + 2.0
-                while len(batch) < stage.batch_size and time.monotonic() < _deadline:
-                    try:
-                        batch.append(stage.queue.get_nowait())
-                    except queue.Empty:
-                        time.sleep(0.05)
                 try:
-                    if self._done[stage_idx] < 3:
-                        logger.info("StageQueue %s: got batch of %d, calling processor", stage.name, len(batch))
-                    results = stage.processor(batch, self)
+                    results = stage.processor(item, self)
                     if next_q and results:
                         for r in results:
                             next_q.put(r)
+                        if self._done[stage_idx] < 5 or self._done[stage_idx] % 200 == 0:
+                            logger.info("StageQueue %s: processed=%d → put %d items to %s",
+                                        stage.name, self._done[stage_idx]+1, len(results),
+                                        self._stages[stage_idx+1].name if stage_idx+1 < len(self._stages) else "done")
                     with self._lock:
-                        self._done[stage_idx] += len(batch)
-                        if self._done[stage_idx] <= 3 or self._done[stage_idx] % 100 == 0:
-                            logger.info("StageQueue %s batch: done=%d, results=%d", stage.name, self._done[stage_idx], len(results) if results else 0)
+                        self._done[stage_idx] += 1
+                        if self._done[stage_idx] % 100 == 0:
+                            logger.info("StageQueue %s: %d done", stage.name, self._done[stage_idx])
                 except Exception as exc:
-                    logger.error("StageQueue %s batch error: %s", stage.name, exc, exc_info=True)
+                    logger.error("StageQueue %s error: %s", stage.name, exc, exc_info=True)
                 finally:
-                    for _ in batch:
-                        stage.queue.task_done()
-                continue
-
-            # 逐项模式
-            try:
-                item = stage.queue.get(timeout=1)
-            except queue.Empty:
-                continue  # 不break, 只等None哨兵
-            if item is None:
-                stage.queue.task_done()
-                break
-            try:
-                results = stage.processor(item, self)
-                if next_q and results:
-                    for r in results:
-                        next_q.put(r)
-                    if self._done[stage_idx] < 5 or self._done[stage_idx] % 200 == 0:
-                        logger.info("StageQueue %s: processed=%d → put %d items to %s",
-                                    stage.name, self._done[stage_idx]+1, len(results),
-                                    self._stages[stage_idx+1].name if stage_idx+1 < len(self._stages) else "done")
-                with self._lock:
-                    self._done[stage_idx] += 1
-                    if self._done[stage_idx] % 100 == 0:
-                        logger.info("StageQueue %s: %d done", stage.name, self._done[stage_idx])
-            except Exception as exc:
-                logger.error("StageQueue %s error: %s", stage.name, exc, exc_info=True)
-            finally:
-                stage.queue.task_done()
+                    stage.queue.task_done()
         except Exception as exc:
-            logger.error("StageQueue worker %s[%d] DIED: %s", stage.name, stage_idx, exc, exc_info=True)(self, stage_idx: int) -> bool:
-        """上游所有阶段的 queue 是否都空了（粗略判断，不完美但够用）。"""
-        for i in range(stage_idx):
-            if not self._stages[i].queue.empty():
-                return False
-        return True
+            logger.error("StageQueue worker %s[%d] DIED: %s", stage.name, stage_idx, exc, exc_info=True)
 
     def run(self, initial_items: list[Any]) -> None:
         """启动管道，阻塞到全部完成。"""
-        # 填入第一阶段
         for item in initial_items:
             self._stages[0].queue.put(item)
 
@@ -157,7 +150,6 @@ class StageQueuePipeline:
         stage_info = ", ".join(f"{s.name}={s.worker_count}" for s in self._stages)
         logger.info("StageQueue start: %d items, stages[%s]", total, stage_info)
 
-        # 启动所有阶段的 workers
         for idx, stage in enumerate(self._stages):
             for i in range(stage.worker_count):
                 t = threading.Thread(
@@ -169,10 +161,8 @@ class StageQueuePipeline:
                 t.start()
                 self._workers.append(t)
 
-        # 逐阶段等完成：阶段 i 的 queue join → 给 i+1 发停止哨兵
         for idx, stage in enumerate(self._stages):
             stage.queue.join()
-            # 本阶段全完成 → 下一阶段发哨兵
             if idx + 1 < len(self._stages):
                 for _ in range(self._stages[idx + 1].worker_count):
                     self._stages[idx + 1].queue.put(None)
