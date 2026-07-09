@@ -3343,6 +3343,26 @@ class SuperFastPipelineEngine:
             logger.error("SQ R1 %s: %s", file_hash, exc, exc_info=True)
             return []
 
+    def _sq_api_filter_processor(self, item, pipeline):
+        """api_filter: 签名级轻量预筛(direct LLM, 看签名) → keep入Phase1-Queue。"""
+        fh, file_hash, file_path = item
+        try:
+            is_entry = asyncio.run(self._run_api_filter(
+                file_hash, fh, file_path, pipeline._dirs, pipeline._state))
+            if is_entry:
+                return [(fh, file_hash, file_path)]
+            else:
+                # filter: 标记funcdb + 丢弃
+                from .funcdb import FunctionDB as _FDB
+                try:
+                    _FDB.open(pipeline._dirs.r1, file_hash).set_fast_mode_result(fh, "filter", 0)
+                except Exception:
+                    pass
+                return []
+        except Exception as exc:
+            logger.error("SQ api_filter %s: %s", fh, exc, exc_info=True)
+            return [(fh, file_hash, file_path)]  # 失败保守keep
+
     def _sq_phase1_processor(self, batch, pipeline):
         """Phase1: 批入口分类(20/批) → keep入R3-Queue。"""
         from .fast_mode_worker import run_fast_mode_classification
@@ -3466,6 +3486,7 @@ class SuperFastPipelineEngine:
 
         stages = [
             Stage("r1", r1_w, self._sq_r1_processor, batch_size=1),
+            Stage("api_filter", slot, self._sq_api_filter_processor, batch_size=1),
             Stage("phase1", slot, self._sq_phase1_processor, batch_size=batch_sz),
             Stage("r3", slot, self._sq_r3_processor, batch_size=batch_sz),
             Stage("r4", slot, self._sq_r4_processor, batch_size=1),
