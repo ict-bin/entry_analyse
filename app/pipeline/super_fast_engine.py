@@ -688,15 +688,23 @@ class SuperFastPipelineEngine:
                 return
 
             # ── R2: tree-sitter 行号准确性验证 ──────────────────────────────
-            # 用信号量限制同时进入 R2 的函数数（防止任务风暴）
-            # 关键：R2 完成后立即释放信号量，R3/CC/R4 不在信号量内
-            # 否则会死锁（持有槽的函数等 all_r2_done，但被槽阻拦的函数无法完成 R2）
-            async with _r2_sem:
+            # fast/super_fast: tree-sitter提取准确 + 已跳gap, R2咒余(每函数重读源文件), 直接跳过
+            if getattr(self.cfg, "fast_mode", False) or getattr(self.cfg, "super_fast_mode", False):
                 if func_state.r2_j_state != NodeState.PASSED:
-                    await self._run_r2(
-                        file_hash, func_hash, file_path, dirs, state)
+                    func_state.r2_j_state = NodeState.PASSED
+                    func_state.r2_j_attempts = 1
                 r2_done_count += 1
-                _maybe_set_all_r2_done()   # 最后一个 R2 完成 → 可能触发 CC
+                _maybe_set_all_r2_done()
+            else:
+                # 用信号量限制同时进入 R2 的函数数（防止任务风暴）
+                # 关键：R2 完成后立即释放信号量，R3/CC/R4 不在信号量内
+                # 否则会死锁（持有槽的函数等 all_r2_done，但被槽阻拦的函数无法完成 R2）
+                async with _r2_sem:
+                    if func_state.r2_j_state != NodeState.PASSED:
+                        await self._run_r2(
+                            file_hash, func_hash, file_path, dirs, state)
+                    r2_done_count += 1
+                    _maybe_set_all_r2_done()   # 最后一个 R2 完成 → 可能触发 CC
             if self._cancel.is_set():
                 return
 
