@@ -3373,7 +3373,7 @@ class SuperFastPipelineEngine:
             logger.warning("merge_funcdb %s failed: %s", file_hash, exc)
 
     def _sq_api_filter_processor(self, batch, pipeline):
-        """api_filter: 批签名预筛(batch_size/批, 只看签名) → keep入Phase1-Queue。"""
+        """api_filter: 批签名预筛(只看签名, 不读body) → keep入Phase1-Queue。"""
         if isinstance(batch, tuple):  # batch_size=1 时传入单item
             batch = [batch]
         from .funcdb import FunctionDB as _FDB
@@ -3388,18 +3388,21 @@ class SuperFastPipelineEngine:
                               "file_hash": file_hash})
         if not funcs:
             return []
-        # 批LLM: 只看签名, 判断keep/filter (复用Phase1 prompt但只传签名)
+        # 批LLM: 只看签名(不传body/callees), 快速筛
         from .fast_mode_worker import run_fast_mode_classification
         try:
             _sc = pipeline._dirs.stage_cwd("sq_af")
             _sc.mkdir(parents=True, exist_ok=True)
             pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
             _bidx = pipeline._next_batch_idx("af")
+            _sf = pipeline._dirs.sessions / f"r3-af-{_bidx:03d}.jsonl"
+            # 清理旧session文件(防pi加载历史对话)
+            _sf.unlink(missing_ok=True)
             pipeline._agent_sem.acquire()
             try:
                 keep_hashes = asyncio.run(run_fast_mode_classification(
                     batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
-                    session_file=str(pipeline._dirs.sessions / f"r3-af-{_bidx:03d}.jsonl"),
+                    session_file=str(_sf),
                     cfg=self.cfg, task_id=self.task_id))
             finally:
                 pipeline._agent_sem.release()
@@ -3420,36 +3423,36 @@ class SuperFastPipelineEngine:
             return [(fh, fhash, fp) for fh, fhash, fp in batch]  # 失败保守keep
 
     def _sq_phase1_processor(self, batch, pipeline):
-        """Phase1: 批入口分类(20/批) → keep入R3-Queue。"""
-        from .fast_mode_worker import run_fast_mode_classification
+        """Phase1: 函数体判别(20/批, 传body给LLM) → keep入R3-Queue。"""
+        from .fast_mode_worker import run_fast_mode_classification, _build_phase1_body_prompt
         funcs = []
         for fh, file_hash, file_path in batch:
             fs = pipeline._state.files.get(file_hash)
             if fs and fh in fs.functions:
                 fn = fs.functions[fh]
-                from .fast_mode_collector import extract_callees
                 from .funcdb import FunctionDB as _FDB
                 try:
                     rec = _FDB(pipeline._dirs.r1 / "functions.db").get_function(fh)
                     body = (rec.get("body") or "") if rec else ""
                 except Exception:
                     body = ""
-                callees = extract_callees(body, own_name=fn.name)
                 funcs.append({"func_hash": fh, "name": fn.name,
                               "signature": fn.signature or fn.name,
                               "file": os.path.basename(file_path),
-                              "file_hash": file_hash, "callees": callees})
+                              "file_hash": file_hash, "body": body})
         try:
             _sc = pipeline._dirs.stage_cwd("sq_phase1")
             _sc.mkdir(parents=True, exist_ok=True)
             pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
             _bidx = pipeline._next_batch_idx("phase1")
+            _sf = pipeline._dirs.sessions / f"r3-phase1-{_bidx:03d}.jsonl"
+            _sf.unlink(missing_ok=True)  # 清旧session防继承
             self._emit("fast_mode_batch_start", batch=_bidx, count=len(funcs))
             pipeline._agent_sem.acquire()
             try:
-                keep_hashes = asyncio.run(run_fast_mode_classification(
+                keep_hashes = asyncio.run(_run_phase1_classification(
                     batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
-                    session_file=str(pipeline._dirs.sessions / f"r3-phase1-{_bidx:03d}.jsonl"),
+                    session_file=str(_sf),
                     cfg=self.cfg, task_id=self.task_id))
             finally:
                 pipeline._agent_sem.release()
@@ -3464,7 +3467,6 @@ class SuperFastPipelineEngine:
                     results.append((fh, file_hash, file_path))
             self._emit("fast_mode_batch_done", batch=_bidx, count=len(funcs),
                        keep=len(results), filter=len(funcs)-len(results), total=len(funcs))
-            # 不 emit per-function 事件(避免10w+日志); funcdb 已存 keep/filter
             return results
         except Exception as exc:
             logger.error("SQ Phase1: %s", exc, exc_info=True)
@@ -3494,11 +3496,13 @@ class SuperFastPipelineEngine:
             _sc2 = pipeline._dirs.stage_cwd("sq_r3")
             _sc2.mkdir(parents=True, exist_ok=True)
             _bidx2 = pipeline._next_batch_idx("r3")
+            _sf2 = pipeline._dirs.sessions / f"r3-taint-{_bidx2:03d}.jsonl"
+            _sf2.unlink(missing_ok=True)  # 清旧session防继承
             pipeline._agent_sem.acquire()
             try:
                 analyses = asyncio.run(run_fast_mode_taint_batch(
                     batch=funcs, batch_idx=_bidx2, stage_cwd=_sc2,
-                    session_file=str(pipeline._dirs.sessions / f"r3-taint-{_bidx2:03d}.jsonl"),
+                    session_file=str(_sf2),
                     cfg=self.cfg, task_id=self.task_id))
             finally:
                 pipeline._agent_sem.release()
@@ -3553,16 +3557,18 @@ class SuperFastPipelineEngine:
 
         slot = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
         r1_w = max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8')))
-        batch_sz = 1000 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+        # batch_size 分离: api_filter(签名级,大批) vs Phase1/R3(函数体级,小批)
+        af_batch = 1000 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+        body_batch = int(getattr(self.cfg, 'fast_mode_batch_size', 20))  # Phase1/R3 始终小批(函数体分析)
 
         # agent槽位(threading.Semaphore, LLM阶段共享)
         agent_sem = _th.Semaphore(slot)
 
         stages = [
             Stage("r1", r1_w, self._sq_r1_processor, batch_size=1),
-            Stage("api_filter", slot, self._sq_api_filter_processor, batch_size=batch_sz),
-            Stage("phase1", slot, self._sq_phase1_processor, batch_size=batch_sz),
-            Stage("r3", slot, self._sq_r3_processor, batch_size=batch_sz),
+            Stage("api_filter", slot, self._sq_api_filter_processor, batch_size=af_batch),
+            Stage("phase1", slot, self._sq_phase1_processor, batch_size=body_batch),
+            Stage("r3", slot, self._sq_r3_processor, batch_size=body_batch),
             Stage("r4", slot, self._sq_r4_processor, batch_size=1),
         ]
 

@@ -2405,7 +2405,43 @@ class TaskService:
 
     def get_task_function_catalog(self, db: Session, task_id: str) -> list[dict]:
         row = self._get_or_404(db, task_id)
+        # 优先从 funcdb (functions.db) 读取
+        catalog = self.get_task_funcdb_functions(db, task_id, offset=0, limit=10000)
+        if catalog.get("total", 0) > 0:
+            return catalog["items"]
         return _build_function_catalog(row)
+
+    def get_task_funcdb_functions(
+        self, db: Session, task_id: str,
+        *, offset: int = 0, limit: int = 50,
+        decision_filter: str | None = None,
+    ) -> dict:
+        """从 functions.db 分页查询函数列表（供前端实时展示）。"""
+        row = self._get_or_404(db, task_id)
+        run_root = _task_run_root(row)
+        if not run_root:
+            return {"items": [], "total": 0, "offset": offset, "limit": limit}
+        from app.pipeline.dirs import PipelineDirs as _Dirs
+        from app.pipeline.funcdb import FunctionDB as _FDB
+        dirs = _Dirs(run_root)
+        r1_dir = dirs.r1
+        # 运行中从 run/r1/functions.db, 完成后从 output/funcdb
+        output_root = _task_output_root(row)
+        if output_root:
+            out_funcdb = output_root / "funcdb"
+            if out_funcdb.is_dir():
+                r1_dir = out_funcdb
+        db_path = r1_dir / "functions.db"
+        if not db_path.is_file():
+            return {"items": [], "total": 0, "offset": offset, "limit": limit}
+        try:
+            fdb = _FDB(r1_dir, "")
+            return fdb.list_functions_paginated(
+                offset=offset, limit=limit, decision_filter=decision_filter)
+        except Exception as exc:
+            import logging
+            logging.getLogger("ea.task_service").warning("funcdb query failed: %s", exc)
+            return {"items": [], "total": 0, "offset": offset, "limit": limit}
 
     def get_task_function_detail(self, db: Session, task_id: str, func_hash: str,
                                   file_hash: str | None = None) -> dict:

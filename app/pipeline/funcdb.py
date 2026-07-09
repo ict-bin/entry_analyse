@@ -539,6 +539,65 @@ class FunctionDB:
             ).fetchone()[0]
         return {"total": total, "analysed": analysed, "with_input": with_input}
 
+    def list_functions_paginated(
+        self, offset: int = 0, limit: int = 50,
+        decision_filter: str | None = None,
+    ) -> dict:
+        """分页查询函数列表（供前端函数分析列表展示）。
+
+        Args:
+            offset: 跳过前 N 条
+            limit:  每页条数
+            decision_filter: None=全部, "keep"=r3_decision=keep, "filter"=r3_decision=filter,
+                             "entry"=has_external_input=1, "pending"=r3_decision IS NULL
+
+        Returns:
+            {"items": [...], "total": N, "offset": offset, "limit": limit}
+        """
+        where = ""
+        if decision_filter == "keep":
+            where = "WHERE f.r3_decision = 'keep'"
+        elif decision_filter == "filter":
+            where = "WHERE f.r3_decision = 'filter'"
+        elif decision_filter == "entry":
+            where = "WHERE f.has_external_input = 1"
+        elif decision_filter == "pending":
+            where = "WHERE f.r3_decision IS NULL"
+
+        with self._get_conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM functions f {where}"
+            ).fetchone()[0]
+
+            rows = conn.execute(
+                f"""SELECT f.func_hash, f.file_hash, f.name, f.signature,
+                           f.start_line, f.end_line, f.body_lines,
+                           f.has_external_input, f.entry_role,
+                           f.r3_decision, f.r4_decision, f.analysis,
+                           fm.rel_path, fm.basename, fm.original_path
+                    FROM functions f
+                    LEFT JOIN file_meta fm ON fm.file_hash = f.file_hash
+                    {where}
+                    ORDER BY fm.basename, f.start_line
+                    LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+
+        items = []
+        for r in rows:
+            d = dict(r)
+            analysis = d.get("analysis")
+            if analysis:
+                try:
+                    d["analysis"] = json.loads(analysis)
+                except (json.JSONDecodeError, TypeError):
+                    d["analysis"] = {}
+            else:
+                d["analysis"] = {}
+            items.append(d)
+
+        return {"items": items, "total": total, "offset": offset, "limit": limit}
+
     # ── 工厂方法 ───────────────────────────────────────────────────────────────
 
     def apply_corrections(

@@ -52,12 +52,43 @@ def _build_batch_prompt(batch: list[dict]) -> str:
         "",
     ]
     for func in batch:
-        callees_str = ", ".join(func.get("callees", [])) if func.get("callees") else "(无)"
         sig = func.get("signature") or func.get("name", "")
         lines.append(f"- func_hash: {func.get('func_hash', '')}")
         lines.append(f"  signature: {sig}")
         lines.append(f"  file: {func.get('file', '')}")
-        lines.append(f"  callees: {callees_str}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_phase1_body_prompt(batch: list[dict]) -> str:
+    """构造 Phase1 函数体判别 prompt(带函数体, 20/批)。
+
+    与 api_filter(签名级) 不同: Phase1 传完整函数体让 LLM 阅读代码逻辑,
+    判断是否处理外部输入。
+    """
+    lines = [
+        f"请分析以下 {len(batch)} 个函数的**函数体**，判断哪些处理外部输入（是模块的潜在外部入口）。",
+        "",
+        "判断为外部入口(true)的条件（满足任一）：",
+        "1. 被动型：参数名含 buf/data/msg/packet/request/arg/name/path/file/module/uri/host/cmd/handle 等外部数据暗示",
+        "2. 主动型：函数体调用 recv/recvfrom/read/accept/mmap/ioctl/fgets/getline 等接收外部数据 I/O",
+        "3. sink 导向：参数流入 dlopen/LoadLibrary/xmlModulePlatformOpen/system/exec/open/connect/sql 等敏感 sink",
+        "4. 外部入口点：函数本身被 OS/外部调用——DllMain/DllEntryPoint/导出函数(EXTERN/BOOL APIENTRY)/main/wmain/回调注册",
+        "服务生命周期函数(_init/_start/_stop/_free/_register 且无外部I/O)不算入口。",
+        "只输出被判定为入口的 func_hash，不要输出分析过程。",
+        "",
+    ]
+    for func in batch:
+        sig = func.get("signature") or func.get("name", "")
+        body = func.get("body") or ""
+        if len(body) > 3000:
+            body = body[:3000] + "\n// ... (truncated)"
+        lines.append(f"── func_hash: {func.get('func_hash', '')} ──")
+        lines.append(f"signature: {sig}")
+        lines.append(f"file: {func.get('file', '')}")
+        lines.append("```cpp")
+        lines.append(body)
+        lines.append("```")
         lines.append("")
     return "\n".join(lines)
 
@@ -95,6 +126,72 @@ def _parse_result(output: str) -> list[str] | None:
             return None
 
     return None
+
+
+async def _run_phase1_classification(
+    batch: list[dict],
+    *,
+    batch_idx: int,
+    stage_cwd: Path,
+    session_file: str,
+    cfg,
+    task_id: str,
+    cancel_event: asyncio.Event | None = None,
+) -> list[str]:
+    """Phase1: 函数体判别(20/批), 传body给LLM阅读代码逻辑。
+
+    与 api_filter(签名级)不同: Phase1 用 _build_phase1_body_prompt 传完整函数体。
+    """
+    system_prompt = _load_system_prompt(cfg)
+    prompt = _build_phase1_body_prompt(batch)
+    batch_func_hashes = [f["func_hash"] for f in batch]
+    batch_hash_set = set(batch_func_hashes)
+    max_parse_retries = 3
+    current_prompt = prompt
+    for parse_attempt in range(1, max_parse_retries + 1):
+        if cancel_event and cancel_event.is_set():
+            return batch_func_hashes
+        result = await run_agent(
+            prompt=current_prompt,
+            model=cfg.workers.agents[0].model,
+            tools=["read", "bash", "edit", "write"],
+            system_prompt=system_prompt,
+            cwd=str(stage_cwd),
+            session_file=session_file,
+            thinking_level=cfg.workers.agents[0].thinking_level or "off",
+            cancel_event=cancel_event,
+            max_retries=cfg.agent_max_retries,
+            retry_delay=cfg.agent_retry_delay,
+            run_timeout_seconds=cfg.agent_run_timeout_seconds,
+            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+            timeout_max_retries=cfg.agent_timeout_max_retries,
+            pi_max_retries=cfg.pi_max_retries,
+            pi_retry_delay=cfg.pi_retry_delay,
+            max_consecutive_empty_responses=cfg.max_consecutive_empty_responses,
+            task_id=task_id,
+            stage_key="phase1_body",
+            role_kind="worker",
+            priority=SemPriority.R3_W,
+            use_slot=False,
+        )
+        if result.error:
+            logger.warning("phase1 batch %d attempt %d: pi error '%s'",
+                           batch_idx, parse_attempt, result.error)
+        parsed = _parse_result(result.output)
+        if parsed is not None:
+            valid = [h for h in parsed if h in batch_hash_set]
+            logger.info("phase1 batch %d: %d/%d keep (%d attempts)",
+                        batch_idx, len(valid), len(batch), parse_attempt)
+            return valid
+        if parse_attempt < max_parse_retries:
+            logger.warning("phase1 batch %d attempt %d: unparseable, retrying",
+                          batch_idx, parse_attempt)
+            current_prompt = prompt + _PARSE_FEEDBACK + f"\n(第 {parse_attempt} 次重试)"
+        else:
+            logger.warning("phase1 batch %d: unparseable after %d, keeping all %d",
+                          batch_idx, max_parse_retries, len(batch))
+            return batch_func_hashes
+    return batch_func_hashes
 
 
 def _load_system_prompt(cfg) -> str:

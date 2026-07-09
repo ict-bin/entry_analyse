@@ -1599,6 +1599,20 @@ def get_task_function_catalog(task_id: str, db: Session = Depends(get_db), _=Dep
     return get_task_service().get_task_function_catalog(db, task_id)
 
 
+@router.get("/tasks/{task_id}/funcdb-functions")
+def get_task_funcdb_functions(
+    task_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    decision: Optional[str] = Query(None, regex="^(keep|filter|entry|pending)$"),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """从 functions.db 分页查询函数列表（运行中 + 完成后均可查）。"""
+    return get_task_service().get_task_funcdb_functions(
+        db, task_id, offset=offset, limit=limit, decision_filter=decision)
+
+
 @router.get("/tasks/{task_id}/functions/{func_hash}", response_model=dict[str, Any])
 def get_task_function_detail(
     task_id: str,
