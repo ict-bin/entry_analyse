@@ -284,19 +284,23 @@ def build_r3_w_prompt(
     if body_lines <= 60:
         step2 = (
             "**步骤 2**：判断是否有外部输入：\n\n"
-            "   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context/arg 等）\n"
+            "   **被动型（P）**：签名参数名暗示外部数据（buf/data/msg/packet/request/context/arg/name/path/file/filename/module/uri/url/host/cmd/handle 等）\n"
             "   **主动型（A）**：函数体调用 %s 等\n\n" % _PATTERNS
             + "   ⚠️ **不要信任签名里的 `ATTRIBUTE_UNUSED` / `__attribute__((unused))` 注解**——它只是编译器提示用于消除警告，不代表参数真没被函数体使用。判断参数是否为外部输入要看**函数体是否引用该参数**（如函数体里有 `func(arg)`/`x = arg` 即使用了 arg，即使签名标了 ATTRIBUTE_UNUSED）\n\n"
+            "   **sink 导向规则（重要）**：只要某个参数（任意名）流入安全敏感 sink 即判 true：动态加载(dlopen/LoadLibrary/xmlModulePlatformOpen)、命令执行(system/exec/popen)、文件打开(open/fopen/sqlite3_open)、网络(connect/sendto)、SQL(sqlite3_exec/mysql_query)、反序列化。例如 `xmlModuleOpen(name)` 里 name 流入 `xmlModulePlatformOpen(name)`(类dlopen) → true\n\n"
+            "   **外部入口点（不论参数是否“请求数据”）**：被 OS/外部框架/导出表调用的函数本身就是外部入口：DllMain/DllEntryPoint/导出函数(BOOL APIENTRY/EXTERN)/回调注册函数/_tWinMain/main/wmain。这些函数即使参数是“控制码”也判 true（外部调用动作=外部触发）\n\n"
             "   **服务生命周期函数必须 filter**：函数名含 *_init/*_start/*_stop/*_free/*_register/*_setup 且无外部 I/O 调用 → false\n\n"
             "   **请求-响应模式不得 filter**：函数名含 Proc+Msg/Handle+Msg/OnMsg + 签名有 *message/*msg/*request 参数 + 日志有 Received/Recv → true\n"
         )
     else:
         step2 = (
             "**步骤 2**：分析结果：\n\n"
-            "   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet/arg 类名称 → false\n"
+            "   - awk/python3 **无命中** + 签名参数名无 buf/data/msg/packet/arg/name/path/file/module 类名称 → false\n"
             "   - 有命中行：确认后分析\n"
             "   - 签名参数名暗示外部数据但 awk 无命中 → 被动型（P）→ true\n\n"
             "   ⚠️ **不要信任签名里的 `ATTRIBUTE_UNUSED` / `__attribute__((unused))` 注解**——它只是编译器提示，不代表参数真没被函数体使用；判断要看函数体是否引用该参数\n\n"
+            "   **sink 导向规则**：参数流入 dlopen/LoadLibrary/xmlModulePlatformOpen/system/exec/open/connect/sql 等敏感 sink → true\n"
+            "   **外部入口点**：DllMain/导出函数/回调/main 等 OS/外部调用的函数本身是入口 → true（不论参数是否“请求数据”）\n\n"
             "   **服务生命周期函数必须 filter**\n"
             "   **请求-响应模式不得 filter**\n"
         )

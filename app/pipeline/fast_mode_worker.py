@@ -61,6 +61,13 @@ def _build_batch_prompt(batch: list[dict]) -> str:
     lines = [
         f"请分析以下 {len(batch)} 个函数，判断哪些是模块的潜在外部入口。",
         "",
+        "判断为外部入口(true)的条件（满足任一）：",
+        "1. 被动型：参数名含 buf/data/msg/packet/request/arg/name/path/file/module/uri/host/cmd/handle 等外部数据暗示",
+        "2. 主动型：callees 含 recv/recvfrom/read/accept/mmap/ioctl/fgets/getline 等接收外部数据 I/O",
+        "3. sink 导向：参数流入 dlopen/LoadLibrary/xmlModulePlatformOpen/system/exec/open/connect/sql 等敏感 sink（即使参数名是 name/path 也算）",
+        "4. 外部入口点：函数本身被 OS/外部调用——DllMain/DllEntryPoint/导出函数(EXTERN/BOOL APIENTRY)/main/wmain/回调注册，不论参数是否“请求数据”都算入口",
+        "服务生命周期函数(_init/_start/_stop/_free/_register 且无外部I/O)不算入口。",
+        "",
     ]
     for func in batch:
         callees_str = ", ".join(func.get("callees", [])) if func.get("callees") else "(无)"

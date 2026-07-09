@@ -514,6 +514,8 @@ class WorkerSlotService:
             "workers": live_workers,
             "retired_worker_rows": [],
             "stale_owner_worker_rows": [],
+            "retired_workers": 0,
+            "stale_owner_workers": 0,
         }
 
     def get_cluster_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
