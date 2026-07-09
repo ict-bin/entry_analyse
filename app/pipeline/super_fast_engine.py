@@ -3580,12 +3580,19 @@ class SuperFastPipelineEngine:
 
         # CC 在独立线程跑(R1全完成后)
         def _cc_thread():
-            # 等R1队列非空(sqp.run填入后再join, 避免空队列join立即返回)
             import time as _time
+            # 等R1队列非空
             while stages[0].queue.empty() and not self._cancel.is_set():
                 _time.sleep(0.5)
-            # 等R1阶段完成(queue全部处理完)
-            stages[0].queue.join()
+            # 等R1完成: 用_done计数器而非queue.join()(join可能因隐晦task_done计数bug永远不返回)
+            total = len(file_hash_paths)
+            while not self._cancel.is_set():
+                with sqp._lock:
+                    done = sqp._done[0]
+                if done >= total:
+                    break
+                _time.sleep(2.0)
+            logger.info("SQ CC: R1 done=%d/%d, starting callchain", sqp._done[0], total)
             if r1_finished_flag is not None:
                 r1_finished_flag[0] = True
             if not self._cancel.is_set():
