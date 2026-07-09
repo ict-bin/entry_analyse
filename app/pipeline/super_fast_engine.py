@@ -3424,7 +3424,7 @@ class SuperFastPipelineEngine:
 
     def _sq_phase1_processor(self, batch, pipeline):
         """Phase1: 函数体判别(20/批, 传body给LLM) → keep入R3-Queue。"""
-        from .fast_mode_worker import run_fast_mode_classification, _build_phase1_body_prompt
+        from .fast_mode_worker import run_fast_mode_classification, _build_phase1_body_prompt, _run_phase1_classification
         funcs = []
         for fh, file_hash, file_path in batch:
             fs = pipeline._state.files.get(file_hash)
