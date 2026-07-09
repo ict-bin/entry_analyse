@@ -3395,10 +3395,14 @@ class SuperFastPipelineEngine:
             _sc.mkdir(parents=True, exist_ok=True)
             pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
             _bidx = pipeline._next_batch_idx("af")
-            keep_hashes = asyncio.run(run_fast_mode_classification(
-                batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
-                session_file=str(pipeline._dirs.sessions / f"r3-af-{_bidx:03d}.jsonl"),
-                cfg=self.cfg, task_id=self.task_id))
+            pipeline._agent_sem.acquire()
+            try:
+                keep_hashes = asyncio.run(run_fast_mode_classification(
+                    batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
+                    session_file=str(pipeline._dirs.sessions / f"r3-af-{_bidx:03d}.jsonl"),
+                    cfg=self.cfg, task_id=self.task_id))
+            finally:
+                pipeline._agent_sem.release()
             keep_set = set(keep_hashes)
             results = []
             for fh, file_hash, file_path in batch:
@@ -3528,13 +3532,19 @@ class SuperFastPipelineEngine:
         return []
 
     def _run_stage_queue(self, dirs, state, file_hash_paths, cc_done_event, r1_finished_flag=None):
-        """用 StageQueuePipeline 跑 R1→Phase1→R3→R4 (纯threading)。"""
+        """用 StageQueuePipeline 跑 R1→api_filter→Phase1→R3→R4 (纯threading, 流水线并行)。
+
+        槽位分离: R1(脚本)用r1_w个worker; LLM阶段(api_filter/Phase1/R3/R4)共享agent_sem(agent_process_limit)。
+        """
         import threading as _th
         from .stage_queue import Stage, StageQueuePipeline
 
         slot = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
         r1_w = max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8')))
         batch_sz = 1000 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+
+        # agent槽位(threading.Semaphore, LLM阶段共享)
+        agent_sem = _th.Semaphore(slot)
 
         stages = [
             Stage("r1", r1_w, self._sq_r1_processor, batch_size=1),
@@ -3548,6 +3558,7 @@ class SuperFastPipelineEngine:
         sqp._dirs = dirs
         sqp._state = state
         sqp._cc_done = cc_done_event
+        sqp._agent_sem = agent_sem  # LLM阶段共享
 
         # CC 在独立线程跑(R1全完成后)
         def _cc_thread():
