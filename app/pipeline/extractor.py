@@ -62,9 +62,10 @@ _TS_AVAILABLE: bool | None = None   # None = 未检测
 _TS_PARSER_C   = None               # C   语言 Parser
 _TS_PARSER_CPP = None               # C++ 语言 Parser
 
-# C++ 源文件扩展名集合
+# C++ 源文件扩展名集合 (.h 可能是 C++ 头文件，用 C++ parser 解析更准确;
+# C++ parser 是 C 超集，纯 C 的 .h 也能正确解析，避免 C parser 把 namespace/class 块误解析为 function_definition)
 _CPP_EXTENSIONS = frozenset({".cc", ".cpp", ".cxx", ".c++", ".C",
-                              ".hh", ".hpp", ".hxx", ".h++"})
+                              ".h", ".hh", ".hpp", ".hxx", ".h++"})
 
 
 def _check_tree_sitter() -> bool:
