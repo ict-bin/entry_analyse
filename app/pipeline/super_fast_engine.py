@@ -3356,8 +3356,11 @@ class SuperFastPipelineEngine:
                               "file": os.path.basename(file_path),
                               "file_hash": file_hash, "callees": callees})
         try:
+            _sc = pipeline._dirs.stage_cwd("sq_phase1")
+            _sc.mkdir(parents=True, exist_ok=True)
+            pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
             keep_hashes = asyncio.run(run_fast_mode_classification(
-                batch=funcs, batch_idx=0, stage_cwd=pipeline._dirs.stage_cwd("sq_phase1"),
+                batch=funcs, batch_idx=0, stage_cwd=_sc,
                 session_file=str(pipeline._dirs.sessions / "sq-phase1.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             keep_set = set(keep_hashes)
@@ -3395,8 +3398,10 @@ class SuperFastPipelineEngine:
                               "file": os.path.basename(file_path),
                               "file_hash": file_hash, "body": body, "callees": callees})
         try:
+            _sc2 = pipeline._dirs.stage_cwd("sq_r3")
+            _sc2.mkdir(parents=True, exist_ok=True)
             analyses = asyncio.run(run_fast_mode_taint_batch(
-                batch=funcs, batch_idx=0, stage_cwd=pipeline._dirs.stage_cwd("sq_r3"),
+                batch=funcs, batch_idx=0, stage_cwd=_sc2,
                 session_file=str(pipeline._dirs.sessions / "sq-r3.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             amap = {str(a.get("func_hash")): a for a in (analyses or []) if isinstance(a, dict)}
