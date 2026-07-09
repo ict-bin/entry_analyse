@@ -101,29 +101,49 @@ def _query_source1_providers(svc_yaml: Any) -> list[dict[str, Any]]:
 
 
 def _query_source2_aliases(svc_yaml: Any) -> list[dict[str, Any]]:
-    """来源 2（网关配置）：从 aigw DB 读 model_aliases（网关可用模型 alias）。"""
+    """来源 2（网关配置）：从 aigw DB 读 model_aliases（网关可用模型 alias）。
+
+    容错: 列不存在/查询失败时返回 [] (不阻断 source1 的 models.json 生成)。
+    """
     gw = getattr(svc_yaml, "ai_gateway", None)
     gw_db = getattr(gw, "database", None) if gw else None
     if gw_db is None or not gw_db.host:
         return []
     import pymysql
-    conn = pymysql.connect(
-        host=gw_db.host, port=int(gw_db.port),
-        user=gw_db.username, password=gw_db.password, database=gw_db.name,
-        read_timeout=10, connect_timeout=10,
-    )
+    try:
+        conn = pymysql.connect(
+            host=gw_db.host, port=int(gw_db.port),
+            user=gw_db.username, password=gw_db.password, database=gw_db.name,
+            read_timeout=10, connect_timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("source2 (aigw) connect failed, skip: %s", exc)
+        return []
     try:
         cur = conn.cursor(pymysql.cursors.DictCursor)
-        cur.execute(
-            "SELECT alias_name, max_tokens_default, enabled "
-            "FROM model_aliases WHERE enabled=1 ORDER BY id"
-        )
+        # 优先查含 max_tokens_default; 列不存在(1054)则降级不含该列
+        try:
+            cur.execute(
+                "SELECT alias_name, max_tokens_default, enabled "
+                "FROM model_aliases WHERE enabled=1 ORDER BY id"
+            )
+        except pymysql.err.OperationalError as oe:
+            if getattr(oe, "args", [None])[0] == 1054:  # Unknown column
+                logger.warning("source2: max_tokens_default 列不存在, 降级查询 alias_name only")
+                cur.execute(
+                    "SELECT alias_name, enabled FROM model_aliases WHERE enabled=1 ORDER BY id"
+                )
+            else:
+                raise
         rows = cur.fetchall() or []
         return [
             {"alias": str(r.get("alias_name") or "").strip(),
              "max_tokens": int(r.get("max_tokens_default") or 0)}
             for r in rows if r.get("alias_name")
         ]
+    except Exception as exc:
+        logger.warning("source2 (aigw) query failed, skip: %s", exc)
+        return []
     finally:
         try:
             conn.close()
