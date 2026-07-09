@@ -201,9 +201,48 @@ class Dispatcher:
                 next(db_gen)
             except StopIteration:
                 pass
+        # 恢复 pending + stale celery_id（worker 死后 cid 残留，pump 只派 cid IS NULL）
+        # cid 不在 active → 清掉让 pump 重派
+        reset += self._recover_pending_stale_cid(active_ids)
         return reset
 
-    # ── debugger 报告泵 + stale ──
+    def _recover_pending_stale_cid(self, active_ids: set[str]) -> int:
+        """pending + celery_task_id IS NOT NULL + cid 不在 active → 清 cid 让 pump 重派。
+
+        场景: worker 收到消息后死（rollout/重启）未来得及 claim，cid 已写但任务仍 pending。
+        pump 只派 pending+cid IS NULL，这些任务会永久 stuck。本方法回收它们。
+        """
+        from app.db import get_db
+        from app.db.models import AppEaTask
+        db_gen = get_db()
+        db = next(db_gen)
+        cleared = 0
+        try:
+            rows = db.query(AppEaTask).filter(
+                AppEaTask.status == "pending",
+                AppEaTask.is_deleted.is_(False),
+                AppEaTask.celery_task_id.is_not(None),
+            ).all()
+            for row in rows:
+                cid = row.celery_task_id
+                if cid in active_ids:
+                    continue  # 仍在队列/worker 中，不碰
+                row.celery_task_id = None
+                row.owner_pod = None
+                row.owner_pod_ip = None
+                row.lease_expires_at = None
+                row.execution_epoch = 0
+                cleared += 1
+                logger.warning("recover pending stale cid task=%s cid=%s (not in active, cleared for re-dispatch)",
+                               row.task_id, cid)
+            if cleared:
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+        return cleared
     def _debug_pump_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -297,6 +336,32 @@ class Dispatcher:
         finally:
             try:
                 next(db_gen)
+            except StopIteration:
+                pass
+        # 恢复 pending + stale cid 的 debug 报告
+        db2_gen = get_db()
+        db2 = next(db2_gen)
+        try:
+            rows = db2.query(AppEaDebugReport).filter(
+                AppEaDebugReport.status == "pending",
+                AppEaDebugReport.is_deleted.is_(False),
+                AppEaDebugReport.celery_task_id.is_not(None),
+            ).all()
+            for row in rows:
+                cid = row.celery_task_id
+                if cid in active_ids:
+                    continue
+                row.celery_task_id = None
+                row.owner_pod = None
+                row.lease_expires_at = None
+                row.execution_epoch = 0
+                reset += 1
+                logger.warning("recover pending stale cid report=%s cid=%s", row.report_id, cid)
+            if reset:
+                db2.commit()
+        finally:
+            try:
+                next(db2_gen)
             except StopIteration:
                 pass
         return reset
