@@ -90,11 +90,13 @@ class StageQueuePipeline:
                     stage.queue.task_done()
                     break
                 batch.append(first)
-                while len(batch) < stage.batch_size:
+                # 等2s让更多item积累(凑满batch_size), 避免每批只1个
+                _deadline = time.monotonic() + 2.0
+                while len(batch) < stage.batch_size and time.monotonic() < _deadline:
                     try:
                         batch.append(stage.queue.get_nowait())
                     except queue.Empty:
-                        break
+                        time.sleep(0.05)
                 try:
                     results = stage.processor(batch, self)
                     if next_q and results:

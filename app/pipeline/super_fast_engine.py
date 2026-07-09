@@ -3368,7 +3368,7 @@ class SuperFastPipelineEngine:
             _bidx = pipeline._next_batch_idx("af")
             keep_hashes = asyncio.run(run_fast_mode_classification(
                 batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
-                session_file=str(pipeline._dirs.sessions / f"sq-af-{_bidx:03d}.jsonl"),
+                session_file=str(pipeline._dirs.sessions / f"r3-af-{_bidx:03d}.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             keep_set = set(keep_hashes)
             results = []
@@ -3414,7 +3414,7 @@ class SuperFastPipelineEngine:
             self._emit("fast_mode_batch_start", batch=_bidx, count=len(funcs))
             keep_hashes = asyncio.run(run_fast_mode_classification(
                 batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
-                session_file=str(pipeline._dirs.sessions / f"sq-phase1-{_bidx:03d}.jsonl"),
+                session_file=str(pipeline._dirs.sessions / f"r3-phase1-{_bidx:03d}.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             keep_set = set(keep_hashes)
             results = []
@@ -3459,7 +3459,7 @@ class SuperFastPipelineEngine:
             _bidx2 = pipeline._next_batch_idx("r3")
             analyses = asyncio.run(run_fast_mode_taint_batch(
                 batch=funcs, batch_idx=_bidx2, stage_cwd=_sc2,
-                session_file=str(pipeline._dirs.sessions / f"sq-r3-{_bidx2:03d}.jsonl"),
+                session_file=str(pipeline._dirs.sessions / f"r3-taint-{_bidx2:03d}.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             amap = {str(a.get("func_hash")): a for a in (analyses or []) if isinstance(a, dict)}
             results = []
