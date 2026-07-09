@@ -100,10 +100,11 @@ class FunctionDB:
     @contextmanager
     def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """获取带 WAL 模式的连接；退出上下文时显式 close，避免 FD 泄漏。"""
-        conn = sqlite3.connect(str(self._path), timeout=30)
+        conn = sqlite3.connect(str(self._path), timeout=120)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=120000")  # 120s busy timeout
             conn.row_factory = sqlite3.Row
             yield conn
             conn.commit()
