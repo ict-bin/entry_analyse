@@ -75,10 +75,12 @@ class StageQueuePipeline:
         return None
 
     def _worker(self, stage: Stage, stage_idx: int):
+        logger.info("StageQueue worker %s[%d] started", stage.name, stage_idx)
         next_q = self._next_queue(stage_idx)
-        while not self._cancelled():
-            # batch 模式: 凑满 batch_size 个 item
-            if stage.batch_size > 1:
+        try:
+            while not self._cancelled():
+                # batch 模式: 凑满 batch_size 个 item
+                if stage.batch_size > 1:
                 batch = []
                 try:
                     first = stage.queue.get(timeout=1)
@@ -137,8 +139,8 @@ class StageQueuePipeline:
                 logger.error("StageQueue %s error: %s", stage.name, exc, exc_info=True)
             finally:
                 stage.queue.task_done()
-
-    def _upstream_done(self, stage_idx: int) -> bool:
+        except Exception as exc:
+            logger.error("StageQueue worker %s[%d] DIED: %s", stage.name, stage_idx, exc, exc_info=True)(self, stage_idx: int) -> bool:
         """上游所有阶段的 queue 是否都空了（粗略判断，不完美但够用）。"""
         for i in range(stage_idx):
             if not self._stages[i].queue.empty():
