@@ -616,21 +616,29 @@ class SuperFastPipelineEngine:
                     pass
 
         def _sync_evt() -> None:
-            """Sync events.jsonl and sessions to NFS for frontend live display."""
+            """Sync events.jsonl + sessions + funcdb to NFS for frontend live display."""
             try:
+                _nfs_run.mkdir(parents=True, exist_ok=True)
                 local_evt = run_dir / "events.jsonl"
                 nfs_evt = _nfs_run / "events.jsonl"
                 if local_evt.exists():
-                    _nfs_run.mkdir(parents=True, exist_ok=True)
                     _shutil.copy2(str(local_evt), str(nfs_evt))
-                # Sync sessions directory
+                # Sync sessions directory (每批独立session文件, 全量拷)
                 local_sessions = run_dir / "sessions"
                 nfs_sessions = _nfs_run / "sessions"
                 if local_sessions.is_dir():
                     nfs_sessions.mkdir(parents=True, exist_ok=True)
                     for f in local_sessions.iterdir():
-                        if f.is_file() and not (nfs_sessions / f.name).exists():
+                        if f.is_file():
                             _shutil.copy2(str(f), str(nfs_sessions / f.name))
+                # Sync funcdb (workspace/r1-functions/*.db) → NFS, 供前端查函数进度
+                local_fdb = run_dir / "workspace" / "r1-functions"
+                nfs_fdb = _nfs_run / "workspace" / "r1-functions"
+                if local_fdb.is_dir():
+                    nfs_fdb.mkdir(parents=True, exist_ok=True)
+                    for f in local_fdb.iterdir():
+                        if f.is_file() and f.suffix == ".db":
+                            _shutil.copy2(str(f), str(nfs_fdb / f.name))
             except Exception:
                 pass
 
