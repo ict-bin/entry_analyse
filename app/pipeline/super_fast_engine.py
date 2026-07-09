@@ -3330,9 +3330,6 @@ class SuperFastPipelineEngine:
                         fn.r2_j_state = NodeState.PASSED
                     if fn.r2_j_state == NodeState.PASSED:
                         results.append((fh, file_hash, file_path))
-                        # emit 进度(兼容前端 r2_j_done)
-                        self._emit("r2_j_done", func_hash=fh, function=fn.name, passed=True, attempt=1)
-            self._emit("r2_script_pass", func_hash=file_hash, function=os.path.basename(file_path), detail="sq_r1")
             return results
         except Exception as exc:
             logger.error("SQ R1 %s: %s", file_hash, exc, exc_info=True)
@@ -3378,6 +3375,7 @@ class SuperFastPipelineEngine:
                     results.append((fh, file_hash, file_path))
             self._emit("fast_mode_batch_done", batch=0, count=len(funcs),
                        keep=len(results), filter=len(funcs)-len(results), total=len(funcs))
+            # 不 emit per-function 事件(避免10w+日志); funcdb 已存 keep/filter
             return results
         except Exception as exc:
             logger.error("SQ Phase1: %s", exc, exc_info=True)
@@ -3429,7 +3427,6 @@ class SuperFastPipelineEngine:
                         except Exception:
                             pass
                     results.append((fh, file_hash, file_path))
-                    self._emit("r3_w_done", func_hash=fh, function=fs.functions[fh].name if fs and fh in fs.functions else "", passed=True)
             return results
         except Exception as exc:
             logger.error("SQ R3: %s", exc, exc_info=True)
@@ -3443,7 +3440,7 @@ class SuperFastPipelineEngine:
             if hasattr(pipeline, '_cc_done') and not pipeline._cc_done.is_set():
                 pipeline._cc_done.wait()
             asyncio.run(self._run_r4_for_func(fh, file_hash, file_path, pipeline._dirs, pipeline._state))
-            self._emit("r4_w_done", func_hash=fh, function="", decision="keep", quick_path=True)
+            # 不 emit per-function 事件; funcdb 已存 r4_decision
         except Exception as exc:
             logger.error("SQ R4 %s: %s", fh, exc, exc_info=True)
         return []
