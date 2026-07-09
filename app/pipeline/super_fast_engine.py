@@ -943,22 +943,22 @@ class SuperFastPipelineEngine:
         ) if self.cfg.fast_mode else None
 
         # ── 后台定期同步 events 到 NFS ──────────────────────────────────
-        async def _periodic_sync() -> None:
-            while not self._cancel.is_set():
-                await asyncio.sleep(15)
+        import threading as _th
+        _sync_stop = _th.Event()
+        def _periodic_sync_thread():
+            while not _sync_stop.is_set() and not self._cancel.is_set():
                 _sync_evt()
-        _sync_task = asyncio.create_task(_periodic_sync())
+                _sync_stop.wait(15)
+        _sync_t = _th.Thread(target=_periodic_sync_thread, name="sq-sync", daemon=True)
+        _sync_t.start()
 
-        await asyncio.gather(
-            _cc_phase(),
-            *[_complete_file_pipeline(fh, fp) for fh, fp in file_hash_paths],
-        )
-        if fm is not None:
-            await fm.flush()
-            _sync_evt()
-        if fm2 is not None:
-            await fm2.flush()
-            _sync_evt()
+        # ── StageQueuePipeline: R1→Phase1→R3→R4 (纯threading, 无gather) ──
+        self._module_files = module_files
+        _cc_done = _th.Event()
+        self._run_stage_queue(dirs, state, file_hash_paths, _cc_done)
+        _sync_stop.set()
+        _sync_evt()
+
         if self._cancel.is_set():
             _move_to_nfs()
             return []
@@ -3313,3 +3313,164 @@ class SuperFastPipelineEngine:
         return (self.cfg.judges.agents[0]
                 if self.cfg.judges.agents
                 else self.cfg.workers.agents[0])
+
+    # ═══ StageQueuePipeline processors (纯threading, 各stage独立) ══════════════
+
+    def _sq_r1_processor(self, item, pipeline):
+        """R1: tree-sitter提取文件函数 → 产函数入Phase1-Queue。"""
+        file_hash, file_path = item
+        try:
+            asyncio.run(self._run_r1(file_hash, file_path, pipeline._dirs, pipeline._state))
+            # fast_mode: 跳R2, 直接标PASSED
+            fs = pipeline._state.files.get(file_hash)
+            results = []
+            if fs:
+                for fh, fn in fs.functions.items():
+                    if getattr(self.cfg, 'fast_mode', False) or getattr(self.cfg, 'super_fast_mode', False):
+                        fn.r2_j_state = NodeState.PASSED
+                    if fn.r2_j_state == NodeState.PASSED:
+                        results.append((fh, file_hash, file_path))
+            return results
+        except Exception as exc:
+            logger.error("SQ R1 %s: %s", file_hash, exc, exc_info=True)
+            return []
+
+    def _sq_phase1_processor(self, batch, pipeline):
+        """Phase1: 批入口分类(20/批) → keep入R3-Queue。"""
+        from .fast_mode_worker import run_fast_mode_classification
+        funcs = []
+        for fh, file_hash, file_path in batch:
+            fs = pipeline._state.files.get(file_hash)
+            if fs and fh in fs.functions:
+                fn = fs.functions[fh]
+                from .fast_mode_collector import extract_callees
+                from .funcdb import FunctionDB as _FDB
+                try:
+                    rec = _FDB.open(pipeline._dirs.r1, file_hash).get_function(fh)
+                    body = (rec.get("body") or "") if rec else ""
+                except Exception:
+                    body = ""
+                callees = extract_callees(body, own_name=fn.name)
+                funcs.append({"func_hash": fh, "name": fn.name,
+                              "signature": fn.signature or fn.name,
+                              "file": os.path.basename(file_path),
+                              "file_hash": file_hash, "callees": callees})
+        try:
+            keep_hashes = asyncio.run(run_fast_mode_classification(
+                batch=funcs, batch_idx=0, stage_cwd=pipeline._dirs.stage_cwd("sq_phase1"),
+                session_file=str(pipeline._dirs.sessions / "sq-phase1.jsonl"),
+                cfg=self.cfg, task_id=self.task_id))
+            keep_set = set(keep_hashes)
+            results = []
+            for fh, file_hash, file_path in batch:
+                if fh in keep_set:
+                    fs = pipeline._state.files.get(file_hash)
+                    if fs and fh in fs.functions:
+                        fs.functions[fh].r4_decision = "keep"
+                        fs.functions[fh].has_external_input = True
+                    results.append((fh, file_hash, file_path))
+            return results
+        except Exception as exc:
+            logger.error("SQ Phase1: %s", exc, exc_info=True)
+            return [(fh, fhash, fp) for fh, fhash, fp in batch]  # 失败保守keep
+
+    def _sq_r3_processor(self, batch, pipeline):
+        """R3: 批taint(20 keep/批) → 入R4-Queue。"""
+        from .fast_mode_worker import run_fast_mode_taint_batch
+        from .funcdb import FunctionDB as _FDB
+        funcs = []
+        for fh, file_hash, file_path in batch:
+            fs = pipeline._state.files.get(file_hash)
+            if fs and fh in fs.functions:
+                fn = fs.functions[fh]
+                try:
+                    rec = _FDB.open(pipeline._dirs.r1, file_hash).get_function(fh)
+                    body = (rec.get("body") or "") if rec else ""
+                except Exception:
+                    body = ""
+                from .fast_mode_collector import extract_callees
+                callees = extract_callees(body, own_name=fn.name)
+                funcs.append({"func_hash": fh, "name": fn.name,
+                              "signature": fn.signature or fn.name,
+                              "file": os.path.basename(file_path),
+                              "file_hash": file_hash, "body": body, "callees": callees})
+        try:
+            analyses = asyncio.run(run_fast_mode_taint_batch(
+                batch=funcs, batch_idx=0, stage_cwd=pipeline._dirs.stage_cwd("sq_r3"),
+                session_file=str(pipeline._dirs.sessions / "sq-r3.jsonl"),
+                cfg=self.cfg, task_id=self.task_id))
+            amap = {str(a.get("func_hash")): a for a in (analyses or []) if isinstance(a, dict)}
+            results = []
+            for fh, file_hash, file_path in batch:
+                a = amap.get(fh, {})
+                if a.get("taints"):
+                    fs = pipeline._state.files.get(file_hash)
+                    if fs and fh in fs.functions:
+                        fn = fs.functions[fh]
+                        fn.entry_role = str(a.get("entry_role") or "").strip() or None
+                        try:
+                            _FDB.open(pipeline._dirs.r1, file_hash).set_analysis(fh, {
+                                "has_external_input": True, "decision": "keep",
+                                "tag": a.get("tag"), "entry_role": a.get("entry_role"),
+                                "taints": a.get("taints"),
+                                "function_description": a.get("function_description"),
+                                "entry_reason": a.get("entry_reason")})
+                        except Exception:
+                            pass
+                    results.append((fh, file_hash, file_path))
+            return results
+        except Exception as exc:
+            logger.error("SQ R3: %s", exc, exc_info=True)
+            return [(fh, fhash, fp) for fh, fhash, fp in batch]
+
+    def _sq_r4_processor(self, item, pipeline):
+        """R4: 判断(等CC完成) → done。"""
+        fh, file_hash, file_path = item
+        try:
+            # 等CC完成
+            if hasattr(pipeline, '_cc_done') and not pipeline._cc_done.is_set():
+                pipeline._cc_done.wait()
+            asyncio.run(self._run_r4_for_func(fh, file_hash, file_path, pipeline._dirs, pipeline._state))
+        except Exception as exc:
+            logger.error("SQ R4 %s: %s", fh, exc, exc_info=True)
+        return []
+
+    def _run_stage_queue(self, dirs, state, file_hash_paths, cc_done_event):
+        """用 StageQueuePipeline 跑 R1→Phase1→R3→R4 (纯threading)。"""
+        import threading as _th
+        from .stage_queue import Stage, StageQueuePipeline
+
+        slot = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
+        r1_w = max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8')))
+        batch_sz = int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+
+        stages = [
+            Stage("r1", r1_w, self._sq_r1_processor, batch_size=1),
+            Stage("phase1", slot, self._sq_phase1_processor, batch_size=batch_sz),
+            Stage("r3", slot, self._sq_r3_processor, batch_size=batch_sz),
+            Stage("r4", slot, self._sq_r4_processor, batch_size=1),
+        ]
+
+        sqp = StageQueuePipeline(stages, on_emit=self._emit, cancel_event=self._cancel)
+        sqp._dirs = dirs
+        sqp._state = state
+        sqp._cc_done = cc_done_event
+
+        # CC 在独立线程跑(R1全完成后)
+        def _cc_thread():
+            # 等R1阶段完成(queue空)
+            stages[0].queue.join()
+            if not self._cancel.is_set():
+                try:
+                    asyncio.run(self._run_callchain_analysis(
+                        dirs, state, self._module_files, file_hash_paths))
+                except Exception as exc:
+                    logger.error("SQ CC: %s", exc, exc_info=True)
+            cc_done_event.set()
+
+        cc_t = _th.Thread(target=_cc_thread, name="sq-cc", daemon=True)
+        cc_t.start()
+
+        sqp.run(file_hash_paths)
+        cc_t.join(timeout=30)
+        return sqp
