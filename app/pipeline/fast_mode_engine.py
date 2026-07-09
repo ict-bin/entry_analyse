@@ -59,8 +59,13 @@ class FastModeBatchProcessor:
         self._lock = threading.Lock()
         self._pending: list[tuple[dict, threading.Event]] = []
         self._results: dict[str, str] = {}  # func_hash -> "keep"|"filter"
-        self._batch_size = max(10, min(
-            int(getattr(cfg, 'fast_mode_batch_size', 20)), 50))
+        if getattr(cfg, 'super_fast_mode', False):
+            # super_fast_mode: 1000个/批（不分20小组），由 idle-flush 在函数到齐后提交
+            self._batch_size = 1000
+            logger.info("fast_mode(super_fast): batch_size=1000(大批不分小组)")
+        else:
+            self._batch_size = max(10, min(
+                int(getattr(cfg, 'fast_mode_batch_size', 20)), 50))
         self._batch_seq = 0
         self._total_collected = 0
         self._total_processed = 0
@@ -82,7 +87,8 @@ class FastModeBatchProcessor:
         self._last_activity = time.monotonic()
         self._stop_flusher = threading.Event()
         self._tail_idle_seconds = max(
-            10, int(os.environ.get('EA_FAST_MODE_TAIL_IDLE_SECONDS', '90')))
+            10, int(os.environ.get('EA_FAST_MODE_TAIL_IDLE_SECONDS',
+                                   '15' if getattr(cfg, 'super_fast_mode', False) else '90')))  # super_fast: 函数到齐后15s提交大batch
         self._flusher_thread = threading.Thread(
             target=self._idle_flush_loop,
             name=f"fm-idle-flush-{task_id[:8]}",
