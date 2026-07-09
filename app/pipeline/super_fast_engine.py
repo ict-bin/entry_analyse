@@ -629,17 +629,15 @@ class SuperFastPipelineEngine:
                     for f in local_sessions.iterdir():
                         if f.is_file():
                             _shutil.copy2(str(f), str(nfs_sessions / f.name))
-                # funcdb: R1完成后才同步(避免R1期间1620+文件全量拷拖慢NFS带宽)
+                # funcdb: R1完成后只同步 functions.db(单文件, 不再1620个per-file db)
                 if _r1_finished[0]:
                     _sync_count[0] += 1
                     if _sync_count[0] % 4 == 0:
-                        local_fdb = run_dir / "workspace" / "r1-functions"
-                        nfs_fdb = _nfs_run / "workspace" / "r1-functions"
-                        if local_fdb.is_dir():
-                            nfs_fdb.mkdir(parents=True, exist_ok=True)
-                            for f in local_fdb.iterdir():
-                                if f.is_file() and f.suffix == ".db":
-                                    _shutil.copy2(str(f), str(nfs_fdb / f.name))
+                        local_agg = run_dir / "workspace" / "r1-functions" / "functions.db"
+                        nfs_agg = _nfs_run / "workspace" / "r1-functions" / "functions.db"
+                        if local_agg.exists():
+                            (_nfs_run / "workspace" / "r1-functions").mkdir(parents=True, exist_ok=True)
+                            _shutil.copy2(str(local_agg), str(nfs_agg))
             except Exception:
                 pass
 
@@ -3326,10 +3324,12 @@ class SuperFastPipelineEngine:
     # ═══ StageQueuePipeline processors (纯threading, 各stage独立) ══════════════
 
     def _sq_r1_processor(self, item, pipeline):
-        """R1: tree-sitter提取文件函数 → 产函数入Phase1-Queue。"""
+        """R1: tree-sitter提取文件函数 → 合入functions.db → 产函数入api_filter-Queue。"""
         file_hash, file_path = item
         try:
             asyncio.run(self._run_r1(file_hash, file_path, pipeline._dirs, pipeline._state))
+            # 合入总functions.db(单文件, 供NFS同步)
+            self._merge_funcdb(file_hash, pipeline._dirs)
             # fast_mode: 跳R2, 直接标PASSED
             fs = pipeline._state.files.get(file_hash)
             results = []
@@ -3343,6 +3343,30 @@ class SuperFastPipelineEngine:
         except Exception as exc:
             logger.error("SQ R1 %s: %s", file_hash, exc, exc_info=True)
             return []
+
+    def _merge_funcdb(self, file_hash: str, dirs) -> None:
+        """将单文件 {file_hash}_functions.db 合入总 functions.db(ATTACH+INSERT)。"""
+        import sqlite3
+        per_file = dirs.r1_functions_db(file_hash)
+        agg = dirs.r1 / "functions.db"
+        if not per_file.exists():
+            return
+        try:
+            conn = sqlite3.connect(str(agg), timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            # 确保表存在
+            from .funcdb import _SCHEMA
+            conn.executescript(_SCHEMA)
+            # ATTACH per-file db + INSERT OR REPLACE
+            conn.execute(f"ATTACH ? AS pf", (str(per_file),))
+            conn.execute("INSERT OR REPLACE INTO functions SELECT * FROM pf.functions")
+            conn.execute("INSERT OR REPLACE INTO file_meta SELECT * FROM pf.file_meta")
+            conn.execute("DETACH pf")
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            logger.warning("merge_funcdb %s failed: %s", file_hash, exc)
 
     def _sq_api_filter_processor(self, batch, pipeline):
         """api_filter: 批签名预筛(batch_size/批, 只看签名) → keep入Phase1-Queue。"""
@@ -3376,7 +3400,7 @@ class SuperFastPipelineEngine:
             for fh, file_hash, file_path in batch:
                 decision = "keep" if fh in keep_set else "filter"
                 try:
-                    _FDB.open(pipeline._dirs.r1, file_hash).set_fast_mode_result(
+                    _FDB(pipeline._dirs.r1 / "functions.db").set_fast_mode_result(
                         fh, decision, 1 if decision == "keep" else 0)
                 except Exception:
                     pass
@@ -3398,7 +3422,7 @@ class SuperFastPipelineEngine:
                 from .fast_mode_collector import extract_callees
                 from .funcdb import FunctionDB as _FDB
                 try:
-                    rec = _FDB.open(pipeline._dirs.r1, file_hash).get_function(fh)
+                    rec = _FDB(pipeline._dirs.r1 / "functions.db").get_function(fh)
                     body = (rec.get("body") or "") if rec else ""
                 except Exception:
                     body = ""
@@ -3444,7 +3468,7 @@ class SuperFastPipelineEngine:
             if fs and fh in fs.functions:
                 fn = fs.functions[fh]
                 try:
-                    rec = _FDB.open(pipeline._dirs.r1, file_hash).get_function(fh)
+                    rec = _FDB(pipeline._dirs.r1 / "functions.db").get_function(fh)
                     body = (rec.get("body") or "") if rec else ""
                 except Exception:
                     body = ""
@@ -3472,7 +3496,7 @@ class SuperFastPipelineEngine:
                         fn = fs.functions[fh]
                         fn.entry_role = str(a.get("entry_role") or "").strip() or None
                         try:
-                            _FDB.open(pipeline._dirs.r1, file_hash).set_analysis(fh, {
+                            _FDB(pipeline._dirs.r1 / "functions.db").set_analysis(fh, {
                                 "has_external_input": True, "decision": "keep",
                                 "tag": a.get("tag"), "entry_role": a.get("entry_role"),
                                 "taints": a.get("taints"),
