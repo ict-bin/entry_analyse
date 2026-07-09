@@ -3359,10 +3359,11 @@ class SuperFastPipelineEngine:
             _sc = pipeline._dirs.stage_cwd("sq_phase1")
             _sc.mkdir(parents=True, exist_ok=True)
             pipeline._dirs.sessions.mkdir(parents=True, exist_ok=True)
-            self._emit("fast_mode_batch_start", batch=0, count=len(funcs))
+            _bidx = pipeline._next_batch_idx("phase1")
+            self._emit("fast_mode_batch_start", batch=_bidx, count=len(funcs))
             keep_hashes = asyncio.run(run_fast_mode_classification(
-                batch=funcs, batch_idx=0, stage_cwd=_sc,
-                session_file=str(pipeline._dirs.sessions / "sq-phase1.jsonl"),
+                batch=funcs, batch_idx=_bidx, stage_cwd=_sc,
+                session_file=str(pipeline._dirs.sessions / f"sq-phase1-{_bidx:03d}.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             keep_set = set(keep_hashes)
             results = []
@@ -3373,7 +3374,7 @@ class SuperFastPipelineEngine:
                         fs.functions[fh].r4_decision = "keep"
                         fs.functions[fh].has_external_input = True
                     results.append((fh, file_hash, file_path))
-            self._emit("fast_mode_batch_done", batch=0, count=len(funcs),
+            self._emit("fast_mode_batch_done", batch=_bidx, count=len(funcs),
                        keep=len(results), filter=len(funcs)-len(results), total=len(funcs))
             # 不 emit per-function 事件(避免10w+日志); funcdb 已存 keep/filter
             return results
@@ -3404,9 +3405,10 @@ class SuperFastPipelineEngine:
         try:
             _sc2 = pipeline._dirs.stage_cwd("sq_r3")
             _sc2.mkdir(parents=True, exist_ok=True)
+            _bidx2 = pipeline._next_batch_idx("r3")
             analyses = asyncio.run(run_fast_mode_taint_batch(
-                batch=funcs, batch_idx=0, stage_cwd=_sc2,
-                session_file=str(pipeline._dirs.sessions / "sq-r3.jsonl"),
+                batch=funcs, batch_idx=_bidx2, stage_cwd=_sc2,
+                session_file=str(pipeline._dirs.sessions / f"sq-r3-{_bidx2:03d}.jsonl"),
                 cfg=self.cfg, task_id=self.task_id))
             amap = {str(a.get("func_hash")): a for a in (analyses or []) if isinstance(a, dict)}
             results = []

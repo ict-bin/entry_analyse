@@ -55,9 +55,18 @@ class StageQueuePipeline:
         self._workers: list[threading.Thread] = []
         self._done = [0] * len(stages)
         self._lock = threading.Lock()
+        self._batch_counters: dict[str, int] = {}
 
     def _cancelled(self) -> bool:
         return self._stop.is_set() or self._cancel.is_set()
+
+    def _next_batch_idx(self, stage_name: str) -> int:
+        """Thread-safe batch counter per stage."""
+        with self._lock:
+            self._batch_counters.setdefault(stage_name, 0)
+            idx = self._batch_counters[stage_name]
+            self._batch_counters[stage_name] = idx + 1
+            return idx
 
     def _next_queue(self, stage_idx: int) -> queue.Queue | None:
         """下一阶段的 queue（最后一阶段返回 None）。"""
