@@ -1763,6 +1763,37 @@ class SuperFastPipelineEngine:
                     if not has_input and not func_state.r4_decision:
                         func_state.r4_decision = "filter"
                     if has_input and decision != "filter":
+                        # ── Phase 2: taint 分析（同 session 第二轮）──────────────
+                        # Phase 1 (build_r3_w_prompt) 只问 has_external_input, 无 taints;
+                        # keep 入口需 Phase 2 (build_r3_w_taint_prompt) 获取 taints/entry_role 等
+                        if not analysis.get("taints"):
+                            try:
+                                _taint_prompt = P.build_r3_w_taint_prompt(
+                                    func_hash=func_hash, func_name=func_state.name,
+                                    signature=func_state.signature,
+                                    start_line=func_state.start_line, end_line=func_state.end_line,
+                                    file_path=file_path,
+                                )
+                                _ar2 = await self._call_agent(
+                                    prompt=_taint_prompt, system_prompt=sys_prompt,
+                                    session_file=session_file, cwd=str(dirs.stage_cwd("r3_w")),
+                                    context=f"r3_w_taint:{func_hash}", acfg=acfg,
+                                    priority=SemPriority.R3_W,
+                                )
+                                _analysis2 = _parse_r2_analysis(_ar2.output)
+                                if _analysis2 is not None:
+                                    # Phase 2 返回完整 analysis(含 taints/entry_role/tag/decision), 合并
+                                    analysis.update({k: v for k, v in _analysis2.items() if v})
+                                    _d2 = str(_analysis2.get("decision") or "").lower().strip()
+                                    if _d2:
+                                        func_state.r4_decision = _d2
+                                        if _d2 == "filter":
+                                            # Phase 2 改判 filter, 跳过 taint 门禁
+                                            func_state.has_external_input = False
+                                    logger.info("R3-W Phase2 taint done %s: taints=%s",
+                                                func_state.name, analysis.get("taints"))
+                            except Exception as _e:
+                                logger.warning("R3-W Phase2 taint failed %s: %s", func_hash, _e)
                         from ..functions_list import VALID_ENTRY_ROLES
                         role = str(analysis.get("entry_role") or "").strip()
                         # entry_role=unknown/空时，尝试从 CC 图推导角色（CC 已建图时）
