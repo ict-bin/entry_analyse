@@ -95,12 +95,16 @@ class StageQueuePipeline:
                     except queue.Empty:
                         time.sleep(0.05)
                 try:
+                    if self._done[stage_idx] < 3:
+                        logger.info("StageQueue %s: got batch of %d, calling processor", stage.name, len(batch))
                     results = stage.processor(batch, self)
                     if next_q and results:
                         for r in results:
                             next_q.put(r)
                     with self._lock:
                         self._done[stage_idx] += len(batch)
+                        if self._done[stage_idx] <= 3 or self._done[stage_idx] % 100 == 0:
+                            logger.info("StageQueue %s batch: done=%d, results=%d", stage.name, self._done[stage_idx], len(results) if results else 0)
                 except Exception as exc:
                     logger.error("StageQueue %s batch error: %s", stage.name, exc, exc_info=True)
                 finally:
