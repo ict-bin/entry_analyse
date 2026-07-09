@@ -615,15 +615,13 @@ class SuperFastPipelineEngine:
                 except Exception:
                     pass
 
+        _sync_count = [0]
+        _r1_finished = [False]
         def _sync_evt() -> None:
-            """Sync events.jsonl + sessions + funcdb to NFS for frontend live display."""
+            """Sync sessions(15s) + funcdb(60s, R1完成后) to NFS."""
             try:
                 _nfs_run.mkdir(parents=True, exist_ok=True)
-                local_evt = run_dir / "events.jsonl"
-                nfs_evt = _nfs_run / "events.jsonl"
-                if local_evt.exists():
-                    _shutil.copy2(str(local_evt), str(nfs_evt))
-                # Sync sessions directory (每批独立session文件, 全量拷)
+                # sessions 全量拷
                 local_sessions = run_dir / "sessions"
                 nfs_sessions = _nfs_run / "sessions"
                 if local_sessions.is_dir():
@@ -631,14 +629,17 @@ class SuperFastPipelineEngine:
                     for f in local_sessions.iterdir():
                         if f.is_file():
                             _shutil.copy2(str(f), str(nfs_sessions / f.name))
-                # Sync funcdb (workspace/r1-functions/*.db) → NFS, 供前端查函数进度
-                local_fdb = run_dir / "workspace" / "r1-functions"
-                nfs_fdb = _nfs_run / "workspace" / "r1-functions"
-                if local_fdb.is_dir():
-                    nfs_fdb.mkdir(parents=True, exist_ok=True)
-                    for f in local_fdb.iterdir():
-                        if f.is_file() and f.suffix == ".db":
-                            _shutil.copy2(str(f), str(nfs_fdb / f.name))
+                # funcdb: R1完成后才同步(避免R1期间1620+文件全量拷拖慢NFS带宽)
+                if _r1_finished[0]:
+                    _sync_count[0] += 1
+                    if _sync_count[0] % 4 == 0:
+                        local_fdb = run_dir / "workspace" / "r1-functions"
+                        nfs_fdb = _nfs_run / "workspace" / "r1-functions"
+                        if local_fdb.is_dir():
+                            nfs_fdb.mkdir(parents=True, exist_ok=True)
+                            for f in local_fdb.iterdir():
+                                if f.is_file() and f.suffix == ".db":
+                                    _shutil.copy2(str(f), str(nfs_fdb / f.name))
             except Exception:
                 pass
 
@@ -963,7 +964,7 @@ class SuperFastPipelineEngine:
         # ── StageQueuePipeline: R1→Phase1→R3→R4 (纯threading, 无gather) ──
         self._module_files = module_files
         _cc_done = _th.Event()
-        self._run_stage_queue(dirs, state, file_hash_paths, _cc_done)
+        self._run_stage_queue(dirs, state, file_hash_paths, _cc_done, r1_finished_flag=_r1_finished)
         _sync_stop.set()
         _sync_evt()
 
@@ -3498,7 +3499,7 @@ class SuperFastPipelineEngine:
             logger.error("SQ R4 %s: %s", fh, exc, exc_info=True)
         return []
 
-    def _run_stage_queue(self, dirs, state, file_hash_paths, cc_done_event):
+    def _run_stage_queue(self, dirs, state, file_hash_paths, cc_done_event, r1_finished_flag=None):
         """用 StageQueuePipeline 跑 R1→Phase1→R3→R4 (纯threading)。"""
         import threading as _th
         from .stage_queue import Stage, StageQueuePipeline
@@ -3524,6 +3525,8 @@ class SuperFastPipelineEngine:
         def _cc_thread():
             # 等R1阶段完成(queue空)
             stages[0].queue.join()
+            if r1_finished_flag is not None:
+                r1_finished_flag[0] = True
             if not self._cancel.is_set():
                 try:
                     asyncio.run(self._run_callchain_analysis(
