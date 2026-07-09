@@ -83,14 +83,11 @@ class StageQueuePipeline:
                 try:
                     first = stage.queue.get(timeout=1)
                 except queue.Empty:
-                    if self._upstream_done(stage_idx) and stage.queue.empty():
-                        break
-                    continue
+                    continue  # 不break, 只等None哨兵
                 if first is None:
                     stage.queue.task_done()
                     break
                 batch.append(first)
-                # 等2s让更多item积累(凑满batch_size), 避免每批只1个
                 _deadline = time.monotonic() + 2.0
                 while len(batch) < stage.batch_size and time.monotonic() < _deadline:
                     try:
@@ -115,9 +112,7 @@ class StageQueuePipeline:
             try:
                 item = stage.queue.get(timeout=1)
             except queue.Empty:
-                if self._upstream_done(stage_idx) and stage.queue.empty():
-                    break
-                continue
+                continue  # 不break, 只等None哨兵
             if item is None:
                 stage.queue.task_done()
                 break
