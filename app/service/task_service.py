@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import tempfile
 import time as _time
 import uuid
@@ -519,6 +520,14 @@ def _safe_create_task_event(db: Session, **kwargs: Any) -> None:
         try:
             if nested.is_active:
                 nested.rollback()
+        except Exception:
+            pass
+        # 连接丢失(MySQL read/write timeout)时 savepoint rollback 救不回死连接;
+        # 回滚整个 session 释放死连接, 下次查询从 pool 取新连接(pool_pre_ping 会 ping)
+        from sqlalchemy.exc import OperationalError as _OpErr
+        try:
+            if isinstance(sys.exc_info()[1], _OpErr):
+                db.rollback()
         except Exception:
             pass
 
