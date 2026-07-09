@@ -121,6 +121,10 @@ class StageQueuePipeline:
                 if next_q and results:
                     for r in results:
                         next_q.put(r)
+                    if self._done[stage_idx] < 5 or self._done[stage_idx] % 200 == 0:
+                        logger.info("StageQueue %s: processed=%d → put %d items to %s",
+                                    stage.name, self._done[stage_idx]+1, len(results),
+                                    self._stages[stage_idx+1].name if stage_idx+1 < len(self._stages) else "done")
                 with self._lock:
                     self._done[stage_idx] += 1
                     if self._done[stage_idx] % 100 == 0:
