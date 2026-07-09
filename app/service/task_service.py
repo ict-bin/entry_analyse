@@ -2966,7 +2966,10 @@ class TaskService:
         return result
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
-        """软删除任务记录，可选同步删除输出目录下的任务文件。运行中任务自动先取消后删除（无条件删除）。"""
+        """硬删除任务：删除全部 DB 记录 + 可选删除文件。运行中任务自动先取消后删除（无条件删除）。
+
+        删除范围：AppEaTask + AppEaTaskEvent + AppEaStageResultIndex + AppEaTaskCommand + AppEaDebugReport + 任务目录。
+        """
         import shutil as _shutil
         from fastapi import HTTPException
         row = (
@@ -2978,9 +2981,10 @@ class TaskService:
         if row is None:
             return {"deleted_event_count": 0}
         task_roots = _task_runtime_roots(row)
-        if row.is_deleted:
-            return {"deleted_event_count": 0}
-        if row.status == "running":
+        _project_id = row.project_id
+        _output_path = row.output_path
+        _was_running = row.status == "running"
+        if _was_running:
             # 无条件删除：运行中任务先自动取消（revoke+killpg）再继续删除
             row.cancel_requested = True
             row.cancel_requested_at = row.cancel_requested_at or now_local()
@@ -2993,42 +2997,22 @@ class TaskService:
                 )
             except Exception as _exc:
                 logger.warning("delete_task: pi cleanup during auto-cancel for %s: %s", row.task_id, _exc)
-            row.status = "cancelled"
-            row.finished_at = now_local()
-            row.celery_task_id = None
-            row.owner_pod = None
-            row.lease_expires_at = None
-            row.execution_epoch = 0
-            _safe_create_task_event(
-                db, task_id=row.task_id, project_id=row.project_id,
-                event_type="task_cancel_requested",
-                message="删除运行中任务，自动触发取消",
-                source=TASK_EVENT_SOURCE_EA, status="cancelled",
-                payload={"reason": "delete_running"},
-                dedupe_key=_event_dedupe_key(row.task_id, "task_cancel_requested", row.updated_at, "delete"),
-            )
-            db.commit()
-            db.refresh(row)
-        row.is_deleted = True
-        db.commit()
-        cleanup: dict[str, Any] = {
-            "deleted_event_count": 0,
-            "timeline_cleanup_status": "skipped",
-            "file_cleanup_status": "skipped",
-            "task_visibility": "deleted",
-        }
+        # best-effort 清理残留 pi/node
         try:
             cleanup_task_pi_processes(
-                logger.warning,
-                label="ea_delete_task",
-                task_id=row.task_id,
-                task_roots=task_roots,
+                logger.warning, label="ea_delete_task",
+                task_id=row.task_id, task_roots=task_roots,
             )
         except Exception as exc:
             logger.warning("task-scoped pi cleanup failed during delete for %s: %s", row.task_id, exc)
-        _force_kill_all_worker_pi(task_id=row.task_id, reason="api_delete")
-        if delete_files and row.output_path:
-            task_dir = os.path.join(row.output_path, task_id)
+        # 删除文件产物（任务目录）
+        cleanup: dict[str, Any] = {
+            "deleted_event_count": 0,
+            "file_cleanup_status": "skipped",
+            "db_cleanup_status": "skipped",
+        }
+        if delete_files and _output_path:
+            task_dir = os.path.join(_output_path, task_id)
             if os.path.isdir(task_dir):
                 try:
                     _shutil.rmtree(task_dir)
@@ -3038,30 +3022,48 @@ class TaskService:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
                     cleanup["file_cleanup_status"] = "failed"
                     cleanup["file_cleanup_error"] = str(_e)
-                if os.path.exists(task_dir):
-                    cleanup["file_cleanup_status"] = "failed"
-                    cleanup["file_cleanup_error"] = f"任务目录删除失败，目录仍然存在: {task_dir}"
-        _safe_create_task_event(
-            db,
-            task_id=row.task_id,
-            project_id=row.project_id,
-            event_type="task_deleted",
-            message="任务已删除",
-            source=TASK_EVENT_SOURCE_EA,
-            status=row.status,
-            payload={"delete_files": bool(delete_files)},
-            dedupe_key=_event_dedupe_key(row.task_id, "task_deleted", row.updated_at, delete_files),
-        )
+        # ── 硬删除全部 DB 记录 ──────────────────────────────────────
         try:
-            deleted_event_count = _clear_task_timeline_with_retry(db, row)
+            # 1. 诊断报告（含其事件）
+            debug_reports = (
+                db.query(AppEaDebugReport)
+                .filter(AppEaDebugReport.task_id == task_id)
+                .all()
+            )
+            for rpt in debug_reports:
+                _revoke_debug_celery_task(rpt)
+            db.query(AppEaDebugReport).filter(
+                AppEaDebugReport.task_id == task_id
+            ).delete(synchronize_session=False)
+            # 2. 命令队列
+            db.query(AppEaTaskCommand).filter(
+                AppEaTaskCommand.task_id == task_id
+            ).delete(synchronize_session=False)
+            # 3. 阶段结果索引
+            db.query(AppEaStageResultIndex).filter(
+                AppEaStageResultIndex.task_id == task_id
+            ).delete(synchronize_session=False)
+            # 4. 事件时间线
+            deleted_event_count = (
+                db.query(AppEaTaskEvent)
+                .filter(AppEaTaskEvent.task_id == task_id)
+                .delete(synchronize_session=False)
+            )
             cleanup["deleted_event_count"] = deleted_event_count
-            cleanup["timeline_cleanup_status"] = "deleted"
-        except OperationalError as exc:
+            # 5. 任务行本身
+            db.query(AppEaTask).filter(
+                AppEaTask.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.commit()
+            cleanup["db_cleanup_status"] = "deleted"
+            log_event(logger, logging.INFO, "task hard-deleted",
+                      event="task_deleted", task_id=task_id, project_id=_project_id,
+                      deleted_events=deleted_event_count, delete_files=bool(delete_files))
+        except Exception as exc:
             db.rollback()
-            cleanup["timeline_cleanup_status"] = "failed_ignored"
-            cleanup["timeline_cleanup_error"] = str(exc)
-            logger.warning("delete_task: timeline cleanup failed but task is already invisible: task_id=%s error=%s", row.task_id, exc)
-        db.commit()
+            cleanup["db_cleanup_status"] = "failed_ignored"
+            cleanup["db_cleanup_error"] = str(exc)
+            logger.warning("delete_task: DB hard-delete failed (files already removed): task_id=%s error=%s", task_id, exc)
         return cleanup
 
     def _get_or_404(self, db: Session, task_id: str) -> AppEaTask:
