@@ -2435,7 +2435,7 @@ class TaskService:
         if not db_path.is_file():
             return {"items": [], "total": 0, "offset": offset, "limit": limit}
         try:
-            fdb = _FDB(r1_dir, "")
+            fdb = _FDB(r1_dir / "functions.db")
             return fdb.list_functions_paginated(
                 offset=offset, limit=limit, decision_filter=decision_filter)
         except Exception as exc:

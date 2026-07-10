@@ -617,6 +617,7 @@ class SuperFastPipelineEngine:
 
         _sync_count = [0]
         _r1_finished = [False]
+        _r1_save_counter = [0]
         def _sync_evt() -> None:
             """Sync sessions(15s) + funcdb(60s, R1完成后) to NFS."""
             try:
@@ -629,15 +630,14 @@ class SuperFastPipelineEngine:
                     for f in local_sessions.iterdir():
                         if f.is_file():
                             _shutil.copy2(str(f), str(nfs_sessions / f.name))
-                # funcdb: R1完成后只同步 functions.db(单文件, 不再1620个per-file db)
-                if _r1_finished[0]:
-                    _sync_count[0] += 1
-                    if _sync_count[0] % 4 == 0:
-                        local_agg = run_dir / "workspace" / "r1-functions" / "functions.db"
-                        nfs_agg = _nfs_run / "workspace" / "r1-functions" / "functions.db"
-                        if local_agg.exists():
-                            (_nfs_run / "workspace" / "r1-functions").mkdir(parents=True, exist_ok=True)
-                            _shutil.copy2(str(local_agg), str(nfs_agg))
+                # funcdb: 每60s同步functions.db(R1期间也同步, 让API能查到进度)
+                _sync_count[0] += 1
+                if _sync_count[0] % 4 == 0:
+                    local_agg = run_dir / "workspace" / "r1-functions" / "functions.db"
+                    nfs_agg = _nfs_run / "workspace" / "r1-functions" / "functions.db"
+                    if local_agg.exists():
+                        (_nfs_run / "workspace" / "r1-functions").mkdir(parents=True, exist_ok=True)
+                        _shutil.copy2(str(local_agg), str(nfs_agg))
             except Exception:
                 pass
 
@@ -1283,7 +1283,10 @@ class SuperFastPipelineEngine:
                 )
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
-            state.save(dirs.state_file)
+            # state.save 改为每100文件一次(避免O(n²)序列化整个state拖慢R1)
+            _r1_save_counter[0] += 1
+            if _r1_save_counter[0] % 100 == 0:
+                state.save(dirs.state_file)
             logger.info("R1_pass(super_fast): file=%s funcs=%s", basename, len(static_funcs))
         except Exception as exc:
             logger.error("R1 failed for %s: %s", file_path, exc)
@@ -3560,7 +3563,7 @@ class SuperFastPipelineEngine:
         slot = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
         r1_w = max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8')))
         # batch_size 分离: api_filter(签名级,大批) vs Phase1/R3(函数体级,小批)
-        af_batch = 1000 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+        af_batch = 500 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
         body_batch = int(getattr(self.cfg, 'fast_mode_batch_size', 20))  # Phase1/R3 始终小批(函数体分析)
 
         # agent槽位(threading.Semaphore, LLM阶段共享)
