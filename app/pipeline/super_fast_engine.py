@@ -3559,7 +3559,7 @@ class SuperFastPipelineEngine:
         slot = int(getattr(self.cfg, 'agent_process_limit', 8) or 8)
         r1_w = max(1, int(os.environ.get('EA_R1_CONCURRENCY', '8')))
         # batch_size 分离: api_filter(签名级,大批) vs Phase1/R3(函数体级,小批)
-        af_batch = 500 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
+        af_batch = 300 if getattr(self.cfg, 'super_fast_mode', False) else int(getattr(self.cfg, 'fast_mode_batch_size', 20))
         body_batch = int(getattr(self.cfg, 'fast_mode_batch_size', 20))  # Phase1/R3 始终小批(函数体分析)
 
         # agent槽位(threading.Semaphore, LLM阶段共享)
