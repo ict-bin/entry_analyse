@@ -56,7 +56,6 @@ class StageQueuePipeline:
         self._done = [0] * len(stages)
         self._lock = threading.Lock()
         self._batch_counters: dict[str, int] = {}
-        self._stop = threading.Event()
 
     def _cancelled(self) -> bool:
         return self._stop.is_set() or (self._cancel and self._cancel.is_set())
@@ -82,6 +81,7 @@ class StageQueuePipeline:
                 # ── batch 模式 ──
                 if stage.batch_size > 1:
                     batch = []
+                    _should_exit = False  # ← 收到None后, 处理完当前batch要退出
                     try:
                         first = stage.queue.get(timeout=1)
                     except queue.Empty:
@@ -95,34 +95,33 @@ class StageQueuePipeline:
                         try:
                             _extra = stage.queue.get_nowait()
                             if _extra is None:
-                                # None哨兵被get_nowait取到: task_done后退出
+                                # None被get_nowait取到: task_done, 标记退出
                                 stage.queue.task_done()
+                                _should_exit = True
                                 break
                             batch.append(_extra)
                         except queue.Empty:
                             time.sleep(0.05)
-                    # 如果在accumulate时收到None, 直接处理当前batch后退出
-                    _got_none = len(batch) < stage.batch_size and time.monotonic() >= _deadline
-                    # (上面break退出while时不会触发_deadline检查, 需要单独标记)
-                    # 简化: 如果batch为空且已收到None, 直接continue
-                    if not batch:
-                        continue
-                    try:
-                        if self._done[stage_idx] < 3:
-                            logger.info("StageQueue %s: got batch of %d, calling processor", stage.name, len(batch))
-                        results = stage.processor(batch, self)
-                        if next_q and results:
-                            for r in results:
-                                next_q.put(r)
-                        with self._lock:
-                            self._done[stage_idx] += len(batch)
-                            if self._done[stage_idx] <= 3 or self._done[stage_idx] % 100 == 0:
-                                logger.info("StageQueue %s batch: done=%d, results=%d", stage.name, self._done[stage_idx], len(results) if results else 0)
-                    except Exception as exc:
-                        logger.error("StageQueue %s batch error: %s", stage.name, exc, exc_info=True)
-                    finally:
-                        for _ in batch:
-                            stage.queue.task_done()
+                    if batch:
+                        try:
+                            if self._done[stage_idx] < 3:
+                                logger.info("StageQueue %s: got batch of %d, calling processor", stage.name, len(batch))
+                            results = stage.processor(batch, self)
+                            if next_q and results:
+                                for r in results:
+                                    next_q.put(r)
+                            with self._lock:
+                                self._done[stage_idx] += len(batch)
+                                if self._done[stage_idx] <= 3 or self._done[stage_idx] % 100 == 0:
+                                    logger.info("StageQueue %s batch: done=%d, results=%d", stage.name, self._done[stage_idx], len(results) if results else 0)
+                        except Exception as exc:
+                            logger.error("StageQueue %s batch error: %s", stage.name, exc, exc_info=True)
+                        finally:
+                            for _ in batch:
+                                stage.queue.task_done()
+                    # 收到过None → 处理完batch后直接退出, 不回while
+                    if _should_exit:
+                        break
                     continue
 
                 # ── 逐项模式 ──
@@ -174,8 +173,8 @@ class StageQueuePipeline:
                 self._workers.append(t)
 
         for idx, stage in enumerate(self._stages):
-            # Stage 0(R1): 用_done计数器(已知total); 后续stage: join(timeout)+done fallback
             if idx == 0:
+                # Stage 0: 用_done计数器(已知total)
                 while True:
                     with self._lock:
                         d = self._done[0]
@@ -184,15 +183,10 @@ class StageQueuePipeline:
                     time.sleep(1.0)
                 logger.info("StageQueue %s: all %d items done", stage.name, total)
             else:
-                # 后续stage: join带timeout, 超时则检查worker是否还活跃(全None退出=done)
-                while not self._stop.is_set():
-                    try:
-                        stage.queue.join()
-                        break
-                    except Exception:
-                        break
-                # join可能不返回(同R1的task_done计数bug), 用worker存活检查兜底
-                # (workers退出后队列自然空, 可发None)
+                # 后续stage: 用queue.join()等待(有None哨兵保证退出)
+                stage.queue.join()
+                logger.info("StageQueue %s: queue joined, done=%d", stage.name, self._done[idx])
+            # 向下一阶段发None哨兵
             if idx + 1 < len(self._stages):
                 for _ in range(self._stages[idx + 1].worker_count):
                     self._stages[idx + 1].queue.put(None)

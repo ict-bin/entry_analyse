@@ -186,7 +186,7 @@ async def _run_phase1_classification(
         if parse_attempt < max_parse_retries:
             logger.warning("phase1 batch %d attempt %d: unparseable, retrying",
                           batch_idx, parse_attempt)
-            current_prompt = prompt + _PARSE_FEEDBACK + f"\n(第 {parse_attempt} 次重试)"
+            current_prompt = _PARSE_FEEDBACK + f"\n(第 {parse_attempt} 次重试)"
         else:
             logger.warning("phase1 batch %d: unparseable after %d, keeping all %d",
                           batch_idx, max_parse_retries, len(batch))
@@ -325,9 +325,9 @@ async def run_fast_mode_classification(
                 "fast_mode batch %d attempt %d: unparseable output, retrying with feedback",
                 batch_idx, parse_attempt,
             )
+            # 重试只发feedback短消息(pi session已有第一次完整prompt, 不重发全部签名)
             current_prompt = (
-                prompt
-                + _PARSE_FEEDBACK
+                _PARSE_FEEDBACK
                 + f"\n(第 {parse_attempt} 次重试)"
             )
         else:
@@ -419,7 +419,7 @@ async def run_fast_mode_taint_batch(
                         batch_idx, len(parsed), len(batch), parse_attempt)
             return parsed
         if parse_attempt < max_parse_retries:
-            current_prompt = prompt + f"\n(第{parse_attempt}次重试, 请输出合法JSON数组)"
+            current_prompt = f"\n(第{parse_attempt}次重试, 请输出合法JSON数组)"
         else:
             logger.warning("fast_mode taint batch %d: unparseable after %d, returning empty", batch_idx, max_parse_retries)
             return []
