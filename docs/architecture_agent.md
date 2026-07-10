@@ -571,8 +571,8 @@ DATE_TAG formula (used for image tagging):
   Example: 20260527-163152-7bb63b6
 
 IMAGE_TAGS produced by CI:
-  ghcr.io/runshine/secflow-app-entry-analyse:latest
-  ghcr.io/runshine/secflow-app-entry-analyse:<DATE_TAG>
+  ghcr.io/gaiasechw/secflow-app-entry-analyse:latest
+  ghcr.io/gaiasechw/secflow-app-entry-analyse:<DATE_TAG>
 
 ---
 ## POD_DEPLOYMENT
@@ -603,7 +603,7 @@ STEP 2: Calculate new DATE_TAG from the triggering commit sha
   "
 
 STEP 3: Update deployment images
-  NEW_IMAGE="ghcr.io/runshine/secflow-app-entry-analyse:<DATE_TAG>"
+  NEW_IMAGE="ghcr.io/gaiasechw/secflow-app-entry-analyse:<DATE_TAG>"
   kubectl set image deployment/secflow-app-entry-analyse \
     secflow-app-entry-analyse=$NEW_IMAGE -n secflow-ns
   kubectl set image deployment/secflow-app-entry-analyse-worker \
