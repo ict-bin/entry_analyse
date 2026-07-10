@@ -1,16 +1,47 @@
-ARG SECFLOW_PI_AGENT_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602
-FROM ${SECFLOW_PI_AGENT_RUNTIME_IMAGE}
+# ═══ 独立构建：从公共镜像开始，不依赖外部私有 base image ═══════════════════
+FROM public.ecr.aws/docker/library/python:3.11-slim AS base
 
 ARG SECFLOW_BUILD_VERSION=""
-ENV PYTHONUNBUFFERED=1
+ARG PI_NPM_PACKAGE=@earendil-works/pi-coding-agent
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Shanghai \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}" \
+    PI_CODING_AGENT_DIR=/root/.pi/agent
+
+# ── 系统依赖（python311-runtime + pi-agent-runtime + entry-analyse 合并）──
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        ripgrep \
+        tini \
+        tzdata \
+        gnupg \
         bubblewrap \
         procps \
         sqlite3 \
         universal-ctags \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo "${TZ}" > /etc/timezone \
+    && python -m venv "${VIRTUAL_ENV}"
+
+# ── Node.js + pi coding agent ─────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "${PI_NPM_PACKAGE}" \
+    && mkdir -p "${PI_CODING_AGENT_DIR}/bin" "${PI_CODING_AGENT_DIR}/skills" \
+    && ln -sf "$(command -v rg)" "${PI_CODING_AGENT_DIR}/bin/rg"
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
 WORKDIR /opt/entry_analyse
@@ -28,7 +59,6 @@ RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/
     && chmod +x .pi/skills/write-entry-list-json/scripts/validate_entry_list.py 2>/dev/null || true
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
-ENV PI_CODING_AGENT_DIR=/root/.pi/agent
 RUN mkdir -p /root/.pi/agent
 
 # ═══ 挂载点 ═══════════════════════════════════════════════════════════════════
@@ -56,4 +86,3 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认 REST API，覆盖: python3 cli.py "分析xxx模块的外部入口"
 CMD ["./scripts/start-with-probe.sh", "python3", "main.py"]
-# retrigger

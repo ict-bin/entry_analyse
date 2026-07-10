@@ -2221,7 +2221,7 @@ class SuperFastPipelineEngine:
 
         state.cc_state = NodeState.RUNNING
         state.cc_attempts += 1
-        await run_in_script_thread(state.save, dirs.state_file)
+        # 不调 state.save (同R1: resume已移除, O(n)序列化整个state拖慢)
         self._emit("callchain_start", attempt=state.cc_attempts)
 
         try:
@@ -2255,7 +2255,7 @@ class SuperFastPipelineEngine:
 
             cc_stats = cc_db.stats()
             state.cc_state = NodeState.PASSED
-            await run_in_script_thread(state.save, dirs.state_file)
+            # 不调 state.save
             self._emit("callchain_done",
                        nodes=cc_stats["nodes"],
                        edges=cc_stats["edges"],
@@ -2264,7 +2264,7 @@ class SuperFastPipelineEngine:
         except Exception as exc:
             logger.warning("CC analysis failed (non-fatal): %s", exc)
             state.cc_state = NodeState.FAILED
-            await run_in_script_thread(state.save, dirs.state_file)
+            # 不调 state.save
             self._emit("callchain_failed", error=str(exc)[:200])
 
     async def _run_entry_classification(
