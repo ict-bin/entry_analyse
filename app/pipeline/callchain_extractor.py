@@ -374,23 +374,26 @@ def collect_known_funcs_from_dbs(
     """
     from .funcdb import FunctionDB
 
-    known_funcs: dict[str, dict] = {}
-    file_hash_map: dict[str, str] = {}
+    # 构建 file_hash_map
+    file_hash_map = {file_path: file_hash for file_hash, file_path in file_hash_paths}
 
-    for file_hash, file_path in file_hash_paths:
-        file_hash_map[file_path] = file_hash
-        try:
-            db = FunctionDB.open(r1_dir, file_hash)
-            for meta in db.get_all_meta():
-                fh = meta.get("func_hash")
-                if fh:
-                    known_funcs[fh] = {
-                        **meta,
-                        "file_hash": file_hash,
-                        "file_path": file_path,
-                    }
-        except Exception as exc:
-            logger.warning("Cannot read funcdb for %s: %s", file_hash, exc)
+    # 只打开一次 DB，读全部函数一次（不再逐文件读全表）
+    hash_to_path = {fh: fp for fh, fp in file_hash_paths}
+    db = FunctionDB.open(r1_dir, "")
+    all_metas = db.get_all_meta()
+
+    known_funcs: dict[str, dict] = {}
+    for meta in all_metas:
+        fh = meta.get("func_hash")
+        if not fh:
+            continue
+        file_hash = meta.get("file_hash", "")
+        file_path = hash_to_path.get(file_hash, "")
+        known_funcs[fh] = {
+            **meta,
+            "file_hash": file_hash,
+            "file_path": file_path,
+        }
 
     logger.debug("collect_known_funcs: %d functions from %d files",
                  len(known_funcs), len(file_hash_paths))
