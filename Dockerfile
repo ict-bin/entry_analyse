@@ -1,5 +1,5 @@
-# ═══ 独立构建：从公共镜像开始，不依赖外部私有 base image ═══════════════════
-FROM public.ecr.aws/docker/library/python:3.11-slim AS base
+# ═══ 独立构建：从完整 Python 镜像开始，不依赖外部私有 base image ══════════
+FROM public.ecr.aws/docker/library/python:3.11 AS base
 
 ARG SECFLOW_BUILD_VERSION=""
 ARG PI_NPM_PACKAGE=@earendil-works/pi-coding-agent
@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}" \
     PI_CODING_AGENT_DIR=/root/.pi/agent
 
-# ── 系统依赖（python311-runtime + pi-agent-runtime + entry-analyse 合并）──
+# ── 系统依赖（完整调试工具链）──────────────────────────────────────
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -25,8 +25,21 @@ RUN apt-get update \
         gnupg \
         bubblewrap \
         procps \
+        psmisc \
         sqlite3 \
         universal-ctags \
+        iproute2 \
+        iputils-ping \
+        dnsutils \
+        net-tools \
+        lsof \
+        strace \
+        gdb \
+        vim \
+        less \
+        tree \
+        htop \
+        file \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && echo "${TZ}" > /etc/timezone \
