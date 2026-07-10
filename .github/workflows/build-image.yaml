@@ -12,7 +12,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -36,6 +35,12 @@ jobs:
             echo "tag=${DATE}-${SHA}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Lowercase image name
+        id: image_name
+        run: |
+          LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "lowercase=$LOWER" >> $GITHUB_OUTPUT
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -56,8 +61,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.image_name.outputs.lowercase }}:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ steps.image_name.outputs.lowercase }}:latest
           build-args: |
             SECFLOW_BUILD_VERSION=${{ steps.tag.outputs.tag }}
           platforms: linux/amd64,linux/arm64
@@ -66,5 +71,6 @@ jobs:
 
       - name: Summary
         run: |
+          IMG="${{ env.REGISTRY }}/${{ steps.image_name.outputs.lowercase }}:${{ steps.tag.outputs.tag }}"
           echo "### Image built" >> $GITHUB_STEP_SUMMARY
-          echo "`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}`" >> $GITHUB_STEP_SUMMARY
+          echo "`$IMG`" >> $GITHUB_STEP_SUMMARY
