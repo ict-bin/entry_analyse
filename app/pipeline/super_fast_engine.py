@@ -1264,7 +1264,6 @@ class SuperFastPipelineEngine:
         if r1_max == 0:
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED
-            state.save(dirs.state_file)
             return
         try:
             from .extractor import extract_functions_static, compute_func_hash
@@ -1283,16 +1282,13 @@ class SuperFastPipelineEngine:
                 )
             fs.r1_w_state = NodeState.PASSED
             fs.r1_j_state = NodeState.PASSED  # no separate J
-            # state.save 改为每100文件一次(避免O(n²)序列化整个state拖慢R1)
-            _r1_save_counter[0] += 1
-            if _r1_save_counter[0] % 100 == 0:
-                state.save(dirs.state_file)
+            # 不调 state.save(): resume已移除(任何恢复走restart), state_file在/tmp无人读
+            # 之前每文件save整个state(O(n²)+锁竞争)是R1慢的根因
             logger.info("R1_pass(super_fast): file=%s funcs=%s", basename, len(static_funcs))
         except Exception as exc:
             logger.error("R1 failed for %s: %s", file_path, exc)
             fs.r1_w_state = NodeState.FAILED
             fs.r1_j_state = NodeState.FAILED
-            state.save(dirs.state_file)
 
     # ── R2（行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
 # ── R2（ctags 行号修正）+ R3（外部输入分析）W+J（每函数串链）───────────────
